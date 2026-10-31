@@ -343,6 +343,42 @@ and are not reused.
 - **SPEC-4.16**: `utils::client_ip::parse_forwarded_ip` must accept a bare IPv4 or IPv6 address, a bracketed IPv6
   literal with an optional `:port` suffix, and an IPv4 `host:port` form, and must return `None` for anything else.
 
+### 4.5 Download headers, HTML escaping, inline images
+
+- **SPEC-4.17**: `utils::content_disposition::content_disposition` must strip `"`, `/`, `\`, NUL and any other control
+  character from the given filename, keep at most the first 255 remaining characters, trim surrounding whitespace, and
+  fall back to the literal name `file` when nothing is left; a non-ASCII character must pass through unchanged. The
+  result must always be returned as `attachment; filename="<name>"`.
+- **SPEC-4.18**: `utils::html::html_escape` must replace `&` with `&amp;` before replacing `<`, `>` and `"`, so an
+  already-escaped entity is never escaped a second time.
+- **SPEC-4.19**: `utils::html::urlencoded` must percent-encode every byte outside `A-Z`, `a-z`, `0-9`, `-`, `_`, `.`
+  and `~`.
+- **SPEC-4.20**: `utils::inline_image::check_inline_image_mime` must accept only `image/png`, `image/jpeg`,
+  `image/webp` and `image/gif` (matched case-insensitively and after cutting the value at the first `;`), returning
+  the canonical lowercase MIME string on success; it must reject every other type, including `image/svg+xml`, because
+  SVG is script-capable and the three public, unauthenticated image surfaces (tenant logo, KB article image, ticket
+  inline image) must never serve one.
+
+### 4.6 Recovery codes, app name, upload limits
+
+- **SPEC-4.21**: `utils::recovery::generate_code` must produce 10 random bytes, base32-encode all 16 resulting
+  characters (no truncation, preserving the full 80 bits of entropy) and format them as `XXXXXXXX-XXXXXXXX`.
+  `canonicalize` must strip whitespace and hyphens and uppercase the remainder, so any of the hyphenated, unhyphenated,
+  lower-case or spaced forms of a code canonicalize identically; `hash_code` and `hash_code_hex` must hash the
+  canonical form with SHA-256.
+- **SPEC-4.22**: `utils::app_name::app_name` must return `DEFAULT_APP_NAME` ("Mokosh") when no name has been set, and
+  must otherwise return the cached name set by the most recent `set_app_name` call; `sanitize` must reject a blank (or
+  whitespace-only) name, a name longer than `MAX_APP_NAME_LEN` (64) characters (counted as Unicode characters, not
+  bytes), and a name containing any control character, since the value is later written into an email `Subject`
+  header.
+- **SPEC-4.23**: `utils::upload_limits::oversized_upload_error` must return an `AppError` that renders as HTTP 413
+  (Payload Too Large) with the message `"{what} exceeds the {cap_bytes} byte cap."`. Every route that accepts an
+  upload against its own size cap must build this refusal through this function rather than a hand-built error.
+- **SPEC-4.24**: `utils::upload_limits::body_limit_bytes` must return the route's logical byte cap plus a fixed 64
+  KiB margin (`MULTIPART_OVERHEAD_BYTES`), and every route with an upload cap must pass that value to
+  `axum::extract::DefaultBodyLimit::max`, because axum's own un-raised multipart body limit is 2 MiB and would refuse
+  an at-cap upload before `oversized_upload_error` ever runs.
+
 ## 5. Interfaces
 
 ### 5.1 HTTP API

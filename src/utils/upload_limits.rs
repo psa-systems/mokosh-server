@@ -35,6 +35,7 @@ use crate::utils::error::AppError;
 /// uploaded (e.g. `"attachment"`, `"logo"`, `"KB image"`) so the message
 /// stays specific while the status code and sentence shape stay identical
 /// everywhere.
+// SPEC-4.23: HTTP 413 with a uniform "{what} exceeds the {cap_bytes} byte cap." message.
 pub fn oversized_upload_error(what: &str, cap_bytes: u64) -> AppError {
     AppError::PayloadTooLarge(format!("{what} exceeds the {cap_bytes} byte cap."))
 }
@@ -53,6 +54,7 @@ const MULTIPART_OVERHEAD_BYTES: u64 = 64 * 1024;
 /// refusal is `oversized_upload_error(_, cap_bytes)`. Call this when building
 /// the route, not the app's own logical cap, so an at-cap upload is accepted
 /// and an over-cap one still reaches the app's own 413 rather than axum's.
+// SPEC-4.24: logical cap plus a 64 KiB multipart-framing margin for DefaultBodyLimit.
 pub fn body_limit_bytes(cap_bytes: u64) -> usize {
     cap_bytes.saturating_add(MULTIPART_OVERHEAD_BYTES) as usize
 }

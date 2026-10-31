@@ -12,6 +12,7 @@
 /// Minimal escaping for the few characters that would break out of an
 /// attribute or an element. Not a general-purpose sanitiser: the values passed
 /// through it are operator configuration and tenant-set names, not documents.
+// SPEC-4.18: escape & before <, > and " so an entity is never double-escaped.
 pub fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -40,6 +41,7 @@ pub fn page_shell_css(max_width: &str) -> String {
 /// Percent-encode a `mailto:` subject. Everything outside the unreserved set
 /// is encoded, so a form name carrying a space, an ampersand or a quote cannot
 /// truncate the URL or escape the attribute.
+// SPEC-4.19: percent-encode everything outside the unreserved character set.
 pub fn urlencoded(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
