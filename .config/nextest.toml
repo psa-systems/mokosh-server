@@ -44,7 +44,7 @@
 # parentheses even when the list is one entry long, and add a new suite to the
 # `unsupported` list only, never here.
 default-filter = 'not (test(/^suites::s3_storage::/) or test(/^suites::google_client_from_infisical::/))'
-# SPEC-10.155, SPEC-10.156: must negate [profile.unsupported]'s filter character-for-character.
+# SPEC-10.155, SPEC-10.156: must negate the unsupported profile's filter character-for-character.
 
 # nextest schedules test CASES across every archived binary at once instead
 # of running one binary to completion before starting the next (what
