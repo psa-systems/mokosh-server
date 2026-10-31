@@ -1,59 +1,14 @@
-//! MAPPS-1099 scaffold: the `InvoiceIssuer` seam a later phase plugs
-//! external invoicing providers (Xero, QuickBooks) into.
+//! Declares `ExternalInvoicingProvider` (the enum) and `ExternalIssuer`
+//! (the trait) for delegating invoice issuance to an external provider.
 //!
-//! An invoice is "issued" by assigning a number, writing the row and
-//! putting it in front of the customer. Today Mokosh does all three; a
-//! tenant that delegates the Invoicing capability to Xero or QuickBooks
-//! wants an external provider to do them, with Mokosh keeping a mirror row
-//! for history and reconciliation.
-//!
-//! This file DOES NOT change the current issuance path. It declares the
-//! trait and the external-provider enum future phases of MAPPS-1099
-//! implement:
-//!
-//! - **Phase A (not shipped):** the Xero API client + OAuth. ~800-1500
-//!   LOC in `src/modules/billing/provider/xero.rs`.
-//! - **Phase B (not shipped):** the QuickBooks API client + OAuth.
-//!   `src/modules/billing/provider/quickbooks.rs`.
-//! - **Phase C (not shipped):** the delegation layer that reads
-//!   `IntegrationsService::get(tenant, provider).enabled_capabilities`
-//!   in `billing::service::create_invoice` and picks the issuer.
-//! - **Phase D (not shipped):** signed webhook receivers at
-//!   `/api/v1/webhooks/{xero,quickbooks}` for payment-received and
-//!   voided events.
-//!
-//! The trait + enum here are the API SHAPE those phases build against,
-//! and they produce an `InvoicingNotImplementedForProvider` error today
-//! so a hypothetical caller that bypassed the dispatch and asked for
-//! external issuance before the clients exist gets a clear refusal.
-//!
-//! # Why this ships before the clients
-//!
-//! Three reasons.
-//!
-//! 1. The migration (278) that adds the `invoices.external_provider`,
-//!    `external_invoice_id` and `external_number` columns ships here so
-//!    the schema is ready to receive the first client's writes without
-//!    needing a schema change in the same PR as the client code (a
-//!    schema change rolled back for a client bug would roll back both).
-//! 2. The trait pins the shape the clients implement, so Xero and
-//!    QuickBooks (siblings, not shared) land as two independent PRs
-//!    without having to re-litigate the issuer surface.
-//! 3. A unit test here asserts that the external path currently refuses:
-//!    the "no capability delegated silently falls through to local"
-//!    invariant is checked at the enum level, so the eventual Phase C
-//!    dispatch cannot accidentally route a non-delegated tenant to a
-//!    stubbed external path.
-//!
-//! Nothing in `billing::service` reads this file yet. The seam is here
-//! waiting for Phase C to call it.
+//! `integrations/registry.rs` reads `ExternalInvoicingProvider` today to
+//! validate a tenant's configured invoicing provider. See
+//! `docs/invariants/billing.md#delegated-issuing` for the shipped
+//! delegated-issuing behaviour; this file does not describe it.
 
 use crate::utils::error::{AppError, AppResult};
 
-/// The external provider for one tenant's Invoicing delegation. The three
-/// providers the registry declares that could ever receive this delegation
-/// are declared one at a time as they ship; today none ship, so this is
-/// shaped for extension.
+/// The external provider for one tenant's Invoicing delegation.
 ///
 /// `Xero` and `Quickbooks` are the two providers whose registry entries
 /// support `Capability::Invoicing`. Stripe is in the registry too but
