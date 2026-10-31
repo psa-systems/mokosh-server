@@ -565,6 +565,41 @@ and are not reused.
   wider column gives up space; a cell that still does not fit its column must be truncated with a trailing
   ellipsis rather than overflowing.
 
+### 4.16 Shared wire-type validators and helpers
+
+- **SPEC-4.79**: a slug must match `^[a-z0-9]+(-[a-z0-9]+)*$`: lowercase letters and digits only, with a single
+  hyphen between groups and no leading, trailing or doubled hyphen.
+- **SPEC-4.80**: a stored rate or hours value must fit `NUMERIC(10,2)` and may be zero; a per-mile rate must fit
+  `NUMERIC(8,4)`; a mileage distance must fit `NUMERIC(8,2)` and must be strictly positive, rejecting zero where
+  the other three accept it.
+- **SPEC-4.81**: sanitizing a string must remove every Unicode format character and U+00AD, fold any non-ASCII
+  whitespace character to a plain space, and trim the result, while a zero-width joiner or non-joiner in the
+  interior of the string must be preserved and only removed when it is leading or trailing.
+- **SPEC-4.82**: resolving a person's local date or "today" must bucket the instant by their configured IANA time
+  zone, falling back to UTC when the zone string is empty or does not parse.
+- **SPEC-4.83**: a PATCH field deserialized through the double-option convention must read an absent key as
+  "leave alone", an explicit JSON `null` as "clear the field", and a present value as "set the field", regardless
+  of which module's copy of the deserializer is applied to that field.
+- **SPEC-4.84**: a form field name must match the same grouping grammar as a slug but with underscores in place of
+  hyphens: lowercase letters and digits only, starting with a letter, with no trailing or doubled underscore.
+- **SPEC-4.85**: a submitted TOTP code must contain only ASCII digits and must not be empty, independently of the
+  6-8 character length check applied to it.
+- **SPEC-4.86**: a user's theme base mode must be one of `light`, `dark` or `system`, rejecting every other value
+  before it can reach the database CHECK constraint on that column.
+
+### 4.17 Ticket notes and SLA status
+
+- **SPEC-4.87**: a ticket note is editable only when the caller's role permits it, the note was not created by a
+  contact, and, for a `Public` note, the note has not already been emailed; an `Internal` or `Resolution` note
+  stays editable regardless of send state, and a `TimeEntry` note is never editable through this path.
+- **SPEC-4.88**: the SLA at-risk lead is 20 percent of the window between a ticket's creation and its due date,
+  clamped between a 5-minute floor and a 24-hour ceiling, with a non-positive window falling back to the floor;
+  a ticket's SLA status must read `NotApplicable` once it is closed, resolved, or its status is flagged closed,
+  `Breached` once `now` passes the due date, `Warning` once `now` enters the at-risk lead before the due date, and
+  `OnTrack` otherwise.
+- **SPEC-4.89**: a saved ticket view name must fail validation when it is empty or contains only whitespace, not
+  merely when its untrimmed length is zero.
+
 ## 5. Interfaces
 
 ### 5.1 HTTP API

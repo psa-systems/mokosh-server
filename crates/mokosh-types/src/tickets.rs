@@ -141,6 +141,7 @@ impl NoteType {
 /// system disagreeing with it is the disagreement an MSP loses. A time-entry
 /// note is edited through its time entry. Internal notes stay in-house so
 /// they can be edited freely subject to the role check.
+// SPEC-4.87: role, author-not-a-contact, and for Public notes not yet sent.
 pub fn note_is_editable(
     note_type: NoteType,
     is_email_sent: bool,
@@ -608,6 +609,8 @@ pub const SLA_AT_RISK_LEAD_CEIL: chrono::Duration = chrono::Duration::hours(24);
 /// the badge and the alert cannot disagree about when a ticket is in trouble.
 /// The worker's numbers won because they are the ones a human already trusts:
 /// they decide whether somebody gets woken up.
+// SPEC-4.88: 20 percent of the window, clamped to [floor, ceil], floor on a
+// non-positive window.
 pub fn sla_at_risk_lead(created_at: DateTime<Utc>, due: DateTime<Utc>) -> chrono::Duration {
     let window = due - created_at;
     if window <= chrono::Duration::zero() {
@@ -641,6 +644,8 @@ pub struct SlaClock {
 /// tickets service, so the threshold logic lives in one place - and, since
 /// PMS-893, by the SLA-sweep worker, so the badge on the screen and the alert
 /// in someone's inbox answer the same question the same way.
+// SPEC-4.88: NotApplicable once closed/resolved/status-closed, else Breached
+// past due, Warning inside the at-risk lead, else OnTrack.
 pub fn compute_sla_status(clock: &SlaClock) -> SlaStatus {
     if clock.closed_at.is_some() || clock.resolved_at.is_some() || clock.status_is_closed {
         return SlaStatus::NotApplicable;
@@ -967,6 +972,7 @@ pub struct TicketSavedView {
 /// `name.trim()` and the column CHECK enforces the trimmed length, so a
 /// whitespace-only name passes `length(min = 1)` here and then fails the
 /// CHECK as an unhandled SQLSTATE 23514 (PMS-1474).
+// SPEC-4.89: rejects a whitespace-only name, not just an empty one.
 fn validate_not_blank(value: &str) -> Result<(), ValidationError> {
     if value.trim().is_empty() {
         Err(ValidationError::new("blank"))

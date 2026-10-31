@@ -81,6 +81,8 @@ fn is_edge_trim(c: char) -> bool {
 /// the logs to explain it. This function has no opinion about field names; the
 /// exemption list lives with the caller that walks a request body
 /// (`mokosh_server::utils::text::SECRET_FIELD_NAMES`).
+// SPEC-4.81: removes format chars and U+00AD, folds exotic spaces to a plain
+// space, trims; interior ZWJ/ZWNJ is kept, only stripped at the edges.
 pub fn sanitize_invisible(value: &str) -> Cow<'_, str> {
     if !value.chars().any(|c| is_removed(c) || is_exotic_space(c)) {
         // Nothing to rewrite: a trim still borrows, so a clean value round-trips
