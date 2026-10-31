@@ -418,6 +418,50 @@ and are not reused.
   (verifying against a fixed dummy hash in the `None` case) and must return `Ok(false)` whenever `row_hash` is
   `None`, so a lookup that matched no row costs the same time as one that did.
 
+### 4.9 Request-body text sanitization
+
+- **SPEC-4.36**: `utils::text::is_secret_field` must match a key against `SECRET_FIELD_NAMES` case-insensitively and
+  exactly (no substring match); `sanitize_json_tree` must skip sanitizing the entire subtree under a key that
+  matches, while still sanitizing the key string itself.
+- **SPEC-4.37**: `sanitize_json_tree` must apply `sanitize_invisible` to every string value and every object key at
+  any depth (except a skipped secret subtree's values), recursing into arrays and objects, and must return `true` if
+  and only if at least one byte changed.
+- **SPEC-4.38**: `utils::text::sanitize_json_body` must forward the request body untouched when the path matches a
+  `RAW_BODY_PATHS` prefix, when the `Content-Type` is not JSON, or when a declared `Content-Length` exceeds
+  `MAX_SANITIZED_JSON_BYTES` (25 MB); on a body that parses as JSON it must store the parsed (and possibly
+  sanitized) tree as a `ParsedJsonBody` request extension, replace the body with an empty one and remove
+  `Content-Length`; on an empty or unparseable body it must forward the original bytes untouched.
+
+### 4.10 Field-level validators
+
+- **SPEC-4.39**: `utils::validation::validate_email` must accept only a string matching
+  `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`.
+- **SPEC-4.40**: `validate_phone` must first strip invisible characters via `sanitize_invisible`, then accept an
+  empty result or one matching the E.164 pattern `^\+?[1-9]\d{1,14}$`.
+- **SPEC-4.41**: `validate_slug` must delegate to `mokosh_types::validation::validate_slug` rather than defining its
+  own grammar, so the server and the wire-type crate cannot diverge on what a slug is.
+- **SPEC-4.42**: `validate_password_strength` must require between 8 and 128 characters and at least one lowercase
+  letter, one uppercase letter, one ASCII digit and one non-alphanumeric character, listing every missing category
+  in the error message.
+- **SPEC-4.43**: `validate_cron` must accept only an expression `cron::Schedule::try_from` parses successfully.
+- **SPEC-4.44**: `validate_scheduling_template_kind`, `validate_contract_type`, `validate_contract_status` and
+  `validate_billing_cycle` must each accept only a value present in its fixed set (`SCHEDULING_TEMPLATE_KINDS`,
+  `CONTRACT_TYPES`, `CONTRACT_STATUSES`, `BILLING_CYCLES` respectively), matching the corresponding database CHECK
+  constraint exactly, so an out-of-set value is rejected with a 422 rather than a database error.
+- **SPEC-4.45**: `validate_money_amount` must reject a magnitude of 10,000,000,000 or more; `validate_payment_amount`
+  must additionally reject a value that is not strictly positive or has more than 2 decimal places;
+  `validate_budget_amount` and `validate_budget_hours` must reject a negative value, more than 2 decimal places, or
+  a magnitude at or above their respective `DECIMAL` column limits; `validate_sla_target_hours` must reject a value
+  that is not strictly positive, has more than 2 decimal places, or reaches 100,000,000; `validate_tax_rate` must
+  reject a negative value, a value over 100, or more than 4 decimal places.
+- **SPEC-4.46**: `validate_ip_address` must accept an empty string or one `std::net::IpAddr` parses; validate a MAC
+  address must accept an empty string or one matching a colon- or hyphen-separated six-octet hex pattern.
+- **SPEC-4.47**: `slugify` must lowercase the input, replace every non-alphanumeric character with `-`, and collapse
+  consecutive separators; `truncate` must cut at a UTF-8 character boundary at or before `max_len - 3` bytes and
+  append `"..."` rather than panicking on a byte offset inside a multi-byte character.
+- **SPEC-4.48**: `cross_field_error` must build a `ValidationError` carrying a `field` param equal to its `field`
+  argument, so a schema-level validation error can be re-keyed onto a named form field instead of a generic bucket.
+
 ## 5. Interfaces
 
 ### 5.1 HTTP API
