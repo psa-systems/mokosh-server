@@ -50,21 +50,22 @@ impl ExternalInvoicingProvider {
 }
 
 /// The subset of an issuance request a provider needs to render the
-/// invoice document. Kept minimal on purpose: Phase A will grow the shape
-/// as the first real client discovers what it actually needs. The default
-/// stub below never reads these fields.
+/// invoice document. No implementation of [`ExternalIssuer`] exists, so
+/// this shape has never been exercised against a real client; the only
+/// impl below, [`NotImplementedIssuer`], never reads these fields.
 ///
 /// Shape is deliberately a struct (versus a trait method with 20
-/// parameters) so adding a field in Phase A does not break the trait
+/// parameters) so adding a field later does not break the trait
 /// signature.
 #[derive(Debug, Clone)]
 pub struct IssuanceRequest {
     /// Mokosh's own invoice id, so a webhook update from the provider
     /// can find the local mirror row.
     pub local_invoice_id: uuid::Uuid,
-    /// The company this invoice bills. Resolved by the caller to a
-    /// provider-specific contact id in Phase A (Xero needs the Contact
-    /// GUID; QuickBooks needs the Customer id).
+    /// The company this invoice bills. An [`ExternalIssuer`] impl would
+    /// resolve this to its own provider-specific contact id (Xero's
+    /// Contact GUID, QuickBooks's Customer id); nothing in the repo does
+    /// that today.
     pub company_id: uuid::Uuid,
     /// The invoice's total in minor units (cents) and currency, so the
     /// provider's shape is built from the authoritative local value
@@ -91,17 +92,16 @@ pub trait ExternalIssuer: Send + Sync {
     fn provider(&self) -> ExternalInvoicingProvider;
 
     /// Issue the invoice at the external provider and return what the
-    /// local mirror row needs. Phase A implements this for Xero; Phase B
-    /// for QuickBooks. Today's stub returns `NotImplemented`.
+    /// local mirror row needs. [`NotImplementedIssuer`] is the only impl
+    /// in the repo and always refuses.
     async fn issue(&self, request: &IssuanceRequest) -> AppResult<IssuanceOutcome>;
 }
 
-/// Phase C will build this from `IntegrationsService::get(tenant, provider)`
-/// for each provider in the tenant's integrations rows whose
-/// `enabled_capabilities` carries `invoicing`, and will pick the one to
-/// dispatch to. Today the function has no caller and returns `None` so a
-/// callsite under test can confirm the local path is picked when no
-/// provider is delegated.
+/// Nothing in the repo builds one of these from live data; it has no
+/// caller outside its own tests below. If something ever resolves a
+/// tenant's delegated providers from the integrations rows, that caller
+/// decides which providers count as delegated, and this struct does only
+/// the arithmetic over the set it is handed.
 ///
 /// The dispatch's refusal shape is intentional: zero delegations means
 /// the local path serves, exactly one means the single delegated provider
@@ -120,9 +120,8 @@ impl DelegationDispatch {
     }
 
     /// A dispatch with the delegations the caller already resolved from
-    /// the integrations rows. The caller is in `billing::service` once
-    /// Phase C lands; the dispatch's job is just the arithmetic over the
-    /// resolved set.
+    /// the integrations rows. Nothing in the repo calls this today; the
+    /// dispatch's job is just the arithmetic over the resolved set.
     pub fn with(delegated: Vec<ExternalInvoicingProvider>) -> Self {
         Self { delegated }
     }
@@ -146,9 +145,11 @@ impl DelegationDispatch {
     }
 }
 
-/// Today's placeholder for every variant of [`ExternalInvoicingProvider`].
-/// Phase A replaces `Xero` with the real `XeroInvoiceIssuer`; Phase B
-/// replaces `Quickbooks` with `QuickbooksInvoiceIssuer`. Named so a stray
+/// The only impl of [`ExternalIssuer`] in the repo, for every variant of
+/// [`ExternalInvoicingProvider`]. The shipped Xero and QuickBooks clients
+/// (`provider_invoice::xero`, `provider_invoice::quickbooks`) issue
+/// invoices through a different path and never implement this trait, so
+/// nothing currently replaces this with a real issuer. Named so a stray
 /// grep for the type lands here instead of a stale file.
 pub struct NotImplementedIssuer {
     provider: ExternalInvoicingProvider,
@@ -172,8 +173,8 @@ impl ExternalIssuer for NotImplementedIssuer {
         // here bypassed the dispatch below; the dispatch is what returns
         // the clean "pick one" or "none delegated" shape.
         Err(AppError::Internal(format!(
-            "Invoicing through {} is not yet implemented. The clients land in later phases of \
-             MAPPS-1099; until then the local Mokosh path is the only issuance path served.",
+            "Invoicing through {} via this trait is not implemented; nothing in the repo \
+             constructs an issuer for it.",
             self.provider.as_str()
         )))
     }
@@ -234,7 +235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_stub_issuer_refuses_with_a_named_phase_pointer() {
+    async fn the_stub_issuer_refuses_naming_the_provider() {
         let issuer = NotImplementedIssuer::new(ExternalInvoicingProvider::Xero);
         let request = IssuanceRequest {
             local_invoice_id: uuid::Uuid::nil(),
@@ -247,8 +248,8 @@ mod tests {
             AppError::Internal(message) => {
                 assert!(message.contains("xero"), "names the provider: {message}");
                 assert!(
-                    message.contains("MAPPS-1099"),
-                    "names the ticket: {message}"
+                    message.contains("not implemented"),
+                    "states it is unimplemented: {message}"
                 );
             }
             other => panic!("expected Internal, got {other:?}"),
