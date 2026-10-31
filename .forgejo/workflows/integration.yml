@@ -212,7 +212,7 @@ jobs:
         # service. The template every case clones (PMS-1254) is built once
         # per shard inside the suite's own advisory lock, idempotent across
         # the three shards and across runs.
-        image: postgres:18.2-alpine3.23
+        image: postgres:18.6-alpine3.23
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_USER: postgres

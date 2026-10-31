@@ -64,7 +64,7 @@ services:
     profiles: ["infisical"]
     container_name: dev-mokosh-infisical-postgres-${USER:?USER missing - run via just dev}
     # https://hub.docker.com/_/postgres
-    image: postgres:18.2-alpine3.23
+    image: postgres:18.6-alpine3.23
     environment:
       POSTGRES_DB: ${INFISICAL_PG_DB:?INFISICAL_PG_DB missing - run `just dev` (which generates .env from .env.example)}
       POSTGRES_USER: ${INFISICAL_PG_USER:?INFISICAL_PG_USER missing - run `just dev` (which generates .env from .env.example)}
@@ -103,7 +103,7 @@ services:
   infisical:
     profiles: ["infisical"]
     container_name: dev-mokosh-infisical-${USER:?USER missing - run via just dev}
-    image: infisical/infisical:v0.161.0
+    image: infisical/infisical:v0.167.4
     environment:
       ENCRYPTION_KEY: ${INFISICAL_ENCRYPTION_KEY:?INFISICAL_ENCRYPTION_KEY missing - run `just dev` (which generates .env from .env.example)}
       AUTH_SECRET: ${INFISICAL_AUTH_SECRET:?INFISICAL_AUTH_SECRET missing - run `just dev` (which generates .env from .env.example)}
@@ -180,7 +180,7 @@ services:
   postgres:
     container_name: dev-mokosh-postgres-${USER:?USER missing - run via just dev}
     # https://hub.docker.com/_/postgres
-    image: postgres:18.2-alpine3.23
+    image: postgres:18.6-alpine3.23
     environment:
       POSTGRES_DB: ${MOKOSH_PG_DB:-mokosh}
       POSTGRES_USER: ${MOKOSH_PG_USER:-postgres}
@@ -228,7 +228,7 @@ services:
   # false, so nothing leaves the box whatever SMTP_FROM says.
   mailpit:
     container_name: dev-mokosh-mailpit-${USER:?USER missing - run via just dev}
-    image: axllent/mailpit:v1.27
+    image: axllent/mailpit:v1.32
     restart: unless-stopped
     environment:
       MP_SMTP_AUTH_ACCEPT_ANY: "true"

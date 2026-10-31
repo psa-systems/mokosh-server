@@ -84,7 +84,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # first `DATA_DIRS` entry) and drops to it with `gosu`. `gosu` lives in
 # Alpine 3.23's community repo, so the runtime stage pins 3.23 and no later
 # `USER` line resets to a baked uid.
-FROM alpine:3.23
+FROM alpine:3.24
 
 WORKDIR /app
 

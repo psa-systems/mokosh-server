@@ -25,11 +25,11 @@ authors = ["Mokosh Server Team"]
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
+uuid = { version = "1.29.0", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 async-trait = "0.1.92"
 secrecy = { version = "0.10.3", features = ["serde"] }
-ipnetwork = "0.20"
+ipnetwork = "0.21.1"
 # `pool` is NOT a lettre default; opt in so LettreMailer reuses TCP
 # connections across sends. `native-tls` over rustls because some SMTP
 # relays' cert chains historically failed verification under rustls.
@@ -64,29 +64,29 @@ path = "src/lib.rs"
 [dependencies]
 # Axum HTTP server
 axum = { version = "0.8.9", features = ["macros", "multipart", "ws"] }
-tower = { version = "0.5", features = ["full"] }
+tower = { version = "0.5.3", features = ["full"] }
 # PMS-780: `compression-br` alongside `compression-gzip` so the global
 # `CompressionLayer` can answer `Accept-Encoding: br`; without the feature it
 # silently negotiates gzip instead.
-tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "compression-br", "limit", "request-id"] }
+tower-http = { version = "0.7.1", features = ["cors", "trace", "compression-gzip", "compression-br", "limit", "request-id"] }
 
 # Database
 # PMS-729 phase 2 H6: `ipnetwork` feature enables sqlx's IpNetwork
 # decode for the portal_refresh_tokens.ip_address column so
 # /portal/auth/me/sessions can surface the requesting IP.
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "rust_decimal", "ipnetwork"] }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "rust_decimal", "ipnetwork"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 # PMS-1381: `try_join_all` runs a per-row set of gateway calls concurrently
 # instead of one row at a time, without spawning (the futures borrow `&self`).
-futures = "0.3"
+futures = "0.3.34"
 # PMS-783: `ReaderStream` turns an open file into a chunked response body so an
 # attachment download never buffers the whole blob. `tokio-stream` supplies the
 # `map` combinator that logs a mid-stream read failure instead of letting the
 # body abort silently. Both were already in the lock file transitively.
-tokio-util = { version = "0.7", features = ["io"] }
-tokio-stream = "0.1"
+tokio-util = { version = "0.7.20", features = ["io"] }
+tokio-stream = "0.1.19"
 
 # Serialization
 serde = { workspace = true }
@@ -99,10 +99,10 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 # IANA timezone database for chrono (business-hours-aware SLA clock,
 # PMS-106). 0.9 tracks chrono 0.4.
-chrono-tz = "0.9"
+chrono-tz = "0.10.4"
 
 # Password hashing
-argon2 = "0.5"
+argon2 = "0.6.0"
 
 # JWT tokens.
 #
@@ -117,24 +117,24 @@ argon2 = "0.5"
 # bunyip's `at+jwt`), and it is pure Rust. `aws_lc_rs` would add a C and
 # CMake build dependency to every image and every runner, which is the class
 # of thing that has broken this repository's CI before.
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 
 # Validation
-validator = { version = "0.19", features = ["derive"] }
+validator = { version = "0.21.0", features = ["derive"] }
 
 # Password-strength scoring. PMS-729 phase 2 H5: portal password policy
 # rejects zxcvbn score < 3 (a fast-crack candidate) alongside the length
 # floor + common-password blocklist. Same primitive Dropbox uses in
 # production; pure-Rust port so no C dep.
-zxcvbn = "3"
+zxcvbn = "3.1.1"
 
 # Error handling
-thiserror = "2"
+thiserror = "2.0.21"
 anyhow = "1.0.104"
 
 # Logging/Tracing
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 # Environment
 dotenvy = "0.15.7"
@@ -147,27 +147,27 @@ secrecy = { workspace = true }
 # HTTP client (for integrations)
 # `stream` so the S3 backend (PMS-958) can hand a GET body to the
 # attachment download as a reader rather than buffering it (PMS-783 F6).
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
-urlencoding = "2"
+reqwest = { version = "0.13.5", features = ["json", "rustls-tls", "stream"], default-features = false }
+urlencoding = "2.1.3"
 
 # Encryption + HMAC (RMM alert ingest signs bodies with HMAC-SHA256;
 # PMS-104.)
-aes-gcm = "0.10"
-base64 = "0.22"
-rand = "0.9"
-hmac = "0.12"
+aes-gcm = "0.11.1"
+base64 = "0.23.1"
+rand = "0.10.3"
+hmac = "0.13.0"
 # SHA-1 is required only by the RFC 6238 TOTP primitive (utils::totp),
 # relocated here from the removed mokosh-auth-crypto crate (PMS-295).
-sha1 = "0.10"
-sha2 = "0.10"
-constant_time_eq = "0.3"
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+constant_time_eq = "0.6.1"
 
 # vCard parsing for the `.vcf` contact import (PMS-1289). The parser behind
 # Stalwart's CardDAV server, lenient by design; default features off, which
 # drops its JMAP and serde stack. `encoding_rs` transcodes an Outlook card
 # written as raw 8-bit bytes before the parser, which takes `&str`, sees it.
 calcard = { version = "0.3.14", default-features = false }
-encoding_rs = "0.8.42"
+encoding_rs = "0.8.44"
 
 # CardDAV multistatus parsing for the iCloud contact sync (PMS-1341). XML is
 # unavoidable here in a way it was not for the S3 provider (PMS-958), which
@@ -178,7 +178,7 @@ encoding_rs = "0.8.42"
 # directly, event by event, because the parts this needs (hrefs, etags,
 # address-data, the sync token) are a handful of elements rather than a document
 # model.
-quick-xml = { version = "0.41", default-features = false }
+quick-xml = { version = "0.42.0", default-features = false }
 
 # CIDR parsing for the trusted-proxy allowlist that gates X-Forwarded-For
 # client-IP extraction (PMS-587).
@@ -186,22 +186,22 @@ ipnetwork = { workspace = true }
 
 # IP -> country lookup for login-location alerts (PMS-657); reads the same
 # IP2Location LITE .BIN the ecosystem already deploys (see dmarc-reporter).
-ip2location = "0.6"
+ip2location = "0.6.1"
 
 # Rate limiting
-governor = "0.8"
+governor = "0.10.4"
 
 # Caching (tenants::service seeded-tenant cache)
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12.16", features = ["future"] }
 
 # Decimal
-rust_decimal = { version = "1", features = ["db-postgres", "serde"] }
+rust_decimal = { version = "1.43.0", features = ["db-postgres", "serde"] }
 
 # Regex
-regex = "1"
+regex = "1.13.1"
 
 # Cron
-cron = "0.15"
+cron = "0.17.0"
 
 # RFC 5545 recurrence-rule (RRULE) expansion for recurring appointments
 # (PMS-58). Expansion happens in-memory at read time, bounded by the
@@ -209,7 +209,7 @@ cron = "0.15"
 rrule = "0.14"
 
 # URL
-url = "2"
+url = "2.5.8"
 
 # Shared DTOs (workspace member). The `models.rs` for each shared
 # module (auth, contacts, tenants, tickets, time_tracking) re-exports
@@ -222,19 +222,19 @@ mokosh-types = { path = "crates/mokosh-types" }
 # by a8n-tools and bunyip so the same defect is not solved three times. Pinned by
 # rev (not branch) so a dunite bump is an explicit reviewable diff, mirroring
 # bunyip's dunite pins. Pinned to dunite main.
-dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "91e27f2b798128aa2cf54f742df8248564888bf0" }
+dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "a831b6a01fecf1ad0d5e1dde0f6eba1f04a60679" }
 
 # BUNYIP-475: the shared ASN / VPN enrichment crate (BUNYIP-437), consumed here
 # as mokosh's second-product use of the same offline IP2Proxy signal so there is
 # no second implementation to drift. Leaf crate (owns its error, depends only on
 # ip2location), so it is pinned to the dunite rev that introduced it independently
 # of dunite-stripe-core above.
-dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "91e27f2b798128aa2cf54f742df8248564888bf0" }
+dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "a831b6a01fecf1ad0d5e1dde0f6eba1f04a60679" }
 # PMS-1014: the shared provider-status contract (report, summary, envelope).
 # Extracted from mokosh's local types so BUNYIP-634's aggregator binds to one
 # definition instead of a copy per producer. Leaf crate, pinned to the dunite
 # rev that introduced it independently of the dunite-* deps above.
-dunite-provider-status = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "91e27f2b798128aa2cf54f742df8248564888bf0" }
+dunite-provider-status = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "a831b6a01fecf1ad0d5e1dde0f6eba1f04a60679" }
 # PMS-876 took no default features (they carry HTML rendering and hyphenation
 # dictionaries nothing here uses). PMS-911 adds the image codecs, and exactly
 # the four `utils::inline_image` already accepts for an uploaded logo: a
@@ -250,9 +250,9 @@ dunite-provider-status = { git = "https://dev.a8n.run/psa-systems/dunite", rev =
 # never 500s on a bad values map (parse / render errors land as 4xx instead).
 # Default features cover `builtins` (needed for `|default`), `multi_template`
 # is unused.
-minijinja = "2.11"
+minijinja = "2.24.0"
 
-printpdf = { version = "0.12.7", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+printpdf = { version = "0.12.8", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # PMS-1008 subsets the embedded faces per document. printpdf's own subsetter is
 # behind its `text_layout` feature, which is what we are declining, but the
 # subsetter it calls is this crate - already in the build graph as printpdf's own
@@ -263,26 +263,26 @@ allsorts = { package = "allsorts-azul", version = "0.17.2", default-features = f
 [dev-dependencies]
 # `test-util` exposes `tokio::time::{pause, advance, resume}` for
 # deterministic virtual-clock tests (used by tests/scheduler.rs).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3.27.0"
 # Integration-test HTTP client. Tests pull the bearer token out of the
 # login JSON body and attach it via `.bearer_auth(&token)` on each call,
 # so no cookie jar is required (the legacy AuthMiddleware authenticates
 # from `Authorization: Bearer ...`, not from a cookie).
 # `multipart` is on for the PMS-483 attachment-upload integration tests.
-reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
+reqwest = { version = "0.13.5", features = ["json", "multipart", "rustls-tls"], default-features = false }
 # Drive #[sqlx::test] from this crate's test binaries. The macro reads
 # DATABASE_URL and provisions a fresh database per test invocation. The
 # `rust_decimal` feature lets test fixtures bind `Decimal` money columns
 # directly instead of interpolating SQL literals (PMS-199).
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "macros", "rust_decimal"] }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "macros", "rust_decimal"] }
 # Name the `Decimal` type in test fixtures that bind money columns.
-rust_decimal = { version = "1", features = ["db-postgres", "serde"] }
+rust_decimal = { version = "1.43.0", features = ["db-postgres", "serde"] }
 # PMS-711: sign a synthetic Stripe webhook (`t=<ts>,v1=<hmac>`) in
 # tests/pms711_stripe_pay_now.rs so the paid/refund paths run through the real
 # signature verification, not a bypass.
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13.0"
+sha2 = "0.11.1"
 # MAPPS-542: exercise `PaginationParams` deserialization from a raw query
 # string in unit tests, matching what axum's `Query` extractor does.
 serde_urlencoded = "0.7.1"

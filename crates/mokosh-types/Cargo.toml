@@ -12,7 +12,7 @@ path = "src/lib.rs"
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = "0.9"
+chrono-tz = "0.10.4"
 uuid = { workspace = true }
-validator = { version = "0.19", features = ["derive"] }
-rust_decimal = { version = "1", features = ["serde"] }
+validator = { version = "0.21.0", features = ["derive"] }
+rust_decimal = { version = "1.43.0", features = ["serde"] }
