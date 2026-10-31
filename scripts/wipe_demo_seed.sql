@@ -28,8 +28,8 @@
 
 BEGIN;
 
--- Identify the demo companies for this tenant (id captured into a temp table so
--- the preview and the deletes target the exact same rows).
+-- SPEC-9.227: identify the demo companies for this tenant (id captured into a
+-- temp table so the preview and the deletes target the exact same rows).
 CREATE TEMP TABLE _demo_companies ON COMMIT DROP AS
 SELECT id
 FROM companies
@@ -37,7 +37,7 @@ WHERE tenant_id = :tenant_id
   AND name = 'Acme Corporation (Demo)'
   AND tags @> ARRAY['demo']::text[];
 
--- PREVIEW: what will be removed.
+-- SPEC-9.227: PREVIEW what will be removed, from the same captured row set.
 SELECT 'companies' AS entity, count(*) AS rows
 FROM companies WHERE id IN (SELECT id FROM _demo_companies)
 UNION ALL
@@ -47,10 +47,11 @@ UNION ALL
 SELECT 'tickets', count(*)
 FROM tickets WHERE company_id IN (SELECT id FROM _demo_companies);
 
--- Tickets first (no cascade from companies), then the companies (contacts and
--- sites cascade via ON DELETE CASCADE).
+-- SPEC-9.228: tickets first (no cascade from companies), then the companies
+-- (contacts and sites cascade via ON DELETE CASCADE).
 DELETE FROM tickets WHERE company_id IN (SELECT id FROM _demo_companies);
 DELETE FROM companies WHERE id IN (SELECT id FROM _demo_companies);
 
--- Safety default: PREVIEW ONLY. Change to COMMIT once the counts look right.
+-- SPEC-9.229: safety default is PREVIEW ONLY. Change to COMMIT once the
+-- counts look right.
 ROLLBACK;
