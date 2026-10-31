@@ -29,6 +29,7 @@ interface Named {
   last_name?: string;
 }
 
+// SPEC-10.210: pages at the server's max page size; a 404 is an empty, disabled module.
 async function listAll(api: APIRequestContext, path: string): Promise<Named[]> {
   const out: Named[] = [];
   for (let page = 1; page <= 50; page += 1) {
@@ -100,6 +101,8 @@ async function sweep(
   return { removed, failed, errors };
 }
 
+// SPEC-10.210: throws when the bearer token file is absent, rather than
+// silently skipping cleanup.
 export default async function globalTeardown(): Promise<void> {
   if (!existsSync(TOKEN_FILE)) {
     throw new Error('[teardown] no bearer token on disk; setup failed, so cleanup did not run');
@@ -112,6 +115,9 @@ export default async function globalTeardown(): Promise<void> {
   const now = Date.now();
   const allErrors: string[] = [];
   try {
+    // SPEC-10.210: fixed, ordered sweep of 23 resource kinds (children before
+    // parents, companies last), deleting any record this run owns or that is
+    // stale.
     // Order matters: a parent refuses deletion while a child still references
     // it. Sweep children before parents, and the company (referenced by almost
     // everything) dead last.
@@ -168,6 +174,8 @@ export default async function globalTeardown(): Promise<void> {
   } finally {
     await api.dispose();
   }
+  // SPEC-10.210: one aggregated error naming every collected failure, thrown
+  // only after the full sweep completes.
   if (allErrors.length > 0) {
     throw new Error(`[teardown] ${allErrors.length} failure(s):\n${allErrors.join('\n')}`);
   }

@@ -9,18 +9,21 @@
 # over /app/target, masking anything baked into the image. Each
 # developer's first `just dev` does the full compile into the named
 # volume; subsequent runs are incremental.
+# SPEC-10.112
 FROM ghcr.io/niceguyit/rust-builder-glibc:v1.2.0-rust1.98.1-trixie
 
 RUN apt-get update && apt-get install --yes --no-install-recommends \
     pkg-config libssl-dev curl \
     && rm -rf /var/lib/apt/lists/*
 
+# SPEC-10.113
 RUN mkdir --parents /app /data /config
 
 WORKDIR /app
 
 # The server listens on $PORT, which compose.dev.yml sets from MOKOSH_PORT
 # (default 8080 in .env.example, same as oci-build/Dockerfile).
+# SPEC-10.113: EXPOSE 8080 is a documentation default only; real port is $PORT.
 EXPOSE 8080
 
 CMD ["cargo", "run", "--bin", "mokosh-server"]

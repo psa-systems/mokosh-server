@@ -17,6 +17,8 @@
 # Comment lines are excluded on purpose: the workflow's own comments name the
 # retired backends when explaining why they were dropped.
 
+# SPEC-10.177: verifies .forgejo/workflows/*.yml against this required/forbidden
+# pattern set, comments stripped first.
 const REQUIRED = [
     [what pattern];
     ["docker-container buildx driver" "--driver docker-container"]

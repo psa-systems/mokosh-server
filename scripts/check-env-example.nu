@@ -203,6 +203,7 @@ def compose-interpolations [] {
     | sort
 }
 
+# SPEC-10.189: unions registry-declared keys and direct code reads into one CODE set.
 def main [] {
     let registry = (registry-keys)
     let direct = (code-reads)
@@ -213,6 +214,7 @@ def main [] {
 
     mut errors = []
 
+    # SPEC-10.190: every CODE name needs a .env.example key and a compose.dev.yml entry, else an allowlist row.
     for name in $code {
         if not ($name in $template) and not ($name in ($CODE_NOT_IN_TEMPLATE | columns)) {
             $errors = ($errors | append $".env.example: ($name) is read by the code but has no key; add it \(a commented-out `# ($name)=` counts\) or allowlist it in CODE_NOT_IN_TEMPLATE with a reason")
@@ -222,6 +224,7 @@ def main [] {
         }
     }
 
+    # SPEC-10.191: every .env.example key must be read by code or interpolated in compose, else a TEMPLATE_UNREAD row.
     for key in $template {
         if ($key in $code) or ($key in $interpolated) { continue }
         if ($key in ($TEMPLATE_UNREAD | columns)) { continue }
@@ -231,6 +234,7 @@ def main [] {
     # An allowlist entry that no longer describes a real asymmetry is stale
     # documentation of a fixed problem, and it silently re-permits the defect if
     # the name comes back.
+    # SPEC-10.192: a stale allowlist entry whose excused asymmetry no longer holds is itself an error.
     for entry in ($CODE_NOT_IN_TEMPLATE | columns) {
         if ($entry in $template) {
             $errors = ($errors | append $"CODE_NOT_IN_TEMPLATE: ($entry) is in .env.example now; drop the allowlist entry")

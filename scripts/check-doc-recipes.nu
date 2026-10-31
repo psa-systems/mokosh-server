@@ -134,6 +134,7 @@ def documented-recipes [file: string] {
     $hits
 }
 
+# SPEC-10.181
 def main [] {
     let recipes = ((justfile-recipes) | append (imported-recipes) | uniq)
     if ($recipes | is-empty) {

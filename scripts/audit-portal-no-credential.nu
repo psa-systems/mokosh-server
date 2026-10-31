@@ -25,6 +25,7 @@
 # is a per-row table plus a per-tenant summary; feed the redacted totals
 # into a PMS-917 comment.
 
+# SPEC-10.193: a manual survey tool, no just wrapper and no CI invocation.
 def main [] {
     let database_url = ($env.DATABASE_URL? | default "")
     if ($database_url | is-empty) {

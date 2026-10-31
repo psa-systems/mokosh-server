@@ -35,6 +35,7 @@
 # already stayed on the merge trigger, so the bump changes nothing here.
 name: Create release
 
+# SPEC-10.46
 on:
   pull_request_target:
     types:
@@ -44,6 +45,7 @@ on:
 
 jobs:
   create-release:
+    # SPEC-10.46
     if: >-
       github.event.pull_request.merged == true
       && startsWith(github.event.pull_request.head.ref, 'release/v')
@@ -53,5 +55,6 @@ jobs:
     # Base label: the reusable job runs git and two HTTP calls to the Forgejo
     # releases API. It compiles nothing, so the dev image's C toolchain is not
     # needed. Medium is the size common's own stub specifies for it.
+    # SPEC-10.46
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
     secrets: inherit

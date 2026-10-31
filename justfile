@@ -12,6 +12,7 @@
 # `check-docker`, `build-docker`, `test`); `set allow-duplicate-recipes` is what
 # makes that override legal rather than a parse error.
 
+# SPEC-10.111
 compose_file := "compose.dev.yml"
 
 # -- psa-systems/common configuration (PMS-786) -----------------------------
@@ -22,19 +23,23 @@ compose_file := "compose.dev.yml"
 
 # Root `package.name`, which `release_crate` defaults to for the `cargo update
 # --package` that syncs Cargo.lock on a release.
+# SPEC-10.106
 app := "mokosh-server"
 
 # The dev compose service the checks run in. Ours is `server`, not the `app`
 # default, and a wrong value fails naming the services that do exist.
+# SPEC-10.107
 compose_service := "server"
 
 # `--workspace`, and deliberately NOT common's default `--all-features`: the
 # crate is feature-gated (`multi-tenant`, `server`) and check.yml compiles the
 # default set, so `--all-features` would have the hook and CI disagree.
+# SPEC-10.108
 clippy_args := "--workspace --all-targets -- -D warnings"
 
 # The forked recipe ran `cargo check`, not `cargo build`: this crate's binaries
 # are expensive to link and check.yml's compile step is a check too.
+# SPEC-10.109
 compile_step := "check"
 compile_args := "--workspace --all-targets"
 
@@ -45,6 +50,7 @@ compile_args := "--workspace --all-targets"
 # invocation. Doc tests therefore run in CI (check.yml's `Doc tests` step) and
 # no longer in the hook; PC-70 asks common for the second invocation, and this
 # line goes back to carrying both when it lands.
+# SPEC-10.110
 test_args := "--workspace --lib"
 
 # `dev_extra_volumes` is deliberately unset: it configures common's `dev-clean`,
@@ -53,10 +59,13 @@ test_args := "--workspace --lib"
 
 # The local `default`, `dev-clean`, `ensure-env`, `check-docker`, `build-docker`
 # and `test` below intentionally shadow common's; last definition wins.
+# SPEC-10.53
 set allow-duplicate-recipes := true
 
+# SPEC-10.52
 import 'common/common.just'
 
+# SPEC-10.54
 # List available recipes
 default:
     @just --list
@@ -76,12 +85,14 @@ default:
 #   oci-build/Dockerfile.
 # - `test-integration` needs a Postgres container, which is why PMS-267 split it
 #   into integration.yml. Run it by hand before touching the tests/suites/*.rs suite.
+# SPEC-10.55
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
 check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-migration-versions-against-base check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-config-docs check-doc-links check-claude-md
 
 # Keep docs/configuration.md's Required / Added in facts and changelog true to
 # the registry and src/config/variables.toml (PMS-1442).
+# SPEC-10.59
 [doc("Fail if docs/configuration.md disagrees with the registry's since/required facts (PMS-1442).")]
 [group: 'check']
 check-config-docs:
@@ -90,12 +101,14 @@ check-config-docs:
 
 # Regenerate docs/configuration.md's Recently added changelog and its Required
 # and Added in columns from the registry and src/config/variables.toml.
+# SPEC-10.99
 [doc("Regenerate the generated parts of docs/configuration.md (PMS-1442).")]
 [group: 'docs']
 config-docs:
     nu scripts/config-docs.nu generate
 
 # The pre-upgrade checklist for a jump longer than the changelog window.
+# SPEC-10.100
 [doc("List every configuration change after <version> with its won't-start / feature-off level; --json for tooling (PMS-1442).")]
 [group: 'docs']
 config-since version *args:
@@ -103,6 +116,7 @@ config-since version *args:
 
 # The block a release's notes carry, linking its Recently added entry. Pass
 # `--ref main` for a release tagged before its entry existed.
+# SPEC-10.101
 [doc("Print <version>'s configuration-changes block for its release notes (PMS-1442).")]
 [group: 'release']
 config-release-notes version *args:
@@ -111,6 +125,7 @@ config-release-notes version *args:
 # Keep every relative Markdown link pointing at a file that exists (PMS-850).
 # The 2026-07-01 docs move left 72 `](../...)` targets one directory short, and
 # three doc audits reported the same set because a broken link fails silently.
+# SPEC-10.60
 [doc("Fail if a relative Markdown link does not resolve to an existing path (PMS-850).")]
 [group: 'check']
 check-doc-links:
@@ -118,6 +133,7 @@ check-doc-links:
 
 # Keep CLAUDE.md an index over docs/ (PMS-1437): at most 20,000 bytes, no prose
 # line over 400 characters, and every docs/ link and anchor it names resolves.
+# SPEC-10.61
 [doc("Fail if CLAUDE.md outgrows its budget or a docs/ link or anchor in it breaks (PMS-1437).")]
 [group: 'check']
 check-claude-md:
@@ -130,6 +146,7 @@ check-claude-md:
 # spends memory the running application and the other developers need. Resolves
 # the path cargo will actually use and fails when its filesystem is tmpfs or
 # ramfs; docs/dev-docs/build-storage.md is where each host keeps its target.
+# SPEC-10.62
 [doc("Fail if the cargo target directory sits on a memory-backed filesystem (PMS-973).")]
 [group: 'check']
 check-build-target-storage:
@@ -138,6 +155,7 @@ check-build-target-storage:
 # Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if one of
 # the docs in `const DOCS` (scripts/check-doc-recipes.nu) names a recipe the
 # justfile does not define; a new page carrying commands belongs in that list.
+# SPEC-10.63
 [doc("Fail if a guarded doc names a recipe the justfile lacks (scope: scripts/check-doc-recipes.nu, PMS-843).")]
 [group: 'check']
 check-doc-recipes:
@@ -146,6 +164,7 @@ check-doc-recipes:
 # Keep config-comment `docs/` pointers resolving (PMS-855). .env.example is
 # minted into every clone's .env, so a dead pointer there reaches every
 # developer. Fails if one of the three config files names a missing path.
+# SPEC-10.64
 [doc("Fail if .env.example, compose.dev.yml or the justfile names a docs/ path that does not exist (PMS-855).")]
 [group: 'check']
 check-config-doc-paths:
@@ -155,6 +174,7 @@ check-config-doc-paths:
 # (PMS-836). Fails if a variable the code reads has no .env.example key or no
 # compose.dev.yml server line (so it cannot be set in dev at all), or if
 # .env.example declares a key nothing consumes.
+# SPEC-10.65
 [doc("Fail if a var the code reads is missing from .env.example or compose.dev.yml (PMS-836).")]
 [group: 'check']
 check-env-example:
@@ -163,6 +183,7 @@ check-env-example:
 # Enforce unique migration prefixes (PMS-198). Fails if two migrations
 # share a numeric prefix (sqlx keys its ledger on that prefix). Runs
 # common's shared recipe (PC-79).
+# SPEC-10.66: check-migration-versions is common/common.just's recipe (out of this section's covered-file scope)
 [doc("Fail if two migrations share a numeric prefix (PMS-198).")]
 [group: 'check']
 check-migrations: check-migration-versions check-migration-versions-against-base
@@ -174,6 +195,7 @@ check-migrations: check-migration-versions check-migration-versions-against-base
 # re-check (which rolled the compile+test cost on every merge); this cheap
 # unions the base ref's migrations with HEAD's and re-asserts prefix
 # uniqueness WITHOUT the compile cost.
+# SPEC-10.67
 [doc("Fail if a PR's migrations would collide with origin/main after the merge (PMS-1402).")]
 [group: 'check']
 check-migration-versions-against-base base_ref="origin/main":
@@ -186,6 +208,7 @@ check-migration-versions-against-base base_ref="origin/main":
 # 208), so a prior migration having already rewritten that text fails the
 # migration instead of silently no-opping (this hit auth.password_reset and
 # auth.welcome twice: migrations 139 and 152).
+# SPEC-10.68
 [doc("Fail if a migration after 209 guards content UPDATE without asserting its row count (PMS-1117).")]
 [group: 'check']
 check-guarded-content-migrations:
@@ -195,6 +218,7 @@ check-guarded-content-migrations:
 # hits the NOBYPASSRLS pool and fail-closes RLS-covered rows to zero, so it is
 # legitimate only on an RLS-exempt table or a pre-auth path, with an adjacent
 # `// SAFETY (PMS-285` note saying which.
+# SPEC-10.69
 [doc("Fail if a serving `.pool()` call appears without its `// SAFETY (PMS-285` note (PMS-692).")]
 [group: 'check']
 check-pool-safety:
@@ -206,6 +230,7 @@ check-pool-safety:
 # exceeds its bound and still reports success was never bounded, because
 # nothing was executing it - which is the one thing PMS-829's job bounds cannot
 # catch.
+# SPEC-10.96
 [doc("Report CI runs that outlived their job's timeout-minutes (PMS-906). Needs FORGEJO_TOKEN.")]
 [group: 'ci']
 ci-stalls days="3":
@@ -221,12 +246,14 @@ ci-stalls days="3":
 #   just ci-log --workflow integration.yml # that workflow's newest failure
 #   just ci-log --sha <commit>             # that commit's run
 #   just ci-log --list                     # recent runs, no log
+# SPEC-10.97
 [doc("Print a Forgejo Actions job's log (PMS-1426). --list, --workflow, --sha, --run.")]
 [group: 'ci']
 ci-log *args:
     nu scripts/ci-job-log.nu {{args}}
 
 # Prove the stall report still reports (PMS-906). Fixtures, no network.
+# SPEC-10.98
 [doc("Self-test for `just ci-stalls`; runs on fixtures, needs no token.")]
 [group: 'ci']
 ci-stalls-self-test:
@@ -237,6 +264,7 @@ ci-stalls-self-test:
 # for one column: over the max the update path 500s on a raw Postgres 22001
 # where create answers 422, and under the min it stores `""` where create
 # refuses it.
+# SPEC-10.70
 [doc("Fail if a Create*Request and its Update*Request validate a field differently (PMS-867).")]
 [group: 'check']
 check-validate-parity:
@@ -245,6 +273,7 @@ check-validate-parity:
 # Every mounted route needs a caller in mokosh-apps/src/ or a dated "parity
 # record" comment in its routes.rs (PMS-1263). Skips loudly with no sibling
 # mokosh-apps checkout (or $MOKOSH_APPS_DIR).
+# SPEC-10.71
 [doc("Fail if a route has no SPA caller and no dated parity record (PMS-1263).")]
 [group: 'check']
 check-route-consumers:
@@ -252,6 +281,7 @@ check-route-consumers:
 
 # Keep transactional email body copy in notification_templates, not in Rust
 # (PMS-700). Fails if a `Mailer` helper re-adds a seeded template's wording.
+# SPEC-10.72
 [doc("Fail if a `Mailer` helper duplicates a seeded template's copy (PMS-700).")]
 [group: 'check']
 check-mail-copy:
@@ -260,6 +290,7 @@ check-mail-copy:
 # Keep every 429 coming from the one shared builder (PMS-773). Fails if a route
 # file constructs a TOO_MANY_REQUESTS response itself, or if a handler computes
 # a retry delay and discards it.
+# SPEC-10.73
 [doc("Fail if a 429 response is built outside the shared builder (PMS-773).")]
 [group: 'check']
 check-rate-limit-helper:
@@ -268,6 +299,7 @@ check-rate-limit-helper:
 # Keep CI jobs on the right runner label (PMS-719). Fails if a compiling job
 # requests the base label, if a workflow installs a C toolchain at run time,
 # or if a runs-on carries no comment justifying its label.
+# SPEC-10.74
 [doc("Fail if a CI job requests the wrong runner label (PMS-719).")]
 [group: 'check']
 check-runner-labels:
@@ -276,6 +308,7 @@ check-runner-labels:
 # Keep the OCI build on the type=gha runner cache (PMS-720, GOV-20). Fails if a
 # buildx workflow drops the docker-container driver or the runtime-env step, or
 # if the retired inline / registry :buildcache backends come back.
+# SPEC-10.75
 [doc("Fail if the OCI build leaves the type=gha runner cache (PMS-720).")]
 [group: 'check']
 check-oci-cache:
@@ -284,6 +317,7 @@ check-oci-cache:
 # Keep `:latest` publishable from main only, and branch builds on the allow-list
 # in oci-build/get-tags.nu (PMS-733). Fails if the workflow's push filter or ref
 # guard drifts from that list, or if the tag resolver stops honouring it.
+# SPEC-10.76
 [doc("Fail if the publish tags drift from oci-build/get-tags.nu (PMS-733).")]
 [group: 'check']
 check-oci-publish-tags:
@@ -292,6 +326,7 @@ check-oci-publish-tags:
 # Keep [workspace.dependencies] describing what the workspace shares (PMS-785).
 # Fails if an entry is inherited by no member, or if a member re-pins a crate
 # the workspace table already pins.
+# SPEC-10.77
 [doc("Fail if [workspace.dependencies] and its members disagree (PMS-785).")]
 [group: 'check']
 check-workspace-deps:
@@ -300,6 +335,7 @@ check-workspace-deps:
 # Fail loud on a dependency declared in Cargo.toml with no call site (PMS-780).
 # `pulldown-cmark` and `minijinja` sat there unused, compiled on every cold
 # build. Install once: `cargo install --locked cargo-machete`.
+# SPEC-10.78
 [doc("Fail on a dependency declared in Cargo.toml with no call site (PMS-780).")]
 [group: 'check']
 check-unused-deps:
@@ -310,6 +346,7 @@ check-unused-deps:
     }
     cargo machete
 
+# SPEC-10.56
 # Check compilation
 [group: 'check']
 check-compile:
@@ -317,11 +354,13 @@ check-compile:
 
 # Run clippy with check.yml's `-D warnings` (PMS-851). Without it a lint that
 # fails the Check job passed here, which is the drift this gate exists to catch.
+# SPEC-10.57
 [doc("Run clippy over all targets with `-D warnings`, exactly as check.yml does.")]
 [group: 'check']
 check-clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# SPEC-10.58
 # Check formatting
 [group: 'check']
 check-fmt:
@@ -332,6 +371,7 @@ check-fmt:
 fmt:
     cargo fmt --all
 
+# SPEC-10.89
 # Run the unit tests (the Postgres-backed suite is `just test-integration`)
 [group: 'test']
 test:
@@ -357,6 +397,7 @@ test:
 # migration 207 on a cluster where the server never booted and so never ran its
 # own `provision_roles`. integration.yml runs the same file against its postgres
 # service; scripts/test-db-roles.sql carries the reasoning.
+# SPEC-10.90
 [doc("Create the DB roles the Postgres-backed suite needs before it runs (PMS-988).")]
 [group: 'test']
 ensure-test-db-roles: ensure-env
@@ -393,6 +434,7 @@ ensure-test-db-roles: ensure-env
 # install` otherwise. PMS-1251: pinned to the same version integration.yml
 # downloads as a release binary, via `--version`, so a local run and CI
 # exercise the same nextest release; update both in the same change.
+# SPEC-10.91: nextest 0.9.145 must match integration.yml's pinned version (SPEC-10.16)
 [group: 'test']
 test-integration: ensure-env ensure-test-db-roles
     docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'cargo install --locked --version 0.9.145 cargo-nextest && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci --no-capture -E '"'"'test(/^suites::template_database::/)'"'"' && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci'
@@ -407,6 +449,7 @@ test-integration: ensure-env ensure-test-db-roles
 # Which suites these are is NOT decided here: `.config/nextest.toml` carries the
 # split as a `default-filter` on the `ci` and `unsupported` profiles, so this
 # recipe names a profile and never a suite.
+# SPEC-10.92
 [doc("Run the suites integration.yml skips: functionality nothing currently uses (PMS-1394).")]
 [group: 'test']
 test-integration-unsupported: ensure-env ensure-test-db-roles
@@ -432,6 +475,7 @@ test-integration-unsupported: ensure-env ensure-test-db-roles
 #
 # Trailing args pass through, so `--json` renders one JSON envelope for CI
 # and `--text` (the default) prints the operator table.
+# SPEC-10.93
 [doc("Boot every provider seam and report per-capability pass/fail (PMS-1013).")]
 [group: 'test']
 verify-providers *args:
@@ -443,6 +487,7 @@ verify-providers *args:
 # Postgres-backed setup as `test-integration`, including its superuser
 # DATABASE_URL override (see the note there for why `mokosh_migrator` cannot
 # run a `#[mokosh_test]` suite).
+# SPEC-10.94
 [doc("Run the demo-critical subset of the integration suite: seed_demo plus data_transfer (PMS-677).")]
 [group: 'test']
 verify-demo: ensure-env ensure-test-db-roles
@@ -454,16 +499,19 @@ verify-demo: ensure-env ensure-test-db-roles
 # outright, and e2e.yml installs with bun too (PMS-852). All three browsers, not
 # just chromium: the `setup` project runs on Firefox and there is a `webkit`
 # project, so a chromium-only install dies before the first assertion.
+# SPEC-10.95
 [doc("Run the Playwright E2E suite against staging or $E2E_BASE_URL; trailing args go to `playwright test` (PMS-140).")]
 [group: 'test']
 test-e2e *args:
     cd e2e && bun install --frozen-lockfile && bun x playwright install chromium firefox webkit && bun x playwright test {{args}}
 
+# SPEC-10.102
 # Build release binaries
 [group: 'build']
 build:
     cargo build --release --bins
 
+# SPEC-10.79
 # Build OCI image for validation (builder stage)
 [group: 'check']
 check-docker:
@@ -482,6 +530,7 @@ check-docker:
 # interpolated into postgres:// URLs are hex (URL-safe alphanumeric); the URL
 # lines are rebuilt from the same generated values so host-side tools (sqlx-cli)
 # stay consistent with the container roles compose provisions from the knobs.
+# SPEC-10.80
 [private]
 [group: 'hooks']
 ensure-env:
@@ -540,6 +589,7 @@ ensure-env:
     print "ensure-env: created .env with freshly generated self-owned secrets"
 
 # Bring up the Traefik-routed dev stack (mokosh-server + Postgres + mailpit; no Infisical, use just dev-infisical). Routed at https://{USER}-mokosh-api.a8n.run. Trailing args go to `docker compose up` (e.g. --build --detach).
+# SPEC-10.81
 [doc("Start the Traefik-routed dev stack in Docker. Trailing args go to `docker compose up` (e.g. --build --detach).")]
 [group: 'dev']
 dev *args: ensure-env
@@ -569,6 +619,7 @@ dev *args: ensure-env
     docker compose --file {{ compose_file }} up {{ args }}
 
 # Start only Infisical + its Postgres (opt-in; not started by `just dev`).
+# SPEC-10.82
 [doc("Start Infisical and its Postgres sidecar (compose profile: infisical)")]
 [group: 'dev']
 dev-infisical *args: ensure-env
@@ -589,6 +640,7 @@ dev-infisical *args: ensure-env
     docker compose --file {{ compose_file }} --profile infisical up {{ args }} infisical infisical-postgres
 
 # Start only MinIO (opt-in; not started by `just dev`). PMS-958.
+# SPEC-10.83
 [doc("Start a MinIO object store and point the blank STORAGE_S3_* keys in .env at it (compose profile: s3)")]
 [group: 'dev']
 dev-s3 *args: ensure-env
@@ -636,12 +688,14 @@ dev-s3 *args: ensure-env
 
 # Stop the dev stack. Volumes preserved. `--remove-orphans` cleans up any
 # stray containers left over from an older multi-file layout.
+# SPEC-10.84
 [doc("Stop the dev stack (volumes preserved)")]
 [group: 'dev']
 down: ensure-env
     docker compose --file {{ compose_file }} down --remove-orphans
 
 # Bootstrap Infisical for the dev stack (run once after `just dev`).
+# SPEC-10.85
 [doc("Bootstrap Infisical for the dev stack (run once after `just dev`)")]
 infisical-bootstrap: ensure-env
     #!/usr/bin/env nu
@@ -666,11 +720,13 @@ infisical-bootstrap: ensure-env
 # Run once after `just dev` boots to exercise the path-based portal login
 # at http://localhost:4301/portal/{portal_id}/login (portal_id from the
 # seeded Company row).
+# SPEC-10.86
 [doc("Seed the PMS-729 client-portal fixture tenants + contacts into the running dev DB (idempotent, dev-only).")]
 [group: 'dev']
 dev-seed-portal: ensure-env
     docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo run --quiet --bin mokosh-bootstrap -- dev-seed-portal'
 
+# SPEC-10.103: same build args as check-docker (SPEC-10.79), computed identically
 # Build OCI image
 [group: 'build']
 build-docker:
@@ -680,11 +736,13 @@ build-docker:
     let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
     docker buildx build --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:local --file oci-build/Dockerfile .
 
+# SPEC-10.104
 # Run database migrations against the running database
 [group: 'db']
 migrate-run:
     sqlx migrate run
 
+# SPEC-10.105
 # Create a new migration
 [group: 'db']
 migrate-create name:
@@ -693,6 +751,7 @@ migrate-create name:
 # -- Cleanup ------------------------------------------------------------------
 
 # Tear down this repo's dev footprint: stop the dev stack (compose.dev.yml) with its network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target, uploaded attachments/logos), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
+# SPEC-10.87
 [group: 'cleanup']
 dev-clean: ensure-env
     #!/usr/bin/env nu
@@ -724,6 +783,7 @@ dev-clean: ensure-env
     }
     print "dev-clean: done"
 
+# SPEC-10.88
 # Everything dev-clean does, plus remove the Docker images this repo builds and prune its buildx cache. Run for a from-scratch rebuild.
 [group: 'cleanup']
 dev-clean-all: dev-clean

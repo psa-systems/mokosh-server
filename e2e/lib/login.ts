@@ -37,6 +37,8 @@ const NO_FORM_BACKOFF_MS = 3_000;
 // the helper enters a TOTP code derived from `E2E_TOTP_SECRET`. The poll
 // uses `/^\/login(\/|$)/` so multi-step flows count as IN /login and the
 // helper only returns once the hub has actually let us through.
+// SPEC-10.204: retries at most 4 times, only on rate-limit/no-form/unclear;
+// fails fast with no retry on a definite credential rejection.
 export async function loginViaSpa(page: Page): Promise<void> {
   // The E2E account shares one email, and the bunyip hub rate-limits login at 5
   // requests / 60s PER EMAIL (bunyip RateLimitConfig::LOGIN, checked BEFORE
@@ -81,6 +83,7 @@ export async function loginViaSpa(page: Page): Promise<void> {
     throw new Error(loginFailureMessage(page, outcome, attempt, maxAttempts));
   }
 
+  // SPEC-10.205: fill a TOTP step when the hub advances to 2fa/mfa.
   // Credentials accepted. Enter the TOTP code if the hub advanced to the 2FA step
   // for this MFA-enabled account.
   if (/^\/login\/(2fa|mfa)/.test(new URL(page.url()).pathname)) {
@@ -105,6 +108,7 @@ export async function loginViaSpa(page: Page): Promise<void> {
   let lastPath = '';
   for (;;) {
     lastPath = new URL(page.url()).pathname;
+    // SPEC-10.205: click the allow/authorize/approve control to persist the grant.
     if (/^\/oauth2\/consent(\/|$)/.test(lastPath)) {
       const allow = page
         .locator('button[name="action"][value="allow"]')
@@ -431,6 +435,9 @@ async function fillTotpStep(page: Page): Promise<void> {
   // throttles. Each attempt relies on the BUNYIP-331 input-event auto-submit
   // (one POST, no button click), so we never re-POST the same code and burn a
   // failed attempt.
+  // SPEC-10.205: generate the code only when >=5s remain in the step, wait for
+  // a step later than this run's last used one, retry at most twice with a
+  // fresh code before the manual submit-click fallback below.
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     await codeInput.waitFor({ state: 'visible', timeout: 10_000 });
     // otplib's default step is 30s; `timeRemaining()` is the seconds until the
@@ -468,6 +475,7 @@ async function fillTotpStep(page: Page): Promise<void> {
 
 // An authenticated session can read the tenant-scoped tickets list (200); an
 // anonymous one is rejected (401/403). Cheapest universal session proof.
+// SPEC-10.206: 200 when authenticated, 401/403 when not.
 export async function expectAuthenticated(request: APIRequestContext): Promise<void> {
   const res = await request.get(`${routes.tickets}?per_page=1`);
   expect(res.status(), `GET ${routes.tickets} should be 200 when authenticated`).toBe(200);
@@ -488,6 +496,7 @@ export async function expectAnonymous(request: APIRequestContext): Promise<void>
 // hub's /login), so the wait budget covers that round-trip. Match any
 // /login* path so an intermediate hub step (e.g. consent screen) still
 // counts as "back at login".
+// SPEC-10.206: polls up to 30000ms until the path matches /^\/login(\/|$)/.
 export async function expectAtLoginScreen(page: Page): Promise<void> {
   await expect
     .poll(() => new URL(page.url()).pathname, {

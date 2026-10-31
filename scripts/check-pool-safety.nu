@@ -14,6 +14,7 @@
 # `migrator_pool()` is the sanctioned BYPASSRLS accessor and is exempt. The
 # `Database` accessors themselves are defined in src/db/pool.rs and are skipped.
 
+# SPEC-10.171: 8-line lookback window; migrator_pool() calls are exempt.
 const LOOKBACK = 8
 
 def main [] {

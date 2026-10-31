@@ -27,6 +27,8 @@
 # Pipe it: `nu scripts/ci-job-log.nu | rg 'FAIL \['` is how PMS-1426 classified
 # ten failures in one pass.
 
+# SPEC-10.195: --run picks a run directly; else newest match of the 50 most
+# recent runs filtered by --workflow/--sha/failure; --list prints no log.
 const HOST = "https://dev.a8n.run"
 const REPO = "psa-systems/mokosh-server"
 

@@ -4,6 +4,7 @@
 name: Build OCI container
 
 
+# SPEC-10.39
 on:
   push:
     branches:
@@ -48,15 +49,18 @@ jobs:
     # ref in addition to the push-trigger branch filter above. The allow-listed
     # branches appended to it publish their own branch tag only; the mode
     # computation below never resolves `latest` off main (PMS-733).
+    # SPEC-10.40
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     # Base label: the musl compile happens inside `docker buildx`, so the runner
     # only needs docker, nu and git. Nothing compiles natively here.
+    # SPEC-10.40
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
 
     # Backstop, not a target (PMS-829): 10 green runs took 6.3-20.5 minutes,
     # median 14.8. The headroom is for a cold `type=gha` cache, where the
     # dependency layer recompiles ~330 crates (PMS-781); the wedge this bounds
     # is a registry or cache round trip that never returns.
+    # SPEC-10.40
     timeout-minutes: 45
     permissions:
       contents: read
@@ -87,6 +91,8 @@ jobs:
           $"IMAGE_REGISTRY=($env.REGISTRY_PROVIDER)/($owner)\n" | save --append $env.GITHUB_ENV
 
       - name: Resolve publish mode, train and tag
+        # SPEC-10.41, SPEC-10.42: mode derives from the trigger alone, never
+        # git describe; dry_run true unless workflow_dispatch with dry_run=false
         id: resolve
         shell: nu {0}
         run: |
@@ -131,6 +137,7 @@ jobs:
       # identified per commit - the E2E deploy-sync gate ends up polling for
       # a hash that never appears (PMS-140).
       - name: Resolve build metadata
+        # SPEC-10.43
         shell: nu {0}
         run: |
           let git_hash = (^git rev-parse --short=12 HEAD | str trim)
@@ -144,6 +151,7 @@ jobs:
           print $"git_hash=($git_hash) git_describe=($git_describe) build_date=($build_date)"
 
       - name: Set up buildx builder
+        # SPEC-10.44
         # The `docker-container` driver is required for any cache export;
         # the default `docker` driver only carries inline metadata, which
         # misses the dependency-build layer ("OCI build workflow" in CI.md of
@@ -165,6 +173,8 @@ jobs:
           ^docker login --username $env.REGISTRY_USER --password $env.REGISTRY_PASSWORD $env.REGISTRY_PROVIDER
 
       - name: Build and push mokosh-server image
+        # SPEC-10.45: --cache-from type=gha always; --cache-to only when not a
+        # dry run; a dry run uses --load and skips --push/--cache-to entirely.
         shell: nu {0}
         run: |
           let tag = "${{ steps.resolve.outputs.tag }}"

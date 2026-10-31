@@ -13,6 +13,7 @@
 # MUST be bumped in lockstep with BOTH `rust-builder-*` image tags. When either
 # image moves to a newer rust, update `channel` here in the same PR and fix any
 # newly-promoted clippy/rustfmt lints alongside it.
+# SPEC-10.149, SPEC-10.150
 [toolchain]
 channel = "1.98.1"
 components = ["clippy", "rustfmt"]
