@@ -462,6 +462,24 @@ and are not reused.
 - **SPEC-4.48**: `cross_field_error` must build a `ValidationError` carrying a `field` param equal to its `field`
   argument, so a schema-level validation error can be re-keyed onto a named form field instead of a generic bucket.
 
+### 4.11 Pagination parameters and response metadata
+
+- **SPEC-4.49**: `utils::pagination::PaginationParams` must reject a deserialized `per_page` greater than
+  `MAX_PER_PAGE` (100) at parse time with a deserialization error; `PaginationParams::per_page` must clamp the
+  stored value to the inclusive range `[1, MAX_PER_PAGE]`.
+- **SPEC-4.50**: `PaginationParams::direction` (used by `order_by`, `order_by_mapped` and
+  `reject_unsupported_sort`) must map `"asc"` (case-insensitive) to `"ASC"`, an empty string or `"desc"` to
+  `"DESC"`, and reject any other value with a 422 naming the `sort_dir` field.
+- **SPEC-4.51**: `order_by` and `order_by_mapped` must reject a `sort` value absent from their allow-list with a
+  422 naming the `sort` field, the requested value and the accepted values, and must leave a `None` sort unchanged
+  by substituting the default field or SQL expression; `order_by_mapped` must resolve an allow-listed public key to
+  its mapped SQL expression rather than ever splicing the client-supplied string into the generated SQL;
+  `reject_unsupported_sort` must reject any non-`None` `sort` with a 422 stating the endpoint does not support
+  sorting.
+- **SPEC-4.52**: `PaginatedResponse::new` must compute `total_pages` as `ceil(total / per_page)` with `per_page`
+  floored to 1 to avoid division by zero, and must set `has_next` to `page < total_pages` and `has_prev` to
+  `page > 1`.
+
 ## 5. Interfaces
 
 ### 5.1 HTTP API
