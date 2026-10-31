@@ -539,6 +539,32 @@ and are not reused.
 - **SPEC-4.70**: `SharedMailer::swap` must replace the active mailer such that every subsequent send through the
   shared handle uses the new mailer, without any consumer needing to re-fetch a reference.
 
+### 4.15 PDF document rendering
+
+- **SPEC-4.71**: resolving a template's theme must fall back to the module's default accent color when the
+  tenant's accent is absent or does not parse as `#rrggbb`, logging a warning only in the unparseable case; the
+  band's text color must be chosen between a near-black and white ink by the accent's WCAG relative luminance so
+  the band's own title stays legible against it.
+- **SPEC-4.72**: parsing an accent color must accept only a leading `#` followed by exactly six ASCII hex digits,
+  rejecting every other string.
+- **SPEC-4.73**: rendering a document must embed, per font weight, only the glyphs that document's text actually
+  draws, selected by a deterministic (sorted) glyph id list, falling back to embedding the whole face without
+  failing the render when subsetting itself fails.
+- **SPEC-4.74**: folding text into the embedded face's character set must replace a C0/C1 control character and
+  any character the face has no glyph for with a single placeholder character, and must collect the distinct
+  missing characters so the caller can report them once per document rather than once per occurrence.
+- **SPEC-4.75**: rendering the same `Document` and the same `generated_on` date must produce byte-identical PDF
+  output on every call, with no part of the output read from the system clock.
+- **SPEC-4.76**: the saved PDF's trailer file identifier must be rewritten from a digest of the file with the
+  original identifier bytes blanked first, replacing both identifier slots with the same value of the same byte
+  length as what it replaces, and must leave the file untouched if the expected identifier markers are not found.
+- **SPEC-4.77**: placing a logo must scale it to fit inside its configured box while preserving its aspect ratio,
+  and a logo image that fails to decode must not fail the render, instead being omitted with a logged warning.
+- **SPEC-4.78**: distributing a table's column widths must never narrow a column below the configured minimum,
+  and a column whose content already fits within the narrow-column threshold must keep its full width before any
+  wider column gives up space; a cell that still does not fit its column must be truncated with a trailing
+  ellipsis rather than overflowing.
+
 ## 5. Interfaces
 
 ### 5.1 HTTP API
