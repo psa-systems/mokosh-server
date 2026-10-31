@@ -57,12 +57,12 @@ Rust edition 2021; the toolchain is pinned in `rust-toolchain.toml` (channel `1.
 
 `mokosh-server` is one long-running process. `src/main.rs` runs, in order:
 
-1. If `argv[1]` names an operator subcommand (section 4.2), run it and exit.
+1. If `argv[1]` names an operator subcommand (section 5.2), run it and exit.
 2. Initialise `tracing` with `RUST_LOG` (default filter `info`), load a `.env` file, read the hosting profile
    (`MOKOSH_DEPLOYMENT_MODE`), and refuse to boot if a retired storage variable name is set.
 3. Select the configuration provider and resolve every declared configuration key into one generation.
 4. Build `AppConfig`; refuse to boot outside development/test if the essential deployment variables are unset or the
-   secrets are weak (section 6.1).
+   secrets are weak (section 7.1).
 5. Provision the two database roles if the migrator role cannot yet log in (needs `MOKOSH_ADMIN_DATABASE_URL`), open
    the two connection pools, and run migrations when `RUN_MIGRATIONS` is true (the default). A migration failure ends
    startup with a non-zero exit.
@@ -100,7 +100,7 @@ protected by declaring an extractor in the handler signature (`RequireAuth`, `Re
 
 Tenant isolation: services open work with `Database::begin_with_tenant(tenant_id)`, which starts a transaction on the
 request-serving pool and sets `app.current_tenant` for that transaction. Row level security policies read that setting
-(section 5.2).
+(section 6.2).
 
 Errors: every failure is an `AppError` rendered as a JSON envelope `{"error": {"code", "message", "errors"?}}`. The
 `normalize_error_envelope` layer rewrites plain-text extractor rejections into the same envelope. Rate-limit
@@ -151,7 +151,7 @@ chain builder (`CONFIG_PROVIDERS`) constructs; the server process itself reads c
 
 ## 3. Functional requirements
 
-Each statement is observable through the interfaces in section 4.
+Each statement is observable through the interfaces in section 5.
 
 ### 3.1 Identity, sessions and tenancy
 
@@ -198,7 +198,7 @@ Each statement is observable through the interfaces in section 4.
   `ticket.priority_changed`. Actions include assign, set priority, set status, add tag and add internal note; cascading
   transitions are bounded by a per-tenant depth cap (default 3). Runs are listed per ticket.
 - Rows in `ticket_automation_rules` are evaluated by the ticket service (`AutomationEngine`), including a `webhook` action
-  that passes the outbound URL guard (section 7.3). No HTTP route or other code in `src` inserts such rows.
+  that passes the outbound URL guard (section 8.3). No HTTP route or other code in `src` inserts such rows.
 - Ticket templates; approval requests on tickets, time entries, change requests and quotes with a pending-approvals
   inbox and decision endpoint.
 - Email-to-ticket intake: a mail gateway posts parsed messages to `POST /api/v1/email-intake` with a tenant intake
@@ -277,9 +277,9 @@ Each statement is observable through the interfaces in section 4.
 - Version information and an opt-in update check against `MOKOSH_UPDATE_CHECK_URL` (reports `disabled` and makes no
   outbound request when unset).
 
-## 4. Interfaces
+## 5. Interfaces
 
-### 4.1 HTTP API
+### 5.1 HTTP API
 
 All paths are relative to the server root. Bodies and responses are JSON unless stated (attachments, logos and PDFs are
 binary; uploads are `multipart/form-data`). List endpoints take `PaginationParams` query parameters and return a
@@ -917,7 +917,7 @@ CORS: allowed methods GET, POST, PUT, DELETE, PATCH, OPTIONS; allowed request he
 (exact origins, or a scheme-locked `https://*.example.com` wildcard on the leftmost label); a malformed entry fails
 startup.
 
-### 4.2 Command line
+### 5.2 Command line
 
 `mokosh-server` with no argument serves. With a first argument from this list it runs the task and exits non-zero on
 error:
@@ -937,9 +937,9 @@ error:
 `bootstrap-infisical`, `qa-seed`, `qa-teardown`, `dev-seed-portal` (portal fixture tenants and contacts for development),
 `normalize-company-industries` (map free-text industries onto the canonical set across tenants) and `--version`.
 
-## 5. Data model
+## 6. Data model
 
-### 5.1 Storage and migrations
+### 6.1 Storage and migrations
 
 PostgreSQL. SQL migrations live in `migrations/` as `NNN_name.sql` files (starting at `002_tenants.sql`) and are embedded
 into the binary with `sqlx::migrate!` and copied into the image at `/app/migrations`. They are applied at boot on the
@@ -952,14 +952,14 @@ serves requests, owns nothing). Both are created idempotently at first boot from
 migrator role cannot yet log in. Each pool allows 20 connections (minimum 2), a 30 s acquire timeout, 600 s idle timeout
 and 1800 s maximum lifetime.
 
-### 5.2 Tenant isolation
+### 6.2 Tenant isolation
 
 Tenant-scoped tables carry `tenant_id`, enable and force row level security, and have a policy named `tenant_isolation`
 comparing `tenant_id` with `current_setting('app.current_tenant')`. The setting is applied per transaction by
 `begin_with_tenant`. Because `mokosh_app` does not bypass RLS, a query run without the setting sees no tenant rows.
 Cross-tenant and pre-authentication reads (login, webhooks, workers) use the migrator pool.
 
-### 5.3 Tables by domain
+### 6.3 Tables by domain
 
 Tables created by the migrations (`CREATE TABLE`), grouped:
 
@@ -1002,18 +1002,18 @@ Tables created by the migrations (`CREATE TABLE`), grouped:
   `status_observations`, `secrets` (tenant secret provider rows), `app_secrets` and `app_config` (deployment-level
   provider rows), `files` (storage ledger).
 
-### 5.4 Constraints worth knowing
+### 6.4 Constraints worth knowing
 
 - Check constraints pin enumerations in SQL as well as Rust, for example opportunity `stage` to six values with `outcome`
   set exactly when the stage is `won` or `lost`, and RMM `provider` to `tactical_rmm`, `mesh_central`, `datto`,
-  `connectwise`, `ninja_rmm`. Of those only `tactical_rmm` has an adapter (section 8); the others answer with a stub that
+  `connectwise`, `ninja_rmm`. Of those only `tactical_rmm` has an adapter (section 9); the others answer with a stub that
   records an error.
 - Numbering (tickets, invoices, quotes, credit notes, per-company invoices, asset tags) comes from sequence tables, not
   from application counters.
 - A tombstoned user keeps its row (`deleted_at`), its email is rewritten to a `deleted-<uuid>` form so the unique
   `(tenant_id, email)` constraint does not block a re-signup.
 
-## 6. Configuration
+## 7. Configuration
 
 Configuration keys are declared once in `src/config/registry.rs` and resolved at boot into a generation; a key not
 declared there cannot be read through the configuration API. The server process reads them from the process environment
@@ -1021,7 +1021,7 @@ declared there cannot be read through the configuration API. The server process 
 are re-resolved on a refresh. A `{NAME}_FILE` form is read by the file-based application-secret provider only. Values are
 never logged; boot records name keys and providers.
 
-### 6.1 Boot-time refusals
+### 7.1 Boot-time refusals
 
 Outside `ENVIRONMENT` values `development`, `dev` and `test` (any other value, including an unknown one, is treated as
 deployed) the server refuses to start when:
@@ -1031,13 +1031,13 @@ deployed) the server refuses to start when:
 - `ENCRYPTION_KEY` is not exactly 64 hexadecimal characters.
 - Any of `MOKOSH_DEPLOYMENT_MODE`, `MOKOSH_APP_DATABASE_URL`, `BASE_URL`, `CLIENT_ORIGIN`, `SPA_BASE_URL` is unset or
   blank. All missing variables are reported in one message with purpose and an example.
-- A retired storage variable name is set (section 6.5).
+- A retired storage variable name is set (section 7.5).
 - `MOKOSH_DEPLOYMENT_MODE`, `CONFIG_BACKEND`, `SECRET_BACKEND`, `APP_SECRET_BACKEND`, `STORAGE_PROVIDER`, `MAIL_PROVIDER` or
   `AUTH_PROVIDERS` holds an unrecognised value, `MAIL_PROVIDER=smtp` has no `SMTP_HOST`, or the mailer transport fails
   its boot verification.
 - An application secret is declared in one provider but held only by another ("misplaced").
 
-### 6.2 Core
+### 7.2 Core
 
 | Key | Purpose |
 |---|---|
@@ -1059,7 +1059,7 @@ deployed) the server refuses to start when:
 | `MOKOSH_UPDATE_CHECK_URL` | Manifest URL for `/version/check`; unset disables the check. |
 | `RUST_LOG` | Log filter; default `info`. |
 
-### 6.3 Secrets and encryption
+### 7.3 Secrets and encryption
 
 | Key | Purpose |
 |---|---|
@@ -1073,7 +1073,7 @@ deployed) the server refuses to start when:
 | `BUNYIP_SECRETS_URL`, `BUNYIP_SECRETS_CLIENT_ID`, `BUNYIP_SECRETS_CLIENT_SECRET` | Connection for the `bunyip` application-secret provider. |
 | `SMTP_PASSWORD`, `GOOGLE_CONTACTS_CLIENT_ID`, `GOOGLE_CONTACTS_CLIENT_SECRET`, `MICROSOFT_CONTACTS_CLIENT_ID`, `MICROSOFT_CONTACTS_CLIENT_SECRET`, `XERO_CLIENT_ID`, `XERO_CLIENT_SECRET`, `XERO_WEBHOOK_KEY`, `QUICKBOOKS_CLIENT_ID`, `QUICKBOOKS_CLIENT_SECRET`, `QUICKBOOKS_VERIFIER_TOKEN` | Governed application secrets. On `saas` the Google pair is read from the `bunyip` provider by default. A half-configured client id/secret pair fails boot. |
 
-### 6.4 Authentication and identity provider
+### 7.4 Authentication and identity provider
 
 | Key | Purpose |
 |---|---|
@@ -1092,7 +1092,7 @@ deployed) the server refuses to start when:
 | `MOKOSH_SEED_TENANT_ID` | UUID of the template tenant whose configuration is copied into newly provisioned tenants; default `00000000-0000-0000-0000-000000000001`. A malformed value is a configuration error. |
 | `MOKOSH_DEMO_SEED` | Truthy value enables automatic first-visit demo seeding outside `production`. |
 
-### 6.5 Mail, storage, network
+### 7.5 Mail, storage, network
 
 | Key | Purpose |
 |---|---|
@@ -1110,15 +1110,15 @@ deployed) the server refuses to start when:
 | `OUTBOUND_PRIVATE_ALLOWLIST` | Hosts and CIDRs that tenant-supplied outbound URLs may reach despite being private. |
 | `STRIPE_API_BASE`, `PAYPAL_API_BASE` | Override the payment API base URL (test stubs); PayPal otherwise selects its sandbox or live host from the credential. |
 
-## 7. Security
+## 8. Security
 
-### 7.1 Authentication and authorization
+### 8.1 Authentication and authorization
 
 - Three credential planes with distinct JWT `typ` claims so a token cannot be replayed across planes: staff (`access`,
   `refresh`, `identity`, plus the identity provider's `at+jwt`), contact portal (`contact`, access 15 minutes, refresh
   30 days, refresh cookie `HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth`), and platform admin (`platform`).
 - Only access tokens are accepted as bearers; a refresh token used as a bearer is refused.
-- Role checks are extractors (section 4.1). Roles are `super_admin`, `admin`, `manager`, `technician`, `dispatcher`,
+- Role checks are extractors (section 5.1). Roles are `super_admin`, `admin`, `manager`, `technician`, `dispatcher`,
   `sales`, `finance`; `RequireAdmin` admits `super_admin` and `admin`, `RequireManager` adds `manager`,
   `RequireFinance` adds `finance`.
 - Passwords are hashed with Argon2id. Contact-portal passwords must be 12 to 128 characters, have a zxcvbn score of at
@@ -1126,10 +1126,10 @@ deployed) the server refuses to start when:
 - Password-reset, portal setup, login-approval, intake and API-key secrets are stored as hashes (portal setup and
   reset tokens also keep a SHA-256 lookup value so one row is verified rather than every candidate).
 - MFA secrets are stored encrypted with `ENCRYPTION_KEY`.
-- Cross-tenant access is prevented by row level security (section 5.2) in addition to service-layer scoping. Contact
+- Cross-tenant access is prevented by row level security (section 6.2) in addition to service-layer scoping. Contact
   portal requests re-check tenant and contact access on every request, not only at token issue.
 
-### 7.2 Secret handling
+### 8.2 Secret handling
 
 - Tenant integration credentials (payment gateways, RMM connections, notification channels) are
   AES-256-GCM ciphertext or live in the selected tenant secret provider; they are never returned to clients.
@@ -1137,9 +1137,9 @@ deployed) the server refuses to start when:
   session tables, and drops secret-looking columns from every row.
 - Credential-vault reveal is a separate audited call; the company documentation view returns references only.
 - `JWT_SECRET`, `ENCRYPTION_KEY` and `BUNYIP_WEBHOOK_SECRET` have development fallbacks that are refused outside
-  dev/test (section 6.1).
+  dev/test (section 7.1).
 
-### 7.3 Input validation and output hardening
+### 8.3 Input validation and output hardening
 
 - Request bodies are validated with `validator` derives; failures return field-level errors in the error envelope.
   String values in JSON bodies are sanitised before reaching handlers (excluding signature-verified paths).
@@ -1154,7 +1154,7 @@ deployed) the server refuses to start when:
 - Client IP for rate limits and audit comes from `X-Forwarded-For` only when the socket peer is inside the trusted
   proxy ranges.
 
-### 7.4 Rate limits
+### 8.4 Rate limits
 
 All limiters are in memory and per process; they do not survive a restart or coordinate across replicas.
 
@@ -1172,7 +1172,7 @@ All limiters are in memory and per process; they do not survive a restart or coo
 
 A limited request answers `429` with `Retry-After`.
 
-## 8. Integrations and dependencies
+## 9. Integrations and dependencies
 
 | Role | System | Direction and use |
 |---|---|---|
@@ -1189,7 +1189,7 @@ A limited request answers `429` with `Retry-After`.
 
 Third-party systems are reached over HTTPS with `reqwest` (rustls); the SMTP transport uses the platform TLS library.
 
-## 9. Deployment and operations
+## 10. Deployment and operations
 
 - Build: `oci-build/Dockerfile` builds both binaries in a musl Rust builder image with dependencies cached in a separate
   layer, then copies `mokosh-server`, `mokosh-bootstrap`, `migrations/` and the font license into an Alpine runtime
@@ -1213,7 +1213,7 @@ Third-party systems are reached over HTTPS with `reqwest` (rustls); the SMTP tra
   configuration and documentation guards implemented as Nushell scripts under `scripts/`; integration tests live in
   `tests/` and browser tests in `e2e/`.
 
-## 10. Non-functional behavior
+## 11. Non-functional behavior
 
 - Logging: `tracing` text output to stdout, filtered by `RUST_LOG`. Request tracing is applied to the whole router.
   Boot logs record the hosting profile, the provider selected per capability and whether each was chosen by profile or by
