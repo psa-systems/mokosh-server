@@ -116,8 +116,7 @@ export default async function globalTeardown(): Promise<void> {
   const allErrors: string[] = [];
   try {
     // SPEC-10.210: fixed, ordered sweep of 23 resource kinds (children before
-    // parents, companies last), deleting any record this run owns or that is
-    // stale.
+    // parents, companies last), deleting any record this run owns or is stale.
     // Order matters: a parent refuses deletion while a child still references
     // it. Sweep children before parents, and the company (referenced by almost
     // everything) dead last.

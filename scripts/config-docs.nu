@@ -533,9 +533,8 @@ def "main generate" [] {
     print $"rewrote the generated parts of ($DOC_FILE)"
 }
 
-# SPEC-10.185: fails on a catalog defect (duplicate name, malformed since/
-# required_since/deprecated/removed, or a code-read var missing from the
-# registry), or on a docs/configuration.md table/Recently-added mismatch.
+# SPEC-10.185: fails on a catalog defect (duplicate name, malformed field, or a
+# code-read var missing from the registry) or a docs/configuration.md mismatch.
 
 def "main check" [] {
     let repo = (load-repo)

@@ -435,9 +435,8 @@ async function fillTotpStep(page: Page): Promise<void> {
   // throttles. Each attempt relies on the BUNYIP-331 input-event auto-submit
   // (one POST, no button click), so we never re-POST the same code and burn a
   // failed attempt.
-  // SPEC-10.205: generate the code only when >=5s remain in the step, wait for
-  // a step later than this run's last used one, retry at most twice with a
-  // fresh code before the manual submit-click fallback below.
+  // SPEC-10.205: generate the code only when >=5s remain in the step, retrying at
+  // most twice with a fresh code before the manual submit-click fallback below.
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     await codeInput.waitFor({ state: 'visible', timeout: 10_000 });
     // otplib's default step is 30s; `timeRemaining()` is the seconds until the

@@ -251,9 +251,8 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v5
 
       - name: Download the nextest archive
-        # SPEC-10.20: each shard downloads the archive, installs the matching
-        # pinned nextest, disables durability, creates DB roles, then builds
-        # the template database before running its own partition.
+        # SPEC-10.20: each shard downloads the archive before installing
+        # nextest, creating DB roles and running its own partition.
         uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           name: nextest-archive

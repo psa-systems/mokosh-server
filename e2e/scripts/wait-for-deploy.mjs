@@ -117,9 +117,8 @@ function buildShaQuery(headSha) {
 // filters that strip the trees `git log -- <path>` needs, so self-heal in
 // two stages: unshallow first if the clone is shallow, then refetch
 // without filter if the path query still finds nothing.
-// SPEC-10.213: resolves the expected SHA by walking git log for the most
-// recent build-trigger-path-touching commit, self-healing with unshallow then
-// refetch if the walk finds nothing.
+// SPEC-10.213: resolves the expected SHA by walking git log for the most recent
+// build-trigger-path commit, self-healing with unshallow/refetch if that finds nothing.
 function resolveBuildSha(headSha) {
   let sha = buildShaQuery(headSha);
   if (sha) return sha;
