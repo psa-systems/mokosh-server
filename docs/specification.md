@@ -480,6 +480,29 @@ and are not reused.
   floored to 1 to avoid division by zero, and must set `has_next` to `page < total_pages` and `has_prev` to
   `page > 1`.
 
+### 4.12 The AppError envelope
+
+- **SPEC-4.53**: `utils::error::AppError::status_code` and `error_code` must each return one fixed value per
+  variant, including `AccountDeleted` as 410 `ACCOUNT_DELETED`, `TokenExpired` as 401 `TOKEN_EXPIRED`, and
+  `RateLimited` as 429 `RATE_LIMITED`, so a client can switch on `code` without string-matching `message`.
+- **SPEC-4.54**: `ErrorResponse::from(AppError)` must render the `Database` variant's wire message as the fixed
+  string `"Database operation failed"` regardless of the wrapped cause, must render every other variant's wire
+  message as its `Display` string, and must populate `errors` only for the `Validation` and `QueryError` variants.
+- **SPEC-4.55**: `AppError`'s `IntoResponse` must render every `RateLimited` value, however constructed, through
+  `rate_limited_response` (a `Retry-After` header and `Cache-Control: no-store`), defaulting the wait to
+  `DEFAULT_RATE_LIMIT_RETRY_AFTER_SECONDS` (60) when `retry_after_seconds` is `None`.
+- **SPEC-4.56**: `normalize_error_envelope` must leave a response unchanged unless its status is a client error
+  (4xx) and its `Content-Type` is not `application/json`; such a response must be replaced with
+  `envelope_for_rejection`'s canonical `{error:{code,message}}` body, discarding the original.
+- **SPEC-4.57**: `From<sqlx::Error> for AppError` must map `RowNotFound` to `NotFound`, a Postgres `23505` unique
+  violation to `Conflict`, and any other database error to `Database` with the raw cause logged at `error` level
+  (a `23505` logs at `debug`).
+- **SPEC-4.58**: `From<validator::ValidationErrors> for AppError` must flatten nested `Struct` and `List` errors
+  into dotted (and `[index]`-suffixed) field paths, must re-key a schema-level error onto the field
+  `validation::cross_field_error` recorded via `cross_field_target`, and must build each message from the field
+  error's explicit `message` when present or otherwise synthesize one from its constraint code and bound
+  parameters (`humanize_field_error`).
+
 ## 5. Interfaces
 
 ### 5.1 HTTP API
