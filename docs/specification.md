@@ -600,6 +600,35 @@ and are not reused.
 - **SPEC-4.89**: a saved ticket view name must fail validation when it is empty or contains only whitespace, not
   merely when its untrimmed length is zero.
 
+### 4.18 Contact and company request validation
+
+- **SPEC-4.90**: a request field holding a NUL byte, singly or in any element of a string list, must be rejected
+  before it reaches the database.
+- **SPEC-4.91**: a required company name must fail validation when it is whitespace-only or contains a control
+  character; the same rule applies to an optional company name field except that an empty string there is
+  accepted and means "clear the stored name".
+- **SPEC-4.92**: a contact request must reject supplying both a `company_id` and a non-empty freeform
+  `company_name` at once, and the same exclusion applies between a non-empty `companies` list and a non-empty
+  freeform `company_name`.
+- **SPEC-4.93**: a child list of phones, or of company links, must reject more than one entry flagged primary; a
+  list with none flagged primary is accepted.
+- **SPEC-4.94**: a `companies` list must reject an entry that names the same `company_id` as another entry in
+  the same list.
+- **SPEC-4.95**: creating a contact must fail when its email is absent or blank; updating a contact must not
+  apply that requirement, since an absent email there means leave the existing value alone.
+- **SPEC-4.96**: a website value must be empty or use an `http`/`https` scheme with a non-empty host, rejecting
+  every other scheme; normalizing a website for storage must add an `https://` prefix and lowercase only the
+  authority when the input has no scheme and is shaped like a bare host, and must otherwise pass the input
+  through unchanged so a value already carrying a scheme still reaches validation as typed.
+- **SPEC-4.97**: normalizing a phone number for storage must first remove invisible characters, then strip only
+  common formatting characters (spaces, tabs, a no-break space, hyphens, parentheses, dots) and nothing else;
+  validating the normalized result against E.164 must accept an empty value, otherwise require an optional
+  leading `+` followed by 2 to 15 digits whose first digit is 1-9.
+- **SPEC-4.98**: a time zone field must be empty or parse as a valid IANA time zone name.
+- **SPEC-4.99**: a country field must be empty or be one of the 249 ISO 3166-1 alpha-2 codes, case-insensitively.
+- **SPEC-4.100**: a postal code field must be empty or be 2 to 12 characters of ASCII letters, digits, spaces or
+  hyphens.
+
 ## 5. Interfaces
 
 ### 5.1 HTTP API

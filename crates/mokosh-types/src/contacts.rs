@@ -21,6 +21,7 @@ use validator::{Validate, ValidationError};
 /// Reject strings containing a NUL byte (U+0000). Postgres `text`/`varchar`
 /// columns cannot store NUL: such input fails at the DB layer and surfaces as
 /// a 500. Reject it here as a field validation error (422) instead.
+// SPEC-4.90: rejects a NUL byte before it reaches the database.
 fn validate_text_no_nul(value: &str) -> Result<(), ValidationError> {
     if value.contains('\0') {
         Err(ValidationError::new("nul_byte"))
@@ -30,6 +31,7 @@ fn validate_text_no_nul(value: &str) -> Result<(), ValidationError> {
 }
 
 /// Reject NUL bytes in any element of a string collection (e.g. `tags`).
+// SPEC-4.90: rejects a NUL byte in any element of the list.
 fn validate_strings_no_nul(values: &[String]) -> Result<(), ValidationError> {
     if values.iter().any(|v| v.contains('\0')) {
         Err(ValidationError::new("nul_byte"))
@@ -41,6 +43,7 @@ fn validate_strings_no_nul(values: &[String]) -> Result<(), ValidationError> {
 /// Validate a company name: not whitespace-only and free of control
 /// characters (which includes NUL). Length bounds stay on the `length`
 /// validator. A bare `" "` passes `length(min = 1)` but is not a real name.
+// SPEC-4.91: rejects whitespace-only or a control character.
 fn validate_company_name(value: &str) -> Result<(), ValidationError> {
     if value.trim().is_empty() {
         return Err(ValidationError::new("blank"));
@@ -56,6 +59,7 @@ fn validate_company_name(value: &str) -> Result<(), ValidationError> {
 /// empty string is accepted: on the update path `Some("")` means "clear the
 /// stored freeform name". Any other value must satisfy the same not-blank /
 /// no-control-character rules as a CRM company name.
+// SPEC-4.91: same rule, but an empty string is accepted and clears the field.
 fn validate_company_name_opt(value: &str) -> Result<(), ValidationError> {
     if value.is_empty() {
         return Ok(());
@@ -67,6 +71,7 @@ fn validate_company_name_opt(value: &str) -> Result<(), ValidationError> {
 /// `company_name` at once (PMS-402). The two are mutually exclusive: a contact
 /// either links to a CRM company or carries a typed-in label, never both. An
 /// empty `company_name` string counts as "not supplied" here.
+// SPEC-4.92: company_id and a non-empty freeform company_name are mutually exclusive.
 fn validate_company_link_exclusive(
     company_id: Option<Uuid>,
     company_name: &Option<String>,
@@ -81,6 +86,7 @@ fn validate_company_link_exclusive(
 /// PMS-806: the multi-company list obeys the same exclusion as the single FK.
 /// A non-empty `companies` array alongside a non-empty freeform `company_name`
 /// is rejected, exactly as `company_id` plus `company_name` is.
+// SPEC-4.92: the same exclusion extended to the companies list.
 fn validate_companies_name_exclusive(
     companies: &Option<Vec<ContactCompanyLinkInput>>,
     company_name: &Option<String>,
@@ -96,6 +102,7 @@ fn validate_companies_name_exclusive(
 /// PMS-806: at most one entry in a child list may carry `is_primary`. A list
 /// with none flagged is fine (the service promotes the first entry); two is a
 /// contradiction the caller has to resolve, so it is a 422.
+// SPEC-4.93: rejects more than one entry flagged primary; zero is fine.
 fn validate_single_primary<T>(
     entries: &Option<Vec<T>>,
     is_primary: impl Fn(&T) -> bool,
@@ -113,6 +120,7 @@ fn validate_single_primary<T>(
 /// PMS-806: reject a `companies` list that names the same company twice. The
 /// `UNIQUE (contact_id, company_id)` constraint would otherwise reject it at
 /// the DB layer, which surfaces as a 500 instead of a field error.
+// SPEC-4.94: rejects a companies list naming the same company_id twice.
 fn validate_companies_distinct(
     companies: &Option<Vec<ContactCompanyLinkInput>>,
 ) -> Result<(), ValidationError> {
@@ -159,6 +167,7 @@ fn validate_create_contact_request(req: &CreateContactRequest) -> Result<(), Val
 /// Reject a create whose email is absent or blank. Rejected as a field-level
 /// error keyed on `email` so the SPA surfaces it inline on the same input
 /// the `#[validate(email)]` format check would.
+// SPEC-4.95: rejects an absent or blank email, create path only.
 fn require_email_on_create(email: Option<&str>) -> Result<(), ValidationError> {
     match email.map(str::trim) {
         Some(v) if !v.is_empty() => Ok(()),
@@ -188,6 +197,7 @@ fn validate_update_company_link(req: &UpdateContactRequest) -> Result<(), Valida
 /// Public since PMS-896: the organisation's own website
 /// (`tenants.branding.website`) is rendered as a link by the same SPA, so it is
 /// held to this rule rather than to a second copy of it.
+// SPEC-4.96: empty or http(s) with a non-empty host; every other scheme is rejected.
 pub fn validate_website(value: &str) -> Result<(), ValidationError> {
     if value.is_empty() {
         return Ok(());
@@ -218,6 +228,8 @@ pub fn validate_website(value: &str) -> Result<(), ValidationError> {
 ///
 /// Public because the website probe (`/companies/website-probe`) must normalize
 /// its query input by exactly this rule rather than a second copy of it.
+// SPEC-4.96: adds https:// and lowercases the authority for a bare host; a
+// value with a scheme, or not host-shaped, passes through unchanged.
 pub fn normalize_website(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -305,6 +317,8 @@ where
 /// so `+1 (415) 555-1234` becomes `+14155551234`. Returns the digits-only
 /// (optionally `+`-prefixed) form; validation of the result is left to
 /// [`validate_phone_e164`].
+// SPEC-4.97: strips invisible characters, then only common formatting chars,
+// not arbitrary non-digits.
 fn normalize_phone(raw: &str) -> String {
     // PMS-924: drop invisible characters first. `\u{00A0}` was already handled
     // below, but a trailing U+200B survived and made `validate_phone_e164`
@@ -349,6 +363,7 @@ where
 /// but a required `String` field may still pass `""`). Turns the
 /// previously-unvalidated phone path into a clear 422 instead of a downstream
 /// failure.
+// SPEC-4.97: empty accepted; else optional + then 2-15 digits, first digit 1-9.
 fn validate_phone_e164(value: &str) -> Result<(), ValidationError> {
     if value.is_empty() {
         return Ok(());
@@ -373,6 +388,7 @@ fn validate_phone_e164(value: &str) -> Result<(), ValidationError> {
 /// values such as `America/New York` (a space instead of an underscore) that
 /// would otherwise be stored and later fail to resolve to an offset. Empty is
 /// accepted as "no value".
+// SPEC-4.98: empty or a valid IANA time zone name.
 fn validate_timezone(value: &str) -> Result<(), ValidationError> {
     if value.is_empty() {
         return Ok(());
@@ -388,6 +404,7 @@ fn validate_timezone(value: &str) -> Result<(), ValidationError> {
 
 /// Validate an ISO 3166-1 alpha-2 country code (PMS-325): exactly two ASCII
 /// letters present in the official set. Empty is accepted as "no value".
+// SPEC-4.99: empty or one of the 249 ISO 3166-1 alpha-2 codes, case-insensitive.
 fn validate_country(value: &str) -> Result<(), ValidationError> {
     if value.is_empty() {
         return Ok(());
@@ -404,6 +421,7 @@ fn validate_country(value: &str) -> Result<(), ValidationError> {
 
 /// Validate a postal code (PMS-325) with a permissive, country-agnostic rule:
 /// 2-12 characters of letters, digits, spaces, or hyphens. Empty is accepted.
+// SPEC-4.100: empty or 2-12 chars of ASCII letters, digits, spaces or hyphens.
 fn validate_postal_code(value: &str) -> Result<(), ValidationError> {
     if value.is_empty() {
         return Ok(());
