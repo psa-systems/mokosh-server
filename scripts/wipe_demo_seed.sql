@@ -37,7 +37,7 @@ WHERE tenant_id = :tenant_id
   AND name = 'Acme Corporation (Demo)'
   AND tags @> ARRAY['demo']::text[];
 
--- SPEC-9.227: PREVIEW what will be removed, from the same captured row set.
+-- SPEC-9.229: PREVIEW what will be removed, from the same captured row set.
 SELECT 'companies' AS entity, count(*) AS rows
 FROM companies WHERE id IN (SELECT id FROM _demo_companies)
 UNION ALL
