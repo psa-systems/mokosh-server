@@ -48,7 +48,7 @@ jobs:
       - name: Clone the repository
         # fetch-depth: 0 so check-migration-immutability can diff the
         # merge commit against `origin/main`'s history. DEV-395.
-        uses: https://code.forgejo.org/actions/checkout@v5
+        uses: https://code.forgejo.org/actions/checkout@v7
         with:
           fetch-depth: 0
           # The root justfile imports `common/common.just` from the

@@ -117,7 +117,7 @@ argon2 = "0.5"
 # bunyip's `at+jwt`), and it is pure Rust. `aws_lc_rs` would add a C and
 # CMake build dependency to every image and every runner, which is the class
 # of thing that has broken this repository's CI before.
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 
 # Validation
 validator = { version = "0.19", features = ["derive"] }
@@ -250,7 +250,7 @@ dunite-provider-status = { git = "https://dev.a8n.run/psa-systems/dunite", rev =
 # never 500s on a bad values map (parse / render errors land as 4xx instead).
 # Default features cover `builtins` (needed for `|default`), `multi_template`
 # is unused.
-minijinja = "2.11"
+minijinja = "3.0.5"
 
 printpdf = { version = "0.12.7", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # PMS-1008 subsets the embedded faces per document. printpdf's own subsetter is

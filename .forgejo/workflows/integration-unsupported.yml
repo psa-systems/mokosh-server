@@ -73,7 +73,7 @@ jobs:
 
     steps:
       - name: Clone the repository
-        uses: https://code.forgejo.org/actions/checkout@v5
+        uses: https://code.forgejo.org/actions/checkout@v7
 
       - name: Cache Rust build
         uses: https://github.com/Swatinem/rust-cache@v2

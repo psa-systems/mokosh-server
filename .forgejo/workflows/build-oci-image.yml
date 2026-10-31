@@ -70,7 +70,7 @@ jobs:
 
     steps:
       - name: Clone the repository
-        uses: https://code.forgejo.org/actions/checkout@v5
+        uses: https://code.forgejo.org/actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -157,7 +157,7 @@ jobs:
         # is masked from run: steps. This action re-exports ACTIONS_CACHE_URL /
         # ACTIONS_RUNTIME_TOKEN into GITHUB_ENV so the build step's `type=gha`
         # cache can reach act_runner's cache server (needs runner cache.enabled).
-        uses: https://github.com/crazy-max/ghaction-github-runtime@v3
+        uses: https://github.com/crazy-max/ghaction-github-runtime@v4
 
       - name: Log in to container registry
         shell: nu {0}

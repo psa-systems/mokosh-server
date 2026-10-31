@@ -88,7 +88,7 @@ services:
     profiles: ["infisical"]
     container_name: dev-mokosh-valkey-${USER:?USER missing - run via just dev}
     # https://hub.docker.com/r/valkey/valkey
-    image: docker.io/valkey/valkey:8-alpine
+    image: docker.io/valkey/valkey:9-alpine
     networks:
       - private
     expose:

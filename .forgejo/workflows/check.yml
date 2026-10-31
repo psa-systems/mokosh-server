@@ -60,7 +60,7 @@ jobs:
       - name: Clone the repository
         # fetch-depth: 0 so the migration-immutability check can diff against
         # origin/main's history (its merge-base with this branch). DEV-395.
-        uses: https://code.forgejo.org/actions/checkout@v5
+        uses: https://code.forgejo.org/actions/checkout@v7
         with:
           fetch-depth: 0
           # PMS-786: the root justfile imports `common/common.just` from the
@@ -79,7 +79,7 @@ jobs:
         # token: the runner's own credentials are scoped to mokosh-server,
         # so a bare checkout stalls at "Determining the default branch"
         # rather than reading anything from psa-systems/mokosh-apps.
-        uses: https://code.forgejo.org/actions/checkout@v5
+        uses: https://code.forgejo.org/actions/checkout@v7
         with:
           repository: psa-systems/mokosh-apps
           path: mokosh-apps
@@ -393,7 +393,7 @@ jobs:
         # fetch-depth: 0 so the git-history scanners see every commit the
         # branch adds; persist-credentials: false so the composite action
         # does not inherit a push-capable token.
-        uses: https://code.forgejo.org/actions/checkout@v5
+        uses: https://code.forgejo.org/actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
