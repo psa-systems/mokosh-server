@@ -48,6 +48,10 @@ import { loginViaSpa } from '../lib/login';
 // auth flow without registering a new OIDC client or maintaining a
 // parallel signup pipeline.
 
+// SPEC-10.217: primary capture is the OIDC token-endpoint response body; the
+// bearer-header sniff is the backstop. Persists token/OP-state/foreign-company
+// to the e2e/.auth/ files.
+
 // Routes the SPA almost certainly hits on landing. Visiting one of these
 // post-login forces the SPA to fire an authenticated request even if the
 // default landing route does not.
