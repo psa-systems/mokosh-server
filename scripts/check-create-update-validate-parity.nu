@@ -154,6 +154,7 @@ def compare-pair [pair: string, create: record, update: record] {
 }
 
 # SPEC-10.172: pairs Create*/Upsert*Request with Update*/Patch*Request by stripped name.
+
 def main [] {
     let files = ($DTO_GLOBS | each {|g| glob $g } | flatten | uniq)
 

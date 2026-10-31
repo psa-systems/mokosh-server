@@ -87,6 +87,7 @@ def resolve [file: string, path: string] {
 }
 
 # SPEC-10.180
+
 def main [] {
     let docs = (^git ls-files "*.md" | lines | where {|f| $f != "" })
     if ($docs | is-empty) {

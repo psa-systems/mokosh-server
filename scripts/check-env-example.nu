@@ -204,6 +204,7 @@ def compose-interpolations [] {
 }
 
 # SPEC-10.189: unions registry-declared keys and direct code reads into one CODE set.
+
 def main [] {
     let registry = (registry-keys)
     let direct = (code-reads)

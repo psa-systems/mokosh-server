@@ -38,6 +38,7 @@ const CUTOFF_PREFIX = 209
 const CONTENT_COLUMNS = [subject body_text body_html name description]
 
 # SPEC-10.169: only migrations numbered above CUTOFF_PREFIX are checked.
+
 def main [] {
     let files = (
         glob migrations/*.sql

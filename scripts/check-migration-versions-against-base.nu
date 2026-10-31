@@ -1,5 +1,7 @@
 #!/usr/bin/env nu
 
+# SPEC-10.170
+
 # PMS-1402: catch a prefix collision that only appears after the merge.
 #
 # `common/scripts/check-migration-versions.nu` scans the migrations
@@ -15,7 +17,6 @@
 #
 # Exits 0 on no collision between HEAD and the base ref's migrations.
 # Exits 1 naming every collision. Exits 2 when git itself fails.
-# SPEC-10.170
 def main [
     migrations_dir: string = "migrations" # directory to scan
     base_ref: string = "origin/main" # ref whose migrations union with HEAD's

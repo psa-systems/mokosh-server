@@ -522,6 +522,7 @@ def main [] {
 
 # SPEC-10.186: rewrites only the Recently-added block and the All-variables
 # table rows; a second run is idempotent.
+
 def "main generate" [] {
     let repo = (load-repo)
     fail-on $repo.errors "the configuration facts are inconsistent"
@@ -535,6 +536,7 @@ def "main generate" [] {
 # SPEC-10.185: fails on a catalog defect (duplicate name, malformed since/
 # required_since/deprecated/removed, or a code-read var missing from the
 # registry), or on a docs/configuration.md table/Recently-added mismatch.
+
 def "main check" [] {
     let repo = (load-repo)
     let lines = (open --raw $DOC_FILE | decode utf-8 | lines)
@@ -550,6 +552,7 @@ def "main check" [] {
 
 # SPEC-10.187: one row per catalog change after `version`, sorted by release,
 # breaking-level, required-first, name.
+
 def "main since" [
     version: string   # the release you run now, e.g. v0.13.0
     --json            # machine-readable: one record per entry with its `level`

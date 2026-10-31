@@ -40,6 +40,7 @@ def referenced-paths [file: string] {
 }
 
 # SPEC-10.182
+
 def main [] {
     let hits = ($FILES | each {|f| referenced-paths $f } | flatten)
     let missing = ($hits | where {|h| not ($h.path | path exists) })
