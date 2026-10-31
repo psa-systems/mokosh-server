@@ -277,6 +277,72 @@ Each statement is observable through the interfaces in section 5.
 - Version information and an opt-in update check against `MOKOSH_UPDATE_CHECK_URL` (reports `disabled` and makes no
   outbound request when unset).
 
+## 4. Utilities, PDF and wire types
+
+Normative requirements for `src/utils/`, `src/pdf/` and `crates/mokosh-types/`. Each requirement below is cited at its
+implementing or enforcing site with a `// SPEC-4.<n>` comment. Requirement numbers are assigned in file-reading order
+and are not reused.
+
+### 4.1 Money and date formatting
+
+- **SPEC-4.1**: `utils::money::money` must format a decimal amount as `"{amount:.2} {currency_code}"` (exactly two
+  decimal places, a literal space, then the code); when no currency is given it must default to `"USD"`, and it must
+  never special-case any single currency with a bare symbol (for example `$`).
+- **SPEC-4.2**: `utils::datetime::add_business_days` must add `n` business days (Monday-Friday) to `start`, skipping
+  Saturday and Sunday, and return a date that is always a weekday; `n == 0` must return `start` unchanged. Holidays are
+  not considered.
+
+### 4.2 Unresolved-person logging
+
+- **SPEC-4.3**: `utils::unresolved_person::log_unresolved_person_names` must be a no-op when `ids` is empty, so every
+  call site can call it unconditionally after filtering to unresolved rows.
+- **SPEC-4.4**: When `ids` is non-empty it must log exactly one `INFO`-level line per call, naming the caller-supplied
+  `surface`, the total `ids.len()`, and at most the first 10 ids (`MAX_IDS_LOGGED`); it must never log a resolved name
+  or email address, because an id alone identifies nothing but a name or email does.
+
+### 4.3 Login-location geolocation and decision
+
+- **SPEC-4.5**: `utils::geoip::GeoIpService::new` must return an error (not silently disable the feature) when the
+  configured IP2Location database path is set but the file cannot be opened as an IP2Location database.
+- **SPEC-4.6**: `GeoIpService::country_code` must return `None` for an address with no location record, and must treat
+  the IP2Location placeholder value `"-"` and a blank string as "no country", never as a real ISO 3166-1 alpha-2 code.
+- **SPEC-4.7**: `utils::login_location::login_location_decision` must return `Record` when there is no previous
+  country (`None`), `Unchanged` when the previous country string equals the current one exactly, and `Alert` for any
+  other previous value; it performs no lookup of its own, only a comparison of two already-resolved country codes.
+
+### 4.4 Outbound URL SSRF guard and client IP
+
+- **SPEC-4.8**: `utils::net::is_non_public_ip` must classify as non-public: IPv4 loopback, RFC1918 private, link-local,
+  unspecified and broadcast addresses, the ranges `100.64.0.0/10`, `192.0.0.0/24` and `198.18.0.0/15`, IPv6 loopback,
+  unspecified, unique-local (`fc00::/7`) and link-local addresses, and any `::ffff:a.b.c.d` IPv4-mapped address whose
+  embedded IPv4 address is itself non-public. It must be the crate's only definition of this predicate.
+- **SPEC-4.9**: `utils::net::guard_outbound_url` must refuse a URL whose scheme is not `http` or `https`
+  (`UrlGuardError::Scheme`), a URL with no host (`UrlGuardError::NoHost`), and, when the caller passes
+  `allowed_ports`, a URL whose port is outside that set (`UrlGuardError::Port`), before performing any DNS resolution.
+- **SPEC-4.10**: Unless the host is named in the `PrivateTargetAllowlist`, `guard_outbound_url` must resolve the host
+  and refuse the URL with `UrlGuardError::Blocked` if any resolved address is non-public per SPEC-4.8 and not covered
+  by an allowlisted network; a resolution failure or a resolution to zero addresses must be reported as
+  `UrlGuardError::Dns`, and a resolved address found non-public on a later redirect hop must be screened the same way.
+- **SPEC-4.11**: `PrivateTargetAllowlist::parse` must treat an entry that parses as an IP address or CIDR as a network
+  exemption and any other non-blank entry as an exact (case-insensitive) hostname exemption; an empty or all-blank
+  input must produce an allowlist that exempts nothing (fail closed). A host named by `allows_host` must be exempted
+  from resolution and screening entirely.
+- **SPEC-4.12**: `utils::net::loggable_url_authority` must reduce a URL-shaped string to its authority (`host[:port]`),
+  stripping any scheme, userinfo, path, query and fragment, even when the input does not parse as a URL at all, so the
+  result is always safe to write to a log line.
+- **SPEC-4.13**: `utils::client_ip::trusted_proxies` must parse `TRUSTED_PROXY_CIDR` as a comma-separated CIDR list,
+  skipping (with a warning, not a boot failure) any entry that fails to parse, and must fall back to the built-in
+  default list (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `::1/128`, `fc00::/7`, `fe80::/10`)
+  when the variable is unset or blank.
+- **SPEC-4.14**: `utils::client_ip::extract_client_ip` must return the socket peer address unchanged, ignoring
+  `X-Forwarded-For` entirely, when the peer is not inside a trusted-proxy network.
+- **SPEC-4.15**: When the peer is a trusted proxy, `extract_client_ip` must read every `X-Forwarded-For` header
+  instance and element from right to left (treating repeated headers as one concatenated list) and return the first
+  address that is not itself inside a trusted-proxy network; when every address in the chain is trusted, or the header
+  is absent or unparseable, it must return the peer address, and it must never panic on malformed input.
+- **SPEC-4.16**: `utils::client_ip::parse_forwarded_ip` must accept a bare IPv4 or IPv6 address, a bracketed IPv6
+  literal with an optional `:port` suffix, and an IPv4 `host:port` form, and must return `None` for anything else.
+
 ## 5. Interfaces
 
 ### 5.1 HTTP API

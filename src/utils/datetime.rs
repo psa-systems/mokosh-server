@@ -8,6 +8,7 @@ use chrono::{Datelike, Duration, NaiveDate, Weekday};
 /// enhancement); this is the "standard due date" offset used by the tenant
 /// `scheduling/default_due_business_days` setting (PMS-345). The result is
 /// always a weekday.
+// SPEC-4.2: Mon-Fri only, n==0 returns start unchanged, no holiday awareness.
 pub fn add_business_days(start: NaiveDate, n: u32) -> NaiveDate {
     let mut date = start;
     let mut remaining = n;
