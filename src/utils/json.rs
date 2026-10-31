@@ -100,6 +100,7 @@ where
 {
     type Rejection = JsonRejection;
 
+    // SPEC-4.29: reuse the extension's already-parsed value; fall back to axum::Json only if absent.
     async fn from_request(mut req: Request, state: &S) -> Result<Self, Self::Rejection> {
         if let Some(ParsedJsonBody(value)) = req.extensions_mut().remove::<ParsedJsonBody>() {
             return serde_json::from_value(value)

@@ -379,6 +379,45 @@ and are not reused.
   `axum::extract::DefaultBodyLimit::max`, because axum's own un-raised multipart body limit is 2 MiB and would refuse
   an at-cap upload before `oversized_upload_error` ever runs.
 
+### 4.7 Password policy, security response headers, sanitized JSON extraction
+
+- **SPEC-4.25**: `utils::password_policy::validate` must reject a password shorter than `policy.min_length`
+  (default 12) or longer than `policy.max_length` (default 128) characters, counted as Unicode characters, before
+  running any other check.
+- **SPEC-4.26**: `validate` must reject a password whose lowercased form, or whose lowercased form with `@` mapped to
+  `a` and `$` mapped to `s`, exactly matches an entry in the embedded common-password list, independent of the length
+  and score checks.
+- **SPEC-4.27**: `validate` must reject a password whose `zxcvbn` score is below `policy.min_zxcvbn_score` (default
+  3), scored with the caller-supplied `context_hints` so a password built from the user's own identifying strings
+  scores lower.
+- **SPEC-4.28**: The `security_headers` middleware must add `strict-transport-security`, `x-content-type-options`,
+  `x-frame-options`, `referrer-policy`, `permissions-policy` and `content-security-policy` to every response, filling
+  in only the headers the handler left unset, so a value the handler set for itself is never overwritten.
+- **SPEC-4.29**: `utils::json::Json` as an extractor must deserialize from the `ParsedJsonBody` request extension
+  when `sanitize_json_body` already parsed the body, and must fall back to `axum::Json`'s own parse only when that
+  extension is absent, so a well-formed JSON request body is parsed by `serde_json` exactly once.
+
+### 4.8 TOTP and recovery/portal cryptography
+
+- **SPEC-4.30**: `utils::totp::base32_encode` must produce RFC 4648 base32 (uppercase alphabet) with no padding;
+  `base32_decode` must ignore whitespace and `=` padding and accept either case.
+- **SPEC-4.31**: `utils::totp::step` must compute the RFC 4226/6238 HMAC-SHA1 dynamic-truncation value for step
+  number `t`, and `verify` must accept `code` only when it is exactly `TOTP_DIGITS` ASCII digits, trying every step
+  from `t - window` to `t + window` inclusive with a constant-time comparison, returning the first matched step.
+- **SPEC-4.32**: `utils::crypto::encrypt` must AES-256-GCM-encrypt with a random 12-byte nonce, store
+  `nonce || ciphertext` and base64-encode the result; `decrypt` must reverse that exactly, rejecting an input shorter
+  than the 12-byte nonce.
+- **SPEC-4.33**: `utils::crypto::parse_encryption_key` must hex-decode a 64-character input to 32 bytes, must treat
+  a 32-character input as raw bytes only when it is not entirely hex digits (rejecting an all-hex 32-character input
+  as ambiguous), and must reject any other length.
+- **SPEC-4.34**: `utils::crypto::generate_portal_slug` must produce a 16-character string drawn only from Crockford
+  base32 characters with `I`, `L`, `O` and `U` excluded; `generate_portal_id` must return an integer in
+  `[100_000_000, 1_000_000_000)` so it always renders as exactly 9 digits.
+- **SPEC-4.35**: `utils::crypto::sha256_hex` must return the lowercase hex SHA-256 digest of its input.
+  `verify_password_or_dummy` must run exactly one Argon2 verification whether `row_hash` is `Some` or `None`
+  (verifying against a fixed dummy hash in the `None` case) and must return `Ok(false)` whenever `row_hash` is
+  `None`, so a lookup that matched no row costs the same time as one that did.
+
 ## 5. Interfaces
 
 ### 5.1 HTTP API
