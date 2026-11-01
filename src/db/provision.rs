@@ -59,6 +59,8 @@ const INVALID_PASSWORD: &str = "28P01";
 /// fails the function connects with `MOKOSH_ADMIN_DATABASE_URL` and creates the
 /// roles idempotently, then closes the admin pool. Call this once at startup,
 /// before [`super::Database::new`] and migrations.
+// SPEC-1 and 2.110: four boot-time role probe outcomes (RolesProbe::BothExist, MigratorConnectsAppMissing,
+// AppPasswordMismatch, MigratorCannotConnect) drive which provisioning statements run, if any.
 pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
     // Fast path: the migrator role can log in AND `mokosh_app` exists. Both
     // halves matter: staging on 2026-09-10 hit "role \"mokosh_app\" does not
@@ -233,6 +235,8 @@ impl<'a> RoleNames<'a> {
 /// `MOKOSH_MIGRATOR_PASSWORD` only when this says yes, and
 /// [`provision_statements`] emits those statements only when it says yes. Two
 /// copies of this test would be two things to keep in step.
+// SPEC-1 and 2.111: only AppPasswordMismatch skips the migrator statements, so
+// reconciling mokosh_app's password never rewrites mokosh_migrator's.
 fn needs_migrator_statements(probe: &RolesProbe) -> bool {
     !matches!(probe, RolesProbe::AppPasswordMismatch)
 }
@@ -246,6 +250,8 @@ fn needs_migrator_statements(probe: &RolesProbe) -> bool {
 /// while healing `mokosh_app` takes out the role the probe just proved was
 /// working, and the boot that does it SUCCEEDS: the breakage lands on the next
 /// one, which makes it an outage with no obvious cause.
+// SPEC-1 and 2.112: creates mokosh_migrator LOGIN BYPASSRLS with GRANT ALL ON SCHEMA public and GRANT CREATE
+// ON DATABASE so migrations can self-install the trusted extensions (uuid-ossp/pg_trgm/citext/pgcrypto).
 fn migrator_statements(names: RoleNames<'_>, migrator_password: &str, db: &str) -> Vec<String> {
     let role = quote_ident(names.migrator);
     let role_literal = sql_quote(names.migrator);
@@ -302,6 +308,8 @@ fn default_privilege_statements(names: RoleNames<'_>) -> Vec<String> {
 /// the privileges it serves requests with.
 ///
 /// This is the whole list a `RolesProbe::AppPasswordMismatch` boot runs.
+// SPEC-1 and 2.113: creates mokosh_app LOGIN NOSUPERUSER NOBYPASSRLS with CONNECT/USAGE/DML grants on the current
+// objects; default-privilege grants for future migration-created objects are a separate statement group below.
 fn app_statements(names: RoleNames<'_>, app_password: &str, db: &str) -> Vec<String> {
     let app = quote_ident(names.app);
     let app_literal = sql_quote(names.app);
@@ -426,6 +434,8 @@ async fn roles_probe(migrator_url: &str) -> RolesProbe {
     // ALTER ROLE reconciles both attributes and the stored password with
     // MOKOSH_APP_PASSWORD in one pass), rather than tripping the fast
     // path and failing the app pool's auth attempt on the next boot step.
+    // SPEC-1 and 2.115: rolcanlogin = TRUE is required, so a hand-created NOLOGIN
+    // mokosh_app routes to the full provision path instead of the fast path.
     let app_can_login: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mokosh_app' AND rolcanlogin = TRUE)",
     )
@@ -489,6 +499,8 @@ pub enum AppLogin {
 /// than its text for the same reason: a Postgres auth error renders the role
 /// name and the message, and formatting the whole thing into a log line is how
 /// a credential ends up in one.
+// SPEC-1 and 2.114: only Postgres SQLSTATE 28P01 counts as a password mismatch; every other
+// failure reports Ok so a transient probe failure cannot force a full provision.
 async fn app_password_matches() -> AppLogin {
     match std::env::var(APP_DATABASE_URL_VAR) {
         Ok(url) if !url.trim().is_empty() => app_login_with(&url).await,

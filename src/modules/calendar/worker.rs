@@ -45,6 +45,7 @@ impl CalendarReminderWorker {
     /// deterministic tick and assert the count.
     #[tracing::instrument(skip_all)]
     pub async fn run_tick(&self, now: chrono::DateTime<chrono::Utc>) -> AppResult<u64> {
+        // SPEC-7.392: with no NotificationsService wired, the tick dispatches nothing and performs no ledger writes.
         // Without a dispatcher there is nothing to fire; the ledger would
         // record sends that never happened, so skip entirely.
         let Some(notifications) = self.calendar.notifications() else {
@@ -62,6 +63,7 @@ impl CalendarReminderWorker {
             // single reminder rather than risking a duplicate; reminders
             // are best-effort, so under-delivery on crash is the safer
             // failure mode than spamming on every retry.
+            // SPEC-7.393: the ledger row is claimed (INSERT) strictly before dispatch, so a crash between the two drops at most one reminder rather than risking a duplicate.
             let inserted = self
                 .calendar
                 .claim_reminder(
@@ -75,6 +77,7 @@ impl CalendarReminderWorker {
                 continue;
             }
 
+            // SPEC-7.395: dispatches appointment.reminder with recipient_user_id set to the appointment's assigned_to_id.
             let context = serde_json::json!({
                 "recipient_user_id": c.assigned_to_id.to_string(),
                 "appointment_id": c.appointment_id.to_string(),
@@ -99,6 +102,7 @@ impl CalendarReminderWorker {
                 )
                 .await
             {
+                // SPEC-7.394: a dispatch failure after a successful ledger claim is logged as a warning and does not fail or retry the tick; the reminder stays recorded as attempted but is not counted in the dispatched total.
                 // Ledger row already committed above, so this reminder is
                 // recorded-but-undelivered. Log and move on rather than
                 // failing the whole tick; a transient notifications error
@@ -123,6 +127,7 @@ impl CalendarReminderWorker {
 
 #[async_trait]
 impl Job for CalendarReminderWorker {
+    // SPEC-7.395: runs as job name "calendar_reminders" on the shared scheduler at a 60s interval (interval configured at scheduler registration in src/main.rs).
     fn name(&self) -> &'static str {
         "calendar_reminders"
     }

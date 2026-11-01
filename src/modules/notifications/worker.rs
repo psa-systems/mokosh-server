@@ -59,6 +59,7 @@ const BACKOFF_SECS: &[i64] = &[60, 300, 1800, 7200, 21600];
 /// Rows drained per scheduler tick. Was the `batch_size` argument to the
 /// old `run_forever`; now a constant since the [`Job`] trait owns the tick
 /// loop and carries no per-tick parameters (PMS-198).
+// SPEC-7.615: 25 rows are drained per scheduled run() tick; the worker carries no per-tick parameter beyond this constant.
 const TICK_BATCH_SIZE: i64 = 25;
 
 /// How long a claim stays valid. A row still `sending` this long after it was
@@ -122,12 +123,14 @@ impl DispatcherWorker {
     /// Exposed publicly so the integration test can drive the worker
     /// deterministically (no sleep, no spawn).
     #[tracing::instrument(skip_all)]
+    // SPEC-7.626: run_tick is public so the integration test suite can drive the worker deterministically; production scheduling goes through Job::run(), which calls run_tick(TICK_BATCH_SIZE) and only logs when stats.examined > 0.
     pub async fn run_tick(&self, limit: i64) -> AppResult<TickStats> {
         let claimed = self.claim(limit).await?;
         if claimed.is_empty() {
             return Ok(TickStats::default());
         }
 
+        // SPEC-7.621: no database transaction is held open across any transport call; resolve_addresses resolves every address for the batch before any deliver call in the tick.
         let addresses = self.resolve_addresses(&claimed).await;
 
         let mut stats = TickStats {
@@ -146,6 +149,7 @@ impl DispatcherWorker {
                     stats.sent += 1;
                     // PMS-788: make the enqueue-to-sent handoff visible so an
                     // operator can tell app-side latency from downstream delivery.
+                    // SPEC-7.627: on successful send, logs tracing::info! with id, channel and latency_ms (now minus created_at), making enqueue-to-sent latency observable.
                     let latency_ms = (chrono::Utc::now() - row.created_at).num_milliseconds();
                     tracing::info!(
                         id = %row.id, channel = %row.channel, latency_ms,
@@ -166,6 +170,7 @@ impl DispatcherWorker {
                     stats.failed += 1;
                 }
                 Err(DeliveryError::Transient(msg)) => {
+                    // SPEC-7.617: BACKOFF_SECS = [60, 300, 1800, 7200, 21600] indexed by attempt_count - 1 (clamped to 0); once exhausted the row is marked failed with next_attempt_at = NULL.
                     let idx = (row.attempt - 1).max(0) as usize;
                     match BACKOFF_SECS.get(idx) {
                         None => {
@@ -218,6 +223,7 @@ impl DispatcherWorker {
         // cadence), so it cannot set a single tenant GUC and runs on the migrator
         // (BYPASSRLS) pool. Each row carries its own `tenant_id` for the delivery
         // / status-update work that follows.
+        // SPEC-7.616: one SQL statement selects due rows (pending and ready, or sending whose 600s claim has expired), oldest first, FOR UPDATE SKIP LOCKED, and in the same statement sets status='sending', bumps attempt_count and stamps next_attempt_at = NOW() + CLAIM_TIMEOUT_SECS, recovering from a worker crash mid-tick with no extra schema.
         let rows = sqlx::query(
             r#"
             WITH due AS (
@@ -279,6 +285,7 @@ impl DispatcherWorker {
         &self,
         claimed: &[ClaimedRow],
     ) -> HashMap<(Uuid, Uuid), Result<String, String>> {
+        // SPEC-7.622: only rows where channel == "email" and user_id is Some are looked up here; standalone-recipient rows and non-email channels are never included.
         let mut wanted: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
         for row in claimed {
             if row.channel == "email" {
@@ -296,6 +303,7 @@ impl DispatcherWorker {
                         resolved.insert((tenant_id, uid), Ok(email));
                     }
                 }
+                // SPEC-7.619: a failed address lookup itself is a transient failure (the read broke, not that the notification is unsendable), so it backs off and retries rather than failing immediately.
                 Err(e) => {
                     let msg = format!("user email lookup: {e}");
                     tracing::error!(
@@ -333,6 +341,7 @@ impl DispatcherWorker {
                 // Row is already visible via GET /api/v1/notifications,
                 // to the user or to the contact it names (PMS-1083);
                 // flipping status to 'sent' IS the delivery for in-app.
+                // SPEC-7.618: a permanent delivery failure always sets status='failed'/next_attempt_at=NULL with no retry on first occurrence; this in_app case (no user_id and no contact_id) is one of several such cases (see also the email cases below and the unregistered-transport case).
                 if row.user_id.is_none() && row.contact_id.is_none() {
                     return Err(DeliveryError::Permanent(
                         "in_app notification has no user_id and no contact_id".to_string(),
@@ -345,6 +354,7 @@ impl DispatcherWorker {
                     (Some(uid), _) => match addresses.get(&(row.tenant_id, uid)) {
                         Some(Ok(addr)) => addr.clone(),
                         Some(Err(msg)) => return Err(DeliveryError::Transient(msg.clone())),
+                        // SPEC-7.618: no resolvable address and no fallback recipient is a permanent failure.
                         None => {
                             return Err(DeliveryError::Permanent(format!(
                                 "user {uid} has no email"
@@ -352,12 +362,14 @@ impl DispatcherWorker {
                         }
                     },
                     (None, Some(addr)) => addr.to_string(),
+                    // SPEC-7.618: neither user_id nor recipient is a permanent failure.
                     (None, None) => {
                         return Err(DeliveryError::Permanent(
                             "email notification has no user_id and no recipient".to_string(),
                         ));
                     }
                 };
+                // SPEC-7.620: an SMTP send failure via Mailer::send_multipart is always Transient ("smtp: {e}"), so it always gets the backoff ladder rather than an immediate permanent fail.
                 self.mailer
                     .send_multipart(
                         &to,
@@ -372,6 +384,7 @@ impl DispatcherWorker {
             // failed loudly so a deployment that forgets to register a
             // transport is visible in the status column, not silently
             // queued forever.
+            // SPEC-7.594, SPEC-7.618: the worker recognizes only "in_app" and "email"; any other channel_type is a permanent, non-retrying failure, even though UpsertNotificationChannelRequest's doc comment lists other names as configurable.
             other => Err(DeliveryError::Permanent(format!(
                 "no transport registered for channel '{other}'"
             ))),
@@ -388,6 +401,7 @@ impl DispatcherWorker {
         // codebase filters on `status = 'active'`; this lookup didn't, so an
         // offboarded user kept receiving tenant mail until their row was
         // deleted rather than the moment they were deactivated.
+        // SPEC-7.623: filters to status = 'active', so an offboarded user's row is excluded and resolves to a permanent "user {uid} has no email" failure.
         let rows: Vec<(Uuid, String)> = sqlx::query_as(
             "SELECT id, email FROM users WHERE tenant_id = $1 AND id = ANY($2) AND status = 'active'",
         )
@@ -400,12 +414,14 @@ impl DispatcherWorker {
         // rolled back lazily, which parks the connection `idle in transaction`
         // for as long as the pool takes to reuse it, i.e. across the sends
         // this phase exists to get out of a transaction (PMS-782).
+        // SPEC-7.624: committed rather than dropped, to avoid leaving the connection idle in transaction while the pool is needed for the sends this phase exists to free up.
         tx.commit().await?;
         Ok(rows)
     }
 
     /// Phase three: write every outcome of the tick back in one transaction,
     /// at most two statements, both independent of the batch size.
+    // SPEC-7.625: writes every tick's outcomes in one transaction using at most two statements regardless of batch size, each skipped entirely if its input list is empty.
     async fn settle(&self, sent_ids: &[Uuid], settlements: &[Settlement]) -> AppResult<()> {
         if sent_ids.is_empty() && settlements.is_empty() {
             return Ok(());

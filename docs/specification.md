@@ -23,6 +23,38 @@ shares the data-transfer types in the workspace crate `crates/mokosh-types`. Ide
 deployment profile is delegated to an external OIDC provider referred to in this document as the identity provider
 (the `bunyip` provider name and `BUNYIP_*` variables in the code).
 
+- **SPEC-1 and 2.1**: the combined router's `.fallback(...)` must catch every request matching none of the six
+  top-level nests, including a bare `GET /`, and must answer the `not_a_frontend` 404 HTML page rather than axum's
+  default 404, which would otherwise leak internal route information, citing `src/api/router.rs:1400`.
+
+### Non-goals
+
+mokosh-server does not serve a user interface (see above). It does not implement its own OIDC identity provider;
+`bunyip` is the one identity provider this document names, and provisioning a different one is out of scope. It
+does not read application configuration from any source this module group's registry does not declare: a key not
+in `src/config/variables.toml` has no reader, by construction of the registry described in section 2.7. It does
+not run scheduled jobs across multiple processes: the scheduler in section 2.5 assumes exactly one running
+instance, and offers no leader election or distributed locking.
+
+### Process model
+
+One long-running process per deployment, serving every tenant from the same `mokosh-server` binary; there is no
+per-tenant process or thread. Section 2.3 states the boot sequence in full; section 2.5 states the interval and
+one-shot background work that runs inside the same process once it is up.
+
+### Retention and cleanup
+
+This module group (sections 1-2) owns no application data, so it states no retention or cleanup rule of its own
+for any domain area; those rules belong to the module group that owns the data and are specified where that group
+lands:
+
+- Billing, time, tickets, contacts, documents, and knowledge base: none in this section; see the module group that
+  owns each (billing and time, service desk, remaining modules) once its specification section exists.
+- Connection pool lifecycle (`src/db/pool.rs`) is a resource limit, not a data-retention rule: a connection is
+  recycled on an idle timeout and a hard lifetime cap, covered in section 2.6, but no row is ever deleted by it.
+- The one-shot correction tasks in `src/scheduler/one_shot.rs` run once per process start; they are idempotent
+  corrections to existing rows, not a cleanup or expiry mechanism, covered in section 2.5.
+
 ## 2. Architecture
 
 ### 2.1 Workspace
@@ -55,25 +87,153 @@ Rust edition 2021; the toolchain is pinned in `rust-toolchain.toml` (channel `1.
 
 ### 2.3 Runtime shape
 
-`mokosh-server` is one long-running process. `src/main.rs` runs, in order:
+`mokosh-server` is one long-running process. `src/main.rs` runs the following, in order. Each step either ends
+startup (a hard failure) or logs and continues (a soft failure); which one applies is stated per step.
 
-1. If `argv[1]` names an operator subcommand (section 4.2), run it and exit.
-2. Initialise `tracing` with `RUST_LOG` (default filter `info`), load a `.env` file, read the hosting profile
-   (`MOKOSH_DEPLOYMENT_MODE`), and refuse to boot if a retired storage variable name is set.
-3. Select the configuration provider and resolve every declared configuration key into one generation.
-4. Build `AppConfig`; refuse to boot outside development/test if the essential deployment variables are unset or the
-   secrets are weak (section 6.1).
-5. Provision the two database roles if the migrator role cannot yet log in (needs `MOKOSH_ADMIN_DATABASE_URL`), open
-   the two connection pools, and run migrations when `RUN_MIGRATIONS` is true (the default). A migration failure ends
-   startup with a non-zero exit.
-6. Create the first platform administrator when `ADMIN_EMAIL` and `ADMIN_PASSWORD` are set and no platform admin
-   exists. A failure here is logged as a warning and boot continues.
-7. Initialise the application-tier secret providers, the deployment's OAuth client pairs (Google, Microsoft, Xero,
-   Intuit), the cached product name, the mailer (the transport is verified at boot and a failure ends startup), the
-   identity-provider token verifier, and the authentication provider chain.
-8. Start the background scheduler (section 2.5), spawn the one-shot data movers, load the optional IP databases.
-9. Build the router and serve it on `HOST:PORT` (defaults `0.0.0.0:8080`) with client connect info. There is no
-   graceful-shutdown handler.
+- **SPEC-1 and 2.2**: a secret resolved via `resolve_secret` (`JWT_SECRET`, `ENCRYPTION_KEY`,
+  `BUNYIP_WEBHOOK_SECRET`) must fall back to its hardcoded development value when unset only in the
+  development/dev/test environments; every other environment value, including the development value set
+  explicitly, is a fatal boot error, citing `src/main.rs:128`.
+- **SPEC-1 and 2.3**: outside development/dev/test, a `JWT_SECRET` shorter than 32 bytes is a fatal boot error;
+  development/dev/test accept any length, citing `src/main.rs:145`.
+- **SPEC-1 and 2.4**: outside development/dev/test, `ENCRYPTION_KEY` must be exactly 64 ASCII hex characters
+  (32 bytes hex-encoded); development/dev/test also accept a raw 32-byte key, citing `src/main.rs:162`.
+- **SPEC-1 and 2.5**: outside development/dev/test, `MOKOSH_DEPLOYMENT_MODE`, `MOKOSH_APP_DATABASE_URL`,
+  `BASE_URL`, `CLIENT_ORIGIN` and `SPA_BASE_URL` form a closed, ordered list; `check_deployment_requirements`
+  must collect every one left unset or blank and raise a single combined fatal error naming each one's purpose,
+  legal options and an example, citing `src/main.rs:215`.
+- **SPEC-1 and 2.6**: a recognized `argv[1]` subcommand must short-circuit to `run_cli` and return before
+  tracing, dotenv, configuration or the database are touched, citing `src/main.rs:530`.
+- **SPEC-1 and 2.7**: the server path's tracing subscriber must read `RUST_LOG`, defaulting to `"info"` when
+  unset or unparsable; this init is skipped entirely on the CLI-dispatch path, which installs its own
+  (SPEC-1 and 2.58), citing `src/main.rs:546`.
+- **SPEC-1 and 2.8**: two unconditional info-level lines (the version banner, then a hardcoded "multi-tenant
+  mode" line) must be logged before any configuration, env file or database is touched, citing `src/main.rs:556`.
+- **SPEC-1 and 2.9**: `.env` is loaded via `dotenvy::dotenv().ok()`, so a missing file must be silently
+  ignored rather than failing startup, citing `src/main.rs:566`.
+- **SPEC-1 and 2.10**: an unrecognized `MOKOSH_DEPLOYMENT_MODE` value must end startup here, naming the legal
+  values, before the database or any provider is touched, citing `src/main.rs:575`.
+- **SPEC-1 and 2.11**: a retired storage env var name must end startup; the message is printed to stderr (not
+  only the tracing log) and returned as the process's fatal error, citing `src/main.rs:586`.
+- **SPEC-1 and 2.12**: an unrecognised `CONFIG_BACKEND`, or a failure resolving the first configuration
+  generation, must end startup here, citing `src/main.rs:598`.
+- **SPEC-1 and 2.13**: unlike every other fatal boot step in this function, an `AppConfig::from_env` failure
+  must panic (`.expect`) rather than returning a typed error, citing `src/main.rs:603`.
+- **SPEC-1 and 2.14**: DB role self-provisioning must run before either request pool is opened, and must be
+  skipped entirely when `mokosh_migrator` can already log in; a failure must propagate as a fatal boot error,
+  citing `src/main.rs:617`.
+- **SPEC-1 and 2.15**: `Database::new` must open both the app and migrator pools in one call; a connection
+  failure must propagate as a fatal boot error before migrations ever run, citing `src/main.rs:628`.
+- **SPEC-1 and 2.16**: a migration failure must be fatal: logged at error level and returned, ending startup
+  without serving on a half-migrated database, citing `src/main.rs:641`.
+- **SPEC-1 and 2.17**: `RUN_MIGRATIONS=false` must skip the whole migration block silently; `main.rs` logs no
+  explicit "migrations skipped" line in that case, citing `src/main.rs:643`.
+- **SPEC-1 and 2.18**: "Database connected" must be logged unconditionally, whether or not migrations ran,
+  citing `src/main.rs:653`.
+- **SPEC-1 and 2.19**: a platform-admin bootstrap failure must be logged at warn level with boot continuing;
+  it is never fatal, citing `src/main.rs:657`.
+- **SPEC-1 and 2.20**: a single hardcoded info line names the two auth mechanisms (bunyip-as-OP Resource
+  Server plus the legacy HS256 cookie); it is not derived from which providers actually resolved, citing
+  `src/main.rs:668`.
+- **SPEC-1 and 2.21**: a malformed `ENCRYPTION_KEY`, re-parsed into raw bytes here after its shape was already
+  validated by `AppConfig::from_env`, must panic via `.expect` rather than returning a typed boot error, citing
+  `src/main.rs:674`.
+- **SPEC-1 and 2.22**: application-tier secret provider construction (the per-secret defaults and the
+  process-wide installation) must be fatal; a failure here ends startup before any provider-backed secret can
+  be read, citing `src/main.rs:699`.
+- **SPEC-1 and 2.23**: a half-configured Google OAuth client pair (one of id/secret set, the other missing) is
+  a fatal boot error; both unset resolves to `None` with no error, citing `src/main.rs:720`.
+- **SPEC-1 and 2.24**: a half-configured Xero or Intuit application pair is a fatal boot error, the same
+  posture as the Google client; unavailable `app_secrets` falls back to `IssuerApps::default()` with no error,
+  citing `src/main.rs:733`.
+- **SPEC-1 and 2.25**: `app_secrets::current()` returning `None` here, meaning the earlier `init_from_env` call
+  silently failed to install, must be a fatal error, not a panic, citing `src/main.rs:778`.
+- **SPEC-1 and 2.26**: a failure loading the product-name setting must be logged at warn level with boot
+  continuing on the built-in default name, citing `src/main.rs:792`.
+- **SPEC-1 and 2.27**: an unrecognised `MAIL_PROVIDER`, or `MAIL_PROVIDER=smtp` with no `SMTP_HOST`, must end
+  startup; the resolved provider and its source (explicit vs. profile default) are logged at info level,
+  citing `src/main.rs:812`.
+- **SPEC-1 and 2.28**: a failure loading the mailer configuration (a DB setting or `SMTP_*` env) must panic via
+  `.expect`, citing `src/main.rs:824`.
+- **SPEC-1 and 2.29**: a failure constructing the `Mailer` for the selected provider must panic via `.expect`,
+  citing `src/main.rs:832`.
+- **SPEC-1 and 2.30**: the mailer transport must be verified at boot, not on first send; a verify failure is
+  fatal (logged at error level, startup ends); `LogMailer`'s verify is a no-op `Ok(())`, citing
+  `src/main.rs:844`.
+- **SPEC-1 and 2.31**: the Bunyip RS verifier is optional; a missing or invalid `OIDC_ISSUER`/`OIDC_AUDIENCE`
+  configuration must log an info-level reason and leave it `None` (the legacy HS256 path still serves); it is
+  never fatal, citing `src/main.rs:860`.
+- **SPEC-1 and 2.32**: an invalid `AUTH_PROVIDERS` selection must end startup; a valid one is logged via
+  `record()` and installed process-wide before the router is built, so every later reader of the selection sees
+  the same value, citing `src/main.rs:883`.
+- **SPEC-1 and 2.33**: tenant-secret provider construction must panic via `.expect("secret provider
+  configuration")` on misconfiguration rather than returning a typed boot error, citing `src/main.rs:971`.
+- **SPEC-1 and 2.34**: object storage provider construction must panic via `.expect("storage provider
+  configuration")` on misconfiguration, the same posture as the secret provider, citing `src/main.rs:993`.
+- **SPEC-1 and 2.35**: `provider_selection.record()` must log, for all five capability kinds, whether the
+  hosting profile's default stands or an operator's explicit override took effect; it performs no validation
+  of its own, citing `src/main.rs:1034`.
+- **SPEC-1 and 2.36**: the `FeatureSnapshot` must start with every toggle off; the scheduler's first
+  (immediate) tick of `FeatureToggleRefresh` is what first populates it, so a request served before that tick
+  sees every feature off regardless of the database's rows, citing `src/main.rs:1047`.
+- **SPEC-1 and 2.37**: unlike every other job registered in `main.rs`, the feature-toggle refresh and (below)
+  the asset-signature-detector refresh must be registered at their own job-module constant intervals, not a
+  literal duration written in `main.rs`, citing `src/main.rs:1054`.
+- **SPEC-1 and 2.38**: the notification dispatcher must be registered on a hardcoded 5-second interval, the
+  only job in `main.rs` at that cadence, citing `src/main.rs:1077`.
+- **SPEC-1 and 2.39**: RMM sync must be registered on a hardcoded 60-second interval, citing
+  `src/main.rs:1080`.
+- **SPEC-1 and 2.40**: the contact-sync runner must be registered as a wakeable job on a hardcoded 60-second
+  interval AND woken on demand via `contact_sync_wake` (also handed to `create_api_router`), so a request that
+  commits a sync run need not wait for the next tick, citing `src/main.rs:1115`.
+- **SPEC-1 and 2.41**: contract lifecycle and recurring invoicing must each be registered on a hardcoded
+  3600-second (1-hour) interval, citing `src/main.rs:1134`.
+- **SPEC-1 and 2.42**: SLA sweep must be registered on a hardcoded 60-second interval, citing
+  `src/main.rs:1141`.
+- **SPEC-1 and 2.43**: calendar reminders must be registered on a hardcoded 60-second interval, citing
+  `src/main.rs:1165`.
+- **SPEC-1 and 2.44**: the grant-invitation expiry sweep must be registered using the module's own
+  `GRANT_INVITATIONS_SWEEP_INTERVAL` constant rather than a literal duration written in `main.rs`, citing
+  `src/main.rs:1181`.
+- **SPEC-1 and 2.45**: scheduled reports must be registered on a hardcoded 60-second interval, citing
+  `src/main.rs:1201`.
+- **SPEC-1 and 2.47**: `main.rs` must spawn five one-shot movers via `spawn_once` (KB attachment, tenant logo,
+  branding assets, gateway credential, Google client-secret cleanup) without awaiting any of them; a failure
+  inside one is handled by `spawn_once` or the mover itself, not surfaced to `main`'s own control flow, citing
+  `src/main.rs:1248`.
+- **SPEC-1 and 2.46**: scheduled dashboards must be registered on a hardcoded 60-second interval, citing
+  `src/main.rs:1215`.
+- **SPEC-1 and 2.48**: invoice reminders must be registered on a hardcoded 3600-second (1-hour) interval,
+  citing `src/main.rs:1319`.
+- **SPEC-1 and 2.49**: status-observation retention must be registered on a hardcoded 21600-second (6-hour)
+  interval, citing `src/main.rs:1334`.
+- **SPEC-1 and 2.50**: `scheduler.start()` must be called exactly once, after every job above is registered;
+  its returned handles must be held for the rest of `main` so the spawned tasks stay alive rather than being
+  dropped before the server starts serving, citing `src/main.rs:1341`.
+- **SPEC-1 and 2.51**: an unset `IP2LOCATION_DB_PATH`, or a failed `.BIN` load, must leave `geoip` as `None`
+  and log info/warn respectively; never fatal, citing `src/main.rs:1351`.
+- **SPEC-1 and 2.52**: an unset `IP2PROXY_DB_PATH`, or a failed `.BIN` load, must leave `ip_enrich` as `None`
+  and log info/warn respectively; never fatal, independent of the geoip service, citing `src/main.rs:1374`.
+- **SPEC-1 and 2.53**: the router must be built with one `create_api_router` call, after every provider,
+  worker and secret above is ready; it is the last construction step before the listener binds, citing
+  `src/main.rs:1397`.
+- **SPEC-1 and 2.54**: the bind address must be `{HOST}:{PORT}` (defaulting to `0.0.0.0`/`8080` per
+  `AppConfig::from_env`); a malformed combination fails the `SocketAddr` parse and is fatal, citing
+  `src/main.rs:1427`.
+- **SPEC-1 and 2.55**: a bind failure (for example the port already in use) must propagate as a fatal startup
+  error, citing `src/main.rs:1431`.
+- **SPEC-1 and 2.56**: `axum::serve` must run with no graceful-shutdown handler attached (no
+  `.with_graceful_shutdown`, no SIGTERM/SIGINT handling in `main.rs`); the process relies entirely on the
+  default OS signal behavior and drains no in-flight connection on exit, citing `src/main.rs:1456`.
+- **SPEC-1 and 2.57**: `run_cli` must load `.env.infisical` then `.env`, each via `let _ =` so either file's
+  absence is silently ignored; this is a different source order than the server path (SPEC-1 and 2.9), which
+  loads only `.env`, citing `src/main.rs:1463`.
+- **SPEC-1 and 2.58**: `run_cli` must install its own tracing subscriber (the same `RUST_LOG`-with-`"info"`-
+  default rule as SPEC-1 and 2.7), because the CLI dispatch at the top of `main` returns before `main`'s own
+  subscriber is installed, citing `src/main.rs:1463`.
+- **SPEC-1 and 2.59**: a subcommand error must be printed to stderr and exit the process via
+  `std::process::exit(1)`, not returned as this function's `Result`, so `main`'s own error formatting never
+  sees it, citing `src/main.rs:1474`.
 
 ### 2.4 Request pipeline
 
@@ -108,6 +268,110 @@ rejections answer `429` with `Retry-After`. A deleted account answers `410` with
 token answers `401` with a `WWW-Authenticate: Bearer` challenge that distinguishes expired, invalid and ended-session
 credentials.
 
+- **SPEC-1 and 2.60**: the seven top-level mounts and their auth models (session `/api/v1`, no-auth-by-design
+  `/api/v1/public`, contact Bearer `/api/v1/contact`, and the four signed receivers) must match CLAUDE.md's
+  "Routing model" claim; the invoice-issuer webhooks mount is a fifth signed receiver CLAUDE.md's prose does
+  not name individually (a documentation-completeness gap; see Intent unclear), citing
+  `src/api/router.rs:1373`.
+- **SPEC-1 and 2.61**: `sanitize_json_body` must be layered once on the combined `Router`, outside every nest,
+  so it runs on every path including the signed receivers; the `RAW_BODY_PATHS` exemption is a prefix check
+  inside the function itself, not a difference in which nests this layer wraps, citing
+  `src/api/router.rs:1414`.
+- **SPEC-1 and 2.62**: seven independent `normalize_error_envelope` instances must each be layered separately:
+  `api_v1`, `bunyip_nest`, `stripe_webhooks`, `paypal_webhooks`, `invoice_issuer_webhooks` (one per provider
+  closure call), `public_api`, and `contact_api`, citing `src/api/router.rs:992` (and repeated at
+  `src/api/router.rs:1118`, `:1166`, `:1190`, `:1240`, `:1334`, `:1367`).
+- **SPEC-1 and 2.63**: the public API's per-IP rate limit must trigger on every request to that nest, keyed by
+  the caller's extracted client IP (trusted-proxy-aware); the quota is `PUBLIC_API_PER_MIN` (60/minute), and a
+  caller past quota gets a 429 with `Retry-After`, citing `src/api/router.rs:1321`.
+- **SPEC-1 and 2.64 DEFECT**: the comment above `logout_verifier.map(...)` claims the back-channel logout
+  receiver is "Mounted whether or not the verifier exists", but `logout_verifier.map(...)` only builds
+  `Some(router)` when `bunyip_verifier` was `Some`, and the `match backchannel_logout { Some(logout) =>
+  bunyip_nest.merge(logout), None => ... }` further down only merges the route in that case; with no verifier
+  the route is NOT mounted and a request to it 404s, contradicting the comment's own claim. Not fixed here;
+  see Defects found, citing `src/api/router.rs:1076` and `src/api/router.rs:1133`.
+- **SPEC-1 and 2.65**: `api_v1`'s middleware stack, innermost to outermost, must be: `seed_middleware`, then
+  `auth_middleware`, then the contact-plane middleware, then `Extension<Database>`,
+  `Extension<SettingsService>`, `Extension<PlatformAdminService>`, and finally `normalize_error_envelope` as
+  the outermost layer; each later `.layer()` call wraps the ones before it, citing `src/api/router.rs:924`.
+- **SPEC-1 and 2.66**: `/platform`'s own `PlatformAdminService` instance (built at the nest) must be a
+  distinct object from the one the outer `Extension` layer injects near the end of the chain; both target the
+  same table but are separate instances serving separate call sites, citing `src/api/router.rs:624` (and
+  `src/api/router.rs:979`).
+- **SPEC-1 and 2.67**: `/tenants`, `/teams` and `/me` (teams) must only be mounted when the `multi-tenant`
+  cargo feature is on; a build without it has no tenant CRUD and no teams surface at all, not merely a gated
+  handler, citing `src/api/router.rs:638`.
+- **SPEC-1 and 2.68**: `contact_api` must compose `contact_portal::contact_routes` with the branding module's
+  contact-scoped routes, sharing one `ContactAuthService` instance between the two merged routers so a single
+  `load_capabilities` implementation backs both, citing `src/api/router.rs:1354`.
+- **SPEC-1 and 2.69**: both routes on the `bunyip_nest` must authenticate via an HMAC signature over the raw
+  body rather than a session; `account_deleted` must run on the migrator/BYPASSRLS pool because it is pre-auth
+  and resolves its own tenant from the `users` row it reads, citing `src/api/router.rs:1120`.
+- **SPEC-1 and 2.70**: Stripe and PayPal must share `provider_webhook_handler` and the per-tenant
+  `/webhooks/{tenant_id}` path shape; only `provider_id` and the state's `billing`/`payment_methods` differ
+  between them, citing `src/api/router.rs:1160`.
+- **SPEC-1 and 2.71**: the invoice-issuer webhooks must register one URL per provider (Xero, QuickBooks), not
+  one per tenant, since there is one application per provider and so one webhook subscription for the host to
+  configure, unlike the per-tenant Stripe/PayPal `{tenant_id}` path, citing `src/api/router.rs:1385`.
+- **SPEC-1 and 2.72**: the global stack order on the combined `Router`, each `.layer()` wrapping the previous
+  outward, must be: `sanitize_json_body`, then tracing, then compression, then CORS, then security headers
+  (outermost), so every response from every nest passes through all five, citing `src/api/router.rs:1420`.
+- **SPEC-1 and 2.73**: `GET /api/v1/health` must answer the static string `"OK"` with no downstream dependency
+  check at all, in contrast to `/ready`, citing `src/api/router.rs:1487`.
+- **SPEC-1 and 2.74**: `GET /api/v1/ready` must answer 200 with
+  `{"status":"ready","checks":{"db":...,"infisical":...}}` when both checks pass, else 503 with
+  `"status":"not_ready"` and the failing check's value replaced by an `"error: ..."` string; every response
+  must carry `Cache-Control: no-store`, citing `src/api/router.rs:1523`.
+- **SPEC-1 and 2.75**: the readiness DB ping must be bounded to 3 seconds; a ping that neither answers nor
+  errors within that bound is treated as a failure ("db ping exceeded 3s") rather than hanging the `/ready`
+  response open, citing `src/api/router.rs:1579`.
+- **SPEC-1 and 2.76**: the Infisical probe must be built lazily in a `OnceLock` on the first `/ready` request,
+  not at `create_api_router` time, caching the parsed URL, a credential-scrubbed display string, and a reused
+  `reqwest::Client`; a blank or unset `INFISICAL_ADDRESS` at that first call means no probe runs for the
+  lifetime of the process, citing `src/api/router.rs:1608`.
+- **SPEC-1 and 2.77**: `probe_infisical` must return a three-way result read by `ready_check`: `Ok(true)`
+  (probe ran, 2xx response) renders `"infisical":"ok"`; `Ok(false)` (unconfigured) renders `"skipped"` and
+  never fails readiness; `Err(_)` (configured but DNS/TCP/non-2xx/timeout failure) renders `"error: ..."` and
+  fails readiness with a 503, citing `src/api/router.rs:1688`.
+- **SPEC-1 and 2.78**: a route-overlap test must textually scan `tickets/routes.rs` (mounted at `/tickets`)
+  and `tickets/attachments.rs` (merged at the top level) for `.route(...)` calls, compute each one's effective
+  `(method, prefix+path)`, and fail on any pair both sources register; it also fails if the scan finds 20 or
+  fewer routes total, guarding against the parser silently matching nothing, citing `src/api/router.rs:1797`.
+- **SPEC-1 and 2.79**: two tests (`brotli_is_negotiated_when_the_client_advertises_it`,
+  `gzip_only_client_still_gets_gzip`) must confirm the global `CompressionLayer::new()` offers brotli when the
+  client advertises it alongside gzip, and falls back to gzip for a gzip-only client, without the layer's
+  offered algorithm set being visible from its construction call, citing `src/api/router.rs:1971`.
+- **SPEC-1 and 2.80**: `CorsOriginMatcher::from_entries` must run exactly once, at router construction (boot),
+  not per request; a parse failure must panic the boot rather than being deferred to request time, citing
+  `src/api/cors_origin.rs:53` (and `src/api/cors_origin.rs:63` for the per-request `matches` call it feeds).
+- **SPEC-1 and 2.81**: `CorsOriginMatcher::from_entries` is the one call site that parses `CORS_ORIGIN` entries;
+  `matches` itself must do no parsing, only byte comparisons against rules parsed once at boot, citing
+  `src/api/cors_origin.rs:53`.
+- **SPEC-1 and 2.82**: an empty `CORS_ORIGIN` entry must panic at boot rather than being skipped or
+  allow-listing nothing, citing `src/api/cors_origin.rs:105`.
+- **SPEC-1 and 2.83**: a wildcard entry with no suffix after `<scheme>://*.` must panic at boot, citing
+  `src/api/cors_origin.rs:113`.
+- **SPEC-1 and 2.84**: a wildcard suffix containing another `*` must panic at boot; only the leftmost label
+  may be a wildcard, citing `src/api/cors_origin.rs:119`.
+- **SPEC-1 and 2.85**: a wildcard suffix with no dot must panic at boot; the suffix must include a TLD, citing
+  `src/api/cors_origin.rs:125`.
+- **SPEC-1 and 2.86**: an entry containing `*` outside the leading `<scheme>://*.` position must panic at
+  boot, citing `src/api/cors_origin.rs:138`.
+- **SPEC-1 and 2.87**: an exact entry that does not parse as a valid header value must panic at boot, citing
+  `src/api/cors_origin.rs:144`.
+- **SPEC-1 and 2.88**: an exact-origin rule must match byte-for-byte, case-sensitively, with no normalization
+  of the incoming `Origin` header, citing `src/api/cors_origin.rs:67`.
+- **SPEC-1 and 2.89**: a wildcard rule's scheme must be matched as a literal prefix, so a wildcard entry never
+  matches the other scheme, citing `src/api/cors_origin.rs:71`.
+- **SPEC-1 and 2.90**: a wildcard rule's suffix comparison must be a tail (suffix) comparison, not
+  leftmost-label-only, so any number of leading host labels match, citing `src/api/cors_origin.rs:85`.
+- **SPEC-1 and 2.91**: a wildcard rule must reject the bare apex and the empty-label host by requiring the
+  matched host to be strictly longer than the stored suffix, citing `src/api/cors_origin.rs:81`.
+- **SPEC-1 and 2.92**: a wildcard rule's suffix is the literal configuration text and must be compared
+  byte-for-byte, case-sensitively, citing `src/api/cors_origin.rs:67`.
+- **SPEC-1 and 2.93**: a wildcard rule's stored suffix must include a leading dot and must include a port if
+  one was written into the configuration entry, citing `src/api/cors_origin.rs:85`.
+
 ### 2.5 Background jobs
 
 All periodic jobs run on the shared scheduler (`src/scheduler/mod.rs`): one tokio task per job, fixed interval, missed
@@ -131,7 +395,159 @@ ticks skipped, the first tick fires immediately at startup, tick errors are logg
 One-shot tasks started at boot (`scheduler/one_shot.rs`): move knowledge-base attachments, tenant logos, branding assets
 and payment-gateway credentials to their current storage layout, and clean up a retired Google client secret.
 
-### 2.6 Provider seams
+- **SPEC-1 and 2.94**: one job runs per registration, ticked at a fixed interval on its own tokio task, citing
+  `src/scheduler/mod.rs:68`.
+- **SPEC-1 and 2.95**: a second job registered with the same name must panic at registration rather than
+  silently shadowing the first, citing `src/scheduler/mod.rs:180`.
+- **SPEC-1 and 2.96**: a wakeable job must keep its registered interval; `JobWake` only runs it sooner and
+  never changes the cadence, citing `src/scheduler/mod.rs:173`.
+- **SPEC-1 and 2.97**: `tokio::sync::Notify::notify_one` retains at most one permit, so any number of wakes
+  before the next `notified()` must collapse into a single extra run rather than one run per wake, citing
+  `src/scheduler/mod.rs:108`.
+- **SPEC-1 and 2.98**: `tokio::time::interval` must fire its first tick immediately, then every `interval`,
+  with missed ticks skipped rather than queued, citing `src/scheduler/mod.rs:240`.
+- **SPEC-1 and 2.99**: a tick that returns `Err` must be logged at warn and discarded; the loop must never
+  stop or retry early, citing `src/scheduler/mod.rs:273`.
+- **SPEC-1 and 2.100**: a one-shot pass must run exactly once per process start, never on a recurring
+  `Scheduler` interval, citing `src/scheduler/one_shot.rs:64`.
+- **SPEC-1 and 2.101**: a `main.rs` local variable named with the `_mover` or `_cleanup` suffix must never be
+  `scheduler.register()`'d, enforced by a test that scans `main.rs` for the convention, citing
+  `src/scheduler/one_shot.rs:134`.
+
+### 2.6 Database and tenancy
+
+Two connection pools back every request: an unprivileged `mokosh_app` pool (`NOBYPASSRLS`) that serves requests
+under row-level security, and a `mokosh_migrator` pool (`BYPASSRLS`) reserved for migrations and the handful of
+tables row-level security does not cover.
+
+- **SPEC-1 and 2.102**: each pool must be capped at 20 connections (minimum 2), with a 30-second acquire
+  timeout, 600-second idle timeout and 1800-second maximum connection lifetime, citing `src/db/pool.rs:62`.
+- **SPEC-1 and 2.103**: `Database::pool()` must return the unprivileged `app_pool`; a serving query that
+  bypasses `begin_with_tenant` fail-closes to zero rows under row-level security, citing `src/db/pool.rs:110`.
+- **SPEC-1 and 2.104**: `Database::migrator_pool()` is the BYPASSRLS accessor; `scripts/check-pool-safety.nu`
+  must require every bare `.pool()` call site elsewhere to carry a `SAFETY (PMS-285)` note, citing
+  `src/db/pool.rs:122`.
+- **SPEC-1 and 2.105**: `set_config`'s `true` argument must make the setting transaction-local (`SET LOCAL`
+  semantics), so the tenant GUC never leaks to the next request that reuses this pooled connection, citing
+  `src/db/pool.rs:189`.
+- **SPEC-1 and 2.106**: `health_check` must run against `app_pool`, never `migrator_pool`, so a readiness
+  probe exercises the same connection serving requests, citing `src/db/pool.rs:150`.
+- **SPEC-1 and 2.107**: `run_migrations` must run on `migrator_pool`; a migration failure must return
+  `AppError::Database`, which ends startup, citing `src/db/pool.rs:136`.
+- **SPEC-1 and 2.108**: `Database::from_pool` must wrap one pool as both `app_pool` and `migrator_pool`, so
+  row-level security never bites (the single role used is whichever one connected it), citing
+  `src/db/pool.rs:84`.
+- **SPEC-1 and 2.109**: `Database::from_pools` must wrap two distinct pools, so a test can connect `app_pool`
+  as the unprivileged `mokosh_app` role and exercise row-level security against it, citing
+  `src/db/pool.rs:97`.
+- **SPEC-1 and 2.110**: `provision_roles` must drive which provisioning statements run, if any, from four
+  boot-time role-probe outcomes (`RolesProbe::BothExist`, `MigratorConnectsAppMissing`, `AppPasswordMismatch`,
+  `MigratorCannotConnect`), citing `src/db/provision.rs:62`.
+- **SPEC-1 and 2.111**: only `AppPasswordMismatch` must skip the migrator statements, so reconciling
+  `mokosh_app`'s password never rewrites `mokosh_migrator`'s, citing `src/db/provision.rs:239`.
+- **SPEC-1 and 2.112**: provisioning must create `mokosh_migrator` as `LOGIN BYPASSRLS` with `GRANT ALL ON
+  SCHEMA public` and `GRANT CREATE ON DATABASE`, so migrations can self-install the trusted extensions
+  (uuid-ossp/pg_trgm/citext/pgcrypto), citing `src/db/provision.rs:254`.
+- **SPEC-1 and 2.113**: provisioning must create `mokosh_app` as `LOGIN NOSUPERUSER NOBYPASSRLS` with
+  CONNECT/USAGE/DML grants on current objects; default-privilege grants for future migration-created objects
+  are a separate statement group, citing `src/db/provision.rs:313`.
+- **SPEC-1 and 2.114**: only Postgres SQLSTATE `28P01` must count as a password mismatch; every other failure
+  reports `Ok` so a transient probe failure cannot force a full provision, citing `src/db/provision.rs:505`.
+- **SPEC-1 and 2.115**: `rolcanlogin = TRUE` must be required for the probe to treat a hand-created
+  `mokosh_app` as already provisioned; a NOLOGIN role routes to the full provision path instead of the fast
+  path, citing `src/db/provision.rs:440`.
+- **SPEC-1 and 2.116**: every read in `src/db/identity.rs` must run on the migrator (BYPASSRLS) pool;
+  `identities` carries no `tenant_id` and no row-level security, and `tenant_memberships`' fail-closed
+  `tenant_isolation` policy is the backstop if a caller passes the app pool instead, citing
+  `src/db/identity.rs:21`.
+- **SPEC-1 and 2.117**: `record_identity_mfa_success` must compare-and-set on `mfa_last_totp_step`; zero rows
+  affected must be treated as a replay, citing `src/db/identity.rs:387`.
+- **SPEC-1 and 2.118**: grant-arm rows must be collected before owner-arm rows, and an owner-arm row whose
+  `tenant_id` already appeared from a grant must be skipped, so a grantee's seat keeps its grant designation,
+  citing `src/db/identity.rs:273`.
+- **SPEC-1 and 2.119**: `platform_admins` is row-level-security-exempt and every read/write in
+  `src/db/platform_admin.rs` must run on the migrator pool; its credential lifecycle is independent of
+  `users`/`identities`/`tenant_memberships`, citing `src/db/platform_admin.rs:10`.
+- **SPEC-1 and 2.120**: `stage_mfa_secret` must stage the secret without flipping `mfa_enabled`, so a
+  misconfigured authenticator cannot lock an operator out before `enable_mfa` confirms it with a live code,
+  citing `src/db/platform_admin.rs:124`.
+- **SPEC-1 and 2.121**: `spend_recovery_code` must use `rows_affected == 1` to distinguish a genuine spend from
+  a replay or an unknown code, citing `src/db/platform_admin.rs:191`.
+
+### 2.7 Configuration provider registry
+
+Every configuration key is declared once in a registry (`src/config/registry.rs`), with a declared `Tier`
+(Bootstrap or Application) determining whether it is resolved once per process or re-resolved on refresh.
+
+- **SPEC-1 and 2.122**: `declare_keys!` is the one declaration site a `ConfigKey` and its Tier/since/required
+  facts come from; a flag or a read naming a key it does not emit must fail to compile, citing
+  `src/config/registry.rs:192`.
+- **SPEC-1 and 2.123**: `Tier` is the two-tier split a provider read is built on (Bootstrap: resolved once per
+  process, unchanged across a refresh; Application: re-resolved on refresh), citing
+  `src/config/registry.rs:55`.
+- **SPEC-1 and 2.124**: `config::get`/`has`/`served_by` are the one read path every caller outside the
+  `ENTRY_POINTS` allowlist must use; `guard.rs`'s `every_env_read_goes_through_the_provider` test must enforce
+  it, citing `src/config/mod.rs:722`.
+- **SPEC-1 and 2.125**: `refresh` must re-resolve every application-tier key atomically and fall back to the
+  previous generation on a rejected outcome, citing `src/config/mod.rs:754`.
+- **SPEC-1 and 2.126**: a bootstrap-tier key must be refused before any I/O on both a full refresh and the
+  per-key `refuse_refresh_of_bootstrap` form, and a rejected outcome must leave the live generation and its
+  counter untouched, citing `src/config/mod.rs:785` (and `src/config/mod.rs:1130`).
+- **SPEC-1 and 2.127**: `init_from_env` is the boot entry point that must install a provider from
+  `CONFIG_BACKEND` (or the hosting profile's default) before any other read, citing `src/config/mod.rs:1152`.
+- **SPEC-1 and 2.128**: `CONFIG_BACKEND` is a single-provider slot that can only resolve to `Environment`
+  today; any other legal provider name must be treated as a wiring error directing the operator to
+  `CONFIG_PROVIDERS`, citing `src/config/mod.rs:559`.
+- **SPEC-1 and 2.129**: the staleness report must compare a recorded generation to a live provider probe
+  without ever exposing a value, only key/provider identity, citing `src/config/mod.rs:900`.
+- **SPEC-1 and 2.130**: the PMS-987 priority-list provider chain and its classification are wired but dormant;
+  no boot path installs one, so `CONFIG_PROVIDERS` still only feeds the single-provider slot via
+  `ConfigSelection` (see Intent unclear), citing `src/config/mod.rs:1286`.
+- **SPEC-1 and 2.131**: the environment provider must treat a non-UTF8 env var as unset-with-error-log,
+  distinct from genuinely absent, citing `src/config/env.rs:21`.
+- **SPEC-1 and 2.132**: the environment provider's enumeration must list only declared registry keys, never
+  the raw process environment, citing `src/config/env.rs:51`.
+- **SPEC-1 and 2.133**: the file provider must read `CONFIG_FILE_DIR` directly as its own construction input,
+  per the `guard.rs` provider-of-record exemption, citing `src/config/file.rs:67`.
+- **SPEC-1 and 2.134**: a missing file-provider directory must resolve to silent-empty (enablement); an
+  unreadable one must log an error; both collapse to an empty provider, citing `src/config/file.rs:85`.
+- **SPEC-1 and 2.135**: the file provider must strip exactly one trailing newline per file; anything else in
+  the value is preserved, citing `src/config/file.rs:267`.
+- **SPEC-1 and 2.136**: the file provider's `set` and `delete` must both refuse a bootstrap-tier key before
+  touching the filesystem, citing `src/config/file.rs:196`.
+- **SPEC-1 and 2.137**: the database provider's `build` must refuse any bootstrap-tier key before any pool
+  I/O, and its cache must only ever hold the application-tier keys it was given, citing
+  `src/config/database.rs:69`.
+- **SPEC-1 and 2.138**: the database provider's `set` must write `app_config` through the migrator pool (not
+  the request-serving pool) and sync the cache so a read-after-write sees it, citing
+  `src/config/database.rs:174`.
+- **SPEC-1 and 2.139**: the Bunyip provider must serve only its declared `SERVED_KEYS` allowlist, to respect
+  bunyip's per-app rate cap rather than the whole registry, citing `src/config/bunyip.rs:64`.
+- **SPEC-1 and 2.140**: the Bunyip provider must read `BUNYIP_CONFIG_URL`/`_CLIENT_ID`/`_CLIENT_SECRET`
+  directly as its own construction input, per the `guard.rs` exemption, citing `src/config/bunyip.rs:90`.
+- **SPEC-1 and 2.141**: fetching a Bunyip-served key must treat a 404 as an unheld key (`Ok(None)`); a 401 or
+  403 must be a hard provider error naming its own remedy, since each is fixed in a different place, citing
+  `src/config/bunyip.rs:248`.
+- **SPEC-1 and 2.142**: the Bunyip provider's `set` must be a stub that always refuses; the provider stays
+  read-only until bunyip's write endpoint exists, citing `src/config/bunyip.rs:233`.
+- **SPEC-1 and 2.143**: a `Flag<T>` must pair a declared application-tier key with a typed default, distinct
+  from a `ConfigKey`'s own Tier (a flag always stays on Application so it is refresh-visible), citing
+  `src/config/flags.rs:119`.
+- **SPEC-1 and 2.144**: `Flag::read` is the one read path for a flag; a blank or unparsable raw value must
+  fall back to the flag's default rather than failing the read, citing `src/config/flags.rs:151`.
+- **SPEC-1 and 2.145**: `FlagDefault::PerProfile` must resolve against the current `DeploymentMode` on every
+  read rather than freezing a mode at construction, citing `src/config/flags.rs:173`.
+- **SPEC-1 and 2.146**: `ENTRY_POINTS` is the complete, named allowlist of files permitted to read the
+  environment directly instead of through `crate::config::get`, citing `src/config/guard.rs:33`.
+- **SPEC-1 and 2.147**: `every_env_read_goes_through_the_provider` is the acceptance criterion in executable
+  form; a new direct environment read outside the seam and `ENTRY_POINTS` must fail the build, citing
+  `src/config/guard.rs:204`.
+- **SPEC-1 and 2.148**: `src/config/variables.toml` carries since/required/changelog facts for a variable read
+  outside the registry (an `ENTRY_POINTS` file), where a `ConfigKey`'s own since/required fields do not apply;
+  it is documentation data for `scripts/config-docs.nu`, not read by `declare_keys!` or any Rust code, citing
+  `src/config/variables.toml:1`.
+
+### 2.8 Provider seams
 
 Five capabilities are selected by name and resolved once at boot (`src/utils/deployment.rs`). Defaults come from the
 hosting profile set by `MOKOSH_DEPLOYMENT_MODE` (`self-hosted` or `saas`):
@@ -148,6 +564,96 @@ Further seams: application-tier secrets (`APP_SECRET_BACKEND`: `environment`, `f
 and the payment provider interface (`stripe`, `paypal`). An unrecognised provider name ends startup naming the legal
 values. The configuration seam also contains `file`, `database` and `bunyip` providers, which only the operator CLI
 chain builder (`CONFIG_PROVIDERS`) constructs; the server process itself reads configuration from `environment`.
+
+### 2.9 Version and build metadata
+
+- **SPEC-1 and 2.149**: every `VersionInfo` field must be a compile-time `env!()` constant; there is no
+  runtime git invocation in the server binary, citing `src/version.rs:11`.
+- **SPEC-1 and 2.150**: `GET /api/v1/version` must serve `VersionInfo::current()` with no auth extractor on
+  the handler, confirming `version.rs`'s doc-comment claim of endpoint consumption, citing
+  `src/api/router.rs:547`.
+- **SPEC-1 and 2.151**: the root `build.rs` must delegate `MOKOSH_GIT_HASH`/`MOKOSH_GIT_DESCRIBE`/
+  `MOKOSH_BUILD_DATE` emission to `build-metadata::emit`, citing `build.rs:9`.
+- **SPEC-1 and 2.152**: the resolution order for each build-metadata value must be the pre-set env var first,
+  a `git` shell-out second, a hardcoded fallback last, citing `crates/build-metadata/src/lib.rs:44`.
+- **SPEC-1 and 2.153**: the self-hosted update check must make no outbound request, and the probe must never
+  be built, when `MOKOSH_UPDATE_CHECK_URL` is unset or blank, citing `src/version_check.rs:80`.
+- **SPEC-1 and 2.154**: the update check's display URL must strip userinfo, query and fragment so a
+  credential embedded in the configured URL never reaches an error message, citing `src/version_check.rs:89`.
+- **SPEC-1 and 2.155**: a successful update-check result must be cached and reused for 15 minutes; a failed
+  one for 60 seconds, citing `src/version_check.rs:131`.
+
+### 2.10 Test infrastructure
+
+The `#[mokosh_test]` attribute (`crates/mokosh-test-macros`, `crates/mokosh-test`) replaces `#[sqlx::test]`: every
+test's database is cloned from one migrated template database rather than migrated from scratch.
+
+- **SPEC-1 and 2.156**: the generated test body must run on a current-thread Tokio runtime with every driver
+  enabled, matching what `#[sqlx::test]` built, citing `crates/mokosh-test-macros/src/lib.rs:90`.
+- **SPEC-1 and 2.157**: the annotated fn must be async and take exactly one argument (the pool); any other
+  shape must be a compile error, not a runtime one, citing `crates/mokosh-test-macros/src/lib.rs:60`.
+- **SPEC-1 and 2.158**: the `#[mokosh_test]` attribute must take no arguments; the template is always built
+  from `./migrations`, so a caller cannot ask for a different set, citing
+  `crates/mokosh-test-macros/src/lib.rs:41`.
+- **SPEC-1 and 2.159**: a per-test database must be a `CREATE DATABASE ... TEMPLATE` clone of the migrated
+  template rather than migrated from scratch, unique per test and per run so it collides with nothing, citing
+  `crates/mokosh-test/src/lib.rs:228`.
+- **SPEC-1 and 2.160**: the template name must be `"mokosh_tpl_"` followed by the first 8 bytes (16 hex
+  characters) of a SHA-256 digest over each migration's length-prefixed version/description/checksum, in
+  order, citing `crates/mokosh-test/src/lib.rs:404`.
+- **SPEC-1 and 2.161**: the template digest must run over `sqlx::migrate!`'s compile-time-embedded migration
+  set, not a runtime directory walk, so the name and the schema that fills it always come from the same
+  source, citing `crates/mokosh-test/src/lib.rs:407`.
+- **SPEC-1 and 2.162**: `crates/mokosh-test/build.rs` must declare `migrations/` a build dependency so the
+  crate recompiles whenever a migration is added or changed, citing `crates/mokosh-test/build.rs:14`.
+- **SPEC-1 and 2.163**: the template build must be serialized across processes by a Postgres session-level
+  advisory lock on a fixed key; the first process to arrive takes the lock and builds, every other process
+  blocks until it is released, citing `crates/mokosh-test/src/lib.rs:99` (and
+  `crates/mokosh-test/src/lib.rs:266`).
+- **SPEC-1 and 2.164**: the template must be built under a `"_building"` name and only renamed to its real
+  name once every migration has applied, so a process killed mid-build leaves a carcass rather than a
+  template that looks done, citing `crates/mokosh-test/src/lib.rs:290`.
+- **SPEC-1 and 2.165**: `ensure_template_built` must be idempotent with the build-if-absent logic `acquire`
+  runs, so calling it ahead of the suite is optional, not required, citing `crates/mokosh-test/src/lib.rs:210`.
+- **SPEC-1 and 2.166**: a per-test database name must be a v4 UUID prefix (so truncation at Postgres's 63-byte
+  identifier limit never collides two test names) followed by as much of the test path's tail as fits, citing
+  `crates/mokosh-test/src/lib.rs:432`.
+- **SPEC-1 and 2.167**: cleanup must run in this exact order: close the pool, drop the pool, drop the runtime,
+  then finish/drop the database; dropping the database before the runtime leaves a connected backend and
+  Postgres refuses the `DROP DATABASE`, citing `crates/mokosh-test-macros/src/lib.rs:108`.
+- **SPEC-1 and 2.168**: a failing (panicked) test's database must be kept, not dropped; a passing test's
+  database must always be dropped, citing `crates/mokosh-test/src/lib.rs:84`.
+- **SPEC-1 and 2.169**: dropping a test database must wait for `pg_stat_activity` to show zero sessions (up to
+  60 polls at 50ms) before a non-`FORCE` `DROP DATABASE`; a database still occupied after the wait must be left
+  in place with its sessions logged, citing `crates/mokosh-test/src/lib.rs:144`.
+- **SPEC-1 and 2.170**: `close_pool` must bound `pool.close()` to 10 seconds; a timeout must log the test path
+  rather than blocking the process indefinitely on a leaked pool, citing `crates/mokosh-test/src/lib.rs:64`.
+- **SPEC-1 and 2.171**: after a template build, every other `"mokosh_tpl_%"` database with no active session
+  must be dropped, so only the current and any still-in-use stale template persist, citing
+  `crates/mokosh-test/src/lib.rs:335`.
+
+### 2.11 Crate wiring and repo hygiene
+
+- **SPEC-1 and 2.172**: `src/lib.rs` is the crate root and must wire every top-level module and re-export
+  `Database`, `AuthState`, `CurrentUser`, `AppError`, `AppResult` and `VersionInfo` at the crate root, so
+  downstream code reaches them as `mokosh_server::X` rather than through the full module path, citing
+  `src/lib.rs:5`.
+- **SPEC-1 and 2.173**: a repo-hygiene test must walk every tracked file under `CARGO_MANIFEST_DIR` (skipping
+  build output and non-source directories, and any `.env*` file except `.env.example`) and fail if the former
+  client repository's name (`mokosh-` followed by the plural of the thing a client is, assembled at runtime so
+  this check is not itself a hit) appears as a byte substring anywhere, citing `src/lib.rs:70`.
+- **SPEC-1 and 2.174**: a repo-hygiene test must scan every `.rs` file under `tests/` line by line for
+  `#[sqlx::test` and fail if any line contains it, since a database-backed test must instead carry
+  `#[mokosh_test]`, citing `src/lib.rs:129`.
+- **SPEC-1 and 2.175**: a repo-hygiene test must read `.config/nextest.toml`, extract each of
+  `[profile.ci]`'s and `[profile.unsupported]`'s `default-filter` string, and fail unless the unsupported
+  filter equals `"not "` prepended to the ci filter (a literal text comparison, not an expression-equivalence
+  check), citing `src/lib.rs:185`.
+- **SPEC-1 and 2.176**: a repo-hygiene test must walk every `.rs` file under `src/secrets/` and `src/storage/`,
+  and for every non-comment line containing a declaration keyword (`mod`/`struct`/`enum`/`trait`/`type`/`fn`/
+  `union`/`const`/`static`) extract the identifier that follows and fail if it contains the substring `store`
+  or `backend`; it does not scan prose or the `SECRET_BACKEND`/`STORAGE_BACKEND` env var names, citing
+  `src/lib.rs:253`.
 
 ## 3. Providers and secrets
 
@@ -1361,67 +1867,670 @@ deployed) the server refuses to start when:
 | `OUTBOUND_PRIVATE_ALLOWLIST` | Hosts and CIDRs that tenant-supplied outbound URLs may reach despite being private. |
 | `STRIPE_API_BASE`, `PAYPAL_API_BASE` | Override the payment API base URL (test stubs); PayPal otherwise selects its sandbox or live host from the credential. |
 
-## 7. Security
+## 7. Service desk
 
-### 7.1 Authentication and authorization
+Requirements for the service desk modules: `src/modules/tickets`, `ticket_templates`, `sla`, `workflows`, `forms`, `email_intake`, `calendar`, `projects`, `approvals`, `notifications`. Each `SPEC-7.<n>` below is cited at its implementing or enforcing site with a `// SPEC-7.<n>` comment in the file's own comment syntax.
 
-- Three credential planes with distinct JWT `typ` claims so a token cannot be replayed across planes: staff (`access`,
-  `refresh`, `identity`, plus the identity provider's `at+jwt`), contact portal (`contact`, access 15 minutes, refresh
-  30 days, refresh cookie `HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth`), and platform admin (`platform`).
-- Only access tokens are accepted as bearers; a refresh token used as a bearer is refused.
-- Role checks are extractors (section 4.1). Roles are `super_admin`, `admin`, `manager`, `technician`, `dispatcher`,
-  `sales`, `finance`; `RequireAdmin` admits `super_admin` and `admin`, `RequireManager` adds `manager`,
-  `RequireFinance` adds `finance`.
-- Passwords are hashed with Argon2id. Contact-portal passwords must be 12 to 128 characters, have a zxcvbn score of at
-  least 3 and not be in a built-in common-password list.
-- Password-reset, portal setup, login-approval, intake and API-key secrets are stored as hashes (portal setup and
-  reset tokens also keep a SHA-256 lookup value so one row is verified rather than every candidate).
-- MFA secrets are stored encrypted with `ENCRYPTION_KEY`.
-- Cross-tenant access is prevented by row level security (section 5.2) in addition to service-layer scoping. Contact
-  portal requests re-check tenant and contact access on every request, not only at token issue.
+### 7.1 Tickets
 
-### 7.2 Secret handling
+- **SPEC-7.1**: Ticket_number is formatted "T{:06}" from the tenant's next sequence value.
+- **SPEC-7.2**: An omitted status_id/priority_id/queue_id resolves to the tenant's is_default row.
+- **SPEC-7.3**: Every FK reference on the request is validated against the caller's own tenant.
+- **SPEC-7.4**: A parent_ticket_id that already has a non-null parent is rejected; nesting is one level only.
+- **SPEC-7.5**: The insert, the audit write, and run_ticket_created all run inside this one transaction.
+- **SPEC-7.6**: On-create automation and SLA evaluation run after commit, outside any open transaction, falling back to the tenant's default due business days when no policy matches.
+- **SPEC-7.7**: Only fields actually present in the request get an UPDATE; an omitted field is never overwritten (PATCH semantics).
+- **SPEC-7.8**: Closed_at/resolved_at are set via now() only the first transition into an is_closed status, guarded by closed_at.is_none() so a later transition does not overwrite the original timestamp.
+- **SPEC-7.9**: A checkbox-only change is skipped from the audit log, since it carries no customer-visible content change.
+- **SPEC-7.10**: Run_ticket_status_changed/run_ticket_priority_changed fire inside the same transaction as the field UPDATE, only when the value actually changes.
+- **SPEC-7.11**: On-update automation and SLA re-evaluation run after commit, outside any open transaction.
+- **SPEC-7.12**: A foreign-key violation (SQLSTATE 23503) on delete is mapped to 400, not a generic 500.
+- **SPEC-7.13**: Attachment blobs are purged from object storage only after the delete transaction commits.
+- **SPEC-7.14**: Assign_ticket updates assigned_to_id but, unlike every other mutation here, writes no audit log row.
+- **SPEC-7.15**: TicketSlaResponse exposes only sla_due_date/first_response_due/first_response_at/resolution_due/resolved_at/closed_at/status/status_name; no policy id, escalation chain, or calendar is exposed.
+- **SPEC-7.16**: SLA status is computed by the single shared compute_sla_status helper everywhere a ticket's SLA state is rendered, so the agent view, portal view, and sweep worker cannot disagree (PMS-893); also, this mapping computes SLA status through the same shared compute_sla_status helper used by the agent view, portal view, and the background SLA sweep worker, so they cannot disagree (PMS-893).
+- **SPEC-7.17**: Reopen_ticket requires the TICKETS_REOPEN capability on the contact plane; the shared implementation clears closed_at/resolved_at and moves the ticket to a non-closed status.
+- **SPEC-7.18**: Reopen_portal_ticket is idempotent; reopening an already-open ticket does not error.
+- **SPEC-7.19**: Every create_* that sets is_default=true first clears is_default on every other row for the tenant and lookup kind, enforcing a single default row per tenant per kind.
+- **SPEC-7.20**: A parent_id that would create a cycle in the category hierarchy is rejected, detected via this recursive CTE.
+- **SPEC-7.21**: Every lookup delete_* maps SQLSTATE 23503 (still referenced by a ticket) to 409 via this shared handler, rather than a 500.
+- **SPEC-7.22**: List_tickets builds its WHERE clause exclusively through this enumeration of every supported filter field; a field not named here is rejected, never silently ignored.
+- **SPEC-7.23**: List_tickets sort keys accepted from the client are limited to this allow-list; a key outside it is rejected (422) rather than translated into an arbitrary SQL expression.
+- **SPEC-7.24**: The priority sort key orders by tp.sort_order (rank), never by id or name, because sorting by name would put "High" above "Urgent".
+- **SPEC-7.25**: These mapped keys must stay exactly equal, in order, to mokosh_types::sort::TICKETS, and no SQL expression may itself be an accepted wire key; enforced by the pms897_tests unit tests below, not the compiler.
+- **SPEC-7.26**: First_response_at is set via COALESCE(first_response_at, now()) the first time a note is added, and left untouched on every subsequent note.
+- **SPEC-7.27**: A mail-send failure here is logged via tracing::warn! and never fails the note-creation request, since the note row already committed.
+- **SPEC-7.28**: This literal must stay byte-identical to the seeded SQL migration 148 template; enforced by scripts/check-no-duplicate-mail-copy.nu.
+- **SPEC-7.29**: The agent view orders notes created_at DESC (newest first).
+- **SPEC-7.30**: The portal/customer view orders notes created_at ASC (oldest first, thread order), distinct from the agent view.
+- **SPEC-7.31**: List_notes_by_contact orders notes created_at DESC (newest first).
+- **SPEC-7.32**: Update_note applies two orthogonal gates, a WHO gate (NoteEditPolicy) returning 403 on failure and a WHAT/row-state gate (note_edit_block) returning 409 on failure.
+- **SPEC-7.33**: A public note with is_email_sent true is refused for edit, since the customer holds the original in their inbox and an edited row would disagree with the customer's own evidence.
+- **SPEC-7.34**: A note with created_by_contact_id set is refused for edit regardless of note_type, because it is the customer's own words.
+- **SPEC-7.35**: A TimeEntry note is refused for edit, directing the edit to the underlying time entry instead.
+- **SPEC-7.36**: An internal note, a resolution note, and a public note that has never been emailed are permitted (return None) when none of the refusal branches below apply.
+- **SPEC-7.37**: Parse accepts only "off"/"author_or_admin"/"author_or_manager" and returns None otherwise; the unset-tenant default is AuthorOrAdmin.
+- **SPEC-7.38**: AuthorOrAdmin permits author or admin, AuthorOrManager permits author or can_manage_users, Off never permits anyone including the author.
+- **SPEC-7.39**: Set_status/set_priority/assign_to/set_queue/add_note run inside the one shared transaction used for the triggering ticket mutation (PMS-1246).
+- **SPEC-7.40**: Webhook/send_notification are collected as DeferredAction values here rather than dispatched, so the network call happens only after the triggering transaction has committed (PMS-1379).
+- **SPEC-7.41**: The outbound URL passes guard_outbound_url (SSRF guard) before the first request and again before following each redirect hop.
+- **SPEC-7.42**: Redirect-following stops and fails after WEBHOOK_MAX_HOPS (5) hops.
+- **SPEC-7.43**: An action referencing a missing required parameter is skipped (not applied, not erroring the whole rule evaluation) and the skip is logged.
+- **SPEC-7.44**: Supported condition operators are exactly equals/not_equals/contains/starts_with/ends_with/is_null/is_not_null over status/priority/company_id/assigned_to_id/source/is_billable; any other operator or field does not silently match.
+- **SPEC-7.45**: The default maximum attachment size is DEFAULT_MAX_BYTES (25 MiB); the inline-image maximum is INLINE_MAX_BYTES (5 MiB), both enforced at upload time.
+- **SPEC-7.46**: The inline-image byte cap in effect at any moment is computed as a floor against the tenant's configured max, never exceeding INLINE_MAX_BYTES.
+- **SPEC-7.47**: Inline image upload restricts MIME type to an allowlist (PNG, JPEG, WebP, GIF); SVG is refused.
+- **SPEC-7.48**: This WHERE clause filters strictly on is_inline = true; an attachment with is_inline = false is never servable through this public route regardless of any other parameter.
+- **SPEC-7.49**: Read_public_inline uses the BYPASSRLS migrator pool (tenant-less lookup), justified by the SAFETY note above per the repo's pool-safety convention.
+- **SPEC-7.50**: The attachment download streams the blob via ReaderStream/Body::from_stream, never buffering the whole file into memory.
+- **SPEC-7.51**: An attachment response carries a strong ETag of the exact form "{uuid}-{filesize}" and honors If-None-Match per RFC 9110 weak-comparison semantics, returning 304 on a match.
+- **SPEC-7.52**: The private (agent-facing) response returns 500 if the blob is missing from storage despite a DB row existing; also, the public inline-image response returns 404 (not 500) when the blob is missing from storage, and omits Content-Disposition while adding X-Content-Type-Options: nosniff below.
+- **SPEC-7.53**: Every stored attachment is addressed by (tenant_id, attachment_id) UUID, never by a filesystem path, when read back through the object storage seam.
+- **SPEC-7.54**: A FileLedger row is recorded for every stored attachment blob, for tenant storage-usage rollups.
+- **SPEC-7.55**: An attachment filename passes through sanitize_filename before being persisted or echoed back to a client.
+- **SPEC-7.56**: Assert_ticket_visible_to_company/assert_portal_ticket_visible return 404, never 403, when a contact requests a ticket outside their own company.
+- **SPEC-7.57**: Every saved-view CRUD method scopes rows strictly to (tenant_id, user_id); another user's saved view in the same tenant is 404, never 403.
+- **SPEC-7.58**: Portal callers are gated per-action by this DB-loaded capability check, never by trusting the JWT's own claims (the JWT is UI-only).
+- **SPEC-7.59**: Every ticket mutation opens its transaction with Database::begin_with_tenant(tenant_id), setting the RLS GUC app.current_tenant for its duration.
 
-- Tenant integration credentials (payment gateways, RMM connections, notification channels) are
-  AES-256-GCM ciphertext or live in the selected tenant secret provider; they are never returned to clients.
-- Tenant data export excludes `payment_gateway_configs`, `credential_vault`, `api_keys`, `rmm_connections`, identity and
-  session tables, and drops secret-looking columns from every row.
-- Credential-vault reveal is a separate audited call; the company documentation view returns references only.
-- `JWT_SECRET`, `ENCRYPTION_KEY` and `BUNYIP_WEBHOOK_SECRET` have development fallbacks that are refused outside
-  dev/test (section 6.1).
+### 7.2 Ticket templates
 
-### 7.3 Input validation and output hardening
+- **SPEC-7.60**: Every ticket-template route (list/get/create/update/delete) requires the RequireAdminUser extractor; there is no agent-level access to this surface.
+- **SPEC-7.61**: Name is validated 1-200 chars and subject 1-500 chars on create; is_active defaults to true (default_true) when the key is omitted.
+- **SPEC-7.62**: The nullable FK fields (category_id/priority_id/type_id) and description/body use double_option, so an absent key leaves the field untouched while an explicit null clears it.
+- **SPEC-7.63**: Get/update/delete all return 404 with the exact literal "Ticket template" when the row is absent or belongs to another tenant.
+- **SPEC-7.64**: Every TicketTemplatesService method opens its own Database::begin_with_tenant(tenant_id) transaction (PMS-683), never sharing the caller's.
+- **SPEC-7.65**: Update does a read-modify-write, merging each field via unwrap_or(current.field) before issuing one full UPDATE of every column.
+- **SPEC-7.66**: List orders results by name ASC and applies the active_only filter only when the caller passes true; false (the admin default) returns retired templates too.
+- **SPEC-7.67**: Create INSERTs and commits, then re-fetches the row through get() rather than relying on RETURNING to build the response.
 
-- Request bodies are validated with `validator` derives; failures return field-level errors in the error envelope.
-  String values in JSON bodies are sanitised before reaching handlers (excluding signature-verified paths).
-- Upload size caps are enforced per route with `DefaultBodyLimit` sized to the configured cap.
-- Outbound fetches of caller- or tenant-supplied URLs (company website probe, ticket automation `webhook` action, RMM provider)
-  pass an SSRF guard that resolves the name, refuses any non-public address, and re-checks every redirect hop;
-  `OUTBOUND_PRIVATE_ALLOWLIST` is the explicit exception list.
-- Every response carries `Strict-Transport-Security` (1 year, includeSubDomains, preload), `X-Content-Type-Options:
-  nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, a restrictive `Permissions-Policy`, and
-  `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none';
-  form-action 'none'` unless the handler already set the header.
-- Client IP for rate limits and audit comes from `X-Forwarded-For` only when the socket peer is inside the trusted
-  proxy ranges.
+### 7.3 SLA policies and the sweep worker
 
-### 7.4 Rate limits
+- **SPEC-7.68**: Requires auth and rejects an unsupported sort query param before the listing query runs.
+- **SPEC-7.69**: Scoped to the caller's tenant and ordered by is_default DESC, name ascending.
+- **SPEC-7.70**: Non-admin callers are rejected by RequireAdmin before reaching the service.
+- **SPEC-7.71**: Name must be 1-100 characters or validation fails before the service is ever called.
+- **SPEC-7.72**: Clear is_default on every other tenant policy first, so at most one policy per tenant is ever default.
+- **SPEC-7.73**: Writes an audit record inside the same transaction as the insert, with `after` set to the row snapshot.
+- **SPEC-7.74**: 404 when no row with that id exists for the caller's tenant.
+- **SPEC-7.75**: Exclude the target row (id <> $2) when clearing other defaults, so the update never un-defaults the row it is itself promoting.
+- **SPEC-7.76**: 404 when the UPDATE affects 0 rows, and the transaction is never committed in that case.
+- **SPEC-7.77**: Requires RequireAdmin (routes.rs) and 404s when 0 rows are deleted.
+- **SPEC-7.78**: Rejects a payload where both hours are present and first_response_hours > resolution_hours; equal values are allowed and either field being absent leaves the pair unconstrained.
+- **SPEC-7.79**: First_response_hours and resolution_hours, when present, must each pass validate_sla_target_hours (positive, <= 2dp).
+- **SPEC-7.80**: Defaults to "24x7" when absent from the request JSON.
+- **SPEC-7.81**: Tenant scoping via the policy join (INNER JOIN sla_policies ON tenant_id = $1 AND p.id = $2) so a caller cannot enumerate another tenant's targets by guessing a policy id.
+- **SPEC-7.82**: Upsert_target requires RequireAdmin and validates the body before the service's tenant-ownership check and write.
+- **SPEC-7.83**: ON CONFLICT (sla_policy_id, priority_id) DO UPDATE means at most one target row exists per pair; a second call for the same pair overwrites rather than duplicates.
+- **SPEC-7.84**: Scopes the delete through the owning policy's tenant and 404s when 0 rows are deleted.
+- **SPEC-7.85**: Timezone defaults to the literal string "UTC" when omitted.
+- **SPEC-7.86**: Accepts JSON null or {} as "no windows" and rejects (422) any other non-object top-level value, keyed onto field "schedule".
+- **SPEC-7.87**: Rejects an unknown weekday key using the same clock::parse_weekday_key the read path uses, so the two cannot drift.
+- **SPEC-7.88**: Each weekday's value must be null, a single {start,end} object, or an array of such objects; any other shape is rejected.
+- **SPEC-7.89**: A window missing a string start/end, an unparseable time, or end <= start (including end == start) is rejected.
+- **SPEC-7.90**: Parses with clock::parse_hhmm, the same time parser the read path uses; also, rejects an unknown weekday key using the same clock::parse_weekday_key the read path uses, so the two cannot drift.
+- **SPEC-7.91**: Accepts null or [] as no holidays, and rejects (422) a non-array value.
+- **SPEC-7.92**: Each entry must be a bare string or an object with a string "date" field, and the date must parse as %Y-%m-%d.
+- **SPEC-7.93**: Clears is_default on every other row of the tenant before inserting, and the insert's audit record is written inside this same transaction below.
+- **SPEC-7.94**: Excludes the target row (id <> $2) above when clearing other defaults, and 404s below on 0 rows affected.
+- **SPEC-7.95**: Requires RequireAdmin (routes.rs) and 404s when 0 rows are deleted.
+- **SPEC-7.96**: Writes an audit record inside the insert transaction (body validated by the handler before this call).
+- **SPEC-7.97**: Scoped to tenant and ordered by name ascending.
+- **SPEC-7.98**: Update and delete both require RequireAdmin (routes.rs) and 404 when 0 rows are affected.
+- **SPEC-7.99**: A non-positive budget returns `start` unchanged, for both Always and BusinessHours.
+- **SPEC-7.100**: The budget is converted to whole seconds, rounded to the nearest second; sub-second precision is not tracked.
+- **SPEC-7.101**: Always computes start + budget as plain wall-clock addition, ignoring the schedule and holidays.
+- **SPEC-7.102**: "24x7" (case-insensitive) maps to Always; every other string, including unrecognized values, maps to BusinessHours, matching the column default.
+- **SPEC-7.103**: An all-closed schedule (no working windows on any weekday) degrades to plain wall-clock addition rather than attempting the day-walk, to avoid an infinite loop.
+- **SPEC-7.104**: The walk operates on a cursor converted to the schedule's local timezone; all boundary comparisons are performed in that local time, and the result is converted back to UTC below.
+- **SPEC-7.105**: A holiday date (interpreted in the schedule's local timezone, not UTC) is skipped by jumping to local midnight of the next day, before checking the weekday's windows.
+- **SPEC-7.106**: A weekday with no configured windows is skipped the same way as a holiday.
+- **SPEC-7.107**: Before the window opens, fast-forward to its open instant (no budget consumed) and re-enter the loop so the same window is evaluated as "inside".
+- **SPEC-7.108**: If remaining fits in the window, the cursor advances by exactly remaining and the walk terminates in that same window (pinned boundary: the last second of a window is allowed, no bump to the next day).
+- **SPEC-7.109**: Otherwise the whole window is consumed and the walk continues to the next window/day; a budget landing past close rolls over to the next working day's open instant plus the remainder.
+- **SPEC-7.110**: Hard cap on iterations as a termination guard against pathological data; each pass either consumes from a window or skips a closed/holiday day, so the cap bounds the calendar span. ~30 years of days is far beyond any realistic SLA budget yet guarantees termination even on a near-empty schedule. This is a silent cap, not an error: a schedule that still has remaining budget after the cap returns whatever `cursor` last reached.
+- **SPEC-7.111**: Multiple (split-shift) windows per day are sorted by start and consumed in order within a day.
+- **SPEC-7.112**: A DST fall-back (ambiguous local time, two valid UTC instants) resolves to the earliest of the two via .earliest().
+- **SPEC-7.113**: A DST spring-forward gap (no valid local instant) walks forward minute by minute, up to 180 minutes, until a valid local instant is found; if none is found it falls back to interpreting the naive datetime as UTC below.
+- **SPEC-7.114**: A holiday date (interpreted in the schedule's local timezone, not UTC) is skipped by jumping to local midnight of the next day, before checking the weekday's windows.
+- **SPEC-7.115**: An unparseable or unknown IANA timezone string maps to UTC rather than erroring.
+- **SPEC-7.116**: Accepts numeric-string keys "0"-"6" (0=Sunday) or lowercase full/abbreviated English names, skipping (not erroring on) any other key.
+- **SPEC-7.117**: Accepts "HH:MM" or "HH:MM:SS"; also, drops (returns None) a window where end <= start, a zero-length or inverted window that never contributes a working window.
+- **SPEC-7.118**: Accepts a bare "YYYY-MM-DD" string or a {"date": ...} object per entry, silently skipping any entry that is neither shape or whose date string fails %Y-%m-%d parsing.
+- **SPEC-7.119**: Evaluate_for_ticket requires RequireAdmin; the handler recomputes and persists the ticket's SLA due fields via the service.
+- **SPEC-7.120**: Silent no-op (Ok(()), no write) when the ticket id does not exist for the tenant.
+- **SPEC-7.121**: The applicable policy is the ticket's own sla_id when set; when NULL it is the tenant's is_default = TRUE policy (LIMIT 1, so more than one default row would be an unspecified pick among them).
+- **SPEC-7.122**: No policy resolved (explicit sla_id not found, or no default policy) is a no-op with no write to the ticket.
+- **SPEC-7.123**: No sla_targets row for (policy_id, priority_id) is a no-op with no write.
+- **SPEC-7.124**: A NULL operational_hours column defaults to "business_hours" here, which differs from the "24x7" request-DTO default used when a client omits the field on write.
+- **SPEC-7.125**: A missing business_hours_id, or a business_hours row that no longer exists, degrades to an all-closed schedule and an empty holiday set, which clock::due_at further degrades to 24x7 wall-clock arithmetic.
+- **SPEC-7.126**: Holiday dates are the union of every holiday_calendars row referenced by the business-hours row's holidays UUID[] column, scoped to the tenant; an empty or NULL array yields no holidays without an extra query.
+- **SPEC-7.127**: Each due field is computed independently via clock::due_at only when its hours value is non-NULL and parses to f64; otherwise that due field is left unset (None -> NULL).
+- **SPEC-7.128**: The final UPDATE runs in a fresh, separate tenant-scoped transaction from the read above, committed independently.
+- **SPEC-7.129**: Converts via a string round-trip; a value whose string form cannot parse as f64 is treated as None rather than erroring.
+- **SPEC-7.130**: SlaSweepWorker runs on a 60-second fixed interval.
+- **SPEC-7.131**: Returns Ok(0) immediately, performing no DB query, when no NotificationsService is wired (the `new`.
+- **SPEC-7.132**: Scans ALL tenants in one query on the BYPASSRLS migrator pool, not a per-tenant GUC-scoped connection, because the scan is itself the cross-tenant enumeration that builds the tenant work list.
+- **SPEC-7.133**: Selects only open tickets (resolved_at IS NULL AND closed_at IS NULL AND status not closed) that have at least one due field set.
+- **SPEC-7.134**: No assignee means the ticket is skipped entirely for this tick: no milestone evaluated, no notification attempted.
+- **SPEC-7.135**: First_response is skipped entirely (both breach and at-risk) once first_response_at IS NOT NULL; resolution has no such satisfied flag and is always evaluated when resolution_due is set.
+- **SPEC-7.136**: A milestone with due = NULL is skipped, performing no evaluation.
+- **SPEC-7.137**: Fires *_breached when now >= due, otherwise *_at_risk when now >= due - sla_at_risk_lead, otherwise no alert this tick. Breach takes precedence: once past due there is no point emitting the at-risk alert for the same field.
+- **SPEC-7.138**: Computes lead = 20% of (due - created_at) via integer milliseconds (floor division, not rounded), then clamps to [5 minutes, 24 hours].
+- **SPEC-7.139**: Returns exactly the 5-minute floor (not a clamped computed negative/zero lead) when due <= created_at.
+- **SPEC-7.140**: Claims the (ticket_id, kind) pair via an INSERT ... ON CONFLICT (ticket_id, kind) DO NOTHING inside a tenant-scoped transaction, scoped to the ticket's own tenant, then commits.
+- **SPEC-7.141**: Rows_affected() == 0 (already claimed by a prior tick or a racing replica/worker) skips the dispatch for that milestone entirely.
+- **SPEC-7.142**: Ledger-first dedupe. The ledger row is already committed, so this milestone will not be retried. Log loudly; a missed heads-up is preferable to a tight retry loop hammering the queue.
+- **SPEC-7.143**: A successful dispatch is logged at INFO with ticket_id, kind and fanout (n), and dispatched is incremented by n.
+- **SPEC-7.144**: The dispatch context JSON includes recipient_user_id, ticket_id, kind, due (RFC3339), entity_type: "ticket", and entity_id.
+- **SPEC-7.145**: Uses TenantId::from_trusted(t.tenant_id), where t.tenant_id is the value the cross-tenant scan itself projected off the tickets row (DB-derived, not user input): the sanctioned use of the trusted- construction escape hatch for this worker.
+- **SPEC-7.146**: Run_tick returns the total count of notifications dispatched across the whole tick; this logs at INFO with field `dispatched` only when dispatched > 0 (a zero-dispatch tick logs nothing beyond the per-tick tracing span).
 
-All limiters are in memory and per process; they do not survive a restart or coordinate across replicas.
+### 7.4 Workflow automation rules
 
-| Scope | Limit |
-|---|---|
-| Staff login | 20 per minute per IP and 5 per minute per lowercased email |
-| Staff forgot-password | 10 per minute per IP and 3 per minute per email |
-| Password re-authentication | 10 per minute per IP and 5 per minute per account |
-| Platform admin login | 20 per minute per IP and 5 per minute per email |
-| Invoice pay | 20 per minute per caller and 10 per minute per invoice |
-| Contact portal login intents | 20 per minute per IP |
-| Request-link and invoice emails | 20 per hour per user |
-| Grant invitation token lookups | 30 per minute per IP |
-| `/api/v1/public/*` | 60 per minute per IP |
+- **SPEC-7.147**: Trigger_event is validated as a string of length 1..=50.
+- **SPEC-7.148**: Name is validated as a string of length 1..=200.
+- **SPEC-7.149**: Actions defaults to {} when omitted from the create request; also, conditions defaults to {} when omitted from the create request.
+- **SPEC-7.150**: Is_active defaults to true when omitted from the create request; also, priority defaults to 100 when omitted from the create request.
+- **SPEC-7.151**: On update, name (when Some) must still satisfy length 1..=200; also, req.validate() re-runs the UpdateWorkflowRuleRequest validators (including name's length 1..=200 when Some) before the service call.
+- **SPEC-7.152**: Only these three trigger names are recognised by the service.
+- **SPEC-7.153**: Rejects any trigger_event not in RECOGNISED_TRIGGERS with 400 and this exact message; the joined list preserves RECOGNISED_TRIGGERS' declared array order (created, status_changed, priority_changed), not alphabetical.
+- **SPEC-7.154**: This DTO has no trigger_event field at all, so an existing rule's trigger event is immutable after creation (it cannot be changed via update).
+- **SPEC-7.155**: GET /api/v1/workflow-rules requires an admin user and lists every rule for the caller's tenant, ordered priority ASC, created_at ASC; also, returns every rule for tenant_id, ordered priority ASC, created_at ASC.
+- **SPEC-7.156**: GET /api/v1/workflow-rules/{id} requires an admin user and scopes the lookup to the caller's tenant; a missing row surfaces as 404 "Workflow rule"; also, scopes the lookup to tenant_id AND id, returning 404 "Workflow rule" when no row matches.
+- **SPEC-7.157**: POST /api/v1/workflow-rules requires an admin user and runs DTO validation before calling the service, which binds the new row to the caller's tenant_id and created_by_id; also, inserts the row bound to the caller's tenant_id and created_by_id = user_id.
+- **SPEC-7.158**: PATCH /api/v1/workflow-rules/{id} requires an admin user and applies only the non-null fields in the request body; also, applies COALESCE per-field updates (only non-null fields in the request body overwrite existing columns); updated_at is always set to NOW().
+- **SPEC-7.159**: Returns 404 "Workflow rule" when no row with this tenant_id/id exists, checked via a separate SELECT id before the UPDATE.
+- **SPEC-7.160**: DELETE /api/v1/workflow-rules/{id} requires an admin user; on success it returns {"deleted": true}; also, deletes the row scoped to tenant_id AND id, and returns 404 "Workflow rule" when rows_affected() == 0.
+- **SPEC-7.161**: Requires an admin user and returns every workflow_rule_runs row for this ticket, scoped to the caller's tenant, ordered ran_at DESC; also, returns every workflow_rule_runs row for entity_type/entity_id scoped to the caller's tenant, ordered ran_at DESC.
+- **SPEC-7.162**: Every CRUD/list query runs inside begin_with_tenant(tenant_id), so tenant_isolation RLS (migration 095) enforces scoping alongside the WHERE predicates.
+- **SPEC-7.163**: Same unresolved-creator logging as list, tagged "workflows.get", without erroring; also, when created_by_name is unresolved (the joined user is gone), log it with context "workflows.list" but still return the row with created_by_name: None rather than erroring.
+- **SPEC-7.164**: Selects only rules with trigger_event = 'ticket.created' AND is_active = true for tenant_id, ordered priority ASC, created_at ASC, and evaluates them in that order.
+- **SPEC-7.165**: Non-object conditions are treated as "match nothing" (returns false), explicitly to avoid a malformed/typo'd conditions blob silently firing every rule.
+- **SPEC-7.166**: An empty conditions object ({}) matches every ticket for this trigger.
+- **SPEC-7.167**: Condition matching is AND across keys: every key present must independently match, else the whole rule fails to match (short-circuits on first non-match).
+- **SPEC-7.168**: Within a key, matching is IN-array semantics: the key's JSON value must be a JSON array; if it is not an array, the whole match fails.
+- **SPEC-7.169**: Recognised condition keys for ticket.created are exactly priority_id, queue_id, company_id, type_id, source; any other key name fails closed (evaluates to false), even a typo'd key like "pri0rity_id".
+- **SPEC-7.170**: Priority_id, queue_id, company_id compare the ticket's UUID field against the condition array via string-parse-then-equality; non-UUID or non-string elements are silently ignored (never match, never error).
+- **SPEC-7.171**: Type_id only matches if the ticket's type_id is Some and that UUID is in the array; if type_id is None, this key never matches.
+- **SPEC-7.172**: Source matches by exact string equality against the array's string elements (not UUID parsing).
+- **SPEC-7.173**: For each matched rule, unconditionally inserts a workflow_rule_runs row with applied_actions set to the rule's full actions blob (not just the ones that fired) and error set to the stringified AppError when apply_create_actions returned Err, else NULL.
+- **SPEC-7.174**: A rule that does not match its conditions produces no workflow_rule_runs row at all; this continue skips both action application and run-row insertion.
+- **SPEC-7.175**: Returns Ok(()) unconditionally as long as the rule-querying and run-row-inserting SQL succeeds; a failing action never propagates as an Err here.
+- **SPEC-7.176**: Reads the tenant's cascade-cap setting via read_workflow_rule_max_depth and delegates to run_status_changed_at_depth starting at depth = 0.
+- **SPEC-7.177**: Reads the tenant's cascade-cap setting via read_workflow_rule_max_depth and delegates to run_priority_changed_at_depth starting at depth = 0.
+- **SPEC-7.178**: The cap comes from tenant_settings (category = 'workflows', key = 'rule_max_depth'); absent defaults to 3, present is clamped to 1..=10.
+- **SPEC-7.179**: Read_workflow_rule_max_depth takes the raw &mut PgConnection of this already-open tenant-scoped transaction (not a fresh begin_with_tenant) to avoid deadlocking on the app.current_tenant GUC SET; the 1..=10 clamp means a value of 1 disables nested/cascaded rule firing entirely.
+- **SPEC-7.180**: Selects only rules matching trigger_event = 'ticket.priority_changed' AND is_active = true for the tenant, ordered priority ASC, created_at ASC; also, selects only rules matching trigger_event = 'ticket.status_changed' AND is_active = true for the tenant, ordered priority ASC, created_at ASC.
+- **SPEC-7.181**: Recognises keys from_status_id, to_status_id, priority_id, queue_id, company_id, type_id; any other key fails the match. Non-object or non-array-valued conditions fail closed the same way as the create matcher, and an empty object matches everything.
+- **SPEC-7.182**: Recognises keys from_priority_id, to_priority_id, status_id, queue_id, company_id, type_id, with the same AND/IN/fail-closed/empty-matches-all semantics as matches_status_changed.
+- **SPEC-7.183**: Depth-cap refusal mirrors the status-changed path; a rule matched exactly at depth == max_depth is refused, recorded with a "cycle cap reached at depth {max_depth}" run row, and the loop continues to the next rule; also, the recursion guard compares depth (u32, starting at 0) with >= against max_depth; a rule matched exactly at depth == max_depth is refused and never applied, so only depth 0..max_depth-1 can apply actions that cascade further.
+- **SPEC-7.184**: For depth < max_depth, applies the actions and unconditionally inserts a run row recording success or the stringified error.
+- **SPEC-7.185**: A transition rule that does not match its conditions produces no run row (same as the create-trigger path); also, a transition rule that does not match its conditions produces no run row.
+- **SPEC-7.186**: Applies actions in this fixed order regardless of key order in the JSON object: assign_to_user_id, assign_to_team_id, set_priority_id (no-cascade), set_status_id (no-cascade), add_tag, add_internal_note; returns Ok(()) if actions is not a JSON object (silently does nothing).
+- **SPEC-7.187**: Each action sub-step below runs even if an earlier sub-step already failed (no early return on an individual action failure); only the FIRST failure is retained via first_error.get_or_insert_with, and that one message becomes the workflow_rule_runs.error for this rule-run.
+- **SPEC-7.188**: Assign_to_user_id / assign_to_team_id actions parse a UUID from the string value and UPDATE assigned_to_id / team_id; an absent key or non-string value is a no-op; a SQL failure and a UUID-parse failure produce distinct error messages ("... failed: {e}" vs "... parse: {e}").
+- **SPEC-7.189**: On the ticket.created path, set_priority_id / set_status_id update the column directly via these no-cascade variants and never fire the corresponding ticket.priority_changed / ticket.status_changed trigger, because ticket creation is the originating event, not a transition.
+- **SPEC-7.190**: Add_tag requires a string value and appends it via array_append, guarded by NOT ($1 = ANY(tags)) so a duplicate tag is not appended twice; an absent or non-string key is a no-op.
+- **SPEC-7.191**: Looks up the OLDEST active user with role super_admin, admin, or manager as the note's created_by_id, not the user who triggered the workflow and not the rule's created_by_id; a SQL failure on this lookup itself sets error "add_internal_note creator lookup: {e}".
+- **SPEC-7.192**: If no eligible admin-tier user exists, this if-let guard skips the INSERT entirely: no note inserted and no error recorded, even though the rule matched and configured this action.
+- **SPEC-7.193**: Inserts into ticket_notes with note_type = 'internal'; a SQL failure here sets error "add_internal_note failed: {e}".
+- **SPEC-7.194**: Applies non-cascading actions first, in this order: assign_to_user_id, assign_to_team_id, add_tag, add_internal_note. set_priority_id / set_status_id are not in this list and the "no_cascade" setters used by the create path are never called at all on the transition path.
+- **SPEC-7.195**: Set_priority_id is evaluated before set_status_id so a rule that changes both ends up firing priority_changed first.
+- **SPEC-7.196**: Set_priority_id / set_status_id are no-ops when the new value equals the current value (no UPDATE, no cascade, no error); otherwise each UPDATEs the column then recurses into the matching transition runner at depth + 1 inside the same transaction, with errors "set_priority_id/set_status_id failed/parse" and a wrapped cascade error ("priority cascade: {e}" / "status cascade: {e}") retained only if first_error is still None.
+- **SPEC-7.197**: Returns Err(AppError::Internal(msg)) with msg equal to the single retained first_error string if any action (including a cascade) failed, else Ok(()).
+- **SPEC-7.198**: Depth-cap refusal mirrors the status-changed path; a rule matched exactly at depth == max_depth is refused, recorded with a "cycle cap reached at depth {max_depth}" run row, and the loop continues to the next rule; also, the recursion guard compares depth (u32, starting at 0) with >= against max_depth; a rule matched exactly at depth == max_depth is refused and never applied, so only depth 0..max_depth-1 can apply actions that cascade further.
+- **SPEC-7.199**: Ticket.created never calls run_ticket_status_changed / run_ticket_priority_changed; this is a hard structural guarantee (not depth-limited) because the create is the originating event, the next mutation is the operator's.
+- **SPEC-7.200**: Boxed with Box::pin to satisfy Rust's requirement that recursive async fns have a statically-sized future.
+- **SPEC-7.201**: Read_workflow_rule_max_depth takes the raw &mut PgConnection of this already-open tenant-scoped transaction (not a fresh begin_with_tenant) to avoid deadlocking on the app.current_tenant GUC SET; the 1..=10 clamp means a value of 1 disables nested/cascaded rule firing entirely.
+- **SPEC-7.202**: The != guard before each UPDATE prevents a rule that targets the ticket's current value from cascading or recursing, closing a trivial infinite-loop vector.
+- **SPEC-7.203**: The only loop guard across the recursive status/priority cascade is the numeric depth counter; there is no de-duplication or cycle-detection against rule identity or ticket-state history, so a cascade that keeps alternating between two values runs until max_depth is hit.
+- **SPEC-7.204**: This INSERT (and the rule-listing SELECTs in run_ticket_created / run_status_changed_at_depth / run_priority_changed_at_depth) use `.await?`, so a SQL-level failure here propagates up through the whole recursive call chain and can abort the caller's outer transaction, unlike action-level failures which are always absorbed into a run row's error column instead.
 
-A limited request answers `429` with `Retry-After`.
+### 7.5 Forms, request links and drafts
+
+- **SPEC-7.205**: GET /forms requires only authentication and lists every definition for the caller's tenant, including retired ones, unless active_only=true narrows the result; also, lists every definition for the tenant ordered by name ASC, including retired ones, unless active_only narrows to is_active = true (default false).
+- **SPEC-7.206**: GET /forms/{id} requires authentication; a missing definition for the caller's tenant is a 404, not any other status; also, a missing definition for the caller's tenant is 404 "Form definition".
+- **SPEC-7.207**: POST /forms (create a definition) requires an admin user, not merely authentication.
+- **SPEC-7.208**: PATCH /forms/{id} (update a definition) requires an admin user.
+- **SPEC-7.209**: No DELETE /forms/{id} and no POST /forms/{id}/submissions route; both stay unmounted and 405 rather than being routed.
+- **SPEC-7.210**: GET /forms/{id}/submissions requires only authentication (any authenticated agent, not admin-only); also, returns every submission for the definition's tenant, ordered by created_at DESC.
+- **SPEC-7.211**: A slug already in use by the same tenant fails with Conflict and the exact message below, rather than a generic duplicate-key error.
+- **SPEC-7.212**: After a successful create, the caller's "new form" draft (keyed by form_definition_id = None) is deleted best-effort; a failure here only logs a warning; also, after a successful update, the caller's draft for this specific form_definition_id is deleted best-effort.
+- **SPEC-7.213**: CreateFormDefinitionRequest.name/slug length and format, fields >= 1 entry (DTO layer, before the service runs), and is_active default.
+- **SPEC-7.214**: UpdateFormDefinitionRequest.contact_info keeps the same 200-char cap via double_option, and fields (when present) must have >= 1 entry.
+- **SPEC-7.215**: CreateFormDefinitionRequest.name/slug length and format, fields >= 1 entry (DTO layer, before the service runs), and is_active default; also, UpdateFormDefinitionRequest.contact_info keeps the same 200-char cap via double_option, and fields (when present) must have >= 1 entry.
+- **SPEC-7.216**: An absent key leaves the corresponding column untouched (COALESCE / CASE), while description, contact_info and kb_article_id use "double option" deserialization so an explicit JSON null clears the column but an absent key does not.
+- **SPEC-7.217**: When `fields` is present, the entire existing field set is deleted and replaced wholesale, never merged; submissions already stored keep their own payload and are unaffected.
+- **SPEC-7.218**: Rule-vs-field consistency is re-checked whenever either `fields` or `rules` is present in the request, using the post-update value of each (the other side falls back to the existing stored value).
+- **SPEC-7.219**: A duplicate field name (case-sensitive exact match) within one definition is rejected with code "duplicate".
+- **SPEC-7.220**: A field_type that resolves to FieldType::Unknown is rejected at write time with code "unknown_field_type".
+- **SPEC-7.221**: A Select field with no options, or an empty options list, is rejected with code "required".
+- **SPEC-7.222**: Min_length > max_length (when both are set) is rejected with code "range".
+- **SPEC-7.223**: All field-set errors are collected and returned together as a single 422 validation error, not just the first.
+- **SPEC-7.224**: Nested per-field DTO checks on CreateFormFieldRequest: name/label length and format, min_length/max_length bounds.
+- **SPEC-7.225**: Nested per-field DTO checks on CreateFormFieldRequest: name/label length and format, min_length/max_length bounds.
+- **SPEC-7.226**: Nested per-field DTO checks on CreateFormFieldRequest: name/label length and format, min_length/max_length bounds.
+- **SPEC-7.227**: Enforced only when the field type honours_length() (Text, Textarea, Email); a bound set on any other type is inert, not an error.
+- **SPEC-7.228**: The only authorable rule kind is RequiredIf; any other/unnamed rule kind is rejected at write time with code "unknown_rule_kind".
+- **SPEC-7.229**: A rule's `field` that does not match any known field name is rejected with code "unknown_field".
+- **SPEC-7.230**: A rule's `when_field` that does not match any known field name is rejected with code "unknown_field".
+- **SPEC-7.231**: Equals is bounded to the condition field's domain (Select options, Boolean true/false) and unbounded for any other type; see equals_outside_domain.
+- **SPEC-7.232**: Equals is bounded to the condition field's domain (Select options, Boolean true/false) and unbounded for any other type; see equals_outside_domain.
+- **SPEC-7.233**: Equals is bounded to the condition field's domain (Select options, Boolean true/false) and unbounded for any other type; see equals_outside_domain.
+- **SPEC-7.234**: The read path is deliberately tolerant. A stored rule this.
+- **SPEC-7.235**: A rule naming a field that does not exist on the definition is inert here. The service rejects such a rule at write time, so this is defence in depth.
+- **SPEC-7.236**: An unparseable stored field_type falls back to Text rather than panicking (unreachable given the CHECK constraint).
+- **SPEC-7.237**: A rules JSON value that fails to deserialize falls back to an empty rule list rather than failing the read, so an unreadable rule shape still opens.
+- **SPEC-7.238**: A non-object JSON payload is rejected with a field error on "payload".
+- **SPEC-7.239**: Every payload key that does not match a known field name is rejected (not silently dropped) with code "unknown_field".
+- **SPEC-7.240**: A string answer is trimmed; if the trimmed result is empty, it is treated as absent (same as a missing key or JSON null) and the trimmed (not raw) value is what gets stored when present.
+- **SPEC-7.241**: A boolean field answered `false` IS an answer. Treating it as.
+- **SPEC-7.242**: A field is required when either its own is_required flag is true or a RequiredIf rule targeting it currently matches.
+- **SPEC-7.243**: String compared trimmed-equal; boolean compared via its to_string() ("true"/"false"); number compared via its to_string(); any other/missing value never matches.
+- **SPEC-7.244**: All field errors are collected and returned together, e.g. three missing required fields report three errors, not just the first.
+- **SPEC-7.245**: A present-but-absent-after-normalisation value is simply omitted from the stored payload (never stored as an empty string); a missing required field produces code "required"; also, a string answer is trimmed; if the trimmed result is empty, it is treated as absent (same as a missing key or JSON null) and the trimmed (not raw) value is what gets stored when present.
+- **SPEC-7.246**: Boolean requires a JSON boolean value; otherwise code "type".
+- **SPEC-7.247**: Text/Textarea/Email require a JSON string (code "type" via as_string), honour min_length/max_length counted in Unicode characters, not bytes (check_length).
+- **SPEC-7.248**: Email additionally must pass validate_email; otherwise code "email".
+- **SPEC-7.249**: A stored field type this build cannot name. It cannot have.
+- **SPEC-7.250**: The value must be a string parseable as NaiveDate in exactly %Y-%m-%d; otherwise code "date_format".
+- **SPEC-7.251**: With date_not_in_past = true, a date strictly before `today` is rejected with code "date_in_past"; a date equal to today is allowed.
+- **SPEC-7.252**: Select requires the value to be a string present (exact match) in field.options (empty slice if options is None); otherwise code "option".
+- **SPEC-7.253**: Text/Textarea/Email require a JSON string (code "type" via as_string), honour min_length/max_length counted in Unicode characters, not bytes (check_length); also, length bounds count CHARACTERS, not bytes, so a limit means the same thing.
+- **SPEC-7.254**: GET/POST /request-forms/{token} are mounted outside authentication middleware and outside the portal tree; the only identity presented is the token itself.
+- **SPEC-7.255**: 30 requests/minute per IP, in-memory and not shared across replicas, applied before the token is resolved.
+- **SPEC-7.256**: Resolving the token is the only point of failure for this route, so a malformed, guessed, expired or already-submitted token all fail the same way from here.
+- **SPEC-7.257**: Resolves the token, submits the body's payload via submit_via_request_link, and returns 201 Created with the receipt on success.
+- **SPEC-7.258**: Issuing a request link requires only authentication, not admin.
+- **SPEC-7.259**: Issuing is rate-limited per issuing user; exceeding it fails the request with a rate-limited error rather than sending another link.
+- **SPEC-7.260**: IssueRequestLinkRequest is DTO-validated before the service call: recipient_email (if present) must be a valid email, people (if present) in 1..=50.
+- **SPEC-7.261**: Issuing a link against a retired (is_active = false) definition fails with Conflict and this exact message.
+- **SPEC-7.262**: Company_id must resolve to a company in the caller's own tenant (looked up inside the tenant transaction); otherwise NotFound("Company").
+- **SPEC-7.263**: Contact_id must resolve to a contact in the caller's tenant (else NotFound("Contact")); a contact with no email and no recipient_email override fails with a BadRequest naming the fix.
+- **SPEC-7.264**: With no contact_id, recipient_email must be present, otherwise BadRequest requiring either one.
+- **SPEC-7.265**: People defaults to 1 when absent and must be within 1..=MAX_PEOPLE_PER_LINK (50), rejected here as defense-in-depth beyond the DTO-level 1..=50 validator.
+- **SPEC-7.266**: A parent container ticket is created at issue time only when people > 1; the default people == 1 creates no parent ticket at all (parent_ticket_id stays None).
+- **SPEC-7.267**: A parent container ticket is created at issue time only when people > 1; the default people == 1 creates no parent ticket at all (parent_ticket_id stays None).
+- **SPEC-7.268**: The token is {token_id}.{secret}, token_id a UUID and secret a 64-character random token; only the Argon2 hash of the secret is ever persisted.
+- **SPEC-7.269**: Expires_at is issue time plus REQUEST_LINK_TTL_DAYS (7 days).
+- **SPEC-7.270**: The inserted row sets uses_allowed = uses_remaining = people and parent_ticket_id to the created parent (or NULL for a single-person link).
+- **SPEC-7.271**: The emailed link is {app_url}/request-forms/{token_id}.{secret}.
+- **SPEC-7.272**: Email delivery is best-effort and happens AFTER the transaction commits, mirroring the portal setup-link path: a failed send must not roll back the already-persisted token row, since that row is what makes a resend possible.
+- **SPEC-7.273**: With no notifications dispatcher wired, or when dispatch fails, the already-persisted token is kept and only a warning is logged; a failed or skipped send never undoes the issued link, since the row is what makes a resend possible.
+- **SPEC-7.274**: The issue response never includes the token, only the row's own audit-trail fields; only the recipient ever holds the credential.
+- **SPEC-7.275**: GET /form-request-links requires only authentication and lists links for the caller's tenant, optionally filtered to one company_id; also, list_request_links returns this tenant's issued links ordered newest-first, optionally filtered to one company, and never includes the token itself.
+- **SPEC-7.276**: A malformed token (no '.', empty secret, non-UUID token_id), a token_id with no matching row, and a matching row whose secret fails verification all return the same generic "Invalid or expired request link" error, so a guessed token cannot be distinguished from a stale one.
+- **SPEC-7.277**: A token with nothing left (uses_remaining <= 0) resolves to Gone (410), reported as "already been submitted".
+- **SPEC-7.278**: An expired token (expires_at <= now) resolves to the same generic invalid/expired BadRequest as a malformed or non-matching token.
+- **SPEC-7.279**: The token row is looked up by primary key on the BYPASSRLS migrator pool, before the tenant is known, because this lookup is what resolves the tenant; the secret is verified below before anything about the row is returned, and every later query runs tenant-scoped via begin_with_tenant.
+- **SPEC-7.280**: A successful resolution returns the tenant via TenantId::from_trusted (the pre-auth escape hatch, since this lookup is what establishes the tenant) along with the form, company, contact, issuing user and remaining-people counts.
+- **SPEC-7.281**: Opening a link against a retired (is_active = false) definition fails with Gone (410), the same terminal shape as an already-submitted link.
+- **SPEC-7.282**: The public response carries only name, description, org identity, people/person_number, rules and public field metadata; it never exposes internal ids, the authoring user, timestamps, or the KB article (an internal procedure, not something the client is entitled to read).
+- **SPEC-7.283**: Person_number is the first unspent use, computed as people - uses_remaining + 1.
+- **SPEC-7.284**: Submitting against a retired definition is rechecked here (not just at open time) and fails with Gone (410), guarding the race where the form is retired between GET and submit.
+- **SPEC-7.285**: The public submission is validated with the exact same validate_submission as the authenticated surface, so a client and an agent get identical rules and identical per-field errors.
+- **SPEC-7.286**: Submission is four separate transactions in order: insert the submission, claim the token's use (uses_remaining > 0 guard, moved ahead of ticket creation per PMS-1370 so a single-use link cannot produce two tickets), create the ticket in TicketService's own transaction, then stamp the submission with the ticket and token ids; a failure between the claim and the ticket commit leaves the use spent with no ticket, judged less harmful than two tickets for one use.
+- **SPEC-7.287**: A token with nothing left to claim (no row updated) returns Gone before any ticket is created, which is what stops a single-use link from producing two tickets under concurrent submission; also, the claim is an UPDATE guarded by uses_remaining > 0; it also stamps used_at when the use drains to zero and sets submission_id to this submission only if one is not already recorded (COALESCE), so a later resubmission attempt never overwrites the first submission's id.
+- **SPEC-7.288**: The claim is an UPDATE guarded by uses_remaining > 0; it also stamps used_at when the use drains to zero and sets submission_id to this submission only if one is not already recorded (COALESCE), so a later resubmission attempt never overwrites the first submission's id.
+- **SPEC-7.289**: The ticket-service presence check happens AFTER the claim commits, so a missing ticket service still leaves the use spent rather than retried.
+- **SPEC-7.290**: Company_id and contact_id on the created ticket come from the resolved TOKEN, never from the submitted payload, so a forwarded link cannot file a request against another company.
+- **SPEC-7.291**: The created ticket's created_by_id is the issuing MSP user, never the client; also, the ticket's acting/created-by user is the MSP user who issued the link (resolved.created_by_id), never the client, since the submitter has no `users` row and created_by_id is NOT NULL.
+- **SPEC-7.292**: Parent_ticket_id is the parent the link was issued with (None for a single-person link), and procedure_kb_article_id is the form definition's own kb_article_id, since the form definition IS the request type.
+- **SPEC-7.293**: The receipt returns the created ticket's number and the token's remaining-uses count, nothing else from the submission.
+- **SPEC-7.294**: The ticket title's summary is the first answered Text-type field in the form's own field order, falling back to "client request" when the form has no text field.
+- **SPEC-7.295**: The ticket description renders each answered field as its own Markdown list item in the form's field order using its label, with an unanswered field dropped and a textarea answer's internal newlines kept as Markdown hard breaks.
+- **SPEC-7.296**: All draft routes (list, upsert, delete) require an admin user, matching the create/update gating on definitions.
+- **SPEC-7.297**: Registered before `/forms/{id}` so the literal path segment `drafts` is never captured as a form id by the `{id}` route.
+- **SPEC-7.298**: Returns only drafts owned by the calling user, filtered by tenant (RLS) and user_id in the WHERE predicate, ordered by updated_at DESC.
+- **SPEC-7.299**: A serialized payload over MAX_PAYLOAD_BYTES (262144) is rejected loudly with the exact size and limit, never silently truncated.
+- **SPEC-7.300**: A payload that fails to serialize to JSON is rejected with a bad-request error naming the failure.
+- **SPEC-7.301**: A form_definition_id must resolve to a definition in the caller's own tenant, otherwise NotFound("Form"); this exists even though RLS already scopes the draft row, to stop a caller filing a draft against another tenant's definition id and having it echoed back.
+- **SPEC-7.302**: A single atomic INSERT ... ON CONFLICT ... DO UPDATE (never read-then-write), against one partial unique index per branch, so two overlapping autosave writes race into an UPDATE rather than a duplicate row or a conflict.
+- **SPEC-7.303**: User_id is part of the DELETE predicate itself (not checked afterward); deleting 0 rows, including a draft owned by someone else, is a 404 "Draft", deliberately not a 403, so the caller cannot learn the draft id exists.
+- **SPEC-7.304**: Best-effort; a database error here is only logged and never propagates to fail the caller's create/update request.
+- **SPEC-7.305**: Returns only definitions with both is_active = TRUE and portal_visible = TRUE, ordered by name ASC; a retired or internal-only form never appears.
+- **SPEC-7.306**: 404 "Form" for a form_id that does not exist, is retired, or is not portal_visible, so this endpoint cannot be used to enumerate internal forms by id.
+- **SPEC-7.307**: Contact_info falls back to the organisation's phrase when the definition sets none.
+- **SPEC-7.308**: People and person_number are always 1 on the portal path, since a portal form is filled in by one signed-in contact exactly once.
+
+### 7.6 Email intake
+
+- **SPEC-7.309**: Message_id must be 1-255 chars; the <...> wrapper is preserved verbatim.
+- **SPEC-7.310**: From_email must be a syntactically valid email address of at most 254 chars.
+- **SPEC-7.311**: From_name, when present, must be at most 200 chars.
+- **SPEC-7.312**: Subject must be 1-500 chars and becomes the created ticket's title verbatim.
+- **SPEC-7.313**: Body_html is never used to build the ticket description or the reply comment content; only body_text feeds those paths; also, body_text, never body_html, feeds the description body.
+- **SPEC-7.314**: References defaults to an empty list when omitted; it is the concatenation of In-Reply-To + References header values.
+- **SPEC-7.315**: Raw_headers defaults to {} when absent from the payload.
+- **SPEC-7.316**: Attachments defaults to an empty list when absent; each element is nested-validated and req.validate() rejects the whole request if any entry fails its own constraints.
+- **SPEC-7.317**: Req.validate() runs, mapped through AppError::from, before the bearer is resolved or intake runs; an invalid payload never reaches resolve_token or intake.
+- **SPEC-7.318**: Authentication is a bearer token read directly off the request, not the normal user-session/cookie auth middleware.
+- **SPEC-7.319**: Returns AppError::Unauthorized when the Authorization header is absent, is not valid header-string text, does not start with "Bearer " or "bearer " (other casings rejected), or has an empty token after stripping the prefix.
+- **SPEC-7.320**: Matches token_hash against a SHA-256 hash of the bearer, requiring kind='email_intake' AND revoked_at IS NULL; an absent, revoked, or wrong-kind token fails with AppError::Unauthorized regardless of tenant.
+- **SPEC-7.321**: Last_used_at is updated to NOW() unconditionally on every successful resolve, including a would-be dedup/threaded request.
+- **SPEC-7.322**: This lookup and the paired last_used_at bump run on the BYPASSRLS migrator pool, not a tenant-scoped transaction, because resolving the tenant from an opaque bearer has no tenant context to set as the RLS GUC beforehand.
+- **SPEC-7.323**: Evaluates, in order, (1) dedup by message_id, (2) threading by references (only if non-empty), (3) contact resolution, (4) creator lookup, (5) ticket creation; the first of (1)/(2) that hits short-circuits the rest; also, this module evaluates, in order, dedup by Message-Id, threading by references, contact resolution, creator lookup, and ticket creation; the first of dedup/threading that hits short-circuits the rest.
+- **SPEC-7.324**: A dedup hit returns deduplicated=true, created=false, threaded=false, comment_added=false, attachments_stored=0 with the existing ticket's id/number, performing no further writes.
+- **SPEC-7.325**: A gateway retry of an identical message_id on an already-created ticket is idempotent, returning the same ticket_id with deduplicated=true rather than erroring or creating a second ticket.
+- **SPEC-7.326**: A concurrent-creation race on the same (tenant_id, message_id) is caught by the partial unique index backing tickets.email_message_id; on a unique-violation (SQLSTATE 23505) the dedup lookup is re-run and its result returned with deduplicated=true rather than propagating the DB error.
+- **SPEC-7.327**: If the re-run dedup lookup after a unique-violation finds nothing (race window), the original database error is propagated unchanged.
+- **SPEC-7.328**: Threading is only attempted when req.references is non-empty.
+- **SPEC-7.329**: The threading lookup matches tickets.email_message_id = ANY(references) scoped to the caller's tenant, and when multiple tickets match more than one reference entry, selects the one with the latest created_at.
+- **SPEC-7.330**: On a threading hit the response sets threaded=true, created=false, deduplicated=false and returns the matched ticket's id/number; the ticket itself is never mutated.
+- **SPEC-7.331**: On a threading hit, the service attempts to resolve (or auto-create) a contact for from_email before deciding whether to append a reply comment.
+- **SPEC-7.332**: An Err or Ok(None) from contact resolution is silently collapsed to "no contact" via .ok().flatten(); no reply comment is appended, comment_added=false, attachments_stored=0.
+- **SPEC-7.333**: A failure from append_reply_comment is swallowed (not propagated), the response reports comment_added=false, attachments_stored=0, and the overall request still returns success with threaded=true.
+- **SPEC-7.334**: Inserts into ticket_notes with note_type='public', content = the inbound body_text trimmed-and-checked (falling back to "(reply body empty)"), created_by_contact_id = the resolved contact, and created_by_id = the tenant's first active admin/manager, in a single begin_with_tenant transaction.
+- **SPEC-7.335**: If the tenant has no active super_admin/admin/manager user, append_reply_comment fails with AppError::Configuration.
+- **SPEC-7.336**: Attachments are only stored on the threading path if the reply comment append succeeded, and are then attached with note_id=Some(note_id) so they render under the reply note.
+- **SPEC-7.337**: A reply's own message_id is never persisted onto the ticket or this note (only the creating email's message_id is ever written to tickets.email_message_id), so a gateway retry of the identical reply re-threads and appends a second, duplicate public note.
+- **SPEC-7.338**: Contact lookup matches contacts by tenant_id and lower(email), case-insensitive on both the stored and inbound address.
+- **SPEC-7.339**: If a matching contact is found and its company_id is non-null, that (contact_id, company_id) pair is used without consulting the tenant default-company setting.
+- **SPEC-7.340**: If a matching contact is found but its company_id is null, the service falls back to the default_company_id tenant setting, logs a tracing::warn!, and uses the existing contact with the default company.
+- **SPEC-7.341**: If no matching contact exists and email_intake/default_company_id is unset, resolution returns Ok(None) (no contact, no error raised at this layer).
+- **SPEC-7.342**: If no matching contact exists and email_intake/default_company_id is set, the service auto-creates a contact with contact_type='primary', the lowercased from_email, and (first_name, last_name) derived from from_name.
+- **SPEC-7.343**: Returns ("Contact", "") when from_name is None or blank after trim; otherwise splits on the first space, putting everything before it in first_name and the trimmed remainder in last_name, or puts the whole trimmed string in first_name with an empty last_name if there is no space or the remainder is blank.
+- **SPEC-7.344**: After auto-creating a contact, ensure_primary_company_link is called in the same transaction so the primary contact_companies link matches the company_id mirror just written; a failure here rolls back the contact insert too.
+- **SPEC-7.345**: When contact resolution yields no contact at all (Ok(None)), intake fails with AppError::BadRequest and this exact message.
+- **SPEC-7.346**: Contact lookup, the default-company setting read, and the auto-create INSERT all run inside one begin_with_tenant (RLS tenant-GUC) transaction.
+- **SPEC-7.347**: The creator (tickets.created_by_id) is the tenant's first active admin/manager, ordered by created_at.
+- **SPEC-7.348**: If no such user exists, ticket creation fails with AppError::Configuration and no ticket is created.
+- **SPEC-7.349**: The created ticket has source=Email, is_billable=false, contact_id/company_id from the resolved contact, email_message_id = the inbound message_id, title = the inbound subject verbatim, and description from build_description.
+- **SPEC-7.350**: Produces "From: {from}\nReceived: {received}\n\n{body}" where {from} is "{name} <{email}>" when from_name is present and non-blank or else just {email}; {received} is Utc::now().to_rfc3339() (capture time, not any header date); and {body} is body_text or, if absent, "(no plaintext body provided)".
+- **SPEC-7.351**: Ticket creation runs under AuditCtx::system(tenant_id.get()), attributed as a system actor for audit purposes, not the resolved creator user.
+- **SPEC-7.352**: On successful creation the response sets created=true, deduplicated=false, threaded=false, comment_added=false.
+- **SPEC-7.353**: File_name must be 1-255 chars; mime_type, if present, at most 100 chars; content_base64 must be non-empty.
+- **SPEC-7.354**: Attachment bytes are decoded as standard (padded) base64 (RFC 4648) via STANDARD.decode.
+- **SPEC-7.355**: A part whose content_base64 fails to decode is skipped (not counted in attachments_stored), logged via tracing::warn!, and does not fail the overall intake.
+- **SPEC-7.356**: When mime_type is absent, the stored MIME type defaults to "application/octet-stream".
+- **SPEC-7.357**: A part that fails to persist (e.g. exceeds the storage size cap) is skipped (not counted), logged via tracing::warn!, and does not fail the overall intake.
+- **SPEC-7.358**: Attachments_stored equals the count of attachments actually persisted, which can be less than req.attachments.len() when a part was skipped, and is never greater.
+- **SPEC-7.359**: On the create-ticket path, attachments are attributed to the resolved sender contact and attached with note_id=None.
+- **SPEC-7.360**: Attachments are only stored on the threading path if the reply comment append succeeded, and are then attached with note_id=Some(note_id) so they render under the reply note.
+- **SPEC-7.361**: Attachments from the retried payload are never stored on a dedup hit (attachments_stored=0 unconditionally), even if the payload includes attachments.
+- **SPEC-7.362**: Every call to intake inserts an email_intake_log row before any dedup/threading/contact logic runs, so even a hard failure in later steps has an audit row.
+- **SPEC-7.363**: Raw_body_html is written verbatim into email_intake_log.raw_body_html on every call, despite the models.rs doc comment calling the field "currently ignored by Phase 1.".
+- **SPEC-7.364**: After intake_inner resolves, the log row is updated: on success ticket_id = the response's ticket_id and error = NULL; on failure ticket_id = NULL and error = the stringified AppError.
+- **SPEC-7.365**: A failure to finalise (UPDATE) the log row is logged via tracing::warn! and does not change or mask the outcome already returned to the caller.
+- **SPEC-7.366**: GET /email-intake-log/{id} requires an admin user and scopes the lookup to the caller's tenant.
+- **SPEC-7.367**: GET /intake-tokens requires an admin user and returns every token (active and revoked) for the caller's tenant.
+- **SPEC-7.368**: POST /intake-tokens requires an admin user and validates the request before calling the service; also, POST /intake-tokens validates kind (1-50 chars) and label (1-200 chars) before the service is called.
+- **SPEC-7.369**: Create_token rejects any kind other than the literal "email_intake" with AppError::BadRequest.
+- **SPEC-7.370**: A minted token's plaintext is 32 cryptographically random bytes, URL-safe-base64-without-padding encoded; only its SHA-256 hex hash is persisted to tenant_intake_tokens.token_hash.
+- **SPEC-7.371**: The plaintext token is placed on this response exactly once; list_tokens and any subsequent read never return it; also, the plaintext token is present on this response exactly once; IntakeTokenResponse (list/get) has no token field.
+- **SPEC-7.372**: DELETE /intake-tokens/{id} requires an admin user, scopes to the caller's tenant, and revokes idempotently.
+- **SPEC-7.373**: Revoking a token that does not exist for the caller's tenant (wrong id, or belongs to another tenant) returns AppError::NotFound (rows_affected == 0).
+- **SPEC-7.374**: Matches token_hash against a SHA-256 hash of the bearer, requiring kind='email_intake' AND revoked_at IS NULL; an absent, revoked, or wrong-kind token fails with AppError::Unauthorized regardless of tenant.
+- **SPEC-7.375**: Every read/write to email_intake_log, contacts, tenant_settings, ticket_notes, and the non-auth-resolution paths of tenant_intake_tokens runs inside begin_with_tenant so the RLS tenant_isolation GUC is set; the one documented exception is the cross-tenant hash lookup (and its last_used_at bump) in resolve_token, which runs on the BYPASSRLS migrator pool.
+- **SPEC-7.376**: TenantId::from_trusted mints the TenantId from the DB-read tenant_id column, since there is no request-session tenant claim to derive it from on this unauthenticated-by-user surface.
+- **SPEC-7.377**: Admin-facing routes derive their TenantId via TenantId::from_trusted(u.tenant_id) from the authenticated admin user, not from any request body field.
+- **SPEC-7.378**: No loop-detection or bounce-detection logic exists anywhere in this module; raw_headers is accepted and persisted to the audit log but never inspected for Auto-Submitted / X-Autoreply / Precedence / bounce-sender signals, so an auto-reply or relayed bounce is processed identically to a human reply.
+
+### 7.7 Calendar, appointments and on-call
+
+- **SPEC-7.379**: Create_appointment rejects an end_time that is not strictly after start_time.
+- **SPEC-7.380**: Validates the effective range (request value, else stored), so a partial update cannot invert the stored range.
+- **SPEC-7.381**: A non-blank recurrence_rule must parse as an RFC 5545 RRULE anchored on start_time.
+- **SPEC-7.382**: Create_appointment rejects any referenced id that does not belong to this tenant; also, update_appointment rejects any referenced id that does not belong to this tenant.
+- **SPEC-7.383**: A ranged read (both from and to, no appointment_type) expands recurring series and paginates the expanded set; otherwise it is a plain SQL-paginated list of stored rows.
+- **SPEC-7.384**: Caps a single series' expanded occurrences at 1000; also, the series is anchored on the master's stored start_time, and a master whose recurrence_rule fails to parse is dropped (logged at warn) rather than failing the query.
+- **SPEC-7.385**: Each expanded occurrence carries recurrence_parent_id set to the master's id and recurrence_rule cleared; the master row itself is never emitted.
+- **SPEC-7.386**: Dispatch_view requires both from and to query parameters, and rejects to < from.
+- **SPEC-7.387**: The dispatch board combines, for [from, to]: appointments (recurring expanded), weekly availability, approved time off, and current on-call coverage.
+- **SPEC-7.388**: Delete_appointment returns 404 when no row matches (tenant_id, id); also, update_appointment returns 404 when no row matches (tenant_id, id).
+- **SPEC-7.389**: The INSERT's ON CONFLICT DO NOTHING enforces at most one claimed row per (appointment_id, occurrence_start, reminder_minutes); returns true only when this call's insert won.
+- **SPEC-7.390**: Due_reminders scans across all tenants (no tenant GUC) via the migrator pool; the window end is now + the largest configured reminder_minutes across the whole table, and no appointment having reminders configured (NULL max) short-circuits to an empty result.
+- **SPEC-7.391**: An occurrence is never reported due once its start is at or before now; a negative reminder offset is skipped entirely.
+- **SPEC-7.392**: With no NotificationsService wired, the tick dispatches nothing and performs no ledger writes.
+- **SPEC-7.393**: The ledger row is claimed (INSERT) strictly before dispatch, so a crash between the two drops at most one reminder rather than risking a duplicate.
+- **SPEC-7.394**: A dispatch failure after a successful ledger claim is logged as a warning and does not fail or retry the tick; the reminder stays recorded as attempted but is not counted in the dispatched total.
+- **SPEC-7.395**: Dispatches appointment.reminder with recipient_user_id set to the appointment's assigned_to_id; also, runs as job name "calendar_reminders" on the shared scheduler at a 60s interval (interval configured at scheduler registration in src/main.rs).
+- **SPEC-7.396**: A non-admin caller editing another user's availability is rejected with 403.
+- **SPEC-7.397**: Full-replace is atomic (delete then insert in one transaction); a window with end_time <= start_time aborts the whole replace and the transaction rolls back any prior inserts in this call.
+- **SPEC-7.398**: Day_of_week must be in [0,6]; violating it fails request validation before the service is called.
+- **SPEC-7.399**: Create_time_off rejects end_date < start_date.
+- **SPEC-7.400**: A non-admin caller creating a time-off request has user_id forced to their own id.
+- **SPEC-7.401**: Approve_time_off rejects a status other than exactly "approved" or "rejected"; also, approving/rejecting time off requires RequireManager.
+- **SPEC-7.402**: Only status = 'approved' time off rows block dispatch; pending and rejected requests never block.
+- **SPEC-7.403**: On_call_now considers only schedules with is_active = true, resolving exactly one OnCallNowResponse per schedule.
+- **SPEC-7.404**: Weekly picks user_ids[ISO_week(now) % len], daily picks user_ids[day_of_year(now) % len], any other rotation_type picks user_ids[0], and an empty user_ids resolves to null.
+- **SPEC-7.405**: Create_on_call requires RequireManager in addition to RequireCalendar; also, delete_on_call requires RequireManager in addition to RequireCalendar; also, update_on_call requires RequireManager in addition to RequireCalendar.
+- **SPEC-7.406**: Kind must be one of the values accepted by validate_scheduling_template_kind ("dispatch" | "calendar").
+- **SPEC-7.407**: Duration_minutes must be >= 1; travel_before_minutes / travel_after_minutes must be >= 0.
+- **SPEC-7.408**: Create_template rejects a default_ticket_id that does not belong to this tenant; also, update_template rejects a default_ticket_id that does not belong to this tenant.
+- **SPEC-7.409**: A field omitted from the PUT body is left unchanged (COALESCE against the stored row), never nulled.
+
+### 7.8 Projects, phases and tasks
+
+- **SPEC-7.410**: Both data and count queries scope to tenant_id = $1.
+- **SPEC-7.411**: Staff caller must be authenticated.
+- **SPEC-7.412**: Contact caller must hold projects:read.
+- **SPEC-7.413**: Server-stamped company_id overrides any client value, which also excludes NULL-company house projects from the contact view.
+- **SPEC-7.414**: A contact caller gets ContactProjectResponse, never the staff ProjectResponse.
+- **SPEC-7.415**: Server-stamped company_id overrides any client value, which also excludes NULL-company house projects from the contact view.
+- **SPEC-7.416**: Status/q length caps enforced before the query runs.
+- **SPEC-7.417**: Staff caller must be authenticated.
+- **SPEC-7.418**: Contact caller must hold projects:read.
+- **SPEC-7.419**: A company mismatch 404s, same as a missing project, so a probe cannot tell the two apart.
+- **SPEC-7.420**: POST/PUT/DELETE projects and every phase/task-status/project-type/task/task-dependency route require RequireProjects, so a contact caller 401s on all of them.
+- **SPEC-7.421**: DELETE /projects/{id} additionally requires admin.
+- **SPEC-7.422**: Create/update/delete task-statuses require admin in addition to RequireProjects.
+- **SPEC-7.423**: Create/update/delete project-types require admin; GET /project-types needs only RequireProjects.
+- **SPEC-7.424**: GET /projects/summary requires RequireProjects.
+- **SPEC-7.425**: The phase routes and the task-dependency routes have no SPA caller as of the 2026-09-22 parity record above.
+- **SPEC-7.426**: Project name must be 1 to 80 characters.
+- **SPEC-7.427**: Project_type defaults to "client" when omitted.
+- **SPEC-7.428**: Status defaults to "planning" when omitted.
+- **SPEC-7.429**: Billing_method defaults to "time_and_materials" when omitted.
+- **SPEC-7.430**: Is_billable defaults to true when omitted.
+- **SPEC-7.431**: Accepts a JSON number, a numeric string, or null; any other JSON type is rejected.
+- **SPEC-7.432**: Budget_hours must be non-negative, at most 2 decimal places, and under the column's magnitude.
+- **SPEC-7.433**: Budget_amount must be non-negative, at most 2 decimal places, and under the column's magnitude.
+- **SPEC-7.434**: Default_due_business_days, if present, must be in 0..=365.
+- **SPEC-7.435**: Project_type_id is resolved from the legacy project_type string, NULL if no matching project_types row.
+- **SPEC-7.436**: The Create audit row is written in the same transaction as the INSERT, before = NULL.
+- **SPEC-7.437**: The create response is the freshly re-read project, so derived fields are populated, not reconstructed.
+- **SPEC-7.438**: Company_name via tenant-scoped correlated subquery; NULL if no company_id or the company row is gone.
+- **SPEC-7.439**: Project_manager_name via tenant-scoped correlated subquery, NULLIF(TRIM(...), '').
+- **SPEC-7.440**: Actual_hours sums duration_minutes/60.0 over non-rejected time entries.
+- **SPEC-7.441**: Actual_amount sums total_amount over the same non-rejected entry set.
+- **SPEC-7.442**: A missing or foreign-tenant project id 404s.
+- **SPEC-7.443**: Independently-numbered placeholders per query, so an added filter never reuses an index between the two.
+- **SPEC-7.444**: Default sort is created_at; order_by rejects any key outside mokosh_types::sort::PROJECTS.
+- **SPEC-7.445**: Q filters name ILIKE '%<q>%', applied as the last optional condition in both queries.
+- **SPEC-7.446**: Before/after snapshots are taken inside one transaction, for the audit diff.
+- **SPEC-7.447**: Every field uses COALESCE($n, column), so an omitted field in the request leaves the stored value unchanged.
+- **SPEC-7.448**: Zero rows affected (missing or foreign-tenant id) 404s.
+- **SPEC-7.449**: A description-only change that is purely a checklist checkbox toggle writes no audit row.
+- **SPEC-7.450**: Name (1 to 80 chars), default_due_business_days (0..=365), and budget_hours/budget_amount follow the same validation as create.
+- **SPEC-7.451**: Deletes only the row matching both tenant_id and id; zero rows affected 404s.
+- **SPEC-7.452**: Counts_by_status and total_budget are computed in one transaction, so both describe the same instant; also, counts_by_status and total_budget are computed together in one transaction so both describe the same instant.
+- **SPEC-7.453**: Billing_method defaults to "time_and_materials" and is_billable defaults to true when the stored column is NULL (predating a NOT NULL default).
+- **SPEC-7.454**: 404s if the project does not exist for the tenant, 409s if its status is "cancelled" (British spelling, matching the migration 007 CHECK).
+- **SPEC-7.455**: Runs inside the caller's tenant-scoped transaction, shared with the subsequent phase/task INSERT.
+- **SPEC-7.456**: Any status other than "cancelled" permits the attach; there is no other status-based gate.
+- **SPEC-7.457**: Lists only phases scoped to tenant_id and project_id, ordered by sort_order, paginated.
+- **SPEC-7.458**: Phase name must be 1 to 100 characters.
+- **SPEC-7.459**: Phase status defaults to "not_started" when omitted.
+- **SPEC-7.460**: Audit row written in the same transaction, and the returned phase is built from the request, not re-read.
+- **SPEC-7.461**: A full-field UPDATE (not COALESCE'd) scoped by tenant_id and id; no matching row 404s; no audit row is written on update.
+- **SPEC-7.462**: Does not call ensure_project_open, so a phase under a now-cancelled project can still be edited.
+- **SPEC-7.463**: Deletes by tenant_id + id; zero rows affected 404s; no audit row is written on delete.
+- **SPEC-7.464**: Lists rows scoped to tenant_id, ordered by sort_order, name, paginated.
+- **SPEC-7.465**: Name must be 1 to 50 characters, color 1 to 7 characters; is_completed and sort_order default to false/0 when omitted.
+- **SPEC-7.466**: Create audit row written in the same transaction as the INSERT; response is built from the request, not re-read.
+- **SPEC-7.467**: A full-field UPDATE scoped by tenant_id + id; zero rows affected 404s; no audit row is written on update.
+- **SPEC-7.468**: Deletes by tenant_id + id; zero rows affected 404s; no audit row written, and no FK-violation mapping (contrast with delete_project_type).
+- **SPEC-7.469**: Lists rows scoped to tenant_id, ordered by sort_order, name, paginated.
+- **SPEC-7.470**: Name must be 1 to 50 characters; is_active defaults to true, is_default/sort_order default to false/0; is_system is never settable from the wire.
+- **SPEC-7.471**: Creating a default clears is_default on every other tenant row first, in the same transaction.
+- **SPEC-7.472**: Updating to is_default = true clears is_default on every other tenant row except the one being updated, in the same transaction.
+- **SPEC-7.473**: A Create audit row is written; the new row's is_system is always false (API-created types are never system rows).
+- **SPEC-7.474**: Zero rows is 404 "Project type"; no audit row is written on update.
+- **SPEC-7.475**: A missing row 404s; a row with is_system = true 409s and the DELETE is never attempted.
+- **SPEC-7.476**: A foreign-key violation (23503, a project still references this type) maps to 409 instead of propagating a 500.
+- **SPEC-7.477**: Status_name and status_is_completed are resolved via a tenant-scoped correlated subquery against task_statuses, not a join.
+- **SPEC-7.478**: Title must be 1 to 255 characters.
+- **SPEC-7.479**: Priority defaults to "medium" when omitted.
+- **SPEC-7.480**: Estimated_hours, if present, must pass the shared hours validator.
+- **SPEC-7.481**: Rejects an inverted start_date/due_date range with a 422 keyed onto due_date (equal dates and either side None are accepted).
+- **SPEC-7.482**: Applies the identical cross-field date check when both dates are supplied in the same PUT.
+- **SPEC-7.483**: An omitted due_date defaults from today + N business days, where N is the project's default_due_business_days override (0 disables it) if set, else the tenant-wide scheduling default; a supplied due_date is used as-is.
+- **SPEC-7.484**: Creating a task shares the ensure_project_open guard from phase creation, so a task cannot be attached to a cancelled or missing project.
+- **SPEC-7.485**: The Create audit row is written in the same transaction as the INSERT, before = NULL.
+- **SPEC-7.486**: The create response is the freshly re-read task, so derived fields (status_name, assigned_to_name, actual_hours, logged_hours) are populated, not reconstructed.
+- **SPEC-7.487**: Assigned_to_name is a tenant-scoped correlated subquery against users, NULL when unassigned.
+- **SPEC-7.488**: Actual_hours and logged_hours are computed identically, summing duration_minutes/60.0 for every time entry whose approval_status is not 'rejected' (PMS-944: approval state is not a fact about whether the work happened).
+- **SPEC-7.489**: Tasks are scoped to tenant_id and project_id, ordered by sort_order then created_at, paginated.
+- **SPEC-7.490**: This query (and its row mapping) is identical to get_task's single-row query below.
+- **SPEC-7.491**: A missing or foreign-tenant task id 404s.
+- **SPEC-7.492**: Before/after snapshots are taken inside one transaction, for the audit diff.
+- **SPEC-7.493**: An effective start/due range combining the request's supplied fields with the stored row's existing values is validated before the UPDATE runs, so a partial PUT cannot invert the range against unsupplied stored dates.
+- **SPEC-7.494**: Every field except completed_at uses COALESCE($n, column), so an omitted field in the request leaves the stored value unchanged.
+- **SPEC-7.495**: Completed_at is inferred from the supplied status_id's is_completed flag via a CASE, not a second read: moving to a completed status stamps it (if not already stamped), moving to a non-completed status clears it, and an omitted status_id leaves it untouched.
+- **SPEC-7.496**: Completed_at only stamps NOW() the first time (COALESCE keeps an existing timestamp), so re-saving an already-completed task does not move its completion time.
+- **SPEC-7.497**: Zero rows affected (missing or foreign-tenant id) 404s.
+- **SPEC-7.498**: Unlike update_project's task-marker-only skip, every task update writes an audit row, with no equivalent description-only exemption.
+- **SPEC-7.499**: As with create, the update response is the freshly re-read task, not reconstructed from the request.
+- **SPEC-7.500**: Deletes by tenant_id + id; zero rows affected 404s; no audit row is written on delete.
+- **SPEC-7.501**: Priority defaults to "medium" and sort_order defaults to 0 when the stored column is NULL.
+- **SPEC-7.502**: A task cannot depend on itself; rejected before any transaction opens.
+- **SPEC-7.503**: A recursive CTE walks the existing depends_on chain from the candidate dependency back toward the task; if task_id is already reachable, adding the edge would close a cycle and is rejected with 409.
+- **SPEC-7.504**: The recursive chain and its join are scoped to tenant_id = $1 at every step, so a cross-tenant dependency chain can never mask or create a cycle.
+- **SPEC-7.505**: ON CONFLICT DO NOTHING makes re-adding an existing (task_id, depends_on_task_id) edge a silent no-op rather than a duplicate row or an error.
+- **SPEC-7.506**: On the no-op path above, this re-read finds no row with the freshly generated dep_id (the existing row kept its own id), so `after` is None and a Create audit row is still written with before = after = None.
+- **SPEC-7.507**: Deletes the edge by tenant_id, task_id and depends_on_task_id; this is idempotent (no error, no audit row) whether or not the edge existed.
+- **SPEC-7.508**: The cycle check and the self-dependency check are the only guards; there is no FK existence pre-check for task_id or depends_on before the INSERT (a foreign-tenant or missing task id surfaces as a database FK error, not an AppError).
+
+### 7.9 Approvals
+
+- **SPEC-7.509**: From_str rejects any string outside these four variants; the DB CHECK on the target column enforces the same set; also, the approvals surface supports exactly these four parent entity kinds (ticket, change_request, quote, time_entry).
+- **SPEC-7.510**: The legacy ticket_id column is populated only for a Ticket target; every other target inserts NULL, which is also why ApprovalResponse.ticket_id is Some only when target is "ticket".
+- **SPEC-7.511**: Entity_reference resolves to ticket_number/quote_number only, and is NULL for change_request/time_entry and for a deleted parent.
+- **SPEC-7.512**: Entity_label falls back to the time_entry duration/date string via `||` so a deleted parent propagates NULL.
+- **SPEC-7.513**: The app layer requires exactly one of the three approver kinds set, before any DB write.
+- **SPEC-7.514**: Returns 404 ("Ticket") when no row in tickets matches (id, tenant_id), before any approver validation or insert.
+- **SPEC-7.515**: The time-entry, change-request, and quote create/list routes each run this first, returning 404 with the human noun (never the raw table name) when the parent is absent in the caller's tenant.
+- **SPEC-7.516**: Reachable only when RequireTimesheets succeeds; a tenant with timesheets disabled sees whatever 404/403 that extractor itself produces.
+- **SPEC-7.517**: A non-null approver_contact_id must name a portal contact of this tenant; checked here (not left to the FK) because the FK bypasses RLS.
+- **SPEC-7.518**: The legacy ticket_id column is populated only for a Ticket target; every other target inserts NULL, which is also why ApprovalResponse.ticket_id is Some only when target is "ticket".
+- **SPEC-7.519**: Approver_role is capped at 50 chars and notes at 4000 chars; req.validate() runs in the route handler before the service.
+- **SPEC-7.520**: This INSERT omits status, decided_by_id, decided_by_contact_id, and decided_at, so a new row always starts as the DB defaults: status 'pending' and those columns NULL.
+- **SPEC-7.521**: This existence check and create_for_entity's insert run as separate transactions (the tx below is dropped before calling in), so the two are not atomic with each other.
+- **SPEC-7.522**: Always inserts requested_by_id NULL, requested_by_contact_id = contact_id, approver_role fixed to 'admin'; a caller-specified approver is never honoured here.
+- **SPEC-7.523**: 404s ("Ticket") when the ticket is absent from the caller's tenant, then delegates with the same fixed admin default.
+- **SPEC-7.524**: The app layer requires exactly one of the three approver kinds set, before any DB write.
+- **SPEC-7.525**: A non-null approver_contact_id must name a portal contact of this tenant; checked here (not left to the FK) because the FK bypasses RLS.
+- **SPEC-7.526**: Only "approve"/"reject" are accepted; anything else is a 400, otherwise approved/rejected status.
+- **SPEC-7.527**: Lock the row before authorization so two concurrent decisions cannot both read pending and both pass.
+- **SPEC-7.528**: 404 ("Approval") when no row matches.
+- **SPEC-7.529**: 400 "Approval is already {status}" when the locked row is not pending.
+- **SPEC-7.530**: Authorization checks only approver_user_id and approver_role, never approver_contact_id, so a contact-only row always yields 403 here regardless of staff role.
+- **SPEC-7.531**: UPDATE is reconditioned on status='pending'; zero rows affected means 400 "Approval is already decided".
+- **SPEC-7.532**: Writes status, decision_notes, decided_by_id and decided_at, and never decided_by_contact_id.
+- **SPEC-7.533**: Commits, then re-fetches via get() to build the response rather than constructing it from the UPDATE's data.
+- **SPEC-7.534**: Requires approvals:decide, loaded from the database per request, before decide_as_contact runs.
+- **SPEC-7.535**: Scoped by (tenant_id, id, approver_contact_id = contact_id); a row not addressed to this contact is indistinguishable from a nonexistent id, so it is 404, never 403.
+- **SPEC-7.536**: Locks the row with FOR UPDATE before checking status, the same concurrency reason as the staff path.
+- **SPEC-7.537**: 400 "Approval is already {status}" when not pending, and "Approval is already decided" if the UPDATE below affects zero rows.
+- **SPEC-7.538**: Decision-value validation identical to the staff path: only "approve"/"reject", same error text.
+- **SPEC-7.539**: Writes status, decision_notes, decided_by_contact_id and decided_at; never decided_by_id.
+- **SPEC-7.540**: Writes a best-effort portal audit row; a failure to write it does not fail the decision, only logs a warn.
+- **SPEC-7.541**: The contact id comes only from the authenticated session, never from the request body.
+- **SPEC-7.542**: 404 ("Approval") when no row matches.
+- **SPEC-7.543**: 400 "Approval is already {status}" when the row's status is not pending.
+- **SPEC-7.544**: 403 unless requested_by_id == caller_id, so a contact-filed row (requested_by_id NULL) is never cancellable by any staff caller through this route.
+- **SPEC-7.545**: Requested_by_id must decode as Option<Uuid>, not a bare Uuid, since it is NULL on a contact-filed row (PMS-1236: decoding it non-optional made such a cancel 500 instead of the intended 403).
+- **SPEC-7.546**: Sets status='cancelled' and decided_at=NOW() without touching any decided_by column; the row is retained, not deleted; also, the row is retained with status 'cancelled', not deleted, so this returns a bare {"cancelled": true} rather than the updated ApprovalResponse.
+- **SPEC-7.547**: Unlike decide/decide_as_contact, this UPDATE takes no row lock and is not reconditioned on status='pending', so a concurrent decide/cancel racing between the read above and this UPDATE can overwrite an already-decided row's status.
+- **SPEC-7.548**: Returns every approval for (tenant, target, entity_id) ordered requested_at DESC, no status filter, no pagination.
+- **SPEC-7.549**: Status pending and (approver_user_id = caller OR approver_role = ANY(roles_held)), ordered requested_at ASC.
+- **SPEC-7.550**: Deliberately a one-element array holding only this role; a future multi-role identity is not currently supported by this call site.
+- **SPEC-7.551**: Identical WHERE predicate to pending_for_user, so the count and the list can never disagree for the same inputs.
+- **SPEC-7.552**: Filters strictly on status pending and approver_contact_id = contact_id, the id taken only from the session; also, the contact plane's pending list and count both require approvals:decide before reading.
+- **SPEC-7.553**: Begin_with_tenant sets the app.current_tenant GUC transaction-locally so reads respect the fail-closed RLS policy.
+- **SPEC-7.554**: 404 ("Approval") when no row matches (tenant_id, id); every mutating call re-fetches through this to build its response.
+- **SPEC-7.555**: Each *_name column is NULLIF(TRIM(CONCAT(...))) so a blank or deleted name resolves to NULL, never an empty string.
+- **SPEC-7.556**: An id set on a row whose resolved name column came back NULL is collected here and logged, tagged per call site; this never changes the HTTP response.
+- **SPEC-7.557**: Every method also takes tenant_id explicitly and filters on it in SQL, so no query here relies solely on RLS.
+- **SPEC-7.558**: Opens its own tenant-scoped transaction for the parent lookup rather than reusing a pool-level connection, so the check stays correct now that these tables are under fail-closed RLS.
+
+### 7.10 Notifications
+
+- **SPEC-7.559**: Dispatch opens exactly one begin_with_tenant transaction per call, covering rule lookup, template load, preference reads and every insert, and commits it before returning.
+- **SPEC-7.560**: Render_event (and enrich_with_branding it calls) never opens a second transaction; both run their reads on the connection the caller's transaction already set the tenant GUC on.
+- **SPEC-7.561**: Returns the total notifications rows actually inserted and propagates any database error to the caller rather than swallowing it.
+- **SPEC-7.562**: Every caller awaits dispatch inline for the row write only; the queued rows are delivered asynchronously later by DispatcherWorker.
+- **SPEC-7.563**: Only active rules for this tenant and event_type are considered; inactive or other-tenant rules are never looked up.
+- **SPEC-7.564**: A missing context key never matches, an array expected value matches by containment ("in"), a scalar expected value requires exact equality; absent conditions or {} match unconditionally; also, a rule whose conditions do not match the dispatch context is skipped entirely (see rule_conditions_match for the match semantics).
+- **SPEC-7.565**: A rule with no template_id, a missing template, or an inactive template is skipped, logged via warn!, and contributes zero to the fanout count; dispatch never falls back to a synthetic subject/body.
+- **SPEC-7.566**: Template_id is required at both the HTTP validation layer and independently here, so non-HTTP callers of create_rule/update_rule are also gated.
+- **SPEC-7.567**: Recipients are the union of rule.recipients.user_ids with an optional context.recipient_user_id, of rule.recipients.emails with an optional context.recipient_email, and of rule.recipients.contacts with an optional context.recipient_contact_id, each deduplicated.
+- **SPEC-7.568**: An email address that case-insensitively matches one of this rule's user_ids' own email is dropped from the emails list before fan-out, so the same person is never queued twice.
+- **SPEC-7.569**: For in_app, contact_ids are the only recipients filtered by contact preferences and emails is forced empty; every other channel forces contact_ids empty.
+- **SPEC-7.570**: Entity_type/entity_id are taken from context; entity_type must be non-empty and at most 50 chars, entity_id must parse as a UUID, otherwise the column stays NULL with no rejection error.
+- **SPEC-7.571**: The template is rendered exactly once per rule, reused unchanged across every channel that rule fans out on.
+- **SPEC-7.572**: A template with no subject leaves notifications.subject NULL rather than synthesizing one.
+- **SPEC-7.573**: Body_html is rendered with Escape::Html while subject/body_text use Escape::Text; the rendered body_html is persisted on the row at dispatch time and never re-rendered by the worker.
+- **SPEC-7.574**: Dispatch (unlike preview) logs one warn per message with a non-empty unresolved list; the placeholders still ship as literal {{key}} text.
+- **SPEC-7.575**: One row per user_id via a single INSERT ... SELECT ... FROM UNNEST, status = 'pending', contact_id/recipient left NULL.
+- **SPEC-7.576**: One row per address via a single UNNEST statement, status = 'pending', user_id/contact_id left NULL.
+- **SPEC-7.577**: One row per contact_id via a single UNNEST statement, status = 'pending'; this branch only fires for in-app rows since contact_ids is empty for any other channel.
+- **SPEC-7.578**: The JSON body is exactly {"fanout": <u64>} where the value is the count dispatch returned.
+- **SPEC-7.579**: Preview renders through the identical render_event function dispatch uses, issues only read-only SELECTs, and commits its own begin_with_tenant transaction despite writing nothing.
+- **SPEC-7.580**: One NotificationPreviewResponse per (rule, channel) pair in the same order dispatch iterates them.
+- **SPEC-7.581**: User_id recipients render as their resolved email with a fallback to the bare UUID; contact_ids are left out of the response entirely.
+- **SPEC-7.582**: Unresolved names the exact {{key}} placeholders that did not resolve; those keys stay literal in subject/body_text/body_html rather than being fabricated as a sample send-time value.
+- **SPEC-7.583**: Preview requires only RequireAuth, not RequireAdmin, because it exposes only the caller's own tenant's templates/rule-recipients, already exposed by the list routes.
+- **SPEC-7.584**: Opt-out by default: no row accepts every channel; is_enabled = false rejects every channel; is_enabled = true (or NULL) accepts only a channel in channel_types. The same function governs both user and contact (contact_notification_preferences) acceptance.
+- **SPEC-7.585**: User and contact preference rows are each batch-loaded in exactly one query per dispatch call, never once per (recipient, channel) pair in a nested loop.
+- **SPEC-7.586**: Upserts on the unique (user_id, event_type) constraint; the caller can only ever write their own preferences.
+- **SPEC-7.587**: Is_enabled defaults to true when omitted from the request JSON.
+- **SPEC-7.588**: Lists only the authenticated caller's own rows (tenant_id + user_id), ordered by event_type, paginated.
+- **SPEC-7.589**: No zero-key constructor exists, so a caller cannot silently make config_encrypted a no-op.
+- **SPEC-7.590**: A config that fails to parse as JSON becomes Null rather than failing the whole list call.
+- **SPEC-7.591**: Channel_type is a free-form String here; nothing in create_channel/update_channel enforces the documented set.
+- **SPEC-7.592**: Channel/template/rule update and delete are tenant-scoped (WHERE tenant_id = $1 AND id = $2); a missing or other-tenant row is AppError::NotFound (404), never 403.
+- **SPEC-7.593**: Create_channel/update_channel/create_template/update_template/create_rule/update_rule each write exactly one audit_write row in the mutation's transaction; the matching delete_* methods write none.
+- **SPEC-7.594**: The worker recognizes only "in_app" and "email"; any other channel_type is a permanent, non-retrying failure, even though UpsertNotificationChannelRequest's doc comment lists other names as configurable.
+- **SPEC-7.595**: Every dispatch and preview call enriches context with msp_name, msp_logo_url, msp_primary_color, msp_support_email, msp_footer_line, msp_footer_line_html and app_name before rendering.
+- **SPEC-7.596**: A caller-supplied msp_name/msp_logo_url/msp_primary_color/msp_support_email always wins over the tenant's stored branding, since ensure_key only inserts when the key is absent.
+- **SPEC-7.597**: With_app_name always overwrites any caller-supplied app_name with the deployment's configured product name, so context data can never rename the product in an outbound email.
+- **SPEC-7.598**: A non-object context is replaced with {} before branding keys are attached, so those keys are never silently dropped.
+- **SPEC-7.599**: Msp_name defaults to the literal "Mokosh Platform" when the tenant's name is empty or the tenant row is not found.
+- **SPEC-7.600**: Msp_logo_url is always an absolute http(s) URL or the empty string, never a relative path.
+- **SPEC-7.601**: Msp_primary_color is always a non-empty color value, defaulting to "#111827" (DEFAULT_PRIMARY_COLOR) when blank or absent.
+- **SPEC-7.602**: Msp_footer_line composition rule (and its HTML twin below), including the escaping of both msp_name and the support email in the HTML variant.
+- **SPEC-7.603**: Flat, non-recursive, non-conditional {{key}} substitution against the top-level fields of context only; no dotted-path or nested-object lookup.
+- **SPEC-7.604**: A string value is emitted verbatim; any other JSON value type is emitted via its Display/to_string representation.
+- **SPEC-7.605**: A {{key}} absent from context keeps its original internal whitespace in the output while the trimmed key is appended once (deduplicated) to the unresolved list.
+- **SPEC-7.606**: An unterminated {{ with no matching }} emits the literal {{ plus the remaining input verbatim and returns immediately, adding nothing to unresolved.
+- **SPEC-7.607**: Under Escape::Html every value is HTML-escaped unless its key is in MARKUP_KEYS (raw markup built in Rust); under Escape::Text nothing is ever escaped.
+- **SPEC-7.608**: Exactly one tracing::trace! event at RENDER_TRACE_TARGET per render pass (subject/body_text/body_html are three separate passes, one per rule, not one per channel).
+- **SPEC-7.609**: Only channel_type = 'in_app' rows, scoped to tenant_id plus either user_id or contact_id, never both in one query.
+- **SPEC-7.610**: The staff arm requires CallerContext::Staff plus auth.user to be Some (staff_user), else AppError::Unauthorized.
+- **SPEC-7.611**: The contact arm additionally requires a DB-loaded require_capability(caps::NOTIFICATIONS_READ) check, separate from session resolution.
+- **SPEC-7.612**: Zero rows affected returns AppError::NotFound("Notification") (404); a row owned by a different user/contact/tenant is never a 403/401.
+- **SPEC-7.613**: Ordered created_at DESC and paginated via the standard envelope; also, reject_unsupported_sort() runs at the route layer before the service query.
+- **SPEC-7.614**: Status defaults to the literal "pending" if the DB column is unexpectedly NULL, rather than erroring.
+- **SPEC-7.615**: 25 rows are drained per scheduled run() tick; the worker carries no per-tick parameter beyond this constant.
+- **SPEC-7.616**: One SQL statement selects due rows (pending and ready, or sending whose 600s claim has expired), oldest first, FOR UPDATE SKIP LOCKED, and in the same statement sets status='sending', bumps attempt_count and stamps next_attempt_at = NOW() + CLAIM_TIMEOUT_SECS, recovering from a worker crash mid-tick with no extra schema.
+- **SPEC-7.617**: BACKOFF_SECS = [60, 300, 1800, 7200, 21600] indexed by attempt_count - 1 (clamped to 0); once exhausted the row is marked failed with next_attempt_at = NULL.
+- **SPEC-7.618**: A permanent delivery failure always sets status='failed'/next_attempt_at=NULL with no retry on first occurrence; this in_app case (no user_id and no contact_id) is one of several such cases (see also the email cases below and the unregistered-transport case); also, neither user_id nor recipient is a permanent failure; also, no resolvable address and no fallback recipient is a permanent failure; also, the worker recognizes only "in_app" and "email"; any other channel_type is a permanent, non-retrying failure, even though UpsertNotificationChannelRequest's doc comment lists other names as configurable.
+- **SPEC-7.619**: A failed address lookup itself is a transient failure (the read broke, not that the notification is unsendable), so it backs off and retries rather than failing immediately.
+- **SPEC-7.620**: An SMTP send failure via Mailer::send_multipart is always Transient ("smtp: {e}"), so it always gets the backoff ladder rather than an immediate permanent fail.
+- **SPEC-7.621**: No database transaction is held open across any transport call; resolve_addresses resolves every address for the batch before any deliver call in the tick.
+- **SPEC-7.622**: Only rows where channel == "email" and user_id is Some are looked up here; standalone-recipient rows and non-email channels are never included.
+- **SPEC-7.623**: Filters to status = 'active', so an offboarded user's row is excluded and resolves to a permanent "user {uid} has no email" failure.
+- **SPEC-7.624**: Committed rather than dropped, to avoid leaving the connection idle in transaction while the pool is needed for the sends this phase exists to free up.
+- **SPEC-7.625**: Writes every tick's outcomes in one transaction using at most two statements regardless of batch size, each skipped entirely if its input list is empty.
+- **SPEC-7.626**: Run_tick is public so the integration test suite can drive the worker deterministically; production scheduling goes through Job::run(), which calls run_tick(TICK_BATCH_SIZE) and only logs when stats.examined > 0.
+- **SPEC-7.627**: On successful send, logs tracing::info! with id, channel and latency_ms (now minus created_at), making enqueue-to-sent latency observable.
+- **SPEC-7.628**: Every channel/template/rule write route requires RequireAuth + RequireAdmin; every GET/list route needs only RequireAuth except list_channels, which also requires RequireAdmin.
+- **SPEC-7.629**: DispatchNotificationRequest derives Validate but declares no field-level #[validate(...)] attributes, so req.validate()? at both the dispatch and preview routes is a structural no-op.
+- **SPEC-7.630**: Documents that every route in this file is admin-surface API with no SPA caller as of the 2026-09-22 parity record, and lists the exempted paths below.
+
 
 ## 8. Integrations and dependencies
 

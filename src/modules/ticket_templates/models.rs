@@ -24,6 +24,7 @@ pub struct TicketTemplateResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-7.61: name is validated 1-200 chars and subject 1-500 chars on create; is_active defaults to true (default_true) when the key is omitted.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateTicketTemplateRequest {
     #[validate(length(min = 1, max = 200))]
@@ -44,6 +45,7 @@ pub struct CreateTicketTemplateRequest {
 /// `Option<Option<Uuid>>` so the caller can distinguish "leave the
 /// category alone" (key absent) from "clear the category" (key present
 /// and `null`).
+// SPEC-7.62: the nullable FK fields (category_id/priority_id/type_id) and description/body use double_option, so an absent key leaves the field untouched while an explicit null clears it.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateTicketTemplateRequest {
     #[validate(length(min = 1, max = 200))]
