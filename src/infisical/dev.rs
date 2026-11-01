@@ -29,6 +29,9 @@ pub struct DevBootstrapConfig {
 
 /// Run the dev bootstrap. Returns the same output as
 /// [`bootstrap_infisical`], so the caller can also print it for the user.
+// SPEC-3.40: writes exactly 6 keys into the target .env-style file
+// (project id, client id, client secret, environment, admin email,
+// admin password) and never writes INFISICAL_ADDRESS.
 pub async fn run_dev_bootstrap(config: DevBootstrapConfig) -> Result<BootstrapOutput, AppError> {
     info!(
         "Bootstrapping Infisical at {} (writing creds to {})",
@@ -74,6 +77,9 @@ pub async fn run_dev_bootstrap(config: DevBootstrapConfig) -> Result<BootstrapOu
 ///
 /// Creates the file if it doesn't exist. The file gets a trailing newline
 /// either way.
+// SPEC-3.41: preserves every existing line verbatim except a line
+// whose key matches an update, which is replaced in place; a key not
+// already present is appended at the end.
 fn upsert_env_file(path: &Path, updates: &[(&str, &str)]) -> Result<(), AppError> {
     let existing = if path.exists() {
         fs::read_to_string(path)

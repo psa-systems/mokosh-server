@@ -149,133 +149,384 @@ and the payment provider interface (`stripe`, `paypal`). An unrecognised provide
 values. The configuration seam also contains `file`, `database` and `bunyip` providers, which only the operator CLI
 chain builder (`CONFIG_PROVIDERS`) constructs; the server process itself reads configuration from `environment`.
 
-## 3. Functional requirements
+## 3. Providers and secrets
 
-Each statement is observable through the interfaces in section 4.
+A provider is one implementation of a capability the application needs; a kind groups the providers that implement
+one trait. `docs/providers.md` is the contract for the model itself (tiers, priority, the boot classification, the
+migrate/purge CLI shape); this section states what the code in `src/app_secrets/`, `src/secrets/`, `src/infisical/`,
+`src/storage/`, `src/providers/`, `src/cli/` and `src/bin/mokosh-bootstrap.rs` actually does, in normative,
+per-requirement form. A requirement here is enforced at the `// SPEC-3.<n>` comment the id's own text names; where no
+single site enforces it (a cross-cutting rule, or a rule that is the absence of a thing), the requirement names the
+file and the id is not cited inline.
 
-### 3.1 Identity, sessions and tenancy
+### 3.1 Application-tier secrets (src/app_secrets/)
 
-- Staff log in with email and password at `POST /api/v1/auth/login`. A user belonging to several tenants selects one
-  (`select-tenant`) or switches (`switch-tenant`). Memberships are listed at `GET /api/v1/auth/memberships`.
-- Server-issued access tokens are HS256 JWTs with issuer and audience `mokosh-server`, valid 1 hour; refresh tokens
-  are valid 7 days. Refresh, logout, logout-all and per-session revocation are supported.
-- When the identity-provider verifier is configured (`OIDC_ISSUER` and `OIDC_AUDIENCE`), bearer tokens of type `at+jwt`
-  are verified against the provider's JWKS first; a verified identity is mirrored into the local `users` table on first
-  sight. Provider roles never map to `super_admin`. First-sight identities without an invitation are rejected unless
-  `ALLOW_UNINVITED_BUNYIP_SIGNUP` is true and the provider has verified the email.
-- A session the identity provider ended (back-channel logout) is refused even if the token has not expired. A deleted
-  provider account tombstones the local user (soft delete, sessions and API keys removed).
-- A deactivated user or a non-active tenant is refused on the next request, not at token expiry.
-- TOTP multi-factor authentication can be enrolled, enabled and disabled. Recovery codes are accepted in place of a code.
-  After 3 failed codes the account is locked for 30 seconds, doubling per further failure up to 1 hour.
-- With `LOGIN_APPROVAL_ENABLED`, a login from a new country (needs the IP2Location database) or a new device (a
-  client-supplied `device_id`) is withheld after password and MFA succeed until the single-use emailed code is sent back
-  with the login request (5 wrong attempts destroy the challenge). With the flag off, a new-country login only triggers
-  an alert.
-- Password reset by emailed token (`forgot-password`, `reset-password`); a user-invite "set password" context lookup.
-- Users can create personal API keys (prefix `psa_`, stored hashed, listed by prefix, revocable). The authentication
-  middleware does not read the `api_keys` table: a key is not accepted as a request credential.
-- Roles: `super_admin`, `admin`, `manager`, `technician`, `dispatcher`, `sales`, `finance`. Platform administrators are
-  a separate plane (`platform_admins`, `POST /api/v1/platform/login`).
-- Tenants have status `active`, `suspended` or `cancelled`. Platform admins create, list, suspend and activate tenants.
-  A signed-in user can create an additional organization or, with an identity token, self-serve their first one.
-  `MOKOSH_MAX_TENANTS` caps tenant creation (409 at the cap), re-read on each create.
-- Teams with leader or member roles; per-tenant module switches (`/tenants/{id}/modules/{module}`, `/settings/modules`).
-- Grant invitations let an organization owner invite an existing identity into the organization; invitees accept or
-  decline by token or from their own list. When the directory client is configured, invitees are looked up at the
-  identity provider.
+An application-tier secret belongs to the whole deployment, not to a tenant. It is read through `AppSecrets`, never
+through a provider directly, and resolves from exactly one provider per secret.
 
-### 3.2 Service desk
+- **SPEC-3.1**: `GovernedSecret` declares exactly 11 variants (`SmtpPassword` and five client-id/client-secret pairs:
+  Google, Microsoft, Xero, QuickBooks, plus the standalone `XeroWebhookKey` and `QuickbooksVerifierToken`); a pair
+  joins the registry as two independent variants, each resolving from its own provider, so a half-configured pair is
+  a boot error naming the missing half rather than a silently incomplete credential (src/app_secrets/mod.rs).
+- **SPEC-3.2**: `GovernedSecret::parse_name` matches case-insensitively against `GovernedSecret::ALL` and rejects any
+  other input with an error naming every legal value; it never falls back to a default (src/app_secrets/mod.rs).
+- **SPEC-3.3**: `AppSecretProviderKind` has exactly 5 variants (`environment`, `file`, `database`, `infisical`,
+  `bunyip`); `AppSecretsSelection::from_env` is the sole reader of `APP_SECRET_BACKEND`, independent of the tenant
+  tier's `SECRET_BACKEND` (split by PMS-1424 because the tenant tier accepts only write-capable providers); a blank
+  value takes the hosting profile's default, a set value is parsed strictly, and an unrecognised value is a hard
+  error naming the legal list rather than a fallback (src/app_secrets/mod.rs).
+- **SPEC-3.4**: `classify_built` returns exactly one of five classifications per secret: `Used` (declared provider
+  holds it, nothing else does), `Missing` (no built provider holds it), `Shadowed` (the declared provider holds it
+  and at least one other built provider also does), `Misplaced` (the declared provider does not hold it but another
+  built provider does), or `Unavailable` (the declared provider could not be built at all, distinct from a built
+  provider answering "no value"); `enforce` logs `Used` and `Shadowed` at info/warn, logs `Missing` at warn with the
+  secret's `feature()` sentence, and returns `AppError::Configuration` naming the secret and provider for `Misplaced`
+  and `Unavailable`, which fails process boot (src/app_secrets/mod.rs).
+- **SPEC-3.5**: `AppSecrets::declared_for` resolves a secret's serving provider from its own per-secret declaration
+  first (PMS-1537, e.g. the Google OAuth pair declared to `bunyip`), falling back to the process-wide declared
+  provider only when the secret has no declaration of its own (src/app_secrets/mod.rs).
+- **SPEC-3.6**: `init_from_env` builds the environment provider unconditionally, the file provider only when
+  `APP_SECRETS_DIR` resolves to a non-empty value, the database provider unconditionally, the Infisical provider only
+  when `INFISICAL_ADDRESS` resolves to a non-empty value, and the bunyip provider only when
+  `BunyipSecretsConfig::from_env` returns `Ok(Some(_))`; it then runs the full survey and `enforce`, so a `Misplaced`
+  or `Unavailable` secret stops boot (src/app_secrets/mod.rs).
+- **SPEC-3.7**: the environment provider (`EnvironmentProvider`) reads only `{NAME}_FILE`, never the plain variable
+  of the same name; a blank path, a missing file, or a file whose trimmed contents are empty all read as unheld; an
+  unreadable path is logged at `error` and also reads as unheld; the provider is read-only (src/app_secrets/env.rs).
+- **SPEC-3.8**: the file provider (`FileProvider`) reads `{APP_SECRETS_DIR}/{secret.secret_file()}`; a missing
+  directory or a missing file inside an existing directory both read as unheld silently, while an existing but
+  unreadable file is logged at `error`; `set` writes the file (creating it if absent) and `delete` treats an
+  already-absent file as success (src/app_secrets/file.rs).
+- **SPEC-3.9**: the database provider (`DatabaseProvider`) loads every `GovernedSecret` row once at construction into
+  an in-memory cache guarded by a `RwLock` and never re-queries the database on `get`/`has`; a row that fails to
+  decrypt, or that decrypts to an empty string, is treated as unheld rather than as a load failure; a row named
+  something outside `GovernedSecret::ALL` is skipped with a `warn` log (src/app_secrets/database.rs).
+- **SPEC-3.10**: the database provider's `set` encrypts with AES-256-GCM and upserts via
+  `ON CONFLICT (name) DO UPDATE`, updating the in-memory cache only after the write succeeds, so a failed write
+  leaves the prior cached value serving; `delete` is idempotent (src/app_secrets/database.rs).
+- **SPEC-3.11**: the database provider's writes and its initial load both use the privileged migrator pool, never
+  the tenant-scoped request pool, because `app_secrets` carries no row-level security and no tenant GUC
+  (src/app_secrets/database.rs).
+- **SPEC-3.12**: `BunyipSecretsConfig::from_env` returns `Ok(None)` when `BUNYIP_SECRETS_URL` is blank; when the URL
+  is set but either `BUNYIP_SECRETS_CLIENT_ID` or `BUNYIP_SECRETS_CLIENT_SECRET` is blank, it returns
+  `AppError::Configuration` naming both required variables and the `bunyip-api machine-client register` remedy
+  (src/app_secrets/bunyip.rs).
+- **SPEC-3.13**: `BunyipProvider::load` fetches exactly one bunyip key, `mokosh/google_oauth_client`, once, via
+  `GET {base_url}/v1/host/secrets/{key}` with HTTP Basic auth; the response's `data.value` is itself a JSON string
+  that must parse into a `{client_id, client_secret}` pair, and a parse failure at either JSON layer is a fatal
+  configuration error naming the key; HTTP 401, 403 and 404 each produce a distinct remedy message, and any other
+  non-success status produces a generic message naming the status and body (src/app_secrets/bunyip.rs).
+- **SPEC-3.14**: `BunyipProvider` answers only for `GoogleContactsClientId` and `GoogleContactsClientSecret`; every
+  other `GovernedSecret` reads as unheld from it; it is read-only, and its `Debug` implementation prints only the
+  count of secrets held, never a value (src/app_secrets/bunyip.rs).
+- **SPEC-3.15**: the application-tier Infisical provider (`InfisicalProvider`) reads from the fixed folder `/app`,
+  distinct from the tenant tier's `/mokosh/integrations`, so the two tiers cannot collide inside one Infisical
+  project; it fetches every governed secret once at `load()`, treating a 404 as unheld and any other network or
+  auth failure during load as a fatal boot error (src/app_secrets/infisical.rs).
 
-- Tickets carry number, title, description, status, priority, queue, optional type, category and subcategory, source
-  (`portal`, `email`, `phone`, `api`, `chat`, `rmm`, `internal`), company, contact, site, assignee, team, parent ticket,
-  contract, SLA due times, scheduling window, estimated and actual hours, billable flag, billing status
-  (`not_billed`, `ready_to_bill`, `billed`, `prepaid`), asset, procedure article, tags and custom fields.
-- Statuses, priorities, queues, types, categories and per-user saved views are tenant-configurable.
-- Agents assign, reopen, add notes (types `internal`, `public`, `resolution`, `time_entry`) and attach files to tickets and notes; inline images are
-  supported.
-- Workflow rules fire inside the ticket transaction on `ticket.created`, `ticket.status_changed` and
-  `ticket.priority_changed`. Actions include assign, set priority, set status, add tag and add internal note; cascading
-  transitions are bounded by a per-tenant depth cap (default 3). Runs are listed per ticket.
-- Rows in `ticket_automation_rules` are evaluated by the ticket service (`AutomationEngine`), including a `webhook` action
-  that passes the outbound URL guard (section 7.3). No HTTP route or other code in `src` inserts such rows.
-- Ticket templates; approval requests on tickets, time entries, change requests and quotes with a pending-approvals
-  inbox and decision endpoint.
-- Email-to-ticket intake: a mail gateway posts parsed messages to `POST /api/v1/email-intake` with a tenant intake
-  bearer token. Messages are deduplicated by Message-Id, threaded by references, matched to a contact by sender, and
-  create `email`-source tickets. Tokens are managed by admins.
-- SLA: policies with targets, business hours with time zones, holiday calendars, per-ticket evaluation, status
-  `on_track`, `warning`, `breached` or `not_applicable`, at-risk and breach notifications.
-- RMM alerts posted to `POST /api/v1/rmm/alerts` (HMAC-signed with the connection secret) create tickets according to
-  alert rules.
+### 3.2 Tenant-tier secrets (src/secrets/)
 
-### 3.3 Time, projects, calendar
+A tenant-tier secret belongs to one MSP tenant: a payment-gateway credential, a contact-sync connection's token.
 
-- Time entries with work types, billable flag, billing status and approval status (`draft`, `pending`, `approved`,
-  `rejected`); rounding rules; start/stop timers; workday clock-in/out with breaks and editable segments; weekly
-  timesheets submitted, withdrawn, approved or rejected per user and week start; mileage entries.
-- Projects with phases, tasks, task statuses, task dependencies and project types; project summary.
-- Appointments with RFC 5545 recurrence expanded in memory over the requested range, user availability windows, time
-  off with approval, on-call schedules and "who is on call now", scheduling templates, and an aggregated dispatch board.
+- **SPEC-3.16**: `SecretKey` is constructible only through its named constructors (`contact_sync`, `oauth_client`,
+  `integration`, `payment_gateway`), each of which takes a tenant id that is never part of `SecretKind`, so a key
+  cannot be built that omits its tenant; `SecretKey::name()` renders as exactly
+  `{KIND_PREFIX}__{tenant_uuid.simple()}__{DISCRIMINATOR_UPPER}`, a format both the `secrets` table row name and the
+  Infisical secret name depend on (src/secrets/mod.rs).
+- **SPEC-3.17**: `validate_discriminator` rejects a discriminator that is empty, longer than 48 bytes, or contains
+  anything other than lowercase ASCII letters, digits or underscore, which is what stops a crafted value from
+  injecting a path or name into the stored key (src/secrets/mod.rs).
+- **SPEC-3.18**: a `ContactSync` key's discriminator is `{provider}_{connection_id.simple()}`, so two sync
+  connections for the same provider under the same tenant never share a secret name (src/secrets/mod.rs).
+- **SPEC-3.19**: `SecretProvider::get` returns `Ok(None)` to mean "not configured" and `Err` to mean "provider
+  unreachable"; the two must never collapse into each other, and `put_if_absent` returns `true` only when its own
+  call performed the write, `false` when a value already existed, which is the compare-and-set contract a
+  gateway-credential move depends on; `delete` of an already-absent secret is not an error (src/secrets/mod.rs).
+- **SPEC-3.20**: `SecretProviderKind::parse_name` accepts only `database` and `infisical`; a name that is valid for
+  the application tier only (`file`, `environment`, `bunyip`) produces a distinct error naming `APP_SECRET_BACKEND`
+  as the variable that would have accepted it, separate from the generic "not a known provider" error for an
+  unrelated typo; a blank value is never a legal input to this function, since the caller resolves blank against the
+  hosting profile's default before calling it (src/secrets/mod.rs).
+- **SPEC-3.21**: `SecretsConfig::from_env` is the sole reader of `SECRET_BACKEND` for the tenant tier
+  (src/secrets/mod.rs).
+- **SPEC-3.22**: the database tenant-secrets provider runs every `get`/`put`/`put_if_absent`/`delete` inside a
+  transaction opened with `begin_with_tenant(key.tenant_id())`, so row-level security independently confines the row
+  to its tenant; `put` is an upsert, `put_if_absent` is `ON CONFLICT (tenant_id, name) DO NOTHING RETURNING 1`
+  returning `true` iff this call inserted the row, and `delete` treats zero rows affected as success
+  (src/secrets/database.rs).
+- **SPEC-3.23**: the Infisical tenant-secrets provider reads and writes under the fixed folder
+  `/mokosh/integrations`; `InfisicalSecretsConfig::from_env` requires `INFISICAL_ADDRESS`, `INFISICAL_PROJECT_ID`,
+  `INFISICAL_CLIENT_ID` and `INFISICAL_CLIENT_SECRET` (blank counts as missing), and `INFISICAL_ENVIRONMENT`
+  defaults to `dev` when unset or blank (src/secrets/infisical.rs).
+- **SPEC-3.24**: the Infisical tenant-secrets provider caches both a present value and a confirmed absence for a
+  fixed 5-minute TTL keyed by secret name; a cache miss (including an expired entry) that also fails at the network
+  level is always `Err`, never collapsed into `Ok(None)`, so an Infisical outage surfaces as an error on every read
+  rather than reading as "not configured" (src/secrets/infisical.rs).
+- **SPEC-3.25**: `put`/`delete` on the Infisical tenant-secrets provider write through to Infisical first, then
+  invalidate (never update in place) the cache entry for that name; `put_if_absent` bypasses the cache entirely for
+  its existence check, making it a check-then-act rather than a true atomic compare-and-set, since Infisical exposes
+  no create-only write (src/secrets/infisical.rs).
 
-### 3.4 Commercial
+### 3.3 Infisical client and first-run bootstrap (src/infisical/)
 
-- Contracts (statuses `draft`, `active`, `expired`, `cancelled`, `renewed`) with items, hour balances and rate cards.
-- Invoices (statuses `draft`, `pending`, `sent`, `paid`, `partially_paid`, `void`, `written_off`) created manually or
-  from time entries; write-off, void, amend, PDF, delivery options, payment readiness, payments list; products, tax rates
-  with lookup, payment terms; credit notes (`issued`, `void`) with PDF; customer statements with PDF; manual payment
-  recording and deletion.
-- Online payment through Stripe or PayPal using each tenant's own gateway credentials (stored through the tenant secret
-  provider). Inbound provider webhooks are verified per tenant before any parsing and reconciled idempotently; webhook
-  deliveries are recorded and listed.
-- Quotes (statuses `draft`, `submitted`, `approved`, `rejected`, `sent`, `accepted`, `declined`, `expired`, `converted`,
-  `cancelled`) with lines, send, PDF, accept, decline and conversion; opportunities with stages `lead`, `qualified`,
-  `proposal`, `negotiation`, `won`, `lost`.
-- Expenses (`draft`, `submitted`, `approved`, `reimbursed`, `rejected`), vendors, expense categories, bills (`draft`,
-  `approved`, `paid`, `void`) with bill payments.
-- Delegated accounting: when the feature switches `delegated_invoice_issuer` and `delegated_bills` are on and a tenant
-  has connected Xero or QuickBooks with the matching capability, invoices and bills are raised in that system.
-  Mappings of companies, products, vendors, expense accounts and people to provider records are managed under
-  `/invoice-issuer-mappings`. Xero and QuickBooks webhooks are verified by HMAC-SHA256.
-- Invoices and quotes can be delivered by email through the configured mailer; per-user sends of request links and
-  invoice emails are limited to 20 per hour.
+- **SPEC-3.26**: `InfisicalClient::new`/`connect` perform no network I/O and do not authenticate at construction;
+  authentication happens lazily on the first API call, and the underlying HTTP client is built with a 30-second
+  request timeout (src/infisical/client.rs).
+- **SPEC-3.27**: `base_url` has any trailing `/` stripped exactly once at construction, so route building never
+  produces a double slash (src/infisical/client.rs).
+- **SPEC-3.28**: Universal Auth login POSTs `{base_url}/api/v1/auth/universal-auth/login` with
+  `Content-Type: application/x-www-form-urlencoded` and a `clientId=<urlencoded>&clientSecret=<urlencoded>` body,
+  never a JSON body; a non-2xx response produces the error text
+  `"Infisical authentication failed ({status}): {body}"` (src/infisical/client.rs).
+- **SPEC-3.29**: a cached access token is treated as invalid, and refreshed, once `now + 300s >= expires_at`, i.e.
+  5 minutes before its stated expiry rather than at exact expiry; `ensure_authenticated` checks validity under a
+  read lock first and re-checks after acquiring the write lock, so two concurrent callers never both re-authenticate
+  when one caller's read-lock check already found a valid token (src/infisical/client.rs).
+- **SPEC-3.30**: `send_with_retry` retries a request exactly once, and only when the first attempt returns HTTP 401:
+  it clears the cached token, re-authenticates, and resends the identical request; a 401 on the retry is not retried
+  again and falls through to the normal error path (src/infisical/client.rs).
+- **SPEC-3.31**: `check_response` classifies a non-success status as exactly one of: 401 clears the cached token and
+  returns the fixed text `"Infisical authentication failed"` with no body echoed; 403 returns
+  `"Infisical access denied: insufficient permissions"`; 404 returns `AppError::NotFound` naming the resource; any
+  other status returns `AppError::external_service` naming the status and body (src/infisical/client.rs).
+- **SPEC-3.32**: `get_secret` treats HTTP 404 as `Ok(None)` and propagates every other failure as `Err`, so an
+  unreachable Infisical is never silently read as an absent secret; `put_secret` attempts `PATCH` first and falls
+  back to `POST` only on `AppError::NotFound`, an ordering that must not be reversed; `delete_secret` treats
+  `AppError::NotFound` as success (src/infisical/client.rs).
+- **SPEC-3.33**: `InfisicalClient`'s `Debug` implementation redacts `client_secret` as the literal string
+  `"[REDACTED]"` and no logging call in this file (`debug!`/`info!`/`warn!`) ever includes the client secret or a
+  bearer token value (src/infisical/client.rs).
+- **SPEC-3.34**: `bootstrap_infisical` performs its setup against a fresh Infisical instance as 7 numbered API calls
+  in this exact order: admin signup, select-organization, create project, create machine identity, promote
+  membership to admin, attach Universal Auth, create client secret; one of these steps (folder pre-creation, see
+  SPEC-3.35) issues additional calls not counted in that number (src/infisical/bootstrap.rs).
+- **SPEC-3.35**: folder pre-creation runs between project creation and identity creation, using the org-scoped admin
+  token, because the Universal Auth identity created afterward has secret-write permission but not folder-create
+  permission; the folders created are exactly `/` to `mokosh`, `/mokosh` to `tenants`, `/mokosh` to `integrations`,
+  in that order; a folder-create call whose error text contains `"already exists"` or `"409"` is treated as success,
+  making the step idempotent on a partially set up project (src/infisical/bootstrap.rs).
+- **SPEC-3.36**: every bootstrap HTTP request sends the fixed header `User-Agent: mokosh-bootstrap/{CARGO_PKG_VERSION}`,
+  because Infisical rejects some endpoints (at least `select-organization`) with a 401 "User-Agent header is
+  required" when it is absent (src/infisical/bootstrap.rs).
+- **SPEC-3.37**: the Universal Auth attach call sets both `clientSecretTrustedIps` and `accessTokenTrustedIps` to the
+  CIDR `0.0.0.0/0`, never the bare IP `0.0.0.0`, because a bare IP is read as `/32` and trips Infisical's paid-plan
+  IP-restriction feature; it requests an access token TTL and max TTL of 2,592,000 seconds (30 days) with no use-limit
+  (src/infisical/bootstrap.rs).
+- **SPEC-3.38**: membership promotion to admin runs before the Universal Auth attach and client-secret creation
+  steps; skipping it would make every runtime secret-write call fail with 403, since the default role grants nothing
+  (src/infisical/bootstrap.rs).
+- **SPEC-3.39**: `BootstrapInput.environment_slug`, when `None`, defaults to the literal `"dev"` for both the
+  returned `BootstrapOutput.environment` and the folder-creation calls (src/infisical/bootstrap.rs).
+- **SPEC-3.40**: `run_dev_bootstrap` writes exactly 6 keys into the target `.env`-style file
+  (`INFISICAL_PROJECT_ID`, `INFISICAL_CLIENT_ID`, `INFISICAL_CLIENT_SECRET`, `INFISICAL_ENVIRONMENT`,
+  `INFISICAL_ADMIN_EMAIL`, `INFISICAL_ADMIN_PASSWORD`) and must never write `INFISICAL_ADDRESS`, because the
+  host-reachable URL used by the CLI differs from the in-network URL the server container uses, and the latter is
+  expected to already exist in the generated `.env` (src/infisical/dev.rs).
+- **SPEC-3.41**: `upsert_env_file` preserves every existing line verbatim except a line whose key (the substring up
+  to the first `=`) exactly matches one of the keys being written, which is replaced in place; a key that matches no
+  existing line is appended at the end; a line is never matched inside a comment (trimmed content starting with `#`)
+  or a blank line; the file always ends with a trailing newline, and a non-existent target file is created rather
+  than treated as an error (src/infisical/dev.rs).
 
-### 3.5 Clients, assets, knowledge
+### 3.4 Object storage (src/storage/)
 
-- Companies (with industries, status, portal slug), contacts, sites, contact phones and company links; a website probe;
-  deletion preview; contact notes.
-- Portal access for contacts: grant, resend, revoke; portal roles with capabilities; access requests that staff resolve.
-- Contact import from Google, Microsoft, iCloud (CardDAV) and `.vcf` upload: connect, preview, queued runs, a review
-  queue for ambiguous matches, per-field locks, unlink and remove-imported-data. Import is one-way (read-only scopes).
-- Assets with types and typed custom fields, relationships, impact view, configuration items, an encrypted credential
-  vault whose reveal is audited, per-asset audit log, search with facets and bulk create (behind feature switches
-  `assets_search_v2` and `assets_catalog`), asset models and templates. A per-company documentation view composes assets,
-  credential references (never secret values) and knowledge-base articles.
-- Knowledge base: categories, articles with drafts, versions and restore, publish states (`draft`, `published`,
-  `archived`), attachments, comments with mentions and resolve, helpful votes, template rendering with a values map,
-  ticket-driving article ranking and measured duration.
-- Forms: definitions with ordered fields (types `text`, `textarea`, `email`, `date`, `select`, `boolean`) and the rule
-  `required_if`; drafts, submissions, and tokenised request links that let a client submit a form without an account.
-  Unknown field types or rules written by a newer version are read tolerantly but rejected on write.
+- **SPEC-3.42**: every `ObjectKey::relative_path()` puts the tenant id as the first path component, except the two
+  `Legacy*` `ObjectKind` variants, which must not, because they address pre-existing layouts from before tenant
+  scoping was added (src/storage/mod.rs).
+- **SPEC-3.43**: a file-extension segment (`TenantLogo`/`LegacyTenantLogo`) must be 1-16 ASCII alphanumeric or `-`
+  characters or the request is rejected as bad input; a digest segment (`BrandingLogo`) must be exactly 64 ASCII hex
+  characters or the request is rejected as an internal error, since a malformed digest there can only come from a
+  bug or an attack, not user input (src/storage/mod.rs).
+- **SPEC-3.44**: `LocalProvider::read` on a missing object returns `AppError::NotFound`; `LocalProvider::open` on the
+  same missing-object condition returns `AppError::Internal`; callers that need the legacy-path fallback behavior
+  use `read`, and the asymmetry between the two methods is deliberate, not a bug to unify (src/storage/mod.rs).
+- **SPEC-3.45**: `LocalProvider::delete` is best-effort: a missing file is swallowed and reports success, since every
+  caller has already deleted the owning database row first; `LocalProvider::rename` is not best-effort and a missing
+  source is a hard `AppError::Internal`, because the caller has just established the source exists and a silent
+  success would wrongly mark an object as migrated (src/storage/mod.rs).
+- **SPEC-3.46**: `StorageProviderKind::parse` accepts only `local` or `s3` and otherwise returns
+  `AppError::Configuration` naming the bad value, never falling back to `local`; `resolve` takes the hosting
+  profile's default only when the input is blank, and an unparseable non-blank value is always a hard error, never a
+  silent fallback (src/storage/mod.rs).
+- **SPEC-3.47**: `storage::shared()` builds the process-wide provider exactly once behind a `OnceLock`; on a path
+  that never called `init_from_env` first (test or CLI code), a build failure there panics rather than returning an
+  error, because there is no request or startup caller to answer with one (src/storage/mod.rs).
+- **SPEC-3.48**: `DEFAULT_ROOT` (`./attachments`) must remain a relative path, never an absolute one, because the
+  container image's working directory and non-root user depend on relativity (src/storage/mod.rs).
+- **SPEC-3.49**: `Retention` is declared per `ObjectKind` (`WhileReferenced`, or `Years(7)` for `FinancialDocument`)
+  and is not enforced by any reaper; the test suite fails the moment a sweep/expire function appears, so this
+  requirement states the current, deliberately advisory-only state (src/storage/mod.rs).
+- **SPEC-3.50**: every storage configuration variable name is `STORAGE_`-prefixed and declared centrally; as of
+  PMS-1443 the previously-deprecated aliases (`STORAGE_BACKEND`, `ATTACHMENT_DIR`, bare `S3_*`) no longer supply a
+  value at all, and `check_boot_env` instead refuses to boot if any of them is set to a non-blank value, naming every
+  retired-to-replacement pair at once; a forwarded-but-blank variable is treated as unset by both checks
+  (src/storage/env.rs).
+- **SPEC-3.51**: `STORAGE_S3_ACCESS_KEY_ID` and `STORAGE_S3_SECRET_ACCESS_KEY` are the only two storage settings
+  marked secret, and `supplied_by()` reports only which variable name supplied a setting, never its value, so
+  `provider-status` cannot leak a credential through this path (src/storage/env.rs).
+- **SPEC-3.52**: `FileLedger::record`/`record_in_tx` upsert (`ON CONFLICT (id) DO UPDATE`) rather than insert-only,
+  because a tenant logo is written to the same row id on every replace; `record_in_tx` runs inside the caller's own
+  transaction when storing a financial document, so the ledger row and the issuing transaction commit or roll back
+  together (src/storage/ledger.rs).
+- **SPEC-3.53**: `FileLedger::forget` is best-effort: a failure to remove a ledger row for an object whose blob
+  delete may already have failed does not fail the caller's request (src/storage/ledger.rs).
+- **SPEC-3.54**: `S3Config::parse` requires `STORAGE_S3_ENDPOINT`, `STORAGE_S3_BUCKET`, `STORAGE_S3_ACCESS_KEY_ID`
+  and `STORAGE_S3_SECRET_ACCESS_KEY` to each resolve to a non-blank value, naming the specific missing variable
+  otherwise; the endpoint must parse as an `http`/`https` URL with a host and no query string or fragment;
+  `STORAGE_S3_PATH_STYLE` accepts only the literals `true`/`1`/`yes` or `false`/`0`/`no` (any other non-empty value
+  is a hard error); the bucket name must satisfy S3's naming rules (length 3-63, lowercase ascii/digit/`-`/`.`, no
+  leading/trailing `-`/`.`, no `..`) (src/storage/s3.rs).
+- **SPEC-3.55**: `S3Config`'s `Debug` implementation redacts `secret_access_key`; the HTTP client used for every S3
+  request has a 10-second connect timeout and a 300-second total request timeout; every request is signed with
+  SigV4 using the hand-rolled `sigv4` submodule (src/storage/s3.rs).
+- **SPEC-3.56**: `S3Provider::read` maps HTTP 404 to `AppError::NotFound` (so a caller can fall back to a legacy
+  path); `S3Provider::open` maps the identical HTTP 404 to `AppError::Internal`, mirroring the same asymmetry as the
+  local provider (SPEC-3.44); `delete` treats `200`, `204` and `404` all as success (src/storage/s3.rs).
+- **SPEC-3.57**: `S3Provider::rename` performs a server-side copy (`x-amz-copy-source`) and then deletes the source;
+  an HTTP 200 copy response whose body contains the literal substring `<Error>` is still treated as a failure, since
+  S3 can return 200 with an XML error body for a copy that started and then failed; a missing source at the copy
+  step is a hard `AppError::Internal`, matching the local provider's non-best-effort rename rule (src/storage/s3.rs).
+- **SPEC-3.58**: the configured S3 endpoint URL is not passed through the outbound-URL SSRF guard used elsewhere,
+  because it is trusted operator configuration like `INFISICAL_ADDRESS`, and a private-network object store is the
+  expected case rather than an attack (src/storage/s3.rs).
 
-### 3.6 Platform services
+### 3.5 Provider status reporting (src/providers/)
 
-- Notifications: channels, templates, per-user preferences, rules, an in-app inbox, preview and dispatch endpoints.
-- Search across tickets, contacts, companies, assets and projects (`GET /api/v1/search?q=`), tenant-scoped.
-- Reports: dashboard, tickets, time, billing, request types, projects, clients, a custom report builder over a
-  whitelisted catalog, CSV export, saved reports and dashboards with cron schedules.
-- Client service status: monitored systems and observations posted by an HMAC-signed endpoint (source `tactical_rmm`),
-  current-status lookup, backup success rate and uptime reports; observations older than 13 months are deleted.
-- Audit log of entity changes with admin list and CSV export, and per-entity history.
-- Tenant data export as a versioned JSON document (all tables with `tenant_id` minus secrets, identity and audit tables)
-  and import; an admin action to load demo data. Demo data is seeded automatically on first visit in the `production`
-  environment only, unless `MOKOSH_DEMO_SEED` is truthy.
-- Branding: tenant logo, favicon and background; company-scoped logo, favicon and background (also manageable by a
-  portal contact for their own company); public GET of these assets.
-- Deployment-wide settings for the operator: SMTP relay settings with test send and verify, product name, the Google
-  contacts OAuth client, feature switches, provider status report, IP enrichment lookup.
-- Version information and an opt-in update check against `MOKOSH_UPDATE_CHECK_URL` (reports `disabled` and makes no
-  outbound request when unset).
+- **SPEC-3.59**: `providers::status::collect()` is the single process-wide reader that builds one
+  `ProviderKindReport` per kind for exactly six kinds, always in this fixed order: configuration, application
+  secrets, tenant secrets, storage, authentication, email; it never calls a provider's value-returning accessor
+  (`get`/`value`), only `has`/`served_by` (src/providers/status/mod.rs).
+- **SPEC-3.60**: the report's `hosting_profile` field is always exactly the string `self-hosted` or `saas`, derived
+  from the lenient (non-fatal) `DeploymentMode::from_env`, since a status report must render even when the value is
+  unrecognised (src/providers/status/mod.rs).
+- **SPEC-3.61**: for the configuration kind, `serving` is the first provider, in priority order, that `served_by`
+  reports holding any registry key; `keys` comes exclusively from `config::check_staleness()`; `staleness_state_name`
+  maps the four staleness states to exactly the wire strings `unchanged`, `appeared`, `disappeared` and
+  `changed_provider` (src/providers/status/mod.rs).
+- **SPEC-3.62**: for the application-secrets kind, when no process-wide `AppSecrets` has been initialized the report
+  shows empty enabled/serving/keys rather than a fabricated shape; when initialized, `serving` is always
+  `secrets.declared()`, the declared provider, independent of which providers were actually built
+  (src/providers/status/mod.rs).
+- **SPEC-3.63**: the tenant-secrets kind never enumerates per-key rows (`keys` is always empty), because enumerating
+  a tenant secret would require a tenant scope the collector does not hold (src/providers/status/mod.rs).
+- **SPEC-3.64**: the storage kind lists every variable in `storage_env::ALL` regardless of whether it is set, and
+  never exposes the value of a storage variable, only which variable name supplied it and whether it is set
+  (src/providers/status/mod.rs).
+- **SPEC-3.65**: the authentication kind reports `local` as always reachable; `bunyip`'s reachability is
+  approximated as "`OIDC_ISSUER` and `OIDC_AUDIENCE` are both non-empty," matching the verifier's own construction
+  check, with a distinct reason string when not reachable (src/providers/status/mod.rs).
+- **SPEC-3.66**: the email kind reads the selection recorded at boot first, so the report cannot disagree with what
+  the process actually runs, and falls back to inferring from `SMTP_HOST` presence only when boot recorded nothing;
+  neither path ever opens an SMTP connection (src/providers/status/mod.rs).
+- **SPEC-3.67**: `collect_deviations` reports one deviation per kind whose resolved provider list differs from the
+  hosting profile's default, naming both the profile default and the explicit list; identical lists produce zero
+  deviations (src/providers/status/mod.rs).
+- **SPEC-3.68**: `GenerationHeader.actor` renders as exactly the literal string `System` for a system-initiated
+  refresh or `Operator(<login>)` for an operator-initiated one, never any credential material
+  (src/providers/status/mod.rs).
+- **SPEC-3.69**: the JSON and HTML renderings must name the exact same set of kind ids; the JSON envelope's top level
+  is `{schema_version: "1", generated_at, report: {hosting_profile, kinds}}` (src/providers/status/renderer_json.rs,
+  src/providers/status/mod.rs).
+- **SPEC-3.70**: the HTML page declares `<meta name="robots" content="noindex">` and renders one `<section
+  id="<kind>">` per kind; every dynamically inserted value passes through HTML escaping, so no raw markup from a
+  provider name or reason string ever reaches the page unescaped (src/providers/status/renderer_html.rs).
+- **SPEC-3.71**: `RequireAdminOrBunyipMachine` tries exactly two credential shapes in order: an HTTP Basic credential
+  matching `BUNYIP_STATUS_CLIENT_ID`/`BUNYIP_STATUS_CLIENT_SECRET` compared in constant time, then a staff admin
+  session; a Basic credential that does not match both halves is refused with 401 immediately and never falls
+  through to the staff-session check even if a valid admin session is also present; when either configured
+  credential variable is unset or empty, the machine path is disabled entirely and every request falls through to
+  the staff-session check (src/providers/status/auth.rs).
+- **SPEC-3.72**: a malformed `Authorization: Basic` header (bad base64, non-UTF-8, missing colon) is classified
+  distinctly from a wrong credential and also falls through to the staff-session check, rather than being treated as
+  a failed machine-credential attempt (src/providers/status/auth.rs).
+- **SPEC-3.73**: the unauthenticated public summary (`summarize()`) exposes exactly five kinds -- configuration,
+  application secrets, storage, authentication, email -- and permanently excludes tenant secrets, because a
+  tenant-chosen provider has no single per-instance identity to report; for each exposed kind it carries only the
+  list of enabled provider names, nothing else observable (src/providers/status/public_summary.rs).
+- **SPEC-3.74**: every string leaf anywhere in the serialized public summary must be one of the hosting-profile
+  strings, the schema version `"1"`, or one of the nine known short provider identifiers (`environment`, `file`,
+  `database`, `bunyip`, `infisical`, `local`, `smtp`, `log`, `s3`); no numeric or boolean leaf may appear anywhere in
+  the summary; this whitelist is the security boundary for the endpoint being unauthenticated
+  (src/providers/status/public_summary.rs).
+- **SPEC-3.75**: `GET /api/v1/providers` is mounted unauthenticated, as a peer of `/version` and `/health`, by
+  design, and does nothing beyond `collect()` then `summarize()` then serializing the result
+  (src/providers/status/public_summary_route.rs).
+- **SPEC-3.76**: exactly three admin endpoints are mounted: `GET /admin/providers/status` (JSON) and `GET
+  /admin/providers/status.html` (HTML), both gated by `RequireAdminOrBunyipMachine`; `POST
+  /admin/providers/status/refresh`, gated by a staff admin session only (never the machine credential), because the
+  refresh handler must record an operator login as the refresh actor and a machine caller has no operator identity
+  to record (src/providers/status/route.rs).
+- **SPEC-3.77**: the refresh endpoint calls `try_refresh` with no required keys; on `RefreshOutcome::Applied` the
+  response is 200 with `{status: "applied", generation_number}`; on `RefreshOutcome::Rejected` it is 409 with
+  `{status: "rejected", previous_generation_number, reason}` (src/providers/status/route.rs).
+
+### 3.6 Operator CLI (src/cli/, src/bin/mokosh-bootstrap.rs)
+
+- **SPEC-3.78**: `mokosh-server`'s operator-subcommand dispatch recognizes exactly these first-argument tokens:
+  `bootstrap-infisical`, `qa-seed`, `qa-teardown`, `showcase-seed`, `showcase-refresh`, `showcase-teardown`,
+  `provider-status`, `provider-set`, `provider-migrate`, `provider-purge`, `verify-providers`; any other token
+  (including none) starts the HTTP server instead of dispatching (src/cli/mod.rs).
+- **SPEC-3.79**: `bootstrap-infisical` requires `INFISICAL_ADMIN_EMAIL` and `INFISICAL_ADMIN_PASSWORD`, naming the
+  missing variable if either is absent, and otherwise falls back to fixed defaults for every other input (address
+  `http://localhost:28002`, project `mokosh`, identity `mokosh-machine`, environment `dev`, env file `.env`, admin
+  name `Mokosh Admin`) (src/cli/mod.rs).
+- **SPEC-3.80**: `qa-seed`/`qa-teardown` resolve the tenant id from `--tenant <uuid>` first, falling back to
+  `MOKOSH_QA_TENANT_ID`; `showcase-*` subcommands use the same resolution order against `MOKOSH_SHOWCASE_TENANT_ID`;
+  absence of both sources is a distinct error from a value that fails to parse as a UUID (src/cli/mod.rs).
+- **SPEC-3.81**: `provider-status`, `provider-migrate`, `provider-set` and `provider-purge` each accept only a fixed
+  set of flags and reject any other argument by name; `--help`/`-h` on any of these four returns an `Err` carrying
+  the usage text as its message, which still exits the process non-zero (src/cli/providers.rs).
+- **SPEC-3.82**: `provider-migrate` requires both `--from` and `--to`; naming the identical provider for both (after
+  trimming) is an error rather than a silent no-op; its per-secret outcome is always exactly one of `"skipped:
+  source does not hold this key"`, `"skipped: target already holds this key"`, `"moved (write + readback +
+  compare)"`, or `"failed: {e}"`; it never deletes from the source provider, on success or failure
+  (src/cli/providers.rs).
+- **SPEC-3.83**: `provider-set` requires `--secret <NAME>` and `--from-env <VAR>`, with no `--to` flag; it
+  distinguishes an unset source environment variable from one that is set but empty, with two different error
+  messages, and never writes an empty value; it resolves the write target through the secret's own per-secret
+  declaration (SPEC-3.5), not the process-wide selection (src/cli/providers.rs).
+- **SPEC-3.84**: `provider-purge` requires `--provider <name>`; `--confirm` is optional and defaults to a dry run;
+  there is no `--force`/`--overwrite`/`--yes-really` flag anywhere in this command, enforced by a source-scan test
+  over the file's own non-comment code; without `--confirm` it never calls `delete`, even on a key that would
+  otherwise be eligible (src/cli/providers.rs).
+- **SPEC-3.85**: `provider-purge`'s secrets-tier interlock refuses a key when the named provider is the one
+  currently declared/selected to serve it, or when the key is not verified live (via `.has()`) in the provider
+  currently serving it; only when both checks pass does it proceed to the writability and confirm checks; a
+  non-writable target (e.g. `environment`) is never deleted from and is reported with a hint naming the `{NAME}_FILE`
+  path for that provider (src/cli/providers.rs).
+- **SPEC-3.86**: every serialized provider-status/migrate/set/purge report passes through a redaction check that
+  panics if the literal substring `{value}` or `{v}` appears anywhere in the serialized JSON, as a hard runtime
+  guard against a value placeholder reaching an operator-facing report (src/cli/providers.rs).
+- **SPEC-3.87**: `build_secret_providers` (shared by all four `provider-*` commands) always builds the environment
+  provider; builds the file provider only when `APP_SECRETS_DIR` is set and non-empty; always attempts the database
+  provider, reporting a failure as absent via a warning rather than propagating it; builds the Infisical provider
+  only when `INFISICAL_ADDRESS` is set and non-empty, again warn-and-absent on failure; builds the bunyip provider
+  only when `BunyipSecretsConfig::from_env()` returns `Ok(Some(_))`, warn-and-absent on build failure or on an
+  incomplete three-variable set (src/cli/providers.rs).
+- **SPEC-3.88**: `boot_shared_state` (shared by all four `provider-*` commands) requires `DATABASE_URL` and
+  `ENCRYPTION_KEY` to be set; it uses `MOKOSH_APP_DATABASE_URL`, falling back to `DATABASE_URL`, for the
+  request-serving pool, and always uses `DATABASE_URL` for the privileged/migrator pool (src/cli/providers.rs).
+- **SPEC-3.89**: `verify-providers --help`/`-h` prints help and exits the process directly with status 0, which
+  differs from every other operator subcommand's `--help`, whose usage text flows back as an `Err` and therefore a
+  non-zero exit (src/cli/verify.rs).
+- **SPEC-3.90**: `verify-providers` reproduces `main`'s own boot order (configuration, then application-tier
+  secrets, then storage, then email) before collecting the provider-status report, and fails if `DATABASE_URL` or
+  `ENCRYPTION_KEY` is unset; a failure to read the database-stored email override falls back to
+  `MailerConfig::from_env()` with a warning rather than failing the whole run (src/cli/verify.rs).
+- **SPEC-3.91**: `verify-providers` classifies a kind's row as `Fail` when any enabled provider is unreachable, when
+  nothing is serving, or when no provider was built at all; the email row is additionally verified with an actual
+  SMTP NOOP bounded by a 10-second timeout, and a pre-existing build failure for email is never overwritten by a
+  passing verify, while a passing build result is overwritten by the verify's own verdict; the overall process exits
+  non-zero whenever any row's verdict is `Fail` (src/cli/verify.rs).
+- **SPEC-3.92**: `mokosh-bootstrap` loads `.env.infisical` then `.env` before parsing arguments, silently ignoring
+  either file's absence; its subcommand set (`bootstrap-infisical`, `qa-seed`, `qa-teardown`, `dev-seed-portal`,
+  `normalize-company-industries`, `--version`/`-V`, `--help`/`-h`/no-args) is disjoint from `mokosh-server`'s
+  operator set apart from the three names both share: it never implements a `provider-*` command or
+  `verify-providers`, and `mokosh-server` never implements `dev-seed-portal` or `normalize-company-industries`
+  (src/bin/mokosh-bootstrap.rs).
+- **SPEC-3.93**: `mokosh-bootstrap`'s `dev-seed-portal` runs pending database migrations before seeding, so it
+  tolerates a fresh database with no `tenants` table yet; an unknown subcommand prints an error naming the
+  unrecognised token, then the help text, then exits with `ExitCode::FAILURE` (src/bin/mokosh-bootstrap.rs).
 
 ## 4. Interfaces
 
