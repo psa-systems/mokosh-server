@@ -1857,13 +1857,9 @@ Polled providers: default 15 minutes, floor 5.
 | Method | Path | Auth gate | Purpose |
 |---|---|---|---|
 | GET | `/integrations` | RequireAdmin | List every registry provider with status, capabilities, setup surface, `configurable_here`, `available` |
-| GET | `/integrations/{provider}` | RequireAdmin | One provider |
-| PUT | `/integrations/{provider}` | RequireAdmin | Update capabilities, config, poll interval |
-| POST | `/integrations/{provider}/connect` | RequireAdmin | Record connection |
-| POST | `/integrations/{provider}/disconnect` | RequireAdmin | Record disconnection |
 
 **Behaviour.**
-- `parse_provider` 404s an unknown provider and any provider whose `credential_home` is not `Integration` ("is configured under <surface>"). In the registry read this session no provider has `CredentialHome::Integration`, so the four per-provider routes answer 404 for every provider today; only `GET /integrations` serves. The list deliberately includes all providers; changing one is confined to its own settings surface.
+- `GET /integrations` is the whole HTTP surface. PMS-1571 removed `GET`/`PUT /integrations/{provider}` and `POST /integrations/{provider}/connect` and `/disconnect`, with `parse_provider` and the DTO validation they carried: the only credential home this surface can connect is `CredentialHome::Integration`, no registry entry takes it, and so those four answered 404 for every provider while the SPA, reading the same `configurable_here`, never drew a control that would call them. The list still includes every provider; changing one is confined to its own settings surface, which `setup` names per provider. `registry::tests::an_integration_home_provider_needs_the_per_provider_routes_back` fails the day an entry takes that home with the routes still absent.
 - `update`/`connect` reject providers whose connection lives elsewhere (409) and providers not built (409). `connect` additionally refuses a credential in the body for payment gateways (400: credentials are entered under the payment gateway settings), requires an existing `payment_gateway_configs` row holding a credential (ciphertext on the row or a value in the secret provider), and writes status through `connection::set_payment_connection`, the one writer of whether a payment provider is connected (it also mirrors `payment_gateway_configs.is_active` one way).
 - Capability validation: unknown key 400, capability not supported by the provider 400, duplicates 400; omitted capabilities on connect means all supported; `config` must be a JSON object; poll interval below the provider floor 400, set on an unpolled provider 400; `poll_interval_minutes` is a double option (explicit null clears to default).
 
