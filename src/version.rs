@@ -8,6 +8,7 @@
 
 use serde::Serialize;
 
+// SPEC-1 and 2.149: every version field is a compile-time env!() constant; there is no runtime git invocation in the server binary.
 /// Crate version from `Cargo.toml` (e.g. `"0.1.0"`).
 pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
