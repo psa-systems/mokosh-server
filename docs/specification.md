@@ -631,6 +631,12 @@ and are not reused.
 - **SPEC-4.101**: the free-text contact field named in a field-values suggestion query must map only to one of a
   fixed, closed set of column names, so that name is safe to interpolate into the query rather than being bound.
 
+### 4.19 Invoice status edit-freeze rule
+
+- **SPEC-4.102**: an invoice whose status is `sent`, `paid`, `partially_paid`, `void` or `written_off` must be
+  treated as frozen, disallowing header or line edits; only `draft` and `pending` remain editable, and correcting
+  a frozen invoice's totals must go through a credit note rather than an in-place edit.
+
 ## 5. Interfaces
 
 ### 5.1 HTTP API
