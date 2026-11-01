@@ -141,6 +141,8 @@ Around thirty modules are mounted and the 501 placeholder mechanism is gone; the
 
 One line per rule, or per group of rules answering one subject, linking its full text. A new convention adds its text under `docs/invariants/` and one line here, or a subsection under the group that already covers it (PMS-1437, PMS-1552).
 
+- Observable behavior is normative in `docs/specification.md`'s numbered `SPEC-` requirements, cited at each implementing site (PMS-1592).
+
 ### Billing
 
 - Billable time is armed at creation, not approval ([PMS-944](docs/invariants/billing.md#billable-time-pms-944))
