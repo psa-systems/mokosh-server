@@ -253,9 +253,10 @@ declare_keys! {
     Bootstrap CONFIG_PROVIDERS = "CONFIG_PROVIDERS", since "v0.14.0", optional;
     /// Base URL of the Bunyip API the Bunyip configuration provider reads.
     Bootstrap BUNYIP_CONFIG_URL = "BUNYIP_CONFIG_URL", since "v0.14.0", optional;
-    /// Machine-credential client id for `POST /v1/oauth2/token`.
+    /// Machine-credential client id this deployment presents to Bunyip's
+    /// `GET /v1/host/config/{KEY}`, as HTTP Basic.
     Bootstrap BUNYIP_CONFIG_CLIENT_ID = "BUNYIP_CONFIG_CLIENT_ID", since "v0.14.0", optional;
-    /// Machine-credential client secret for `POST /v1/oauth2/token`.
+    /// Machine-credential client secret for the same HTTP Basic credential.
     Bootstrap BUNYIP_CONFIG_CLIENT_SECRET = "BUNYIP_CONFIG_CLIENT_SECRET", since "v0.14.0", optional;
     /// PMS-981: authentication provider enablement, a comma-separated priority
     /// list (`bunyip,local` by default in `saas`; `local` in `self-hosted`).
