@@ -67,6 +67,8 @@ impl OperationalHours {
     /// Map the stored `operational_hours` string onto the enum.
     /// Anything other than `"24x7"` (case-insensitive) is treated as
     /// `BusinessHours`, matching the column default.
+    // SPEC-7.102: "24x7" (case-insensitive) maps to Always, everything else maps to
+    // BusinessHours (the column default).
     pub fn from_db(s: &str) -> Self {
         if s.eq_ignore_ascii_case("24x7") {
             OperationalHours::Always
@@ -146,6 +148,8 @@ impl BusinessSchedule {
     /// timezone falls back to UTC (logged by the caller if desired); a
     /// malformed schedule yields an all-closed schedule, which the engine
     /// degrades to 24x7 via [`BusinessSchedule::has_any_window`].
+    // SPEC-7.115: an unparseable or unknown IANA timezone string maps
+    // to UTC rather than erroring.
     pub fn parse(timezone: &str, schedule: &serde_json::Value) -> Self {
         let tz: Tz = timezone.parse().unwrap_or(Tz::UTC);
         let mut by_weekday: HashMap<Weekday, Vec<Window>> = HashMap::new();
@@ -155,6 +159,8 @@ impl BusinessSchedule {
                 let Some(weekday) = parse_weekday_key(key) else {
                     continue;
                 };
+                // SPEC-7.111: multiple (split-shift) windows per day
+                // are sorted by start and consumed in order within a day.
                 let mut windows = parse_windows(value);
                 windows.sort_by_key(|w| w.start);
                 if !windows.is_empty() {
@@ -175,6 +181,7 @@ impl BusinessSchedule {
 /// Exposed to the module (PMS-604) so the write-time schedule validator
 /// accepts exactly the key set this parser understands, keeping the two in
 /// lock-step rather than duplicating the mapping.
+// SPEC-7.116: accepts "0"-"6" (0=Sunday) or lowercase English weekday names, else None.
 pub(crate) fn parse_weekday_key(key: &str) -> Option<Weekday> {
     match key.trim() {
         "0" | "sun" | "sunday" => Some(Weekday::Sun),
@@ -202,6 +209,8 @@ fn parse_windows(value: &serde_json::Value) -> Vec<Window> {
 
 /// Parse a single `{"start": "HH:MM", "end": "HH:MM"}` object. Returns
 /// `None` if either field is missing, unparseable, or `end <= start`.
+// SPEC-7.117: drops (returns None) a window where end <= start, a
+// zero-length or inverted window that never contributes a working window.
 fn parse_window(value: &serde_json::Value) -> Option<Window> {
     let start = parse_hhmm(value.get("start")?.as_str()?)?;
     let end = parse_hhmm(value.get("end")?.as_str()?)?;
@@ -216,6 +225,7 @@ fn parse_window(value: &serde_json::Value) -> Option<Window> {
 ///
 /// Exposed to the module (PMS-604) so the write-time schedule validator
 /// accepts exactly the time formats this parser understands.
+// SPEC-7.117: accepts "HH:MM" or "HH:MM:SS".
 pub(crate) fn parse_hhmm(s: &str) -> Option<NaiveTime> {
     NaiveTime::parse_from_str(s, "%H:%M")
         .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S"))
@@ -226,6 +236,8 @@ pub(crate) fn parse_hhmm(s: &str) -> Option<NaiveTime> {
 ///
 /// Accepts bare `"YYYY-MM-DD"` strings or `{"date": "YYYY-MM-DD", ...}`
 /// objects (the `{date, name}` shape). Unparseable entries are skipped.
+// SPEC-7.118: accepts a bare "YYYY-MM-DD" string or a {"date": ...} object per entry,
+// skipping any entry with neither shape or a date that fails %Y-%m-%d parsing.
 pub fn parse_holidays(holidays: &serde_json::Value) -> HashSet<NaiveDate> {
     let mut set = HashSet::new();
     if let Some(items) = holidays.as_array() {
@@ -264,17 +276,23 @@ pub fn due_at(
     holidays: &HashSet<NaiveDate>,
     operational: OperationalHours,
 ) -> DateTime<Utc> {
+    // SPEC-7.99: a non-positive budget returns `start` unchanged,
+    // for both Always and BusinessHours.
     if hours <= 0.0 {
         return start;
     }
 
-    // Budget in whole seconds; sub-second precision is not meaningful for
-    // SLA targets and keeps the arithmetic on integers.
+    // SPEC-7.100: the budget is converted to whole seconds, rounded
+    // to the nearest second; sub-second precision is not tracked.
     let budget = Duration::seconds((hours * 3600.0).round() as i64);
 
     match operational {
+        // SPEC-7.101: Always computes start + budget as plain
+        // wall-clock addition, ignoring the schedule and holidays.
         OperationalHours::Always => start + budget,
         OperationalHours::BusinessHours => {
+            // SPEC-7.103: an all-closed schedule falls back to plain wall-clock addition
+            // instead of the day-walk, to avoid an infinite loop.
             if !schedule.has_any_window() {
                 // Misconfigured / empty schedule: avoid an infinite walk.
                 return start + budget;
@@ -292,29 +310,29 @@ fn due_at_business_hours(
     schedule: &BusinessSchedule,
     holidays: &HashSet<NaiveDate>,
 ) -> DateTime<Utc> {
+    // SPEC-7.104: walks on a cursor in the schedule's local timezone; boundary checks use
+    // local time, converted back to UTC on return.
     let tz = schedule.timezone();
     // Cursor in the schedule's local time.
     let mut cursor = start.with_timezone(&tz);
     let mut remaining = budget;
 
-    // Hard cap on iterations as a termination guard against pathological
-    // data. Each pass either consumes from a window (advancing the
-    // cursor) or skips a closed/holiday day (advancing one calendar day),
-    // so the cap bounds the calendar span the walk can cover. ~30 years
-    // of days is far beyond any realistic SLA budget yet guarantees
-    // termination even on a near-empty schedule.
+    // SPEC-7.110: hard cap of 366*30 iterations guarantees termination; past the cap,
+    // returns silently with whatever `cursor` last reached (not an error).
     for _ in 0..(366 * 30) {
         if remaining <= Duration::zero() {
             break;
         }
         let date = cursor.date_naive();
 
-        // Holiday or non-working weekday: jump to local midnight of the
-        // next day and retry.
+        // SPEC-7.105,7.114: a holiday date (local timezone, not UTC) is skipped by
+        // jumping to local midnight of the next day, before checking that day's windows.
         if holidays.contains(&date) {
             cursor = next_day_start(tz, date);
             continue;
         }
+        // SPEC-7.106: a weekday with no configured windows is
+        // skipped the same way as a holiday.
         let windows = schedule.windows(cursor.weekday());
         if windows.is_empty() {
             cursor = next_day_start(tz, date);
@@ -333,19 +351,22 @@ fn due_at_business_hours(
                 continue;
             }
 
-            // Before the window opens: fast-forward to its open instant
-            // (no budget consumed) and re-enter the loop so the same
-            // window is evaluated as "inside".
+            // SPEC-7.107: before the window opens, fast-forward to its open instant
+            // (no budget consumed), then treat the window as entered.
             if cursor < win_start {
                 cursor = win_start;
             }
 
             // We are now inside [win_start, win_end). Consume from here.
             let avail = win_end - cursor;
+            // SPEC-7.108: if remaining fits, cursor advances by remaining and stops here;
+            // the window's last second is a valid due instant (no bump to the next day).
             if remaining <= avail {
                 cursor += remaining;
                 remaining = Duration::zero();
             } else {
+                // SPEC-7.109: otherwise the whole window is consumed and the walk rolls
+                // over to the next working day's open instant plus the remainder.
                 remaining -= avail;
                 cursor = win_end;
             }
@@ -376,11 +397,12 @@ fn due_at_business_hours(
 /// (no local instant) needs the minute-walk fallback.
 fn local_dt(tz: Tz, date: NaiveDate, time: NaiveTime) -> DateTime<Tz> {
     let naive = date.and_time(time);
+    // SPEC-7.112: a DST fall-back (two valid UTC instants) resolves to the earliest.
     if let Some(dt) = tz.from_local_datetime(&naive).earliest() {
         return dt;
     }
-    // Spring-forward gap: walk forward minute by minute until the local
-    // time exists. Bounded by the largest real DST jump.
+    // SPEC-7.113: a DST spring-forward gap walks forward by minute, up to 180 minutes;
+    // if still none found, falls back to interpreting the naive datetime as UTC below.
     let mut t = naive;
     for _ in 0..180 {
         t += Duration::minutes(1);

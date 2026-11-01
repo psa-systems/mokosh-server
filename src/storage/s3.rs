@@ -31,6 +31,10 @@
 //! it comes from operator env, like `INFISICAL_ADDRESS` and the Stripe API
 //! base, and an object store on a private network is the normal case rather
 //! than the SSRF that guard exists to refuse.
+//!
+// SPEC-3.58: the configured S3 endpoint URL is not passed through the
+// outbound-URL SSRF guard used elsewhere, because it is operator
+// configuration and not a value taken from a request.
 
 use std::fmt;
 use std::time::Duration;
@@ -66,6 +70,7 @@ pub struct S3Config {
 }
 
 /// By hand, so the secret never reaches a log line through `{:?}`.
+// SPEC-3.55: redacts secret_access_key.
 impl fmt::Debug for S3Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("S3Config")
@@ -100,6 +105,13 @@ impl S3Config {
     /// falling back to the bare `S3_*` it replaced. [`env::resolve`] owns that
     /// rule and the blank-is-unset one with it, so a compose file that
     /// forwards the new name unset cannot shadow a working old one.
+    // SPEC-3.54: requires the endpoint, bucket and both halves of the
+    // credential to each resolve to a non-blank value, naming the
+    // specific missing variable otherwise; the endpoint must parse as
+    // an http/https URL with a host and no query string or fragment;
+    // STORAGE_S3_PATH_STYLE accepts only true/1/yes or false/0/no, any
+    // other non-empty value is a hard error; the bucket name must
+    // satisfy S3's naming rules.
     pub fn parse(lookup: impl Fn(&str) -> Option<String>) -> AppResult<Self> {
         let get = |var: env::StorageVar| env::resolve(var, &lookup).0;
         let required = |var: env::StorageVar| {
@@ -187,6 +199,10 @@ impl fmt::Debug for S3Provider {
 }
 
 impl S3Provider {
+    // SPEC-3.55: the HTTP client used for every S3 request has a
+    // 10-second connect timeout and a 300-second total request
+    // timeout; every request is signed with SigV4 using the
+    // hand-rolled sigv4 submodule.
     pub fn new(config: S3Config) -> AppResult<Self> {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -345,6 +361,10 @@ impl ObjectProvider for S3Provider {
         }
     }
 
+    // SPEC-3.56: maps HTTP 404 to AppError::NotFound here, so a caller
+    // can fall back to a legacy path; open (below) maps the identical
+    // HTTP 404 to AppError::Internal, mirroring the same asymmetry as
+    // the local provider.
     async fn read(&self, key: &ObjectKey) -> AppResult<Vec<u8>> {
         let object_key = Self::object_key(key)?;
         let response = self
@@ -380,6 +400,7 @@ impl ObjectProvider for S3Provider {
         }
     }
 
+    // SPEC-3.56: treats 200, 204 and 404 all as success.
     async fn delete(&self, key: &ObjectKey) -> AppResult<()> {
         let object_key = Self::object_key(key)?;
         let response = self
@@ -419,6 +440,13 @@ impl ObjectProvider for S3Provider {
     /// and, for anything else, may come back as `200 OK` with an `<Error>`
     /// document in the body: a documented S3 behaviour for a copy that started
     /// and then failed, so the body is checked and not just the status.
+    // SPEC-3.57: performs a server-side copy then deletes the source;
+    // an HTTP 200 copy response whose body contains the literal
+    // substring "<Error>" is still treated as a failure, since S3 can
+    // return 200 with an XML error body for a copy that started and
+    // then failed; a missing source at the copy step is a hard
+    // AppError::Internal, matching the local provider's non-best-effort
+    // rename rule.
     async fn rename(&self, from: &ObjectKey, to: &ObjectKey) -> AppResult<()> {
         let source_key = Self::object_key(from)?;
         let destination_key = Self::object_key(to)?;

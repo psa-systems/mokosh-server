@@ -72,6 +72,9 @@ pub mod route;
 /// human-readable string, never credential material: [`RefreshActor::System`]
 /// renders as `"System"`, an [`RefreshActor::Operator`] as
 /// `"Operator(<login>)"`.
+// SPEC-3.68: renders as exactly the literal string "System" for a
+// system-initiated refresh or "Operator(<login>)" for an
+// operator-initiated one, never any credential material.
 fn generation_header_from(generation: &Generation) -> GenerationHeader {
     let actor = match generation.actor() {
         RefreshActor::System => "System".to_string(),
@@ -90,6 +93,13 @@ fn generation_header_from(generation: &Generation) -> GenerationHeader {
 /// Never calls `provider.get(key)` or `generation.value(key)`. See the
 /// `no_value_readers_in_collector` source-scan test for the enforced form of
 /// that rule.
+// SPEC-3.59: the single process-wide reader that builds one
+// ProviderKindReport per kind for exactly six kinds, always in this
+// fixed order: configuration, application secrets, tenant secrets,
+// storage, authentication, email; never calls a provider's
+// value-returning accessor, only has/served_by.
+// SPEC-3.60: hosting_profile is always exactly the string
+// "self-hosted" or "saas", derived from the lenient DeploymentMode::from_env.
 pub fn collect() -> ProviderStatusReport {
     // The lenient reader: this is a status report, not a boot check, so
     // an unrecognised value defaults to self-hosted rather than aborting
@@ -141,6 +151,11 @@ pub fn collect() -> ProviderStatusReport {
 /// Configuration kind report. If a chain is installed (PMS-987) we walk it;
 /// otherwise we synthesize a one-entry equivalent from the environment
 /// provider that is the single-provider slot's default.
+// SPEC-3.61: serving is the first provider, in priority order, that
+// served_by reports holding any registry key; keys comes exclusively
+// from config::check_staleness(); staleness_state_name maps the four
+// staleness states to exactly the wire strings unchanged, appeared,
+// disappeared and changed_provider.
 fn collect_configuration_kind(
     installed_chain: Option<&ConfigProviderChain>,
     generation: &Generation,
@@ -233,6 +248,10 @@ fn staleness_state_name(state: config::StalenessState) -> &'static str {
 /// Application-tier secrets. PMS-988 shipped dormant: `init_from_env` may
 /// not have run in this process, in which case the module reports nothing
 /// held rather than fabricating a shape.
+// SPEC-3.62: when no process-wide AppSecrets has been initialized the
+// report shows empty enabled/serving/keys rather than a fabricated
+// shape; when initialized, serving is always secrets.declared(), the
+// declared provider, independent of which providers were actually built.
 fn collect_secrets_application_kind(secrets: Option<Arc<AppSecrets>>) -> ProviderKindReport {
     let Some(secrets) = secrets else {
         return ProviderKindReport {
@@ -299,6 +318,9 @@ fn collect_secrets_application_kind(secrets: Option<Arc<AppSecrets>>) -> Provide
 ///
 /// Returns `(report, explicit_override)` so the outer collector can build
 /// `ProviderOverrides` without a second reader of `SECRET_BACKEND`.
+// SPEC-3.63: never enumerates per-key rows (keys is always empty),
+// because enumerating a tenant secret would require a tenant scope
+// the collector does not hold.
 fn collect_secrets_tenant_kind(
     hosting_profile: DeploymentMode,
 ) -> (ProviderKindReport, Option<Vec<&'static str>>) {
@@ -342,6 +364,9 @@ fn collect_secrets_tenant_kind(
 /// Every storage setting is now listed whether or not it is set, because the
 /// list an operator needs is the one that includes the variable they have not
 /// set yet.
+// SPEC-3.64: lists every variable in storage_env::ALL regardless of
+// whether it is set, and never exposes the value of a storage
+// variable, only which variable name supplied it and whether it is set.
 fn collect_storage_kind(
     hosting_profile: DeploymentMode,
 ) -> (ProviderKindReport, Option<Vec<&'static str>>) {
@@ -400,6 +425,10 @@ fn collect_storage_kind(
 /// Authentication kind. `AuthProviderSelection::from_env` reads
 /// `AUTH_PROVIDERS` through the configuration provider, so no direct env
 /// read is needed here.
+// SPEC-3.65: reports local as always reachable; bunyip's reachability
+// is approximated as "OIDC_ISSUER and OIDC_AUDIENCE are both
+// non-empty," matching the verifier's own construction check, with a
+// distinct reason string when not reachable.
 fn collect_authentication_kind(
     hosting_profile: DeploymentMode,
 ) -> (ProviderKindReport, Option<Vec<&'static str>>) {
@@ -499,6 +528,10 @@ fn collect_authentication_kind(
 /// (`SMTP_HOST` presence infers smtp; otherwise the profile default), matching
 /// what `EmailConfig::resolve` would return for the same environment. Neither
 /// path opens an SMTP connection; the verify action is a separate route.
+// SPEC-3.66: reads the selection recorded at boot first, so the
+// report cannot disagree with what the process actually runs, and
+// falls back to inferring from SMTP_HOST presence only when boot
+// recorded nothing; neither path ever opens an SMTP connection.
 fn collect_email_kind(profile_default: &str) -> (ProviderKindReport, Option<Vec<&'static str>>) {
     let (kind, source) = match crate::utils::email::selected_kind() {
         Some(kind) => (kind, EnablementSource::Explicit),
@@ -561,6 +594,10 @@ fn collect_configuration_override() -> Option<Vec<&'static str>> {
     }
 }
 
+// SPEC-3.67: reports one deviation per kind whose resolved provider
+// list differs from the hosting profile's default, naming both the
+// profile default and the explicit list; identical lists produce zero
+// deviations.
 fn collect_deviations(selection: &ProviderSelection) -> Vec<HostingProfileDeviation> {
     selection
         .deviations()

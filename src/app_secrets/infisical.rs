@@ -73,6 +73,9 @@ impl InfisicalProvider {
     /// classification exists to catch. A missing secret in Infisical is a
     /// different fact (returned as `None` by the client on 404), and is
     /// treated as unheld in the cache.
+    // SPEC-3.15: reads from the fixed folder /app, distinct from the tenant
+    // tier's /mokosh/integrations; fetches every governed secret once; a
+    // 404 reads as unheld, any other load failure is fatal.
     pub async fn load() -> AppResult<Self> {
         let config = InfisicalSecretsConfig::from_env()?;
         let client =

@@ -1102,6 +1102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::time::Duration::from_secs(3600),
     );
     // SPEC-1 and 2.42: SLA sweep is registered on a hardcoded 60s interval.
+    // SPEC-7.130: SlaSweepWorker runs on a 60-second fixed interval.
     scheduler.register(sla_worker, std::time::Duration::from_secs(60));
 
     // Appointment-reminder worker (PMS-58 follow-up). Each 60s tick
