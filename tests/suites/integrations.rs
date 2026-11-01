@@ -76,6 +76,22 @@ fn entry<'a>(entries: &'a [Value], provider: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("{provider} is not in the catalog"))
 }
 
+/// A path this surface does not serve, whatever method asked for it.
+///
+/// PMS-1571: two statuses, because the app-level fallback in
+/// `create_api_router` is `get(not_a_frontend)` - a GET-only method router. A
+/// path no route matches therefore answers 404 to a GET (that handler's own
+/// HTML page, not the JSON envelope) and 405 to anything else, since the
+/// fallback matched the path and refused the method. Both mean "no route
+/// here", and asserting the pair rather than one of them is what keeps this
+/// about the integrations surface instead of pinning the fallback's shape.
+fn assert_not_served(status: StatusCode, what: &str) {
+    assert!(
+        status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+        "{what} answered {status}, so something still serves it"
+    );
+}
+
 async fn connect(
     app: &common::TestApp,
     token: &str,
@@ -167,7 +183,11 @@ async fn the_catalog_says_which_providers_the_write_route_will_take(pool: PgPool
             .send()
             .await
             .expect("put");
-        let takes_it = put.status() != StatusCode::NOT_FOUND;
+        // Served at all, by the same pair `assert_not_served` explains: a
+        // mounted PUT answers with its handler's status, an absent one with
+        // the fallback's 404 or 405.
+        let takes_it =
+            put.status() != StatusCode::NOT_FOUND && put.status() != StatusCode::METHOD_NOT_ALLOWED;
         assert_eq!(
             configurable,
             takes_it,
@@ -363,7 +383,7 @@ async fn no_provider_can_be_connected_here_and_the_catalog_says_where_each_one_i
             .send()
             .await
             .expect("get");
-        assert_eq!(get.status(), StatusCode::NOT_FOUND, "GET {base}");
+        assert_not_served(get.status(), &format!("GET {base}"));
 
         let put = app
             .client
@@ -373,14 +393,10 @@ async fn no_provider_can_be_connected_here_and_the_catalog_says_where_each_one_i
             .send()
             .await
             .expect("put");
-        assert_eq!(put.status(), StatusCode::NOT_FOUND, "PUT {base}");
+        assert_not_served(put.status(), &format!("PUT {base}"));
 
         let connected = connect(&app, &token, provider, json!({ "credential": "anything" })).await;
-        assert_eq!(
-            connected.status(),
-            StatusCode::NOT_FOUND,
-            "POST {base}/connect"
-        );
+        assert_not_served(connected.status(), &format!("POST {base}/connect"));
 
         let disconnected = app
             .client
@@ -389,11 +405,7 @@ async fn no_provider_can_be_connected_here_and_the_catalog_says_where_each_one_i
             .send()
             .await
             .expect("disconnect");
-        assert_eq!(
-            disconnected.status(),
-            StatusCode::NOT_FOUND,
-            "POST {base}/disconnect"
-        );
+        assert_not_served(disconnected.status(), &format!("POST {base}/disconnect"));
 
         assert_eq!(
             row_count(&pool, provider).await,
@@ -413,11 +425,23 @@ async fn no_provider_can_be_connected_here_and_the_catalog_says_where_each_one_i
         "a credential was stored for a provider this surface cannot connect"
     );
 
-    // The operator-facing half: each provider names its own page, and no two
-    // name the same one. This was asserted against the refusal messages while
-    // they existed; the catalog is where the SPA reads it, so it is where the
-    // rule belongs.
-    let mut surfaces: Vec<String> = Vec::new();
+    // The operator-facing half: each provider names a page, and no provider
+    // is sent to another one's. This was asserted against the refusal
+    // messages while they existed; the catalog is where the SPA reads it, so
+    // it is where the rule belongs.
+    //
+    // Sharing a page is allowed, and the first version of this assertion was
+    // wrong to forbid it: Stripe and PayPal are both set up on Settings >
+    // Payment Gateways, because the surface is a property of the credential
+    // home and two payment providers do not get to disagree about where the
+    // payments page is. What must not happen is a provider sent to a page
+    // that belongs to a DIFFERENT home - a Xero admin pointed at contact
+    // sync - so the rule is that two providers naming one page must name one
+    // home too. `credential_elsewhere` is the home as the response states it,
+    // absent for the invoice issuers, whose credential is a consent round
+    // trip and is entered nowhere.
+    let mut by_surface: std::collections::HashMap<&str, Vec<(&str, Option<&str>)>> =
+        std::collections::HashMap::new();
     for row in &entries {
         let provider = row["provider"].as_str().expect("provider");
         let label = row["setup"]["label"].as_str().unwrap_or_else(|| {
@@ -427,16 +451,17 @@ async fn no_provider_can_be_connected_here_and_the_catalog_says_where_each_one_i
             !label.contains("MAPPS-") && !label.contains("PMS-"),
             "an MSP admin has no use for our issue keys: {label}"
         );
-        surfaces.push(label.to_string());
+        let home = row["credential_elsewhere"].as_str();
+        by_surface.entry(label).or_default().push((provider, home));
     }
-    let mut unique = surfaces.clone();
-    unique.sort();
-    unique.dedup();
-    assert_eq!(
-        unique.len(),
-        surfaces.len(),
-        "two providers send an operator to the same page: {surfaces:?}"
-    );
+    for (label, sharers) in &by_surface {
+        let homes: Vec<Option<&str>> = sharers.iter().map(|(_, home)| *home).collect();
+        assert!(
+            homes.windows(2).all(|pair| pair[0] == pair[1]),
+            "{label} is named by providers whose credentials live in different places, so at \
+             least one of them is pointed at another provider's page: {sharers:?}"
+        );
+    }
 }
 
 /// A row left by an earlier build can still be disconnected, and disconnecting
@@ -489,7 +514,10 @@ async fn a_row_left_by_an_earlier_build_can_still_be_disconnected(pool: PgPool) 
         .send()
         .await
         .expect("disconnect");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_not_served(
+        response.status(),
+        "POST /integrations/{provider}/disconnect",
+    );
 
     // And the way out exists on the page that owns it, which is the half of
     // this case that matters: the invariant is that a tenant is never
@@ -605,7 +633,14 @@ async fn one_tenants_integration_is_invisible_to_another(pool: PgPool) {
         .send()
         .await
         .expect("disconnect across tenants");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // PMS-1571: the route is gone, so this says less than it did - the
+    // isolation it was asserting is the LIST above, which is where this case
+    // earns its keep. Kept as the statement that no path on this surface lets
+    // one tenant touch another's row.
+    assert_not_served(
+        response.status(),
+        "POST /integrations/{provider}/disconnect across tenants",
+    );
 
     // Ours is untouched.
     let ours = list(&app, &token).await;
