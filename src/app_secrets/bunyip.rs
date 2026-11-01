@@ -89,6 +89,9 @@ impl BunyipSecretsConfig {
     /// A URL with half a credential is an error rather than `None`: the
     /// operator plainly meant to configure this, and a silent `None` would
     /// make the secret look merely absent.
+    // SPEC-3.12: blank BUNYIP_SECRETS_URL means Ok(None); a set URL with a
+    // missing half of the credential is a fatal Configuration error naming
+    // the register-machine-client remedy.
     pub fn resolve(
         base_url: &str,
         client_id: &str,
@@ -179,6 +182,8 @@ pub struct BunyipProvider {
 /// Hand-written rather than derived: a derive would print the cached values,
 /// and a provider that renders its secrets into a panic message or a debug log
 /// is the leak this tier exists to prevent. The count is the useful fact.
+// SPEC-3.14: answers only for the Google client id/secret pair; Debug
+// prints only the count of secrets held, never a value.
 impl std::fmt::Debug for BunyipProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BunyipProvider")
@@ -195,6 +200,10 @@ impl BunyipProvider {
     /// Each one names its own remedy, since they are fixed in three different
     /// places: a 403 is bunyip's allow-list, a 404 is bunyip's admin page, and
     /// a transport failure is the URL or the network between them.
+    // SPEC-3.13: fetches exactly one key (mokosh/google_oauth_client) once,
+    // via HTTP Basic auth; its value is a JSON string parsed into a
+    // client_id/client_secret pair; 401/403/404/other each produce a
+    // distinct remedy message.
     pub async fn load(config: &BunyipSecretsConfig) -> AppResult<Self> {
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)

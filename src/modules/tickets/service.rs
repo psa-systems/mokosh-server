@@ -27,6 +27,7 @@ use super::models::*;
 /// migration 148 on every CI run, so editing one side without the other
 /// fails the build the way migrations 104/110/148 rewriting the same row
 /// three times with nobody noticing never did.
+// SPEC-7.28: this literal must stay byte-identical to the seeded SQL migration 148 template; enforced by scripts/check-no-duplicate-mail-copy.nu.
 const TICKET_NOTE_ADDED_SENTENCE: &str = "has added an update to ticket";
 
 /// Ticket management service
@@ -58,6 +59,7 @@ impl TicketService {
     /// staff pass `None`. The state is `compute_sla_status` over the
     /// same clock the list badge uses (created, due, resolved, closed,
     /// and the status's `is_closed` flag), so the two never disagree.
+    // SPEC-7.15: TicketSlaResponse exposes only sla_due_date/first_response_due/first_response_at/resolution_due/resolved_at/closed_at/status/status_name; no policy id, escalation chain, or calendar is exposed.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, ticket_id = %ticket_id))]
     pub async fn get_ticket_sla(
         &self,
@@ -81,6 +83,7 @@ impl TicketService {
         .fetch_optional(&mut *tx)
         .await?;
         let row = row.ok_or_else(|| AppError::NotFound("Ticket".to_string()))?;
+        // SPEC-7.16: SLA status is computed by the single shared compute_sla_status helper everywhere a ticket's SLA state is rendered, so the agent view, portal view, and sweep worker cannot disagree (PMS-893).
         let status = mokosh_types::tickets::compute_sla_status(&mokosh_types::tickets::SlaClock {
             created_at: row.created_at,
             sla_due_date: row.sla_due_date,
@@ -222,6 +225,7 @@ impl TicketService {
     /// was not found.
     /// PMS-737: the parent a child may name: this tenant's, the same
     /// company's, and not itself a child.
+    // SPEC-7.4: a parent_ticket_id that already has a non-null parent is rejected; nesting is one level only.
     async fn assert_parent_ticket(
         &self,
         tenant_id: TenantId,
@@ -298,6 +302,7 @@ impl TicketService {
     }
 
     /// Generate next ticket number for tenant
+    // SPEC-7.1: ticket_number is formatted "T{:06}" from the tenant's next sequence value.
     async fn next_ticket_number(&self, tenant_id: TenantId) -> AppResult<String> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, (i32,)>(
@@ -328,6 +333,7 @@ impl TicketService {
         let ticket_id = Uuid::new_v4();
         let ticket_number = self.next_ticket_number(tenant_id).await?;
 
+        // SPEC-7.2: an omitted status_id/priority_id/queue_id resolves to the tenant's is_default row.
         // Get default status
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let default_status_id: Uuid = sqlx::query_scalar(
@@ -365,6 +371,7 @@ impl TicketService {
         };
         drop(tx);
 
+        // SPEC-7.3: every FK reference on the request is validated against the caller's own tenant.
         // PSA audit: every foreign id from the request body must belong to
         // this tenant before it is linked, so a request cannot point a
         // ticket at another tenant's company/contact/site/etc.
@@ -393,6 +400,8 @@ impl TicketService {
                 .await?;
         }
 
+        // SPEC-7.5: the insert, the audit write, and run_ticket_created all run inside this one transaction.
+        // SPEC-7.59: every ticket mutation opens its transaction with Database::begin_with_tenant(tenant_id), setting the RLS GUC app.current_tenant for its duration.
         // Insert + audit row in one transaction: capture the new row
         // with Postgres to_jsonb and write the audit entry on the same
         // tx so a rollback drops both. PMS-117.
@@ -488,6 +497,7 @@ impl TicketService {
         .await?;
         tx.commit().await?;
 
+        // SPEC-7.6: on-create automation and SLA evaluation run after commit, outside any open transaction, falling back to the tenant's default due business days when no policy matches.
         // Audit F11: run on_create automation rules. Failures are logged
         // but do not abort the ticket creation - a misconfigured rule
         // shouldn't block legitimate work. Runs before `evaluate_sla`
@@ -730,6 +740,7 @@ impl TicketService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // SPEC-7.7: only fields actually present in the request get an UPDATE; an omitted field is never overwritten (PATCH semantics).
         // Build update
         if let Some(ref title) = request.title {
             sqlx::query("UPDATE tickets SET title = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
@@ -752,6 +763,7 @@ impl TicketService {
         }
 
         if let Some(status_id) = request.status_id {
+            // SPEC-7.8: closed_at/resolved_at are set via now() only the first transition into an is_closed status, guarded by closed_at.is_none() so a later transition does not overwrite the original timestamp.
             // Check if status is closing the ticket
             let is_closed: bool =
                 sqlx::query_scalar("SELECT is_closed FROM ticket_statuses WHERE id = $1")
@@ -836,6 +848,7 @@ impl TicketService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // SPEC-7.9: a checkbox-only change is skipped from the audit log, since it carries no customer-visible content change.
         // PMS-349: a description edit that only flips task-list checkboxes is a
         // checklist toggle, not a content change, so skip the audit entry to
         // keep the change history free of checkbox noise.
@@ -853,6 +866,7 @@ impl TicketService {
             .await?;
         }
 
+        // SPEC-7.10: run_ticket_status_changed/run_ticket_priority_changed fire inside the same transaction as the field UPDATE, only when the value actually changes.
         // PMS-448 phase 2: fire transition triggers. Each runs in
         // this same transaction so a logged rule firing commits
         // atomically with the underlying transition. Both
@@ -897,6 +911,7 @@ impl TicketService {
         }
         tx.commit().await?;
 
+        // SPEC-7.11: on-update automation and SLA re-evaluation run after commit, outside any open transaction.
         // Audit F11: run on_update automation rules. Same fail-soft
         // policy as on_create - log but do not surface a 500. Runs
         // before `evaluate_sla` (PMS-1564): a rule's `set_priority_id` /
@@ -978,6 +993,7 @@ impl TicketService {
             .execute(&mut *tx)
             .await
         {
+            // SPEC-7.12: a foreign-key violation (SQLSTATE 23503) on delete is mapped to 400, not a generic 500.
             // A referencing row with the default RESTRICT FK (time entries,
             // child tickets, billing) raises SQLSTATE 23503. Surface it as a
             // 400 with an actionable message instead of the generic 500 that
@@ -1005,6 +1021,7 @@ impl TicketService {
         )
         .await?;
         tx.commit().await?;
+        // SPEC-7.13: attachment blobs are purged from object storage only after the delete transaction commits.
         crate::storage::purge_attachment_blobs(&self.db, tenant_id.get(), &attachment_ids, false)
             .await;
 
@@ -1012,6 +1029,7 @@ impl TicketService {
     }
 
     /// Assign ticket to user
+    // SPEC-7.14: assign_ticket updates assigned_to_id but, unlike every other mutation here, writes no audit log row.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn assign_ticket(
         &self,
@@ -1086,6 +1104,7 @@ impl TicketService {
             .execute(&mut *tx)
             .await?;
 
+        // SPEC-7.26: first_response_at is set via COALESCE(first_response_at, now()) the first time a note is added, and left untouched on every subsequent note.
         // Record first response if this is a public note and first response hasn't been recorded
         if request.note_type == NoteType::Public {
             sqlx::query(
@@ -1137,6 +1156,7 @@ impl TicketService {
     /// the record is the point. Returned as a sentence because the caller turns
     /// it into a 409 and the agent has to be able to act on it.
     fn note_edit_block(note: &TicketNote) -> Option<String> {
+        // SPEC-7.34: a note with created_by_contact_id set is refused for edit regardless of note_type, because it is the customer's own words.
         // The customer's own words, posted through the portal (PMS-449). An
         // agent editing them is putting words in the customer's mouth.
         if note.created_by_contact_id.is_some() {
@@ -1145,10 +1165,12 @@ impl TicketService {
                     .to_string(),
             );
         }
+        // SPEC-7.36: an internal note, a resolution note, and a public note that has never been emailed are permitted (return None) when none of the refusal branches below apply.
         match note.note_type {
             // Never left the building.
             NoteType::Internal | NoteType::Resolution => None,
             NoteType::Public => {
+                // SPEC-7.33: a public note with is_email_sent true is refused for edit, since the customer holds the original in their inbox and an edited row would disagree with the customer's own evidence.
                 // The customer holds the original in their inbox. Editing this
                 // row makes the system disagree with the customer's own
                 // evidence, which is the disagreement an MSP loses.
@@ -1162,6 +1184,7 @@ impl TicketService {
                     None
                 }
             }
+            // SPEC-7.35: a TimeEntry note is refused for edit, directing the edit to the underlying time entry instead.
             // Nothing writes one today, but the type exists to mirror a time
             // entry and the edit belongs on the entry.
             NoteType::TimeEntry => {
@@ -1240,6 +1263,7 @@ impl TicketService {
         // inheriting `can_manage_users`. Each refusal names what would have to
         // change, because "Forbidden" alone does not tell an agent whether to
         // ask the author or the administrator.
+        // SPEC-7.32: update_note applies two orthogonal gates, a WHO gate (NoteEditPolicy) returning 403 on failure and a WHAT/row-state gate (note_edit_block) returning 409 on failure.
         let policy = self.note_edit_policy(tenant_id).await?;
         if !policy.permits(editor, note.created_by_id) {
             return Err(AppError::Forbidden(match policy {
@@ -1318,6 +1342,7 @@ impl TicketService {
     /// logged; we never surface a 5xx for a note add when only the
     /// email side fails, because the note itself is already persisted
     /// and visible to the agent.
+    // SPEC-7.27: a mail-send failure here is logged via tracing::warn! and never fails the note-creation request, since the note row already committed.
     async fn send_note_email(
         &self,
         tenant_id: TenantId,
@@ -1476,6 +1501,7 @@ impl TicketService {
     }
 
     /// Get notes for a ticket
+    // SPEC-7.29: the agent view orders notes created_at DESC (newest first).
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_ticket_notes(
         &self,
@@ -1664,6 +1690,8 @@ impl TicketService {
     // default clears the prior default in the SAME transaction so a tenant
     // never has two defaults. Deletes catch the FK violation a still-referenced
     // row raises (SQLSTATE 23503) and surface it as a 409 instead of a 500.
+    //
+    // SPEC-7.19: every create_* that sets is_default=true first clears is_default on every other row for the tenant and lookup kind, enforcing a single default row per tenant per kind.
     // ========================================================================
 
     /// Create a ticket status.
@@ -2251,6 +2279,7 @@ impl TicketService {
         // (A -> B -> C -> A) and any tree walk over `parent_id` would never
         // terminate. The depth-1 self-parent case above is the trivial member
         // of this set; this CTE covers the transitive cases.
+        // SPEC-7.20: a parent_id that would create a cycle in the category hierarchy is rejected, detected via this recursive CTE.
         if let Some(parent_id) = request.parent_id {
             let mut tx = self.db.begin_with_tenant(tenant_id).await?;
             let forms_cycle: bool = sqlx::query_scalar(
@@ -2330,6 +2359,7 @@ impl TicketService {
     /// compile-time constants, never user input. Maps the FK violation a
     /// still-referenced row raises (SQLSTATE 23503) to a 409, and a missing
     /// row to a 404.
+    // SPEC-7.21: every lookup delete_* maps SQLSTATE 23503 (still referenced by a ticket) to 409 via this shared handler, rather than a 500.
     async fn delete_lookup(
         &self,
         tenant_id: TenantId,
@@ -2473,6 +2503,7 @@ impl TicketService {
     /// back-channel discussion. Cross-company access surfaces as 404
     /// (same posture as `get_portal_ticket`), so a guessed ticket id
     /// in another company yields the same response as a missing one.
+    // SPEC-7.30: the portal/customer view orders notes created_at ASC (oldest first, thread order), distinct from the agent view.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_portal_ticket_notes(
         &self,
@@ -2538,6 +2569,7 @@ impl TicketService {
     /// from this customer" feed. The partial index on
     /// `(tenant_id, created_by_contact_id)` from migration 069 makes
     /// this one index scan per call.
+    // SPEC-7.31: list_notes_by_contact orders notes created_at DESC (newest first).
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_notes_by_contact(
         &self,
@@ -2742,6 +2774,7 @@ impl TicketService {
         let Some(is_closed) = currently_closed else {
             return Err(AppError::NotFound("Ticket".to_string()));
         };
+        // SPEC-7.18: reopen_portal_ticket is idempotent; reopening an already-open ticket does not error.
         if !is_closed {
             // Already open (or a status the customer would not call
             // "closed"). Nothing to do; return the current state.
@@ -2882,6 +2915,7 @@ impl TicketService {
     /// Verify the ticket belongs to the portal contact's company within the
     /// caller's tenant. Surfaces 404 on miss to avoid confirming the existence
     /// of another company's ticket.
+    // SPEC-7.56: assert_ticket_visible_to_company/assert_portal_ticket_visible return 404, never 403, when a contact requests a ticket outside their own company.
     async fn assert_portal_ticket_visible(
         &self,
         tenant_id: TenantId,
@@ -3021,6 +3055,8 @@ impl TicketService {
     // `(tenant_id, user_id, name)` is per-user, and a view id this user does
     // not own answers 404 rather than 403 so a cross-user caller cannot use
     // the endpoint as an existence oracle. RLS handles the tenant half.
+    //
+    // SPEC-7.57: every saved-view CRUD method scopes rows strictly to (tenant_id, user_id); another user's saved view in the same tenant is 404, never 403.
     // ========================================================================
 
     /// List this user's saved views for the Tickets list, name-ascending so
@@ -3223,6 +3259,7 @@ struct TicketFilterSql {
 /// the PMS-406 `my_teams` scope to resolve the caller's team membership;
 /// `None` on paths with no user (e.g. portal), where `my_teams` is never
 /// set anyway.
+// SPEC-7.22: list_tickets builds its WHERE clause exclusively through this enumeration of every supported filter field; a field not named here is rejected, never silently ignored.
 #[allow(unused_assignments)]
 fn build_ticket_filter_sql(
     filter: &TicketFilter,
@@ -3596,6 +3633,8 @@ struct TicketResponseRow {
 /// expressions must NOT be shared. `order_by_mapped` exists so a joined column
 /// can be sorted without the API ever naming it, and exporting these pairs
 /// would give that away.
+// SPEC-7.23: list_tickets sort keys accepted from the client are limited to this allow-list; a key outside it is rejected (422) rather than translated into an arbitrary SQL expression.
+// SPEC-7.25: these mapped keys must stay exactly equal, in order, to mokosh_types::sort::TICKETS, and no SQL expression may itself be an accepted wire key; enforced by the pms897_tests unit tests below, not the compiler.
 const TICKET_SORT_COLUMNS: &[(&str, &str)] = &[
     ("created_at", "t.created_at"),
     ("updated_at", "t.updated_at"),
@@ -3603,6 +3642,7 @@ const TICKET_SORT_COLUMNS: &[(&str, &str)] = &[
     ("ticket_number", "t.ticket_number"),
     ("company_name", "co.name"),
     ("status", "ts.name"),
+    // SPEC-7.24: the priority sort key orders by tp.sort_order (rank), never by id or name, because sorting by name would put "High" above "Urgent".
     // The rank, not the id or the name: a UUID is meaningless to sort by, and
     // the name puts High above Urgent.
     ("priority", "tp.sort_order"),
@@ -3626,6 +3666,7 @@ fn unresolved_ticket_response_person_ids(rows: &[TicketResponseRow]) -> Vec<Uuid
 }
 
 impl From<TicketResponseRow> for TicketResponse {
+    // SPEC-7.16: this mapping computes SLA status through the same shared compute_sla_status helper used by the agent view, portal view, and the background SLA sweep worker, so they cannot disagree (PMS-893).
     fn from(r: TicketResponseRow) -> Self {
         // The joined row already carries everything `compute_sla_status`
         // needs, so reuse the shared helper instead of rebuilding a full

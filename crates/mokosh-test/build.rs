@@ -11,5 +11,7 @@
 //! build script.
 
 fn main() {
+    // SPEC-1 and 2.162: declares migrations/ a build dependency so this crate recompiles whenever a migration is
+    // added or changed, keeping the compile-time-embedded migration set from going stale relative to the tree.
     println!("cargo:rerun-if-changed=../../migrations");
 }

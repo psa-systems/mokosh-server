@@ -58,6 +58,7 @@ pub fn ticket_template_routes(service: TicketTemplatesService) -> Router {
 // Authoring + reading ticket templates is admin-gated to match the
 // workflow-rule surface: both are tenant-wide automation config an
 // admin owns, not per-agent data.
+// SPEC-7.60: every ticket-template route (list/get/create/update/delete) requires the RequireAdminUser extractor; there is no agent-level access to this surface.
 
 async fn list(
     State(s): State<TicketTemplatesRouterState>,
