@@ -27,6 +27,9 @@ impl DatabaseSecretProvider {
 
 #[async_trait]
 impl SecretProvider for DatabaseSecretProvider {
+    // SPEC-3.22: every get/put/put_if_absent/delete runs inside a
+    // begin_with_tenant transaction, so RLS independently confines the row
+    // to its tenant.
     async fn get(&self, key: &SecretKey) -> AppResult<Option<String>> {
         let name = key.name()?;
         // `begin_with_tenant` and not the migrator pool, even though the row is
@@ -75,6 +78,8 @@ impl SecretProvider for DatabaseSecretProvider {
         Ok(())
     }
 
+    // SPEC-3.22: ON CONFLICT (tenant_id, name) DO NOTHING RETURNING 1 is the
+    // atomic compare-and-set; returns true iff this call inserted the row.
     async fn put_if_absent(&self, key: &SecretKey, value: &str) -> AppResult<bool> {
         let name = key.name()?;
         let ciphertext = crate::utils::crypto::encrypt(value, &self.encryption_key)?;

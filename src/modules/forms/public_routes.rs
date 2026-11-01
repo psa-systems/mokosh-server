@@ -48,6 +48,8 @@ impl RequestFormLimiter {
         // is several requests in a minute, and a false 429 on a client-facing
         // form is a support call. 30/min still cuts a grinder to a rate at
         // which the token space is unreachable.
+        // SPEC-7.255: 30 requests/minute per IP, in-memory and not shared across
+        // replicas, applied before the token is resolved.
         let quota = Quota::per_minute(NonZeroU32::new(30).expect("30 is non-zero"));
         Arc::new(Self {
             by_ip: RateLimiter::keyed(quota),
@@ -80,6 +82,8 @@ struct PublicFormsState {
 }
 
 /// Mounted by the caller under `/api/v1/public`.
+// SPEC-7.254: GET/POST /request-forms/{token} are mounted outside authentication
+// middleware and outside the portal tree; the only identity presented is the token itself.
 pub fn public_form_routes(service: FormsService) -> Router {
     let state = PublicFormsState {
         service: Arc::new(service),
@@ -110,6 +114,8 @@ fn rate_limited(retry_after: u64) -> Response {
 /// Render the form behind a link. Resolving is what validates the token, so a
 /// used, expired or guessed link fails here with the same generic message a
 /// malformed one gets.
+// SPEC-7.256: resolving the token is the only point of failure for this route, so a
+// malformed, guessed, expired or already-submitted token all fail the same way from here.
 async fn get_public_form(
     State(s): State<PublicFormsState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -126,6 +132,8 @@ async fn get_public_form(
 
 /// Submit the form behind a link: validate, store, create the ticket, burn the
 /// link. Returns the ticket number so the client has something to quote.
+// SPEC-7.257: resolves the token, submits the body's payload via
+// submit_via_request_link, and returns 201 Created with the receipt on success.
 async fn submit_public_form(
     State(s): State<PublicFormsState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,

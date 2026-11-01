@@ -88,6 +88,8 @@ pub struct ApprovalCountResponse {
 /// Each variant maps 1:1 to the `target` column's CHECK values; the
 /// route layer mounts a per-entity prefix that resolves into this
 /// enum before calling into the generic service.
+// SPEC-7.509: from_str rejects any string outside these four
+// variants; the DB CHECK on the target column enforces the same set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalTarget {
     Ticket,
@@ -117,6 +119,8 @@ impl ApprovalTarget {
     }
 }
 
+// SPEC-7.519: approver_role is capped at 50 chars and notes at
+// 4000 chars; req.validate() runs in the route handler before the service.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateApprovalRequest {
     /// Exactly one of `approver_user_id` (assign-by-id),

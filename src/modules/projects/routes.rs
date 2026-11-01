@@ -6,6 +6,7 @@
 //! deferred to a Gantt / dependency-graph screen. Note covers ONLY the
 //! three phase / task-dep routes; every other route in this file is consumed.
 
+// SPEC-7.425: the phase routes and the task-dependency routes have no SPA caller as of the 2026-09-22 parity record above.
 use std::sync::Arc;
 
 use crate::utils::json::Json;
@@ -99,20 +100,20 @@ async fn list_projects(
     Query(p): Query<PaginationParams>,
 ) -> AppResult<axum::response::Response> {
     use axum::response::IntoResponse;
-    f.validate()?;
-    // PMS-935: dual-plane sweep. Contact callers must hold
-    // `projects:read`; server stamps `company_id` from the session
-    // so a spoofed query param cannot widen visibility. Projects
-    // with a NULL `company_id` (staff-side house projects) are
-    // implicitly excluded from the contact view. PMS-1061: the contact
-    // arm answers with `ContactProjectResponse`, the customer's
-    // projection, never the staff type.
+    f.validate()?; // SPEC-7.416: status/q length caps enforced before the query runs
+                   // PMS-935: dual-plane sweep. Contact callers must hold
+                   // `projects:read`; server stamps `company_id` from the session
+                   // so a spoofed query param cannot widen visibility. Projects
+                   // with a NULL `company_id` (staff-side house projects) are
+                   // implicitly excluded from the contact view. PMS-1061: the contact
+                   // arm answers with `ContactProjectResponse`, the customer's
+                   // projection, never the staff type.
     let tenant = caller.tenant();
     match &caller {
-        CallerContext::Staff(auth) => assert_staff_authenticated(auth)?,
+        CallerContext::Staff(auth) => assert_staff_authenticated(auth)?, // SPEC-7.411: staff caller must be authenticated
         CallerContext::Contact(session) => {
-            caller.require_capability(caps::PROJECTS_READ, &db).await?;
-            f.company_id = Some(session.company_id);
+            caller.require_capability(caps::PROJECTS_READ, &db).await?; // SPEC-7.412: contact caller must hold projects:read
+            f.company_id = Some(session.company_id); // SPEC-7.413, SPEC-7.415: server-stamped company_id overrides any client value, which also excludes NULL-company house projects from the contact view
         }
     }
     let (items, total) = s.service.list_projects(tenant, &f, &p).await?;
@@ -120,6 +121,7 @@ async fn list_projects(
         CallerContext::Staff(_) => {
             Json(PaginatedResponse::from_params(items, &p, total)).into_response()
         }
+        // SPEC-7.414: a contact caller gets ContactProjectResponse, never the staff ProjectResponse
         CallerContext::Contact(_) => Json(PaginatedResponse::from_params(
             items
                 .into_iter()
@@ -136,6 +138,7 @@ async fn list_projects(
 /// stat cards without fetching every project to add them up.
 async fn project_summary(
     State(s): State<ProjectsRouterState>,
+    // SPEC-7.424: GET /projects/summary requires RequireProjects
     RequireProjects { user: u, .. }: RequireProjects,
 ) -> AppResult<Json<ProjectSummaryResponse>> {
     Ok(Json(s.service.project_summary(u.tenant()).await?))
@@ -166,9 +169,9 @@ async fn get_project(
     // `ContactProjectResponse`, never the staff type.
     let tenant = caller.tenant();
     match &caller {
-        CallerContext::Staff(auth) => assert_staff_authenticated(auth)?,
+        CallerContext::Staff(auth) => assert_staff_authenticated(auth)?, // SPEC-7.417: staff caller must be authenticated
         CallerContext::Contact(_) => {
-            caller.require_capability(caps::PROJECTS_READ, &db).await?;
+            caller.require_capability(caps::PROJECTS_READ, &db).await?; // SPEC-7.418: contact caller must hold projects:read
         }
     }
     let project = s.service.get_project(tenant, id).await?;
@@ -176,6 +179,7 @@ async fn get_project(
         CallerContext::Staff(_) => Json(project).into_response(),
         CallerContext::Contact(session) => {
             if project.company_id != Some(session.company_id) {
+                // SPEC-7.419: a company mismatch 404s, same as a missing project, so a probe cannot tell the two apart
                 return Err(AppError::NotFound("Project".to_string()));
             }
             Json(ContactProjectResponse::from(project)).into_response()
@@ -192,6 +196,7 @@ async fn get_project(
 /// types, task dependencies) stays behind `RequireProjects` and is
 /// therefore implicitly staff-only: a contact bearer never
 /// populates `AuthState`, so those extractors 401.
+// SPEC-7.420: POST/PUT/DELETE projects and every phase/task-status/project-type/task/task-dependency route require RequireProjects, so a contact caller 401s on all of them
 fn assert_staff_authenticated(auth: &crate::modules::auth::AuthState) -> AppResult<()> {
     auth.user.as_ref().ok_or(AppError::Unauthorized)?;
     Ok(())
@@ -213,7 +218,7 @@ async fn update_project(
 async fn delete_project(
     State(s): State<ProjectsRouterState>,
     RequireProjects { user: u, .. }: RequireProjects,
-    _a: RequireAdmin,
+    _a: RequireAdmin, // SPEC-7.421: DELETE /projects/{id} additionally requires admin
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
     s.service.delete_project(u.tenant(), id).await
@@ -294,7 +299,7 @@ async fn list_task_statuses(
 async fn create_task_status(
     State(s): State<ProjectsRouterState>,
     RequireProjects { user: u, .. }: RequireProjects,
-    _a: RequireAdmin,
+    _a: RequireAdmin, // SPEC-7.422: create/update/delete task-statuses require admin in addition to RequireProjects
     ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertTaskStatusRequest>,
 ) -> AppResult<Json<TaskStatusResponse>> {
@@ -348,7 +353,7 @@ async fn list_project_types(
 async fn create_project_type(
     State(s): State<ProjectsRouterState>,
     RequireProjects { user: u, .. }: RequireProjects,
-    _a: RequireAdmin,
+    _a: RequireAdmin, // SPEC-7.423: create/update/delete project-types require admin; GET /project-types needs only RequireProjects
     ctx: crate::modules::audit::AuditCtx,
     Json(req): Json<UpsertProjectTypeRequest>,
 ) -> AppResult<Json<ProjectTypeResponse>> {
