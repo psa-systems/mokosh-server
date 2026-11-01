@@ -1334,7 +1334,7 @@ pub fn create_api_router(
     ));
 
     // SPEC-1 and 2.60: the seven top-level mounts and their auth models (session /api/v1, no-auth-by-design /api/v1/public, contact Bearer /api/v1/contact, and the four signed
-    // receivers) match CLAUDE.md's "Routing model" claim; the invoice-issuer webhooks mount below is a fifth signed receiver the CLAUDE.md prose does not name individually.
+    // receivers) match CLAUDE.md's "Routing model" claim; the invoice-issuer webhooks mount below is the fourth signed receiver the CLAUDE.md prose does not name individually.
     Router::new()
         .nest("/api/v1", api_v1)
         .nest("/api/v1/public", public_api)
@@ -1355,7 +1355,7 @@ pub fn create_api_router(
                 crate::modules::billing::invoice_issuer::InvoiceProviderKind::Quickbooks,
             )),
         )
-        // SPEC-1 and 2.1: catches every request matching none of the six nests above (including a bare GET to
+        // SPEC-1 and 2.1: catches every request matching none of the seven nests above (including a bare GET to
         // `/`), answering a 404 HTML page rather than letting axum's default 404 leak internal route info.
         .fallback(get(move |headers| {
             not_a_frontend(headers, client_origin.clone())
