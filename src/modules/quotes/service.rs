@@ -574,6 +574,28 @@ impl QuotesService {
                     next.as_str()
                 )));
             }
+            // PMS-1624: one authority at a time. A quote under a staff
+            // approval chain is approved by that chain, so "Mark approved"
+            // is refused while a decision is outstanding; otherwise the two
+            // race and whichever landed second would be silently ignored.
+            //
+            // Only `approved`. A manual `rejected` is the same answer a veto
+            // gives, so it creates no conflicting claim, and refusing it
+            // would strand a quote whose named approver has gone on leave.
+            if next == QuoteStatus::Approved
+                && super::approval_sync::has_pending_staff_approval(
+                    &mut tx,
+                    tenant_id.get(),
+                    quote_id,
+                )
+                .await?
+            {
+                return Err(AppError::Conflict(
+                    "This quote is waiting on an approval; approve it from the approvals queue, \
+                     or cancel the approval to decide it here"
+                        .to_string(),
+                ));
+            }
         }
 
         // PMS-1000: the same rule the create path applies. Validating against

@@ -17,6 +17,7 @@
 //!    rejected with 409 rather than silently changing what was signed
 //!    off. See [`models::QuoteStatus::is_frozen`].
 
+pub(crate) mod approval_sync;
 pub mod models;
 pub mod routes;
 pub mod service;
