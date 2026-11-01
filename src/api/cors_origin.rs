@@ -50,6 +50,8 @@ pub(crate) struct CorsOriginMatcher {
 impl CorsOriginMatcher {
     /// Parse the raw CORS_ORIGIN entry list. Panics with a clear
     /// message on a malformed entry so a bad env fails the boot.
+    // SPEC-1 and 2.80, SPEC-1 and 2.81: called exactly once, at router construction (boot), not
+    // per request; a parse failure here panics the boot instead of being deferred to request time.
     pub(crate) fn from_entries(entries: &[String]) -> Self {
         let rules = entries.iter().map(|raw| parse_entry(raw)).collect();
         Self { rules }
@@ -57,10 +59,16 @@ impl CorsOriginMatcher {
 
     /// Return `true` if `origin_bytes` (the raw `Origin` header value)
     /// matches any configured entry.
+    // SPEC-1 and 2.80: runs on every CORS-checked request; does no parsing, only
+    // byte comparisons against the rules parsed once at boot.
     pub(crate) fn matches(&self, origin_bytes: &[u8]) -> bool {
         self.rules.iter().any(|rule| match rule {
+            // SPEC-1 and 2.88, SPEC-1 and 2.92: byte-for-byte, case-sensitive; no
+            // normalization of the incoming Origin header.
             Rule::Exact(v) => v.as_bytes() == origin_bytes,
             Rule::Wildcard { scheme, suffix } => {
+                // SPEC-1 and 2.89: scheme is matched as a literal prefix, so a
+                // wildcard entry never matches the other scheme.
                 let scheme_bytes = scheme.as_bytes();
                 let Some(host) = origin_bytes.strip_prefix(scheme_bytes) else {
                     return false;
@@ -69,9 +77,12 @@ impl CorsOriginMatcher {
                 // with `evilclient.a8n.systems`: the suffix must sit
                 // exactly at the tail of the host, and the label to the
                 // left of the leading dot must be non-empty.
+                // SPEC-1 and 2.91: rejects the bare apex and the empty-label host.
                 if host.len() <= suffix.len() {
                     return false;
                 }
+                // SPEC-1 and 2.90, SPEC-1 and 2.93: a tail (suffix) comparison, not leftmost-label-only, so any number of leading
+                // host labels match; suffix is the literal config text and includes a port if one was written into the entry.
                 host.ends_with(suffix.as_bytes())
             }
         })
@@ -88,6 +99,7 @@ impl CorsOriginMatcher {
 fn parse_entry(raw: &str) -> Rule {
     let raw = raw.trim();
     if raw.is_empty() {
+        // SPEC-1 and 2.82: panics at boot rather than being skipped or allow-listing nothing.
         panic!("CORS_ORIGIN entry is empty");
     }
 
@@ -95,16 +107,19 @@ fn parse_entry(raw: &str) -> Rule {
         let wildcard_prefix = format!("{scheme}*.");
         if let Some(suffix) = raw.strip_prefix(&wildcard_prefix) {
             if suffix.is_empty() {
+                // SPEC-1 and 2.83: panics at boot on a wildcard with no suffix.
                 panic!(
                     "CORS_ORIGIN wildcard {raw:?} is missing a suffix after {wildcard_prefix:?}"
                 );
             }
             if suffix.contains('*') {
+                // SPEC-1 and 2.84: panics at boot; only the leftmost label may be a wildcard.
                 panic!(
                     "CORS_ORIGIN wildcard {raw:?} must not contain another `*` after the leftmost label"
                 );
             }
             if !suffix.contains('.') {
+                // SPEC-1 and 2.85: panics at boot; a wildcard suffix must have a TLD.
                 panic!(
                     "CORS_ORIGIN wildcard {raw:?} suffix must include at least one dot (host must have a TLD)"
                 );
@@ -117,11 +132,13 @@ fn parse_entry(raw: &str) -> Rule {
     }
 
     if raw.contains('*') {
+        // SPEC-1 and 2.86: panics at boot; `*` is only legal in the `<scheme>://*.` position.
         panic!(
             "CORS_ORIGIN entry {raw:?} contains `*` outside the leading `<scheme>://*.` position"
         );
     }
 
+    // SPEC-1 and 2.87: panics at boot if an exact entry is not a valid header value.
     let value = raw
         .parse::<HeaderValue>()
         .unwrap_or_else(|e| panic!("CORS_ORIGIN entry {raw:?} is not a valid header value: {e}"));
