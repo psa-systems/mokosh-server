@@ -314,16 +314,8 @@ impl FormsService {
     ) -> AppResult<FormDefinitionResponse> {
         let existing = self.get(tenant_id, id).await?;
 
-        // SPEC-7.218: rule-vs-field consistency is re-checked whenever either `fields`
-        // or `rules` is present in the request, using the post-update value of each (the other
-        // side falls back to the existing stored value).
-        // Rules are checked against whichever field set will be in force AFTER
-        // this update, against whichever rule set will be in force after it.
-        // Both halves matter: replacing the field set without touching the
-        // rules can strand a rule on a field that no longer exists, which
-        // would leave it silently inert rather than rejected. So the check
-        // runs whenever EITHER half changes, using the post-update value of
-        // each.
+        // SPEC-7.218: rule-vs-field consistency is re-checked whenever either `fields` or
+        // `rules` is present, using each side's post-update value (else the stored one).
         if let Some(fields) = &req.fields {
             check_field_set(fields)?;
         }
@@ -352,10 +344,8 @@ impl FormsService {
         }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        // SPEC-7.216: an absent key leaves the corresponding column untouched
-        // (COALESCE / CASE), while description, contact_info and kb_article_id use "double
-        // option" deserialization so an explicit JSON null clears the column but an absent key
-        // does not.
+        // SPEC-7.216: an absent key leaves the column untouched (COALESCE/CASE); description,
+        // contact_info and kb_article_id use "double option" so a JSON null clears it.
         sqlx::query(
             "UPDATE form_definitions SET \
                name = COALESCE($3, name), \
@@ -385,13 +375,8 @@ impl FormsService {
         .execute(&mut *tx)
         .await?;
 
-        // SPEC-7.217: when `fields` is present, the entire existing field set is deleted
-        // and replaced wholesale, never merged; submissions already stored keep their own
-        // payload and are unaffected.
-        // A field set is REPLACED wholesale, never merged: field identity is
-        // the payload key, and a merge cannot express a rename or a deletion
-        // unambiguously. Submissions already taken keep their own payload, so
-        // rewriting the field set does not rewrite history.
+        // SPEC-7.217: when `fields` is present, the existing field set is deleted and
+        // replaced wholesale, never merged; already-stored submissions keep their own payload.
         if let Some(fields) = &req.fields {
             sqlx::query("DELETE FROM form_fields WHERE tenant_id = $1 AND form_definition_id = $2")
                 .bind(tenant_id)
@@ -743,9 +728,8 @@ fn check_rules_against_fields(rules: &[FormRule], known: &[RuleField]) -> AppRes
                 format!("Rule reads unknown field `{when_field}`"),
                 "unknown_field",
             )),
-            // SPEC-7.231, SPEC-7.232, SPEC-7.233: equals is bounded to the
-            // condition field's domain (Select options, Boolean true/false) and unbounded for
-            // any other type; see equals_outside_domain.
+            // SPEC-7.231,7.232,7.233: equals is bounded to the condition field's domain
+            // (Select options, Boolean true/false), unbounded otherwise; see equals_outside_domain.
             Some(condition) => {
                 if let Some(message) = equals_outside_domain(condition, equals) {
                     errors.push(FieldError::new(

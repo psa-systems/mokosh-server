@@ -608,9 +608,7 @@ pub const SLA_AT_RISK_LEAD_CEIL: chrono::Duration = chrono::Duration::hours(24);
 /// the badge and the alert cannot disagree about when a ticket is in trouble.
 /// The worker's numbers won because they are the ones a human already trusts:
 /// they decide whether somebody gets woken up.
-// SPEC-7.138: computes lead = 20% of (due - created_at) via integer
-// milliseconds (floor division, not rounded), then clamps to [5 minutes,
-// 24 hours].
+// SPEC-7.138: lead = 20% of (due - created_at), floor division, clamped to [5m, 24h].
 pub fn sla_at_risk_lead(created_at: DateTime<Utc>, due: DateTime<Utc>) -> chrono::Duration {
     let window = due - created_at;
     // SPEC-7.139: returns exactly the 5-minute floor (not a clamped

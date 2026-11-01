@@ -153,9 +153,8 @@ impl FormsService {
         // an unknown or blank name stays blank here, and `salutation` decides
         // how the message opens.
         let (contact_id, recipient_email, display_name) = match req.contact_id {
-            // SPEC-7.263: contact_id must resolve to a contact in the caller's tenant
-            // (else NotFound("Contact")); a contact with no email and no recipient_email
-            // override fails with a BadRequest naming the fix.
+            // SPEC-7.263: contact_id must resolve to a contact in the caller's tenant (else
+            // NotFound("Contact")); no email and no recipient_email override is a BadRequest.
             Some(contact_id) => {
                 let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
                     "SELECT email, first_name FROM contacts WHERE tenant_id = $1 AND id = $2",
@@ -183,9 +182,8 @@ impl FormsService {
             }
         };
 
-        // SPEC-7.265: people defaults to 1 when absent and must be within
-        // 1..=MAX_PEOPLE_PER_LINK (50), rejected here as defense-in-depth beyond the DTO-level
-        // 1..=50 validator.
+        // SPEC-7.265: people defaults to 1, and must be within 1..=MAX_PEOPLE_PER_LINK (50),
+        // checked again here as defense-in-depth beyond the DTO validator.
         // PMS-737: a link for several people. One is the default and is the
         // single-use link that has always existed.
         let people = req.people.unwrap_or(1);
@@ -211,9 +209,8 @@ impl FormsService {
         // chase a request nobody has filled in yet. It carries NO SLA, no
         // assignee and no time: every child carries its own, which is what
         // keeps the PMS-732 measured duration an average over people.
-        // SPEC-7.266, SPEC-7.267: a parent container ticket is created at issue
-        // time only when people > 1; the default people == 1 creates no parent ticket at all
-        // (parent_ticket_id stays None).
+        // SPEC-7.266,7.267: a parent container ticket is created only when people > 1; the
+        // default people == 1 leaves parent_ticket_id None.
         let parent = match people > 1 {
             true => Some(
                 self.create_request_parent(
@@ -253,12 +250,8 @@ impl FormsService {
         .await?;
         tx.commit().await?;
 
-        // SPEC-7.272: email delivery is best-effort and happens AFTER the transaction
-        // commits, mirroring the portal setup-link path: a failed send must not roll back the
-        // already-persisted token row, since that row is what makes a resend possible.
-        // Delivery is best-effort and happens AFTER the commit, mirroring the
-        // portal setup-link path: a failed send must not roll back the token,
-        // because the row is what makes a resend possible.
+        // SPEC-7.272: delivery is best-effort after the commit; a failed send must not roll
+        // back the token row, since that row is what makes a resend possible.
         let token = format!("{token_id}.{secret}");
         // SPEC-7.271: the emailed link is {app_url}/request-forms/{token_id}.{secret}.
         let form_link = format!("{}/request-forms/{}", app_url.trim_end_matches('/'), token);
@@ -369,9 +362,8 @@ impl FormsService {
             form_link,
             expires_at,
         } = mail;
-        // SPEC-7.273: with no notifications dispatcher wired, or when dispatch fails,
-        // the already-persisted token is kept and only a warning is logged; a failed or skipped
-        // send never undoes the issued link, since the row is what makes a resend possible.
+        // SPEC-7.273: no dispatcher wired, or a failed send, only logs a warning; the
+        // persisted token is kept since that row is what makes a resend possible.
         let Some(notify) = self.notifications.as_ref() else {
             tracing::warn!(
                 "no notifications dispatcher wired; request-link token persisted but no message queued",
@@ -428,10 +420,8 @@ impl FormsService {
     /// - expired                  -> `BadRequest` (400)
     /// - malformed or no match    -> `BadRequest` (400)
     pub async fn resolve_request_token(&self, token: &str) -> AppResult<ResolvedRequestToken> {
-        // SPEC-7.276: a malformed token (no '.', empty secret, non-UUID token_id), a
-        // token_id with no matching row, and a matching row whose secret fails verification all
-        // return the same generic "Invalid or expired request link" error, so a guessed token
-        // cannot be distinguished from a stale one.
+        // SPEC-7.276: a malformed token, an unmatched token_id, or a failed secret check all
+        // return the same generic "Invalid or expired request link" error.
         let invalid = || AppError::BadRequest("Invalid or expired request link".to_string());
 
         let (token_id, secret) = token.split_once('.').ok_or_else(invalid)?;
@@ -440,10 +430,8 @@ impl FormsService {
         }
         let token_id = Uuid::parse_str(token_id).map_err(|_| invalid())?;
 
-        // SPEC-7.279: the token row is looked up by primary key on the BYPASSRLS
-        // migrator pool, before the tenant is known, because this lookup is what resolves the
-        // tenant; the secret is verified below before anything about the row is returned, and
-        // every later query runs tenant-scoped via begin_with_tenant.
+        // SPEC-7.279: looked up by primary key on the BYPASSRLS migrator pool, since this
+        // lookup is what resolves the tenant; every later query is tenant-scoped.
         let row = sqlx::query_as::<_, TokenRow>(
             "SELECT tenant_id, form_definition_id, company_id, contact_id, token_hash, \
                         expires_at, created_by_id, uses_allowed, uses_remaining, \
@@ -495,10 +483,8 @@ impl FormsService {
             ..
         } = row;
 
-        // SPEC-7.280: a successful resolution returns the tenant via
-        // TenantId::from_trusted (the pre-auth escape hatch, since this lookup is what
-        // establishes the tenant) along with the form, company, contact, issuing user and
-        // remaining-people counts.
+        // SPEC-7.280: returns the tenant via TenantId::from_trusted (the pre-auth escape
+        // hatch, since this lookup establishes the tenant) plus form/company/contact/counts.
         Ok(ResolvedRequestToken {
             token_id,
             tenant_id: TenantId::from_trusted(tenant_id),
@@ -554,9 +540,7 @@ impl FormsService {
         // the client who was asking.
         let contact_info = org.phrase_with(definition.contact_info.as_deref());
         // SPEC-7.282: the public response carries only name, description, org identity,
-        // people/person_number, rules and public field metadata; it never exposes internal ids,
-        // the authoring user, timestamps, or the KB article (an internal procedure, not
-        // something the client is entitled to read).
+        // people/person_number, rules and field metadata; never internal ids, author or KB id.
         Ok(PublicFormResponse {
             name: definition.name,
             description: definition.description,
@@ -564,9 +548,7 @@ impl FormsService {
             contact_info,
             logo_url: org.logo_path().map(str::to_string),
             people: resolved.people,
-            // SPEC-7.283: person_number is the first unspent use, computed as
-            // people - uses_remaining + 1.
-            // The one being filled in now: the first unspent use.
+            // SPEC-7.283: person_number is the first unspent use: people - uses_remaining + 1.
             person_number: resolved.people - resolved.uses_remaining + 1,
             rules: definition.rules,
             fields: definition
@@ -609,12 +591,8 @@ impl FormsService {
     /// less harmful than the alternative of two tickets for one use, and is
     /// visible to the MSP as an orphan `form_submissions` row with no
     /// `ticket_id`, the same as a failure after the first commit always was.
-    // SPEC-7.286: submission is four separate transactions in order: insert the
-    // submission, claim the token's use (uses_remaining > 0 guard, moved ahead of ticket
-    // creation per PMS-1370 so a single-use link cannot produce two tickets), create the ticket
-    // in TicketService's own transaction, then stamp the submission with the ticket and token
-    // ids; a failure between the claim and the ticket commit leaves the use spent with no
-    // ticket, judged less harmful than two tickets for one use.
+    // SPEC-7.286: four transactions in order: insert submission, claim the token's use
+    // (ahead of ticket creation, PMS-1370), create the ticket, then stamp the submission.
     pub async fn submit_via_request_link(
         &self,
         resolved: &ResolvedRequestToken,
@@ -622,9 +600,8 @@ impl FormsService {
     ) -> AppResult<PublicSubmissionReceipt> {
         let tenant_id = resolved.tenant_id;
         let definition = self.get(tenant_id, resolved.form_definition_id).await?;
-        // SPEC-7.284: submitting against a retired definition is rechecked here (not
-        // just at open time) and fails with Gone (410), guarding the race where the form is
-        // retired between GET and submit.
+        // SPEC-7.284: retired-definition check is rechecked here (not just at open time) and
+        // fails with Gone (410), guarding the race between GET and submit.
         if !definition.is_active {
             // PMS-838: match the GET's shape and status. 410 instead of 409 so
             // the client treats the two paths the same (terminal, stop trying);
@@ -636,11 +613,8 @@ impl FormsService {
             ));
         }
 
-        // SPEC-7.285: the public submission is validated with the exact same
-        // validate_submission as the authenticated surface, so a client and an agent get
-        // identical rules and identical per-field errors.
-        // Same validator the authenticated surface uses, so a client and an
-        // agent get identical rules and identical per-field errors.
+        // SPEC-7.285: validated with the same validate_submission as the authenticated
+        // surface, so a client and an agent get identical rules and per-field errors.
         let normalised = super::validation::validate_submission(
             &definition.fields,
             &definition.rules,
@@ -671,10 +645,8 @@ impl FormsService {
         // nothing; the loser is reported as already submitted rather than
         // quietly accepted, and creates no ticket in doing so.
         let mut claim_tx = self.db.begin_with_tenant(tenant_id).await?;
-        // SPEC-7.287, SPEC-7.288: the claim is an UPDATE guarded by
-        // uses_remaining > 0; it also stamps used_at when the use drains to zero and sets
-        // submission_id to this submission only if one is not already recorded (COALESCE), so
-        // a later resubmission attempt never overwrites the first submission's id.
+        // SPEC-7.287,7.288: claim is an UPDATE guarded by uses_remaining > 0; stamps used_at
+        // at zero and sets submission_id via COALESCE so a resubmit never overwrites it.
         let remaining: Option<i32> = sqlx::query_scalar(
             "UPDATE form_request_tokens \
              SET uses_remaining = uses_remaining - 1, \
@@ -690,9 +662,8 @@ impl FormsService {
         .await?;
         claim_tx.commit().await?;
 
-        // SPEC-7.287: a token with nothing left to claim (no row updated) returns Gone
-        // before any ticket is created, which is what stops a single-use link from producing
-        // two tickets under concurrent submission.
+        // SPEC-7.287: no row updated returns Gone before any ticket is created, stopping a
+        // single-use link from producing two tickets under concurrent submission.
         let Some(remaining) = remaining else {
             return Err(AppError::Gone(
                 "This request link has already been submitted".to_string(),
@@ -707,13 +678,8 @@ impl FormsService {
             ));
         };
 
-        // SPEC-7.290: company_id and contact_id on the created ticket come from the
-        // resolved TOKEN, never from the submitted payload, so a forwarded link cannot file a
-        // request against another company.
-        // Company and contact come from the TOKEN, never from the payload, so
-        // a forwarded link cannot file a request against another company. The
-        // acting user is the MSP user who issued the link: the submitter is a
-        // client with no `users` row, and `tickets.created_by_id` is NOT NULL.
+        // SPEC-7.290: company_id and contact_id come from the resolved TOKEN, never the
+        // payload, so a forwarded link cannot file a request against another company.
         let request = mokosh_types::tickets::CreateTicketRequest {
             title: format!(
                 "{}: {}",
@@ -724,12 +690,8 @@ impl FormsService {
             company_id: resolved.company_id,
             contact_id: resolved.contact_id,
             source: mokosh_types::tickets::TicketSource::Portal,
-            // SPEC-7.292: parent_ticket_id is the parent the link was issued with (None
-            // for a single-person link), and procedure_kb_article_id is the form definition's
-            // own kb_article_id, since the form definition IS the request type.
-            // PMS-737: one child per person, under the parent the link was
-            // issued with. `None` for a single-person link, which stays the
-            // one ticket it has always been.
+            // SPEC-7.292: parent_ticket_id is the link's issued parent (None for a
+            // single-person link); procedure_kb_article_id is the definition's own kb_article_id.
             parent_ticket_id: resolved.parent_ticket_id,
             // PMS-730 AC: the ticket carries the article describing how to
             // perform this change, selected by the request type. The form
@@ -739,9 +701,8 @@ impl FormsService {
             ..Default::default()
         };
         let ctx = crate::modules::audit::AuditCtx::system(tenant_id.get());
-        // SPEC-7.291: the ticket's acting/created-by user is the MSP user who issued the
-        // link (resolved.created_by_id), never the client, since the submitter has no `users`
-        // row and created_by_id is NOT NULL.
+        // SPEC-7.291: acting/created-by user is the MSP user who issued the link
+        // (resolved.created_by_id), never the client: created_by_id is NOT NULL.
         let ticket = tickets
             .create_ticket(tenant_id, resolved.created_by_id, &request, &ctx)
             .await?;
@@ -818,8 +779,8 @@ fn abuse_notice(abuse_contact_email: Option<&str>, form_name: &str) -> (String, 
 /// field in display order. Falls back to the company-agnostic form name alone
 /// when the form has no text field, which keeps the title deterministic rather
 /// than guessing at semantics the definition does not declare.
-// SPEC-7.294: the ticket title's summary is the first answered Text-type field in the
-// form's own field order, falling back to "client request" when the form has no text field.
+// SPEC-7.294: title summary is the first answered Text-type field in field order, or
+// "client request" when the form has none.
 pub(super) fn summarise(
     definition: &super::models::FormDefinitionResponse,
     answers: &serde_json::Map<String, serde_json::Value>,
@@ -853,9 +814,8 @@ pub(super) fn summarise(
 /// PMS-729 phase 2 §7 slice B / I8: `pub(super)` so the portal form-submit
 /// handler in `super::service::submit_from_portal` can call this too - the
 /// portal path renders the same description shape as the request-link path.
-// SPEC-7.295: the ticket description renders each answered field as its own Markdown
-// list item in the form's field order using its label, with an unanswered field dropped and a
-// textarea answer's internal newlines kept as Markdown hard breaks.
+// SPEC-7.295: each answered field renders as a Markdown list item in field order by label;
+// unanswered fields are dropped and newlines become Markdown hard breaks.
 pub(super) fn render_answers(
     definition: &super::models::FormDefinitionResponse,
     answers: &serde_json::Map<String, serde_json::Value>,

@@ -123,9 +123,8 @@ async fn create_for_ticket(
 /// A one-person MSP has the flag off (PMS-943) and gets a 404 here, which is
 /// what "no approval step exists at all" has to mean for a route: not an empty
 /// list, which would read as a feature that is present and unused.
-// SPEC-7.516: reachable only when RequireTimesheets succeeds; a
-// tenant with timesheets disabled sees whatever 404/403 that extractor
-// itself produces.
+// SPEC-7.516: reachable only when RequireTimesheets succeeds; a disabled tenant sees
+// whatever 404/403 that extractor itself produces.
 async fn list_for_time_entry(
     State(s): State<ApprovalsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -256,9 +255,8 @@ async fn pending_for_caller(
             // list so the service stays role-source-agnostic and a future
             // multi-role identity can pass the full set without a
             // signature change.
-            // SPEC-7.550: deliberately a one-element array
-            // holding only this role; a future multi-role identity is not
-            // currently supported by this call site.
+            // SPEC-7.550: deliberately a one-element array holding only this role; a
+            // future multi-role identity is not currently supported by this call site.
             let roles = vec![u.role.as_str().to_string()];
             s.service
                 .pending_for_user(u.tenant_id, u.id, &roles)
@@ -355,9 +353,8 @@ async fn cancel(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<serde_json::Value>> {
     s.service.cancel(u.tenant_id, id, u.id).await?;
-    // SPEC-7.546: the row is retained with status 'cancelled',
-    // not deleted, so this returns a bare {"cancelled": true} rather than
-    // the updated ApprovalResponse.
+    // SPEC-7.546: the row is retained with status 'cancelled', not deleted, so this
+    // returns a bare {"cancelled": true} rather than the updated ApprovalResponse.
     Ok(Json(serde_json::json!({ "cancelled": true })))
 }
 
@@ -365,12 +362,8 @@ async fn cancel(
 /// Surfaces 404 when the row is absent in the caller's tenant so a
 /// guessed UUID never leaks "I have an approval against an id you
 /// can't see" via a 200 with empty body.
-// SPEC-7.515: the time-entry, change-request, and quote create/list
-// routes each run this first, returning 404 with the human noun (never the
-// raw table name) when the parent is absent in the caller's tenant.
-// SPEC-7.558: opens its own tenant-scoped transaction for the
-// parent lookup rather than reusing a pool-level connection, so the check
-// stays correct now that these tables are under fail-closed RLS.
+// SPEC-7.515,7.558: each create/list route runs this first, 404ing with the human noun
+// (never the raw table name); opens its own tenant-scoped tx so the check stays correct under RLS.
 async fn assert_parent_exists(
     s: &ApprovalsRouterState,
     table: &'static str,

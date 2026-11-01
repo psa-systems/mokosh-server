@@ -74,9 +74,8 @@ async fn get_one(
     Ok(Json(s.service.get(u.tenant_id, id).await?))
 }
 
-// SPEC-7.157: POST /api/v1/workflow-rules requires an admin user and runs DTO
-// validation before calling the service, which binds the new row to the caller's tenant_id
-// and created_by_id.
+// SPEC-7.157: POST /api/v1/workflow-rules requires an admin, validates the DTO, then binds
+// the new row to the caller's tenant_id and created_by_id.
 async fn create(
     State(s): State<WorkflowsRouterState>,
     RequireAdminUser(u): RequireAdminUser,
@@ -86,10 +85,8 @@ async fn create(
     Ok(Json(s.service.create(u.tenant_id, u.id, req).await?))
 }
 
-// SPEC-7.151: req.validate() re-runs the UpdateWorkflowRuleRequest validators
-// (including name's length 1..=200 when Some) before the service call.
-// SPEC-7.158: PATCH /api/v1/workflow-rules/{id} requires an admin user and
-// applies only the non-null fields in the request body.
+// SPEC-7.151,7.158: PATCH /api/v1/workflow-rules/{id} requires an admin, validates
+// (name length 1..=200 when Some), then applies only the non-null request fields.
 async fn update(
     State(s): State<WorkflowsRouterState>,
     RequireAdminUser(u): RequireAdminUser,

@@ -118,9 +118,8 @@ impl WorkflowsService {
             .filter(|r| r.created_by_name.is_none())
             .map(|r| r.created_by_id)
             .collect();
-        // SPEC-7.163: when created_by_name is unresolved (the joined user is
-        // gone), log it with context "workflows.list" but still return the row with
-        // created_by_name: None rather than erroring.
+        // SPEC-7.163: unresolved created_by_name logs with context "workflows.list" but
+        // still returns the row with created_by_name: None.
         crate::utils::unresolved_person::log_unresolved_person_names("workflows.list", &unresolved);
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -141,8 +140,7 @@ impl WorkflowsService {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound("Workflow rule".into()))?;
-        // SPEC-7.163: same unresolved-creator logging as list, tagged
-        // "workflows.get", without erroring.
+        // SPEC-7.163: same unresolved-creator logging as list, tagged "workflows.get".
         if row.created_by_name.is_none() {
             crate::utils::unresolved_person::log_unresolved_person_names(
                 "workflows.get",
@@ -164,9 +162,8 @@ impl WorkflowsService {
         // silently create a rule that never fires. The Phase 2
         // allow-list covers `ticket.created`, `ticket.status_changed`,
         // and `ticket.priority_changed`.
-        // SPEC-7.153: rejects any trigger_event not in RECOGNISED_TRIGGERS with
-        // 400 and this exact message; the joined list preserves RECOGNISED_TRIGGERS'
-        // declared array order (created, status_changed, priority_changed), not alphabetical.
+        // SPEC-7.153: rejects an unrecognised trigger_event with 400; the joined list
+        // preserves RECOGNISED_TRIGGERS' declared order, not alphabetical.
         if !RECOGNISED_TRIGGERS.contains(&req.trigger_event.as_str()) {
             return Err(AppError::BadRequest(format!(
                 "Unsupported trigger_event='{}'. Recognised: {}",

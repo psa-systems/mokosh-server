@@ -24,10 +24,8 @@
 //! can be unit-tested without spinning up the full ticket-service
 //! path.
 
-// SPEC-7.203: the only loop guard across the recursive status/priority cascade
-// is the numeric depth counter; there is no de-duplication or cycle-detection against rule
-// identity or ticket-state history, so a cascade that keeps alternating between two values
-// runs until max_depth is hit.
+// SPEC-7.203: the recursive status/priority cascade's only loop guard is the depth
+// counter; no dedup or cycle detection, so an alternating cascade runs until max_depth.
 
 use uuid::Uuid;
 
@@ -88,11 +86,8 @@ pub struct TicketPriorityChangedContext {
 pub struct WorkflowExecutor;
 
 impl WorkflowExecutor {
-    // SPEC-7.164: selects only rules with trigger_event = 'ticket.created' AND
-    // is_active = true for tenant_id, ordered priority ASC, created_at ASC, and evaluates
-    // them in that order.
-    // SPEC-7.175: returns Ok(()) unconditionally as long as the rule-querying
-    // and run-row-inserting SQL succeeds; a failing action never propagates as an Err here.
+    // SPEC-7.164: evaluates active ticket.created rules for tenant_id, ordered priority
+    // ASC, created_at ASC. SPEC-7.175: returns Ok(()) unless the rule/run-row SQL itself fails.
     pub async fn run_ticket_created(
         tx: &mut sqlx::PgConnection,
         tenant_id: Uuid,
@@ -111,9 +106,8 @@ impl WorkflowExecutor {
         .await?;
 
         for rule in rules {
-            // SPEC-7.174: a rule that does not match its conditions produces no
-            // workflow_rule_runs row at all; this continue skips both action application
-            // and run-row insertion.
+            // SPEC-7.174: a non-matching rule gets no workflow_rule_runs row at all; this
+            // skips both action application and run-row insertion.
             if !matches_conditions(&rule.conditions, &ctx) {
                 continue;
             }
@@ -122,10 +116,8 @@ impl WorkflowExecutor {
             // SPA's ticket-detail timeline reads this surface;
             // dropping a failed run would hide buggy rules from the
             // operator.
-            // SPEC-7.173: for each matched rule, unconditionally inserts a
-            // workflow_rule_runs row with applied_actions set to the rule's full actions
-            // blob (not just the ones that fired) and error set to the stringified
-            // AppError when apply_create_actions returned Err, else NULL.
+            // SPEC-7.173: inserts a workflow_rule_runs row per matched rule with the rule's
+            // full actions blob and error set to the stringified AppError, or NULL on success.
             let error_msg = outcome.err().map(|e| e.to_string());
             insert_run_row(
                 tx,
@@ -147,15 +139,8 @@ impl WorkflowExecutor {
     /// re-fires at the next depth level. The per-tenant cap from
     /// `workflows/rule_max_depth` (default 3) refuses to fire a rule
     /// whose depth has reached the cap and logs a depth-cap row.
-    // SPEC-7.176: reads the tenant's cascade-cap setting via
-    // read_workflow_rule_max_depth and delegates to run_status_changed_at_depth starting
-    // at depth = 0.
-    // SPEC-7.178: the cap comes from tenant_settings (category = 'workflows',
-    // key = 'rule_max_depth'); absent defaults to 3, present is clamped to 1..=10.
-    // SPEC-7.179, SPEC-7.201: read_workflow_rule_max_depth takes the
-    // raw &mut PgConnection of this already-open tenant-scoped transaction (not a fresh
-    // begin_with_tenant) to avoid deadlocking on the app.current_tenant GUC SET; the
-    // 1..=10 clamp means a value of 1 disables nested/cascaded rule firing entirely.
+    // SPEC-7.176,7.178,7.179,7.201: starts the cascade at depth 0 using the tenant's
+    // rule_max_depth setting (default 3, clamped 1..=10), read on the already-open tx.
     pub async fn run_ticket_status_changed(
         tx: &mut sqlx::PgConnection,
         tenant_id: Uuid,
@@ -168,9 +153,7 @@ impl WorkflowExecutor {
 
     /// PMS-448 phase 2: fires after a successful priority transition.
     /// PMS-467 phase 3: see `run_ticket_status_changed`.
-    // SPEC-7.177: reads the tenant's cascade-cap setting via
-    // read_workflow_rule_max_depth and delegates to run_priority_changed_at_depth starting
-    // at depth = 0.
+    // SPEC-7.177: starts the priority-change cascade at depth 0 using the tenant's cap.
     pub async fn run_ticket_priority_changed(
         tx: &mut sqlx::PgConnection,
         tenant_id: Uuid,
@@ -213,10 +196,8 @@ async fn run_status_changed_at_depth(
         if !matches_status_changed(&rule.conditions, &ctx) {
             continue;
         }
-        // SPEC-7.183, SPEC-7.198: the recursion guard compares depth
-        // (u32, starting at 0) with >= against max_depth; a rule matched exactly at
-        // depth == max_depth is refused and never applied, so only depth 0..max_depth-1
-        // can apply actions that cascade further.
+        // SPEC-7.183,7.198: depth >= max_depth refuses the rule; only depth 0..max_depth-1
+        // can apply cascading actions.
         if depth >= max_depth {
             // Depth-cap refusal: the rule matched but the cascade
             // chain has hit the per-tenant ceiling. Record it so the
@@ -291,10 +272,8 @@ async fn run_priority_changed_at_depth(
         if !matches_priority_changed(&rule.conditions, &ctx) {
             continue;
         }
-        // SPEC-7.183, SPEC-7.198: depth-cap refusal mirrors the
-        // status-changed path; a rule matched exactly at depth == max_depth is refused,
-        // recorded with a "cycle cap reached at depth {max_depth}" run row, and the loop
-        // continues to the next rule.
+        // SPEC-7.183,7.198: mirrors the status-changed depth cap; records a
+        // "cycle cap reached at depth {max_depth}" run row and continues to the next rule.
         if depth >= max_depth {
             let err = format!("cycle cap reached at depth {max_depth}");
             insert_run_row(
@@ -348,10 +327,8 @@ async fn run_priority_changed_at_depth(
 /// Other keys (priority_id / queue_id / company_id / type_id) match
 /// against the ticket's current (post-update) values so a rule can
 /// compose "moved into closed AND company X".
-// SPEC-7.181: recognises keys from_status_id, to_status_id, priority_id,
-// queue_id, company_id, type_id; any other key fails the match. Non-object or
-// non-array-valued conditions fail closed the same way as the create matcher, and an
-// empty object matches everything.
+// SPEC-7.181: recognises from_status_id, to_status_id, priority_id, queue_id, company_id,
+// type_id; any other key, or a non-object/non-array value, fails closed; empty matches all.
 fn matches_status_changed(
     conditions: &serde_json::Value,
     ctx: &TicketStatusChangedContext,
@@ -385,9 +362,8 @@ fn matches_status_changed(
 /// Conditions matcher for `ticket.priority_changed`. Same shape as
 /// the status-changed matcher with `from_priority_id` /
 /// `to_priority_id` as the two new keys.
-// SPEC-7.182: recognises keys from_priority_id, to_priority_id, status_id,
-// queue_id, company_id, type_id, with the same AND/IN/fail-closed/empty-matches-all
-// semantics as matches_status_changed.
+// SPEC-7.182: recognises from_priority_id, to_priority_id, status_id, queue_id, company_id,
+// type_id, with the same AND/IN/fail-closed/empty-matches-all semantics as the status matcher.
 fn matches_priority_changed(
     conditions: &serde_json::Value,
     ctx: &TicketPriorityChangedContext,
@@ -428,11 +404,8 @@ struct RuleRow {
 /// Evaluate a structured conditions blob against the ticket. AND
 /// across keys, IN across array values within a key. An empty
 /// conditions object matches every ticket.
-// SPEC-7.165: non-object conditions are treated as "match nothing" (returns
-// false), explicitly to avoid a malformed/typo'd conditions blob silently firing every rule.
-// SPEC-7.166: an empty conditions object ({}) matches every ticket for this trigger.
-// SPEC-7.167: condition matching is AND across keys: every key present must
-// independently match, else the whole rule fails to match (short-circuits on first non-match).
+// SPEC-7.165,7.166,7.167: non-object conditions match nothing (avoids a typo silently
+// firing every rule); empty {} matches everything; otherwise AND across keys, short-circuit.
 fn matches_conditions(conditions: &serde_json::Value, ctx: &TicketCreateContext) -> bool {
     let Some(map) = conditions.as_object() else {
         // Non-object conditions are treated as "match nothing" so a
@@ -443,21 +416,12 @@ fn matches_conditions(conditions: &serde_json::Value, ctx: &TicketCreateContext)
         return true;
     }
     for (key, value) in map {
-        // SPEC-7.168: within a key, matching is IN-array semantics: the key's
-        // JSON value must be a JSON array; if it is not an array, the whole match fails.
+        // SPEC-7.168: a key's value must be a JSON array (IN semantics); non-array fails.
         let Some(arr) = value.as_array() else {
             return false;
         };
-        // SPEC-7.169: recognised condition keys for ticket.created are exactly
-        // priority_id, queue_id, company_id, type_id, source; any other key name fails
-        // closed (evaluates to false), even a typo'd key like "pri0rity_id".
-        // SPEC-7.170: priority_id, queue_id, company_id compare the ticket's
-        // UUID field against the condition array via string-parse-then-equality; non-UUID
-        // or non-string elements are silently ignored (never match, never error).
-        // SPEC-7.171: type_id only matches if the ticket's type_id is Some and
-        // that UUID is in the array; if type_id is None, this key never matches.
-        // SPEC-7.172: source matches by exact string equality against the
-        // array's string elements (not UUID parsing).
+        // SPEC-7.169,7.170,7.171,7.172: keys are priority_id/queue_id/company_id (UUID
+        // parse-equality), type_id (only if Some), source (string equality); others fail closed.
         let ok = match key.as_str() {
             "priority_id" => uuid_in_array(arr, ctx.priority_id),
             "queue_id" => uuid_in_array(arr, ctx.queue_id),
@@ -485,13 +449,8 @@ fn uuid_in_array(arr: &[serde_json::Value], needle: Uuid) -> bool {
 /// recursion plumbing because `ticket.created` cannot itself fire a
 /// status_changed or priority_changed trigger (the create is the
 /// originating event; the next mutation is the operator's).
-// SPEC-7.186: applies actions in this fixed order regardless of key order in
-// the JSON object: assign_to_user_id, assign_to_team_id, set_priority_id (no-cascade),
-// set_status_id (no-cascade), add_tag, add_internal_note; returns Ok(()) if actions is
-// not a JSON object (silently does nothing).
-// SPEC-7.199: ticket.created never calls run_ticket_status_changed /
-// run_ticket_priority_changed; this is a hard structural guarantee (not depth-limited)
-// because the create is the originating event, the next mutation is the operator's.
+// SPEC-7.186,7.199: fixed action order (assign_to_user_id/team_id, set_priority_id,
+// set_status_id, add_tag, add_internal_note); non-object actions no-ops Ok(()), never cascades.
 async fn apply_create_actions(
     tx: &mut sqlx::PgConnection,
     tenant_id: Uuid,
@@ -503,10 +462,8 @@ async fn apply_create_actions(
     };
     let mut first_error: Option<String> = None;
 
-    // SPEC-7.187: each action sub-step below runs even if an earlier sub-step
-    // already failed (no early return on an individual action failure); only the FIRST
-    // failure is retained via first_error.get_or_insert_with, and that one message becomes
-    // the workflow_rule_runs.error for this rule-run.
+    // SPEC-7.187: every sub-step runs even after an earlier one failed; only the first
+    // failure is retained and becomes workflow_rule_runs.error.
     apply_assign_user(tx, tenant_id, ctx.ticket_id, map, &mut first_error).await;
     apply_assign_team(tx, tenant_id, ctx.ticket_id, map, &mut first_error).await;
     apply_set_priority_no_cascade(tx, tenant_id, ctx.ticket_id, map, &mut first_error).await;
@@ -545,10 +502,8 @@ async fn apply_transition_actions(
     };
     let mut first_error: Option<String> = None;
 
-    // SPEC-7.194: applies non-cascading actions first, in this order:
-    // assign_to_user_id, assign_to_team_id, add_tag, add_internal_note. set_priority_id /
-    // set_status_id are not in this list and the "no_cascade" setters used by the create
-    // path are never called at all on the transition path.
+    // SPEC-7.194: non-cascading actions run first, in order: assign_to_user_id,
+    // assign_to_team_id, add_tag, add_internal_note; no_cascade setters are never used here.
     apply_assign_user(tx, tenant_id, ticket_id, map, &mut first_error).await;
     apply_assign_team(tx, tenant_id, ticket_id, map, &mut first_error).await;
     apply_add_tag(tx, tenant_id, ticket_id, map, &mut first_error).await;
@@ -559,17 +514,8 @@ async fn apply_transition_actions(
     // row before recursion descends. Priority cascades before status
     // so a rule that changes both ends up firing priority_changed
     // first (matching the ticket-update ordering in the service).
-    // SPEC-7.195: set_priority_id is evaluated before set_status_id so a rule
-    // that changes both ends up firing priority_changed first.
-    // SPEC-7.196: set_priority_id / set_status_id are no-ops when the new value
-    // equals the current value (no UPDATE, no cascade, no error); otherwise each UPDATEs
-    // the column then recurses into the matching transition runner at depth + 1 inside the
-    // same transaction, with errors "set_priority_id/set_status_id failed/parse" and a
-    // wrapped cascade error ("priority cascade: {e}" / "status cascade: {e}") retained only
-    // if first_error is still None.
-    // SPEC-7.202: the != guard before each UPDATE prevents a rule that targets
-    // the ticket's current value from cascading or recursing, closing a trivial
-    // infinite-loop vector.
+    // SPEC-7.195,7.196,7.202: priority before status (fires priority_changed first); each
+    // no-ops when new == current (closes an infinite-loop vector), else UPDATEs and recurses.
     if let Some(new_priority_id) = map
         .get("set_priority_id")
         .and_then(|v| v.as_str())
@@ -652,19 +598,16 @@ async fn apply_transition_actions(
         }
     }
 
-    // SPEC-7.197: returns Err(AppError::Internal(msg)) with msg equal to the
-    // single retained first_error string if any action (including a cascade) failed,
-    // else Ok(()).
+    // SPEC-7.197: returns Err with the single retained first_error if any action or
+    // cascade failed, else Ok(()).
     match first_error {
         Some(msg) => Err(crate::utils::error::AppError::Internal(msg)),
         None => Ok(()),
     }
 }
 
-// SPEC-7.188: assign_to_user_id / assign_to_team_id actions parse a UUID from
-// the string value and UPDATE assigned_to_id / team_id; an absent key or non-string value
-// is a no-op; a SQL failure and a UUID-parse failure produce distinct error messages
-// ("... failed: {e}" vs "... parse: {e}").
+// SPEC-7.188: parses a UUID from the string value and UPDATEs assigned_to_id/team_id; an
+// absent key or non-string value is a no-op; SQL and parse failures produce distinct messages.
 async fn apply_assign_user(
     tx: &mut sqlx::PgConnection,
     tenant_id: Uuid,
@@ -726,10 +669,8 @@ async fn apply_assign_team(
 /// PMS-448 phase 1: priority mutation without recursion. Used by the
 /// create path. The transition path uses the cascade-capable variant
 /// inside `apply_transition_actions`.
-// SPEC-7.189: on the ticket.created path, set_priority_id / set_status_id
-// update the column directly via these no-cascade variants and never fire the
-// corresponding ticket.priority_changed / ticket.status_changed trigger, because ticket
-// creation is the originating event, not a transition.
+// SPEC-7.189: on ticket.created, these no-cascade variants update the column directly and
+// never fire the priority_changed/status_changed trigger; create is the originating event.
 async fn apply_set_priority_no_cascade(
     tx: &mut sqlx::PgConnection,
     tenant_id: Uuid,
@@ -792,9 +733,8 @@ async fn apply_set_status_no_cascade(
     }
 }
 
-// SPEC-7.190: add_tag requires a string value and appends it via
-// array_append, guarded by NOT ($1 = ANY(tags)) so a duplicate tag is not appended twice;
-// an absent or non-string key is a no-op.
+// SPEC-7.190: appends the string value via array_append guarded by NOT ($1 = ANY(tags)) so
+// a duplicate tag is not appended twice; absent or non-string key is a no-op.
 async fn apply_add_tag(
     tx: &mut sqlx::PgConnection,
     tenant_id: Uuid,
@@ -829,10 +769,8 @@ async fn apply_add_internal_note(
     let Some(note) = map.get("add_internal_note").and_then(|v| v.as_str()) else {
         return;
     };
-    // SPEC-7.191: looks up the OLDEST active user with role super_admin,
-    // admin, or manager as the note's created_by_id, not the user who triggered the
-    // workflow and not the rule's created_by_id; a SQL failure on this lookup itself
-    // sets error "add_internal_note creator lookup: {e}".
+    // SPEC-7.191: creator is the OLDEST active user with role super_admin/admin/manager,
+    // not the triggering user; a lookup failure sets "add_internal_note creator lookup: {e}".
     let creator: Option<Uuid> = match sqlx::query_scalar(
         "SELECT id FROM users WHERE tenant_id = $1 AND status = 'active' \
              AND role IN ('super_admin', 'admin', 'manager') \
@@ -848,12 +786,9 @@ async fn apply_add_internal_note(
             None
         }
     };
-    // SPEC-7.192: if no eligible admin-tier user exists, this if-let guard
-    // skips the INSERT entirely: no note inserted and no error recorded, even though the
-    // rule matched and configured this action.
+    // SPEC-7.192: if no eligible admin-tier user exists, skips the INSERT with no error.
     if let Some(creator) = creator {
-        // SPEC-7.193: inserts into ticket_notes with note_type = 'internal';
-        // a SQL failure here sets error "add_internal_note failed: {e}".
+        // SPEC-7.193: inserts into ticket_notes with note_type = 'internal'.
         let r = sqlx::query(
             "INSERT INTO ticket_notes \
                  (tenant_id, ticket_id, note_type, content, created_by_id) \
@@ -871,11 +806,8 @@ async fn apply_add_internal_note(
     }
 }
 
-// SPEC-7.204: this INSERT (and the rule-listing SELECTs in
-// run_ticket_created / run_status_changed_at_depth / run_priority_changed_at_depth) use
-// `.await?`, so a SQL-level failure here propagates up through the whole recursive call
-// chain and can abort the caller's outer transaction, unlike action-level failures which
-// are always absorbed into a run row's error column instead.
+// SPEC-7.204: this INSERT and the rule-listing SELECTs use `.await?`, so a SQL failure here
+// propagates up the recursive call chain and can abort the outer transaction, unlike action errors.
 async fn insert_run_row(
     tx: &mut sqlx::PgConnection,
     tenant_id: Uuid,

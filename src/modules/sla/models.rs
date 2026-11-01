@@ -36,9 +36,8 @@ pub struct SlaTargetResponse {
     pub operational_hours: String,
 }
 
-// SPEC-7.78: rejects a payload where both hours are present and
-// first_response_hours > resolution_hours; equal values are allowed and
-// either field being absent leaves the pair unconstrained.
+// SPEC-7.78: rejects first_response_hours > resolution_hours when both are present;
+// equal or either absent is allowed.
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[validate(schema(function = validate_sla_target_range))]
 pub struct UpsertSlaTargetRequest {
@@ -157,9 +156,8 @@ fn validate_business_schedule(schedule: &serde_json::Value) -> Result<(), Valida
         ));
     };
     for (key, value) in map {
-        // SPEC-7.87, SPEC-7.90: rejects an unknown weekday key
-        // using the same clock::parse_weekday_key the read path uses, so the
-        // two cannot drift.
+        // SPEC-7.87,7.90: rejects an unknown weekday key, using the same
+        // clock::parse_weekday_key the read path uses so the two cannot drift.
         if super::clock::parse_weekday_key(key).is_none() {
             return Err(json_shape_error(
                 "invalid_schedule",

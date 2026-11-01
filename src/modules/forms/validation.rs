@@ -76,9 +76,8 @@ pub fn validate_submission(
         // or a RequiredIf rule targeting it currently matches.
         let required = field.is_required || required_by_rule(field, rules, object);
 
-        // SPEC-7.245: a present-but-absent-after-normalisation value is simply omitted
-        // from the stored payload (never stored as an empty string); a missing required field
-        // produces code "required".
+        // SPEC-7.245: a value that normalises to absent is omitted from the stored payload
+        // (never an empty string); a missing required field produces code "required".
         let Some(value) = present else {
             if required {
                 errors.push(FieldError::new(
@@ -120,9 +119,8 @@ fn normalise_present(field: &FormFieldResponse, raw: Option<&Value>) -> Option<V
         return None;
     }
     match raw {
-        // SPEC-7.240, SPEC-7.245: a string answer is trimmed; if the trimmed
-        // result is empty, it is treated as absent (same as a missing key or JSON null) and the
-        // trimmed (not raw) value is what gets stored when present.
+        // SPEC-7.240,7.245: a string answer is trimmed; an empty trim is treated as absent,
+        // else the trimmed (not raw) value is stored.
         Value::String(s) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
@@ -201,9 +199,8 @@ fn validate_value(
                 ));
             }
         }
-        // SPEC-7.247, SPEC-7.253: Text/Textarea/Email require a JSON string (code
-        // "type" via as_string), honour min_length/max_length counted in Unicode characters, not
-        // bytes (check_length).
+        // SPEC-7.247,7.253: Text/Textarea/Email require a JSON string (code "type"); length
+        // bounds are counted in Unicode characters, not bytes (check_length).
         FieldType::Text | FieldType::Textarea | FieldType::Email => {
             let s = as_string(field, value)?;
             check_length(field, s).map_err(|(m, c)| err(m, c))?;

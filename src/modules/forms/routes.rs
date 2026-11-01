@@ -132,10 +132,8 @@ async fn create(
     RequireAdminUser(u): RequireAdminUser,
     Json(body): Json<CreateFormDefinitionRequest>,
 ) -> AppResult<Json<FormDefinitionResponse>> {
-    // SPEC-7.213, SPEC-7.215: CreateFormDefinitionRequest.name/slug length and
-    // format, fields >= 1 entry (DTO layer, before the service runs), and is_active default.
-    // SPEC-7.224, SPEC-7.225, SPEC-7.226: nested per-field DTO checks on
-    // CreateFormFieldRequest: name/label length and format, min_length/max_length bounds.
+    // SPEC-7.213,7.215,7.224,7.225,7.226: DTO-layer checks on name/slug/fields and, per
+    // field, CreateFormFieldRequest's name/label/min_length/max_length, before the service runs.
     body.validate()?;
     let created = s.service.create(u.tenant(), u.id, body).await?;
     // SPEC-7.212: after a successful create, the caller's "new form" draft (keyed by

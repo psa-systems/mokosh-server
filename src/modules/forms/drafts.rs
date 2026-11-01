@@ -118,10 +118,8 @@ impl FormsService {
         // draft row, but without this a caller could file a draft against
         // another tenant's definition id and get it back on every list, which
         // leaks that the id exists.
-        // SPEC-7.301: a form_definition_id must resolve to a definition in the caller's
-        // own tenant, otherwise NotFound("Form"); this exists even though RLS already scopes the
-        // draft row, to stop a caller filing a draft against another tenant's definition id and
-        // having it echoed back.
+        // SPEC-7.301: form_definition_id must resolve to a definition in the caller's own
+        // tenant, else NotFound("Form"), so a draft cannot echo back another tenant's id.
         if let Some(definition_id) = req.form_definition_id {
             let exists: Option<Uuid> = sqlx::query_scalar(
                 "SELECT id FROM form_definitions WHERE tenant_id = $1 AND id = $2",
@@ -137,9 +135,8 @@ impl FormsService {
 
         let returning =
             "RETURNING id, form_definition_id, payload ->> 'name' AS name, payload, updated_at";
-        // SPEC-7.302: a single atomic INSERT ... ON CONFLICT ... DO UPDATE (never
-        // read-then-write), against one partial unique index per branch, so two overlapping
-        // autosave writes race into an UPDATE rather than a duplicate row or a conflict.
+        // SPEC-7.302: single atomic INSERT ON CONFLICT DO UPDATE per partial unique index, so
+        // two overlapping autosave writes race into an UPDATE, not a duplicate row or conflict.
         let row = match req.form_definition_id {
             Some(definition_id) => {
                 sqlx::query_as::<_, FormDraftResponse>(&format!(
@@ -178,9 +175,8 @@ impl FormsService {
     /// `user_id` is part of the predicate rather than checked afterwards, so a
     /// draft belonging to someone else is a 404 and not a 403: the caller
     /// should not learn that the id exists.
-    // SPEC-7.303: user_id is part of the DELETE predicate itself (not checked
-    // afterward); deleting 0 rows, including a draft owned by someone else, is a 404 "Draft",
-    // deliberately not a 403, so the caller cannot learn the draft id exists.
+    // SPEC-7.303: user_id is part of the DELETE predicate; deleting 0 rows (including someone
+    // else's draft) is a 404 "Draft", not a 403, so the caller cannot learn the id exists.
     pub async fn delete_form_draft(
         &self,
         tenant_id: TenantId,

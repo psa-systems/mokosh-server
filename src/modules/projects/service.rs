@@ -443,9 +443,8 @@ impl ProjectsService {
     /// the caller's tenant-scoped tx so the status read and the subsequent
     /// INSERT share one transaction (the RLS GUC is set for both). A missing
     /// row is a 404; a cancelled project is a 409.
-    // SPEC-7.454: 404s if the project does not exist for the tenant, 409s if its status is "cancelled" (British spelling, matching the migration 007 CHECK)
-    // SPEC-7.455: runs inside the caller's tenant-scoped transaction, shared with the subsequent phase/task INSERT
-    // SPEC-7.456: any status other than "cancelled" permits the attach; there is no other status-based gate
+    // SPEC-7.454,7.455,7.456: 404 if missing, 409 if cancelled, else attach; runs inside the
+    // caller's tenant tx, shared with the subsequent INSERT.
     async fn ensure_project_open(
         &self,
         tx: &mut sqlx::PgConnection,
