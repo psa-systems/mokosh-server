@@ -374,6 +374,74 @@ async fn rollover_carries_capped_unused_hours(pool: PgPool) {
     assert_eq!(out.overage_hours, common::dec("0"));
 }
 
+/// PMS-1572: rolling the same close twice rolls once.
+///
+/// The doc on `roll_to_next_period` used to claim idempotency and meant only
+/// that the next-period row is UPSERTed. Nothing zeroes the closing period's
+/// `hours_remaining`, so a second call read the same unused hours and the
+/// `DO UPDATE` added them again. It had no caller, so nothing was ever
+/// double-credited; PMS-1572 gave it one, which is what makes this a case
+/// rather than a note.
+#[mokosh_test]
+async fn rolling_the_same_close_twice_rolls_once(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let company = common::seed_company(&pool).await;
+    let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let contract = seed_block_contract(&pool, company, start).await;
+    seed_block_item(
+        &pool,
+        contract,
+        common::dec("10"),
+        common::dec("100"),
+        true,
+        Some(common::dec("3")),
+    )
+    .await;
+
+    let svc = ContractsService::new(Database::from_pool(pool.clone()));
+    let jan = Utc.with_ymd_and_hms(2026, 1, 10, 0, 0, 0).unwrap();
+    svc.consume_hours(
+        TenantId::from_trusted(tenant),
+        contract,
+        common::dec("4"),
+        jan,
+    )
+    .await
+    .expect("consume jan");
+
+    let jan_end = NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
+    let first = svc
+        .roll_to_next_period(TenantId::from_trusted(tenant), contract, jan_end)
+        .await
+        .expect("roll once");
+    assert_eq!(first, common::dec("3"));
+
+    let second = svc
+        .roll_to_next_period(TenantId::from_trusted(tenant), contract, jan_end)
+        .await
+        .expect("roll again");
+    assert_eq!(
+        second,
+        common::dec("0"),
+        "the second roll reports nothing rolled, because nothing was"
+    );
+
+    let feb_start = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+    let (included, remaining, rollover): (Decimal, Decimal, Decimal) = sqlx::query_as(
+        r#"SELECT hours_included, hours_remaining, rollover_hours
+           FROM contract_hour_balances
+           WHERE contract_id = $1 AND period_start = $2"#,
+    )
+    .bind(contract)
+    .bind(feb_start)
+    .fetch_one(&pool)
+    .await
+    .expect("feb balance");
+    assert_eq!(included, common::dec("13"), "13, not 16");
+    assert_eq!(remaining, common::dec("13"));
+    assert_eq!(rollover, common::dec("3"));
+}
+
 /// Seed a billable work type and return its id.
 async fn seed_work_type(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
