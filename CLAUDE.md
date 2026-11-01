@@ -232,6 +232,7 @@ One line per rule, or per group of rules answering one subject, linking its full
 
 - A KB version records who, what kind and why ([PMS-1126](docs/invariants/kb.md#versions-pms-1126))
 - KB comments are staff-only ([PMS-1128, PMS-1129, PMS-1130](docs/invariants/kb.md#comments-pms-1128-pms-1129-pms-1130))
+- Templated articles render dual-plane, validated server-side ([PMS-1450](docs/invariants/kb.md#template-rendering-pms-1450))
 
 ### Contacts and mail
 
