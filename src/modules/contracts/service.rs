@@ -1426,7 +1426,14 @@ impl ContractsService {
     /// `period_end` is the last day of the window (the day before the
     /// next window's start), matching the DATE columns' inclusive
     /// `period_start`/`period_end` semantics.
-    fn period_for(
+    ///
+    /// `pub(crate)` since PMS-1572: the recurring-invoicing run anchors its
+    /// periods with its own `current_billing_period`, and the roll it now
+    /// performs lands on the window this function names. The two walking the
+    /// same windows is load-bearing, so
+    /// `billing::service::pms1572_period_agreement_tests` asserts it rather
+    /// than leaving two private functions to drift.
+    pub(crate) fn period_for(
         anchor: NaiveDate,
         billing_cycle: &str,
         when: NaiveDate,
