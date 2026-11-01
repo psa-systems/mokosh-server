@@ -23,6 +23,38 @@ shares the data-transfer types in the workspace crate `crates/mokosh-types`. Ide
 deployment profile is delegated to an external OIDC provider referred to in this document as the identity provider
 (the `bunyip` provider name and `BUNYIP_*` variables in the code).
 
+- **SPEC-1 and 2.1**: the combined router's `.fallback(...)` must catch every request matching none of the six
+  top-level nests, including a bare `GET /`, and must answer the `not_a_frontend` 404 HTML page rather than axum's
+  default 404, which would otherwise leak internal route information, citing `src/api/router.rs:1400`.
+
+### Non-goals
+
+mokosh-server does not serve a user interface (see above). It does not implement its own OIDC identity provider;
+`bunyip` is the one identity provider this document names, and provisioning a different one is out of scope. It
+does not read application configuration from any source this module group's registry does not declare: a key not
+in `src/config/variables.toml` has no reader, by construction of the registry described in section 2.7. It does
+not run scheduled jobs across multiple processes: the scheduler in section 2.5 assumes exactly one running
+instance, and offers no leader election or distributed locking.
+
+### Process model
+
+One long-running process per deployment, serving every tenant from the same `mokosh-server` binary; there is no
+per-tenant process or thread. Section 2.3 states the boot sequence in full; section 2.5 states the interval and
+one-shot background work that runs inside the same process once it is up.
+
+### Retention and cleanup
+
+This module group (sections 1-2) owns no application data, so it states no retention or cleanup rule of its own
+for any domain area; those rules belong to the module group that owns the data and are specified where that group
+lands:
+
+- Billing, time, tickets, contacts, documents, and knowledge base: none in this section; see the module group that
+  owns each (billing and time, service desk, remaining modules) once its specification section exists.
+- Connection pool lifecycle (`src/db/pool.rs`) is a resource limit, not a data-retention rule: a connection is
+  recycled on an idle timeout and a hard lifetime cap, covered in section 2.6, but no row is ever deleted by it.
+- The one-shot correction tasks in `src/scheduler/one_shot.rs` run once per process start; they are idempotent
+  corrections to existing rows, not a cleanup or expiry mechanism, covered in section 2.5.
+
 ## 2. Architecture
 
 ### 2.1 Workspace
@@ -55,25 +87,153 @@ Rust edition 2021; the toolchain is pinned in `rust-toolchain.toml` (channel `1.
 
 ### 2.3 Runtime shape
 
-`mokosh-server` is one long-running process. `src/main.rs` runs, in order:
+`mokosh-server` is one long-running process. `src/main.rs` runs the following, in order. Each step either ends
+startup (a hard failure) or logs and continues (a soft failure); which one applies is stated per step.
 
-1. If `argv[1]` names an operator subcommand (section 4.2), run it and exit.
-2. Initialise `tracing` with `RUST_LOG` (default filter `info`), load a `.env` file, read the hosting profile
-   (`MOKOSH_DEPLOYMENT_MODE`), and refuse to boot if a retired storage variable name is set.
-3. Select the configuration provider and resolve every declared configuration key into one generation.
-4. Build `AppConfig`; refuse to boot outside development/test if the essential deployment variables are unset or the
-   secrets are weak (section 6.1).
-5. Provision the two database roles if the migrator role cannot yet log in (needs `MOKOSH_ADMIN_DATABASE_URL`), open
-   the two connection pools, and run migrations when `RUN_MIGRATIONS` is true (the default). A migration failure ends
-   startup with a non-zero exit.
-6. Create the first platform administrator when `ADMIN_EMAIL` and `ADMIN_PASSWORD` are set and no platform admin
-   exists. A failure here is logged as a warning and boot continues.
-7. Initialise the application-tier secret providers, the deployment's OAuth client pairs (Google, Microsoft, Xero,
-   Intuit), the cached product name, the mailer (the transport is verified at boot and a failure ends startup), the
-   identity-provider token verifier, and the authentication provider chain.
-8. Start the background scheduler (section 2.5), spawn the one-shot data movers, load the optional IP databases.
-9. Build the router and serve it on `HOST:PORT` (defaults `0.0.0.0:8080`) with client connect info. There is no
-   graceful-shutdown handler.
+- **SPEC-1 and 2.2**: a secret resolved via `resolve_secret` (`JWT_SECRET`, `ENCRYPTION_KEY`,
+  `BUNYIP_WEBHOOK_SECRET`) must fall back to its hardcoded development value when unset only in the
+  development/dev/test environments; every other environment value, including the development value set
+  explicitly, is a fatal boot error, citing `src/main.rs:128`.
+- **SPEC-1 and 2.3**: outside development/dev/test, a `JWT_SECRET` shorter than 32 bytes is a fatal boot error;
+  development/dev/test accept any length, citing `src/main.rs:145`.
+- **SPEC-1 and 2.4**: outside development/dev/test, `ENCRYPTION_KEY` must be exactly 64 ASCII hex characters
+  (32 bytes hex-encoded); development/dev/test also accept a raw 32-byte key, citing `src/main.rs:162`.
+- **SPEC-1 and 2.5**: outside development/dev/test, `MOKOSH_DEPLOYMENT_MODE`, `MOKOSH_APP_DATABASE_URL`,
+  `BASE_URL`, `CLIENT_ORIGIN` and `SPA_BASE_URL` form a closed, ordered list; `check_deployment_requirements`
+  must collect every one left unset or blank and raise a single combined fatal error naming each one's purpose,
+  legal options and an example, citing `src/main.rs:215`.
+- **SPEC-1 and 2.6**: a recognized `argv[1]` subcommand must short-circuit to `run_cli` and return before
+  tracing, dotenv, configuration or the database are touched, citing `src/main.rs:530`.
+- **SPEC-1 and 2.7**: the server path's tracing subscriber must read `RUST_LOG`, defaulting to `"info"` when
+  unset or unparsable; this init is skipped entirely on the CLI-dispatch path, which installs its own
+  (SPEC-1 and 2.58), citing `src/main.rs:546`.
+- **SPEC-1 and 2.8**: two unconditional info-level lines (the version banner, then a hardcoded "multi-tenant
+  mode" line) must be logged before any configuration, env file or database is touched, citing `src/main.rs:556`.
+- **SPEC-1 and 2.9**: `.env` is loaded via `dotenvy::dotenv().ok()`, so a missing file must be silently
+  ignored rather than failing startup, citing `src/main.rs:566`.
+- **SPEC-1 and 2.10**: an unrecognized `MOKOSH_DEPLOYMENT_MODE` value must end startup here, naming the legal
+  values, before the database or any provider is touched, citing `src/main.rs:575`.
+- **SPEC-1 and 2.11**: a retired storage env var name must end startup; the message is printed to stderr (not
+  only the tracing log) and returned as the process's fatal error, citing `src/main.rs:586`.
+- **SPEC-1 and 2.12**: an unrecognised `CONFIG_BACKEND`, or a failure resolving the first configuration
+  generation, must end startup here, citing `src/main.rs:598`.
+- **SPEC-1 and 2.13**: unlike every other fatal boot step in this function, an `AppConfig::from_env` failure
+  must panic (`.expect`) rather than returning a typed error, citing `src/main.rs:603`.
+- **SPEC-1 and 2.14**: DB role self-provisioning must run before either request pool is opened, and must be
+  skipped entirely when `mokosh_migrator` can already log in; a failure must propagate as a fatal boot error,
+  citing `src/main.rs:617`.
+- **SPEC-1 and 2.15**: `Database::new` must open both the app and migrator pools in one call; a connection
+  failure must propagate as a fatal boot error before migrations ever run, citing `src/main.rs:628`.
+- **SPEC-1 and 2.16**: a migration failure must be fatal: logged at error level and returned, ending startup
+  without serving on a half-migrated database, citing `src/main.rs:641`.
+- **SPEC-1 and 2.17**: `RUN_MIGRATIONS=false` must skip the whole migration block silently; `main.rs` logs no
+  explicit "migrations skipped" line in that case, citing `src/main.rs:643`.
+- **SPEC-1 and 2.18**: "Database connected" must be logged unconditionally, whether or not migrations ran,
+  citing `src/main.rs:653`.
+- **SPEC-1 and 2.19**: a platform-admin bootstrap failure must be logged at warn level with boot continuing;
+  it is never fatal, citing `src/main.rs:657`.
+- **SPEC-1 and 2.20**: a single hardcoded info line names the two auth mechanisms (bunyip-as-OP Resource
+  Server plus the legacy HS256 cookie); it is not derived from which providers actually resolved, citing
+  `src/main.rs:668`.
+- **SPEC-1 and 2.21**: a malformed `ENCRYPTION_KEY`, re-parsed into raw bytes here after its shape was already
+  validated by `AppConfig::from_env`, must panic via `.expect` rather than returning a typed boot error, citing
+  `src/main.rs:674`.
+- **SPEC-1 and 2.22**: application-tier secret provider construction (the per-secret defaults and the
+  process-wide installation) must be fatal; a failure here ends startup before any provider-backed secret can
+  be read, citing `src/main.rs:699`.
+- **SPEC-1 and 2.23**: a half-configured Google OAuth client pair (one of id/secret set, the other missing) is
+  a fatal boot error; both unset resolves to `None` with no error, citing `src/main.rs:720`.
+- **SPEC-1 and 2.24**: a half-configured Xero or Intuit application pair is a fatal boot error, the same
+  posture as the Google client; unavailable `app_secrets` falls back to `IssuerApps::default()` with no error,
+  citing `src/main.rs:733`.
+- **SPEC-1 and 2.25**: `app_secrets::current()` returning `None` here, meaning the earlier `init_from_env` call
+  silently failed to install, must be a fatal error, not a panic, citing `src/main.rs:778`.
+- **SPEC-1 and 2.26**: a failure loading the product-name setting must be logged at warn level with boot
+  continuing on the built-in default name, citing `src/main.rs:792`.
+- **SPEC-1 and 2.27**: an unrecognised `MAIL_PROVIDER`, or `MAIL_PROVIDER=smtp` with no `SMTP_HOST`, must end
+  startup; the resolved provider and its source (explicit vs. profile default) are logged at info level,
+  citing `src/main.rs:812`.
+- **SPEC-1 and 2.28**: a failure loading the mailer configuration (a DB setting or `SMTP_*` env) must panic via
+  `.expect`, citing `src/main.rs:824`.
+- **SPEC-1 and 2.29**: a failure constructing the `Mailer` for the selected provider must panic via `.expect`,
+  citing `src/main.rs:832`.
+- **SPEC-1 and 2.30**: the mailer transport must be verified at boot, not on first send; a verify failure is
+  fatal (logged at error level, startup ends); `LogMailer`'s verify is a no-op `Ok(())`, citing
+  `src/main.rs:844`.
+- **SPEC-1 and 2.31**: the Bunyip RS verifier is optional; a missing or invalid `OIDC_ISSUER`/`OIDC_AUDIENCE`
+  configuration must log an info-level reason and leave it `None` (the legacy HS256 path still serves); it is
+  never fatal, citing `src/main.rs:860`.
+- **SPEC-1 and 2.32**: an invalid `AUTH_PROVIDERS` selection must end startup; a valid one is logged via
+  `record()` and installed process-wide before the router is built, so every later reader of the selection sees
+  the same value, citing `src/main.rs:883`.
+- **SPEC-1 and 2.33**: tenant-secret provider construction must panic via `.expect("secret provider
+  configuration")` on misconfiguration rather than returning a typed boot error, citing `src/main.rs:971`.
+- **SPEC-1 and 2.34**: object storage provider construction must panic via `.expect("storage provider
+  configuration")` on misconfiguration, the same posture as the secret provider, citing `src/main.rs:993`.
+- **SPEC-1 and 2.35**: `provider_selection.record()` must log, for all five capability kinds, whether the
+  hosting profile's default stands or an operator's explicit override took effect; it performs no validation
+  of its own, citing `src/main.rs:1034`.
+- **SPEC-1 and 2.36**: the `FeatureSnapshot` must start with every toggle off; the scheduler's first
+  (immediate) tick of `FeatureToggleRefresh` is what first populates it, so a request served before that tick
+  sees every feature off regardless of the database's rows, citing `src/main.rs:1047`.
+- **SPEC-1 and 2.37**: unlike every other job registered in `main.rs`, the feature-toggle refresh and (below)
+  the asset-signature-detector refresh must be registered at their own job-module constant intervals, not a
+  literal duration written in `main.rs`, citing `src/main.rs:1054`.
+- **SPEC-1 and 2.38**: the notification dispatcher must be registered on a hardcoded 5-second interval, the
+  only job in `main.rs` at that cadence, citing `src/main.rs:1077`.
+- **SPEC-1 and 2.39**: RMM sync must be registered on a hardcoded 60-second interval, citing
+  `src/main.rs:1080`.
+- **SPEC-1 and 2.40**: the contact-sync runner must be registered as a wakeable job on a hardcoded 60-second
+  interval AND woken on demand via `contact_sync_wake` (also handed to `create_api_router`), so a request that
+  commits a sync run need not wait for the next tick, citing `src/main.rs:1115`.
+- **SPEC-1 and 2.41**: contract lifecycle and recurring invoicing must each be registered on a hardcoded
+  3600-second (1-hour) interval, citing `src/main.rs:1134`.
+- **SPEC-1 and 2.42**: SLA sweep must be registered on a hardcoded 60-second interval, citing
+  `src/main.rs:1141`.
+- **SPEC-1 and 2.43**: calendar reminders must be registered on a hardcoded 60-second interval, citing
+  `src/main.rs:1165`.
+- **SPEC-1 and 2.44**: the grant-invitation expiry sweep must be registered using the module's own
+  `GRANT_INVITATIONS_SWEEP_INTERVAL` constant rather than a literal duration written in `main.rs`, citing
+  `src/main.rs:1181`.
+- **SPEC-1 and 2.45**: scheduled reports must be registered on a hardcoded 60-second interval, citing
+  `src/main.rs:1201`.
+- **SPEC-1 and 2.47**: `main.rs` must spawn five one-shot movers via `spawn_once` (KB attachment, tenant logo,
+  branding assets, gateway credential, Google client-secret cleanup) without awaiting any of them; a failure
+  inside one is handled by `spawn_once` or the mover itself, not surfaced to `main`'s own control flow, citing
+  `src/main.rs:1248`.
+- **SPEC-1 and 2.46**: scheduled dashboards must be registered on a hardcoded 60-second interval, citing
+  `src/main.rs:1215`.
+- **SPEC-1 and 2.48**: invoice reminders must be registered on a hardcoded 3600-second (1-hour) interval,
+  citing `src/main.rs:1319`.
+- **SPEC-1 and 2.49**: status-observation retention must be registered on a hardcoded 21600-second (6-hour)
+  interval, citing `src/main.rs:1334`.
+- **SPEC-1 and 2.50**: `scheduler.start()` must be called exactly once, after every job above is registered;
+  its returned handles must be held for the rest of `main` so the spawned tasks stay alive rather than being
+  dropped before the server starts serving, citing `src/main.rs:1341`.
+- **SPEC-1 and 2.51**: an unset `IP2LOCATION_DB_PATH`, or a failed `.BIN` load, must leave `geoip` as `None`
+  and log info/warn respectively; never fatal, citing `src/main.rs:1351`.
+- **SPEC-1 and 2.52**: an unset `IP2PROXY_DB_PATH`, or a failed `.BIN` load, must leave `ip_enrich` as `None`
+  and log info/warn respectively; never fatal, independent of the geoip service, citing `src/main.rs:1374`.
+- **SPEC-1 and 2.53**: the router must be built with one `create_api_router` call, after every provider,
+  worker and secret above is ready; it is the last construction step before the listener binds, citing
+  `src/main.rs:1397`.
+- **SPEC-1 and 2.54**: the bind address must be `{HOST}:{PORT}` (defaulting to `0.0.0.0`/`8080` per
+  `AppConfig::from_env`); a malformed combination fails the `SocketAddr` parse and is fatal, citing
+  `src/main.rs:1427`.
+- **SPEC-1 and 2.55**: a bind failure (for example the port already in use) must propagate as a fatal startup
+  error, citing `src/main.rs:1431`.
+- **SPEC-1 and 2.56**: `axum::serve` must run with no graceful-shutdown handler attached (no
+  `.with_graceful_shutdown`, no SIGTERM/SIGINT handling in `main.rs`); the process relies entirely on the
+  default OS signal behavior and drains no in-flight connection on exit, citing `src/main.rs:1456`.
+- **SPEC-1 and 2.57**: `run_cli` must load `.env.infisical` then `.env`, each via `let _ =` so either file's
+  absence is silently ignored; this is a different source order than the server path (SPEC-1 and 2.9), which
+  loads only `.env`, citing `src/main.rs:1463`.
+- **SPEC-1 and 2.58**: `run_cli` must install its own tracing subscriber (the same `RUST_LOG`-with-`"info"`-
+  default rule as SPEC-1 and 2.7), because the CLI dispatch at the top of `main` returns before `main`'s own
+  subscriber is installed, citing `src/main.rs:1463`.
+- **SPEC-1 and 2.59**: a subcommand error must be printed to stderr and exit the process via
+  `std::process::exit(1)`, not returned as this function's `Result`, so `main`'s own error formatting never
+  sees it, citing `src/main.rs:1474`.
 
 ### 2.4 Request pipeline
 
@@ -108,6 +268,110 @@ rejections answer `429` with `Retry-After`. A deleted account answers `410` with
 token answers `401` with a `WWW-Authenticate: Bearer` challenge that distinguishes expired, invalid and ended-session
 credentials.
 
+- **SPEC-1 and 2.60**: the seven top-level mounts and their auth models (session `/api/v1`, no-auth-by-design
+  `/api/v1/public`, contact Bearer `/api/v1/contact`, and the four signed receivers) must match CLAUDE.md's
+  "Routing model" claim; the invoice-issuer webhooks mount is a fifth signed receiver CLAUDE.md's prose does
+  not name individually (a documentation-completeness gap; see Intent unclear), citing
+  `src/api/router.rs:1373`.
+- **SPEC-1 and 2.61**: `sanitize_json_body` must be layered once on the combined `Router`, outside every nest,
+  so it runs on every path including the signed receivers; the `RAW_BODY_PATHS` exemption is a prefix check
+  inside the function itself, not a difference in which nests this layer wraps, citing
+  `src/api/router.rs:1414`.
+- **SPEC-1 and 2.62**: seven independent `normalize_error_envelope` instances must each be layered separately:
+  `api_v1`, `bunyip_nest`, `stripe_webhooks`, `paypal_webhooks`, `invoice_issuer_webhooks` (one per provider
+  closure call), `public_api`, and `contact_api`, citing `src/api/router.rs:992` (and repeated at
+  `src/api/router.rs:1118`, `:1166`, `:1190`, `:1240`, `:1334`, `:1367`).
+- **SPEC-1 and 2.63**: the public API's per-IP rate limit must trigger on every request to that nest, keyed by
+  the caller's extracted client IP (trusted-proxy-aware); the quota is `PUBLIC_API_PER_MIN` (60/minute), and a
+  caller past quota gets a 429 with `Retry-After`, citing `src/api/router.rs:1321`.
+- **SPEC-1 and 2.64 DEFECT**: the comment above `logout_verifier.map(...)` claims the back-channel logout
+  receiver is "Mounted whether or not the verifier exists", but `logout_verifier.map(...)` only builds
+  `Some(router)` when `bunyip_verifier` was `Some`, and the `match backchannel_logout { Some(logout) =>
+  bunyip_nest.merge(logout), None => ... }` further down only merges the route in that case; with no verifier
+  the route is NOT mounted and a request to it 404s, contradicting the comment's own claim. Not fixed here;
+  see Defects found, citing `src/api/router.rs:1076` and `src/api/router.rs:1133`.
+- **SPEC-1 and 2.65**: `api_v1`'s middleware stack, innermost to outermost, must be: `seed_middleware`, then
+  `auth_middleware`, then the contact-plane middleware, then `Extension<Database>`,
+  `Extension<SettingsService>`, `Extension<PlatformAdminService>`, and finally `normalize_error_envelope` as
+  the outermost layer; each later `.layer()` call wraps the ones before it, citing `src/api/router.rs:924`.
+- **SPEC-1 and 2.66**: `/platform`'s own `PlatformAdminService` instance (built at the nest) must be a
+  distinct object from the one the outer `Extension` layer injects near the end of the chain; both target the
+  same table but are separate instances serving separate call sites, citing `src/api/router.rs:624` (and
+  `src/api/router.rs:979`).
+- **SPEC-1 and 2.67**: `/tenants`, `/teams` and `/me` (teams) must only be mounted when the `multi-tenant`
+  cargo feature is on; a build without it has no tenant CRUD and no teams surface at all, not merely a gated
+  handler, citing `src/api/router.rs:638`.
+- **SPEC-1 and 2.68**: `contact_api` must compose `contact_portal::contact_routes` with the branding module's
+  contact-scoped routes, sharing one `ContactAuthService` instance between the two merged routers so a single
+  `load_capabilities` implementation backs both, citing `src/api/router.rs:1354`.
+- **SPEC-1 and 2.69**: both routes on the `bunyip_nest` must authenticate via an HMAC signature over the raw
+  body rather than a session; `account_deleted` must run on the migrator/BYPASSRLS pool because it is pre-auth
+  and resolves its own tenant from the `users` row it reads, citing `src/api/router.rs:1120`.
+- **SPEC-1 and 2.70**: Stripe and PayPal must share `provider_webhook_handler` and the per-tenant
+  `/webhooks/{tenant_id}` path shape; only `provider_id` and the state's `billing`/`payment_methods` differ
+  between them, citing `src/api/router.rs:1160`.
+- **SPEC-1 and 2.71**: the invoice-issuer webhooks must register one URL per provider (Xero, QuickBooks), not
+  one per tenant, since there is one application per provider and so one webhook subscription for the host to
+  configure, unlike the per-tenant Stripe/PayPal `{tenant_id}` path, citing `src/api/router.rs:1385`.
+- **SPEC-1 and 2.72**: the global stack order on the combined `Router`, each `.layer()` wrapping the previous
+  outward, must be: `sanitize_json_body`, then tracing, then compression, then CORS, then security headers
+  (outermost), so every response from every nest passes through all five, citing `src/api/router.rs:1420`.
+- **SPEC-1 and 2.73**: `GET /api/v1/health` must answer the static string `"OK"` with no downstream dependency
+  check at all, in contrast to `/ready`, citing `src/api/router.rs:1487`.
+- **SPEC-1 and 2.74**: `GET /api/v1/ready` must answer 200 with
+  `{"status":"ready","checks":{"db":...,"infisical":...}}` when both checks pass, else 503 with
+  `"status":"not_ready"` and the failing check's value replaced by an `"error: ..."` string; every response
+  must carry `Cache-Control: no-store`, citing `src/api/router.rs:1523`.
+- **SPEC-1 and 2.75**: the readiness DB ping must be bounded to 3 seconds; a ping that neither answers nor
+  errors within that bound is treated as a failure ("db ping exceeded 3s") rather than hanging the `/ready`
+  response open, citing `src/api/router.rs:1579`.
+- **SPEC-1 and 2.76**: the Infisical probe must be built lazily in a `OnceLock` on the first `/ready` request,
+  not at `create_api_router` time, caching the parsed URL, a credential-scrubbed display string, and a reused
+  `reqwest::Client`; a blank or unset `INFISICAL_ADDRESS` at that first call means no probe runs for the
+  lifetime of the process, citing `src/api/router.rs:1608`.
+- **SPEC-1 and 2.77**: `probe_infisical` must return a three-way result read by `ready_check`: `Ok(true)`
+  (probe ran, 2xx response) renders `"infisical":"ok"`; `Ok(false)` (unconfigured) renders `"skipped"` and
+  never fails readiness; `Err(_)` (configured but DNS/TCP/non-2xx/timeout failure) renders `"error: ..."` and
+  fails readiness with a 503, citing `src/api/router.rs:1688`.
+- **SPEC-1 and 2.78**: a route-overlap test must textually scan `tickets/routes.rs` (mounted at `/tickets`)
+  and `tickets/attachments.rs` (merged at the top level) for `.route(...)` calls, compute each one's effective
+  `(method, prefix+path)`, and fail on any pair both sources register; it also fails if the scan finds 20 or
+  fewer routes total, guarding against the parser silently matching nothing, citing `src/api/router.rs:1797`.
+- **SPEC-1 and 2.79**: two tests (`brotli_is_negotiated_when_the_client_advertises_it`,
+  `gzip_only_client_still_gets_gzip`) must confirm the global `CompressionLayer::new()` offers brotli when the
+  client advertises it alongside gzip, and falls back to gzip for a gzip-only client, without the layer's
+  offered algorithm set being visible from its construction call, citing `src/api/router.rs:1971`.
+- **SPEC-1 and 2.80**: `CorsOriginMatcher::from_entries` must run exactly once, at router construction (boot),
+  not per request; a parse failure must panic the boot rather than being deferred to request time, citing
+  `src/api/cors_origin.rs:53` (and `src/api/cors_origin.rs:63` for the per-request `matches` call it feeds).
+- **SPEC-1 and 2.81**: `CorsOriginMatcher::from_entries` is the one call site that parses `CORS_ORIGIN` entries;
+  `matches` itself must do no parsing, only byte comparisons against rules parsed once at boot, citing
+  `src/api/cors_origin.rs:53`.
+- **SPEC-1 and 2.82**: an empty `CORS_ORIGIN` entry must panic at boot rather than being skipped or
+  allow-listing nothing, citing `src/api/cors_origin.rs:105`.
+- **SPEC-1 and 2.83**: a wildcard entry with no suffix after `<scheme>://*.` must panic at boot, citing
+  `src/api/cors_origin.rs:113`.
+- **SPEC-1 and 2.84**: a wildcard suffix containing another `*` must panic at boot; only the leftmost label
+  may be a wildcard, citing `src/api/cors_origin.rs:119`.
+- **SPEC-1 and 2.85**: a wildcard suffix with no dot must panic at boot; the suffix must include a TLD, citing
+  `src/api/cors_origin.rs:125`.
+- **SPEC-1 and 2.86**: an entry containing `*` outside the leading `<scheme>://*.` position must panic at
+  boot, citing `src/api/cors_origin.rs:138`.
+- **SPEC-1 and 2.87**: an exact entry that does not parse as a valid header value must panic at boot, citing
+  `src/api/cors_origin.rs:144`.
+- **SPEC-1 and 2.88**: an exact-origin rule must match byte-for-byte, case-sensitively, with no normalization
+  of the incoming `Origin` header, citing `src/api/cors_origin.rs:67`.
+- **SPEC-1 and 2.89**: a wildcard rule's scheme must be matched as a literal prefix, so a wildcard entry never
+  matches the other scheme, citing `src/api/cors_origin.rs:71`.
+- **SPEC-1 and 2.90**: a wildcard rule's suffix comparison must be a tail (suffix) comparison, not
+  leftmost-label-only, so any number of leading host labels match, citing `src/api/cors_origin.rs:85`.
+- **SPEC-1 and 2.91**: a wildcard rule must reject the bare apex and the empty-label host by requiring the
+  matched host to be strictly longer than the stored suffix, citing `src/api/cors_origin.rs:81`.
+- **SPEC-1 and 2.92**: a wildcard rule's suffix is the literal configuration text and must be compared
+  byte-for-byte, case-sensitively, citing `src/api/cors_origin.rs:67`.
+- **SPEC-1 and 2.93**: a wildcard rule's stored suffix must include a leading dot and must include a port if
+  one was written into the configuration entry, citing `src/api/cors_origin.rs:85`.
+
 ### 2.5 Background jobs
 
 All periodic jobs run on the shared scheduler (`src/scheduler/mod.rs`): one tokio task per job, fixed interval, missed
@@ -131,7 +395,159 @@ ticks skipped, the first tick fires immediately at startup, tick errors are logg
 One-shot tasks started at boot (`scheduler/one_shot.rs`): move knowledge-base attachments, tenant logos, branding assets
 and payment-gateway credentials to their current storage layout, and clean up a retired Google client secret.
 
-### 2.6 Provider seams
+- **SPEC-1 and 2.94**: one job runs per registration, ticked at a fixed interval on its own tokio task, citing
+  `src/scheduler/mod.rs:68`.
+- **SPEC-1 and 2.95**: a second job registered with the same name must panic at registration rather than
+  silently shadowing the first, citing `src/scheduler/mod.rs:180`.
+- **SPEC-1 and 2.96**: a wakeable job must keep its registered interval; `JobWake` only runs it sooner and
+  never changes the cadence, citing `src/scheduler/mod.rs:173`.
+- **SPEC-1 and 2.97**: `tokio::sync::Notify::notify_one` retains at most one permit, so any number of wakes
+  before the next `notified()` must collapse into a single extra run rather than one run per wake, citing
+  `src/scheduler/mod.rs:108`.
+- **SPEC-1 and 2.98**: `tokio::time::interval` must fire its first tick immediately, then every `interval`,
+  with missed ticks skipped rather than queued, citing `src/scheduler/mod.rs:240`.
+- **SPEC-1 and 2.99**: a tick that returns `Err` must be logged at warn and discarded; the loop must never
+  stop or retry early, citing `src/scheduler/mod.rs:273`.
+- **SPEC-1 and 2.100**: a one-shot pass must run exactly once per process start, never on a recurring
+  `Scheduler` interval, citing `src/scheduler/one_shot.rs:64`.
+- **SPEC-1 and 2.101**: a `main.rs` local variable named with the `_mover` or `_cleanup` suffix must never be
+  `scheduler.register()`'d, enforced by a test that scans `main.rs` for the convention, citing
+  `src/scheduler/one_shot.rs:134`.
+
+### 2.6 Database and tenancy
+
+Two connection pools back every request: an unprivileged `mokosh_app` pool (`NOBYPASSRLS`) that serves requests
+under row-level security, and a `mokosh_migrator` pool (`BYPASSRLS`) reserved for migrations and the handful of
+tables row-level security does not cover.
+
+- **SPEC-1 and 2.102**: each pool must be capped at 20 connections (minimum 2), with a 30-second acquire
+  timeout, 600-second idle timeout and 1800-second maximum connection lifetime, citing `src/db/pool.rs:62`.
+- **SPEC-1 and 2.103**: `Database::pool()` must return the unprivileged `app_pool`; a serving query that
+  bypasses `begin_with_tenant` fail-closes to zero rows under row-level security, citing `src/db/pool.rs:110`.
+- **SPEC-1 and 2.104**: `Database::migrator_pool()` is the BYPASSRLS accessor; `scripts/check-pool-safety.nu`
+  must require every bare `.pool()` call site elsewhere to carry a `SAFETY (PMS-285)` note, citing
+  `src/db/pool.rs:122`.
+- **SPEC-1 and 2.105**: `set_config`'s `true` argument must make the setting transaction-local (`SET LOCAL`
+  semantics), so the tenant GUC never leaks to the next request that reuses this pooled connection, citing
+  `src/db/pool.rs:189`.
+- **SPEC-1 and 2.106**: `health_check` must run against `app_pool`, never `migrator_pool`, so a readiness
+  probe exercises the same connection serving requests, citing `src/db/pool.rs:150`.
+- **SPEC-1 and 2.107**: `run_migrations` must run on `migrator_pool`; a migration failure must return
+  `AppError::Database`, which ends startup, citing `src/db/pool.rs:136`.
+- **SPEC-1 and 2.108**: `Database::from_pool` must wrap one pool as both `app_pool` and `migrator_pool`, so
+  row-level security never bites (the single role used is whichever one connected it), citing
+  `src/db/pool.rs:84`.
+- **SPEC-1 and 2.109**: `Database::from_pools` must wrap two distinct pools, so a test can connect `app_pool`
+  as the unprivileged `mokosh_app` role and exercise row-level security against it, citing
+  `src/db/pool.rs:97`.
+- **SPEC-1 and 2.110**: `provision_roles` must drive which provisioning statements run, if any, from four
+  boot-time role-probe outcomes (`RolesProbe::BothExist`, `MigratorConnectsAppMissing`, `AppPasswordMismatch`,
+  `MigratorCannotConnect`), citing `src/db/provision.rs:62`.
+- **SPEC-1 and 2.111**: only `AppPasswordMismatch` must skip the migrator statements, so reconciling
+  `mokosh_app`'s password never rewrites `mokosh_migrator`'s, citing `src/db/provision.rs:239`.
+- **SPEC-1 and 2.112**: provisioning must create `mokosh_migrator` as `LOGIN BYPASSRLS` with `GRANT ALL ON
+  SCHEMA public` and `GRANT CREATE ON DATABASE`, so migrations can self-install the trusted extensions
+  (uuid-ossp/pg_trgm/citext/pgcrypto), citing `src/db/provision.rs:254`.
+- **SPEC-1 and 2.113**: provisioning must create `mokosh_app` as `LOGIN NOSUPERUSER NOBYPASSRLS` with
+  CONNECT/USAGE/DML grants on current objects; default-privilege grants for future migration-created objects
+  are a separate statement group, citing `src/db/provision.rs:313`.
+- **SPEC-1 and 2.114**: only Postgres SQLSTATE `28P01` must count as a password mismatch; every other failure
+  reports `Ok` so a transient probe failure cannot force a full provision, citing `src/db/provision.rs:505`.
+- **SPEC-1 and 2.115**: `rolcanlogin = TRUE` must be required for the probe to treat a hand-created
+  `mokosh_app` as already provisioned; a NOLOGIN role routes to the full provision path instead of the fast
+  path, citing `src/db/provision.rs:440`.
+- **SPEC-1 and 2.116**: every read in `src/db/identity.rs` must run on the migrator (BYPASSRLS) pool;
+  `identities` carries no `tenant_id` and no row-level security, and `tenant_memberships`' fail-closed
+  `tenant_isolation` policy is the backstop if a caller passes the app pool instead, citing
+  `src/db/identity.rs:21`.
+- **SPEC-1 and 2.117**: `record_identity_mfa_success` must compare-and-set on `mfa_last_totp_step`; zero rows
+  affected must be treated as a replay, citing `src/db/identity.rs:387`.
+- **SPEC-1 and 2.118**: grant-arm rows must be collected before owner-arm rows, and an owner-arm row whose
+  `tenant_id` already appeared from a grant must be skipped, so a grantee's seat keeps its grant designation,
+  citing `src/db/identity.rs:273`.
+- **SPEC-1 and 2.119**: `platform_admins` is row-level-security-exempt and every read/write in
+  `src/db/platform_admin.rs` must run on the migrator pool; its credential lifecycle is independent of
+  `users`/`identities`/`tenant_memberships`, citing `src/db/platform_admin.rs:10`.
+- **SPEC-1 and 2.120**: `stage_mfa_secret` must stage the secret without flipping `mfa_enabled`, so a
+  misconfigured authenticator cannot lock an operator out before `enable_mfa` confirms it with a live code,
+  citing `src/db/platform_admin.rs:124`.
+- **SPEC-1 and 2.121**: `spend_recovery_code` must use `rows_affected == 1` to distinguish a genuine spend from
+  a replay or an unknown code, citing `src/db/platform_admin.rs:191`.
+
+### 2.7 Configuration provider registry
+
+Every configuration key is declared once in a registry (`src/config/registry.rs`), with a declared `Tier`
+(Bootstrap or Application) determining whether it is resolved once per process or re-resolved on refresh.
+
+- **SPEC-1 and 2.122**: `declare_keys!` is the one declaration site a `ConfigKey` and its Tier/since/required
+  facts come from; a flag or a read naming a key it does not emit must fail to compile, citing
+  `src/config/registry.rs:192`.
+- **SPEC-1 and 2.123**: `Tier` is the two-tier split a provider read is built on (Bootstrap: resolved once per
+  process, unchanged across a refresh; Application: re-resolved on refresh), citing
+  `src/config/registry.rs:55`.
+- **SPEC-1 and 2.124**: `config::get`/`has`/`served_by` are the one read path every caller outside the
+  `ENTRY_POINTS` allowlist must use; `guard.rs`'s `every_env_read_goes_through_the_provider` test must enforce
+  it, citing `src/config/mod.rs:722`.
+- **SPEC-1 and 2.125**: `refresh` must re-resolve every application-tier key atomically and fall back to the
+  previous generation on a rejected outcome, citing `src/config/mod.rs:754`.
+- **SPEC-1 and 2.126**: a bootstrap-tier key must be refused before any I/O on both a full refresh and the
+  per-key `refuse_refresh_of_bootstrap` form, and a rejected outcome must leave the live generation and its
+  counter untouched, citing `src/config/mod.rs:785` (and `src/config/mod.rs:1130`).
+- **SPEC-1 and 2.127**: `init_from_env` is the boot entry point that must install a provider from
+  `CONFIG_BACKEND` (or the hosting profile's default) before any other read, citing `src/config/mod.rs:1152`.
+- **SPEC-1 and 2.128**: `CONFIG_BACKEND` is a single-provider slot that can only resolve to `Environment`
+  today; any other legal provider name must be treated as a wiring error directing the operator to
+  `CONFIG_PROVIDERS`, citing `src/config/mod.rs:559`.
+- **SPEC-1 and 2.129**: the staleness report must compare a recorded generation to a live provider probe
+  without ever exposing a value, only key/provider identity, citing `src/config/mod.rs:900`.
+- **SPEC-1 and 2.130**: the PMS-987 priority-list provider chain and its classification are wired but dormant;
+  no boot path installs one, so `CONFIG_PROVIDERS` still only feeds the single-provider slot via
+  `ConfigSelection` (see Intent unclear), citing `src/config/mod.rs:1286`.
+- **SPEC-1 and 2.131**: the environment provider must treat a non-UTF8 env var as unset-with-error-log,
+  distinct from genuinely absent, citing `src/config/env.rs:21`.
+- **SPEC-1 and 2.132**: the environment provider's enumeration must list only declared registry keys, never
+  the raw process environment, citing `src/config/env.rs:51`.
+- **SPEC-1 and 2.133**: the file provider must read `CONFIG_FILE_DIR` directly as its own construction input,
+  per the `guard.rs` provider-of-record exemption, citing `src/config/file.rs:67`.
+- **SPEC-1 and 2.134**: a missing file-provider directory must resolve to silent-empty (enablement); an
+  unreadable one must log an error; both collapse to an empty provider, citing `src/config/file.rs:85`.
+- **SPEC-1 and 2.135**: the file provider must strip exactly one trailing newline per file; anything else in
+  the value is preserved, citing `src/config/file.rs:267`.
+- **SPEC-1 and 2.136**: the file provider's `set` and `delete` must both refuse a bootstrap-tier key before
+  touching the filesystem, citing `src/config/file.rs:196`.
+- **SPEC-1 and 2.137**: the database provider's `build` must refuse any bootstrap-tier key before any pool
+  I/O, and its cache must only ever hold the application-tier keys it was given, citing
+  `src/config/database.rs:69`.
+- **SPEC-1 and 2.138**: the database provider's `set` must write `app_config` through the migrator pool (not
+  the request-serving pool) and sync the cache so a read-after-write sees it, citing
+  `src/config/database.rs:174`.
+- **SPEC-1 and 2.139**: the Bunyip provider must serve only its declared `SERVED_KEYS` allowlist, to respect
+  bunyip's per-app rate cap rather than the whole registry, citing `src/config/bunyip.rs:64`.
+- **SPEC-1 and 2.140**: the Bunyip provider must read `BUNYIP_CONFIG_URL`/`_CLIENT_ID`/`_CLIENT_SECRET`
+  directly as its own construction input, per the `guard.rs` exemption, citing `src/config/bunyip.rs:90`.
+- **SPEC-1 and 2.141**: fetching a Bunyip-served key must treat a 404 as an unheld key (`Ok(None)`); a 401 or
+  403 must be a hard provider error naming its own remedy, since each is fixed in a different place, citing
+  `src/config/bunyip.rs:248`.
+- **SPEC-1 and 2.142**: the Bunyip provider's `set` must be a stub that always refuses; the provider stays
+  read-only until bunyip's write endpoint exists, citing `src/config/bunyip.rs:233`.
+- **SPEC-1 and 2.143**: a `Flag<T>` must pair a declared application-tier key with a typed default, distinct
+  from a `ConfigKey`'s own Tier (a flag always stays on Application so it is refresh-visible), citing
+  `src/config/flags.rs:119`.
+- **SPEC-1 and 2.144**: `Flag::read` is the one read path for a flag; a blank or unparsable raw value must
+  fall back to the flag's default rather than failing the read, citing `src/config/flags.rs:151`.
+- **SPEC-1 and 2.145**: `FlagDefault::PerProfile` must resolve against the current `DeploymentMode` on every
+  read rather than freezing a mode at construction, citing `src/config/flags.rs:173`.
+- **SPEC-1 and 2.146**: `ENTRY_POINTS` is the complete, named allowlist of files permitted to read the
+  environment directly instead of through `crate::config::get`, citing `src/config/guard.rs:33`.
+- **SPEC-1 and 2.147**: `every_env_read_goes_through_the_provider` is the acceptance criterion in executable
+  form; a new direct environment read outside the seam and `ENTRY_POINTS` must fail the build, citing
+  `src/config/guard.rs:204`.
+- **SPEC-1 and 2.148**: `src/config/variables.toml` carries since/required/changelog facts for a variable read
+  outside the registry (an `ENTRY_POINTS` file), where a `ConfigKey`'s own since/required fields do not apply;
+  it is documentation data for `scripts/config-docs.nu`, not read by `declare_keys!` or any Rust code, citing
+  `src/config/variables.toml:1`.
+
+### 2.8 Provider seams
 
 Five capabilities are selected by name and resolved once at boot (`src/utils/deployment.rs`). Defaults come from the
 hosting profile set by `MOKOSH_DEPLOYMENT_MODE` (`self-hosted` or `saas`):
@@ -148,6 +564,96 @@ Further seams: application-tier secrets (`APP_SECRET_BACKEND`: `environment`, `f
 and the payment provider interface (`stripe`, `paypal`). An unrecognised provider name ends startup naming the legal
 values. The configuration seam also contains `file`, `database` and `bunyip` providers, which only the operator CLI
 chain builder (`CONFIG_PROVIDERS`) constructs; the server process itself reads configuration from `environment`.
+
+### 2.9 Version and build metadata
+
+- **SPEC-1 and 2.149**: every `VersionInfo` field must be a compile-time `env!()` constant; there is no
+  runtime git invocation in the server binary, citing `src/version.rs:11`.
+- **SPEC-1 and 2.150**: `GET /api/v1/version` must serve `VersionInfo::current()` with no auth extractor on
+  the handler, confirming `version.rs`'s doc-comment claim of endpoint consumption, citing
+  `src/api/router.rs:547`.
+- **SPEC-1 and 2.151**: the root `build.rs` must delegate `MOKOSH_GIT_HASH`/`MOKOSH_GIT_DESCRIBE`/
+  `MOKOSH_BUILD_DATE` emission to `build-metadata::emit`, citing `build.rs:9`.
+- **SPEC-1 and 2.152**: the resolution order for each build-metadata value must be the pre-set env var first,
+  a `git` shell-out second, a hardcoded fallback last, citing `crates/build-metadata/src/lib.rs:44`.
+- **SPEC-1 and 2.153**: the self-hosted update check must make no outbound request, and the probe must never
+  be built, when `MOKOSH_UPDATE_CHECK_URL` is unset or blank, citing `src/version_check.rs:80`.
+- **SPEC-1 and 2.154**: the update check's display URL must strip userinfo, query and fragment so a
+  credential embedded in the configured URL never reaches an error message, citing `src/version_check.rs:89`.
+- **SPEC-1 and 2.155**: a successful update-check result must be cached and reused for 15 minutes; a failed
+  one for 60 seconds, citing `src/version_check.rs:131`.
+
+### 2.10 Test infrastructure
+
+The `#[mokosh_test]` attribute (`crates/mokosh-test-macros`, `crates/mokosh-test`) replaces `#[sqlx::test]`: every
+test's database is cloned from one migrated template database rather than migrated from scratch.
+
+- **SPEC-1 and 2.156**: the generated test body must run on a current-thread Tokio runtime with every driver
+  enabled, matching what `#[sqlx::test]` built, citing `crates/mokosh-test-macros/src/lib.rs:90`.
+- **SPEC-1 and 2.157**: the annotated fn must be async and take exactly one argument (the pool); any other
+  shape must be a compile error, not a runtime one, citing `crates/mokosh-test-macros/src/lib.rs:60`.
+- **SPEC-1 and 2.158**: the `#[mokosh_test]` attribute must take no arguments; the template is always built
+  from `./migrations`, so a caller cannot ask for a different set, citing
+  `crates/mokosh-test-macros/src/lib.rs:41`.
+- **SPEC-1 and 2.159**: a per-test database must be a `CREATE DATABASE ... TEMPLATE` clone of the migrated
+  template rather than migrated from scratch, unique per test and per run so it collides with nothing, citing
+  `crates/mokosh-test/src/lib.rs:228`.
+- **SPEC-1 and 2.160**: the template name must be `"mokosh_tpl_"` followed by the first 8 bytes (16 hex
+  characters) of a SHA-256 digest over each migration's length-prefixed version/description/checksum, in
+  order, citing `crates/mokosh-test/src/lib.rs:404`.
+- **SPEC-1 and 2.161**: the template digest must run over `sqlx::migrate!`'s compile-time-embedded migration
+  set, not a runtime directory walk, so the name and the schema that fills it always come from the same
+  source, citing `crates/mokosh-test/src/lib.rs:407`.
+- **SPEC-1 and 2.162**: `crates/mokosh-test/build.rs` must declare `migrations/` a build dependency so the
+  crate recompiles whenever a migration is added or changed, citing `crates/mokosh-test/build.rs:14`.
+- **SPEC-1 and 2.163**: the template build must be serialized across processes by a Postgres session-level
+  advisory lock on a fixed key; the first process to arrive takes the lock and builds, every other process
+  blocks until it is released, citing `crates/mokosh-test/src/lib.rs:99` (and
+  `crates/mokosh-test/src/lib.rs:266`).
+- **SPEC-1 and 2.164**: the template must be built under a `"_building"` name and only renamed to its real
+  name once every migration has applied, so a process killed mid-build leaves a carcass rather than a
+  template that looks done, citing `crates/mokosh-test/src/lib.rs:290`.
+- **SPEC-1 and 2.165**: `ensure_template_built` must be idempotent with the build-if-absent logic `acquire`
+  runs, so calling it ahead of the suite is optional, not required, citing `crates/mokosh-test/src/lib.rs:210`.
+- **SPEC-1 and 2.166**: a per-test database name must be a v4 UUID prefix (so truncation at Postgres's 63-byte
+  identifier limit never collides two test names) followed by as much of the test path's tail as fits, citing
+  `crates/mokosh-test/src/lib.rs:432`.
+- **SPEC-1 and 2.167**: cleanup must run in this exact order: close the pool, drop the pool, drop the runtime,
+  then finish/drop the database; dropping the database before the runtime leaves a connected backend and
+  Postgres refuses the `DROP DATABASE`, citing `crates/mokosh-test-macros/src/lib.rs:108`.
+- **SPEC-1 and 2.168**: a failing (panicked) test's database must be kept, not dropped; a passing test's
+  database must always be dropped, citing `crates/mokosh-test/src/lib.rs:84`.
+- **SPEC-1 and 2.169**: dropping a test database must wait for `pg_stat_activity` to show zero sessions (up to
+  60 polls at 50ms) before a non-`FORCE` `DROP DATABASE`; a database still occupied after the wait must be left
+  in place with its sessions logged, citing `crates/mokosh-test/src/lib.rs:144`.
+- **SPEC-1 and 2.170**: `close_pool` must bound `pool.close()` to 10 seconds; a timeout must log the test path
+  rather than blocking the process indefinitely on a leaked pool, citing `crates/mokosh-test/src/lib.rs:64`.
+- **SPEC-1 and 2.171**: after a template build, every other `"mokosh_tpl_%"` database with no active session
+  must be dropped, so only the current and any still-in-use stale template persist, citing
+  `crates/mokosh-test/src/lib.rs:335`.
+
+### 2.11 Crate wiring and repo hygiene
+
+- **SPEC-1 and 2.172**: `src/lib.rs` is the crate root and must wire every top-level module and re-export
+  `Database`, `AuthState`, `CurrentUser`, `AppError`, `AppResult` and `VersionInfo` at the crate root, so
+  downstream code reaches them as `mokosh_server::X` rather than through the full module path, citing
+  `src/lib.rs:5`.
+- **SPEC-1 and 2.173**: a repo-hygiene test must walk every tracked file under `CARGO_MANIFEST_DIR` (skipping
+  build output and non-source directories, and any `.env*` file except `.env.example`) and fail if the former
+  client repository's name (`mokosh-` followed by the plural of the thing a client is, assembled at runtime so
+  this check is not itself a hit) appears as a byte substring anywhere, citing `src/lib.rs:70`.
+- **SPEC-1 and 2.174**: a repo-hygiene test must scan every `.rs` file under `tests/` line by line for
+  `#[sqlx::test` and fail if any line contains it, since a database-backed test must instead carry
+  `#[mokosh_test]`, citing `src/lib.rs:129`.
+- **SPEC-1 and 2.175**: a repo-hygiene test must read `.config/nextest.toml`, extract each of
+  `[profile.ci]`'s and `[profile.unsupported]`'s `default-filter` string, and fail unless the unsupported
+  filter equals `"not "` prepended to the ci filter (a literal text comparison, not an expression-equivalence
+  check), citing `src/lib.rs:185`.
+- **SPEC-1 and 2.176**: a repo-hygiene test must walk every `.rs` file under `src/secrets/` and `src/storage/`,
+  and for every non-comment line containing a declaration keyword (`mod`/`struct`/`enum`/`trait`/`type`/`fn`/
+  `union`/`const`/`static`) extract the identifier that follows and fail if it contains the substring `store`
+  or `backend`; it does not scan prose or the `SECRET_BACKEND`/`STORAGE_BACKEND` env var names, citing
+  `src/lib.rs:253`.
 
 ## 3. Providers and secrets
 
