@@ -1024,6 +1024,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recurring_invoicing_worker,
         std::time::Duration::from_secs(3600),
     );
+    // SPEC-7.130: SlaSweepWorker runs on a 60-second fixed interval.
     scheduler.register(sla_worker, std::time::Duration::from_secs(60));
 
     // Appointment-reminder worker (PMS-58 follow-up). Each 60s tick

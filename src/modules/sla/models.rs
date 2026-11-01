@@ -16,6 +16,8 @@ pub struct SlaPolicyResponse {
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertSlaPolicyRequest {
+    // SPEC-7.71: name must be 1-100 characters or validation fails
+    // before the service is ever called.
     #[validate(length(min = 1, max = 100))]
     pub name: String,
     pub description: Option<String>,
@@ -34,15 +36,21 @@ pub struct SlaTargetResponse {
     pub operational_hours: String,
 }
 
+// SPEC-7.78: rejects a payload where both hours are present and
+// first_response_hours > resolution_hours; equal values are allowed and
+// either field being absent leaves the pair unconstrained.
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[validate(schema(function = validate_sla_target_range))]
 pub struct UpsertSlaTargetRequest {
     pub priority_id: Uuid,
+    // SPEC-7.79: first_response_hours and resolution_hours, when
+    // present, must each pass validate_sla_target_hours (positive, <= 2dp).
     #[validate(custom(function = crate::utils::validation::validate_sla_target_hours))]
     pub first_response_hours: Option<Decimal>,
     #[validate(custom(function = crate::utils::validation::validate_sla_target_hours))]
     pub resolution_hours: Option<Decimal>,
     /// "business_hours" | "24x7"
+    // SPEC-7.80: defaults to "24x7" when absent from the request JSON.
     #[serde(default = "default_24x7")]
     pub operational_hours: String,
 }
@@ -88,6 +96,8 @@ pub struct BusinessHoursResponse {
 pub struct UpsertBusinessHoursRequest {
     #[validate(length(min = 1, max = 100))]
     pub name: String,
+    // SPEC-7.85: timezone defaults to the literal string "UTC" when
+    // omitted.
     #[serde(default = "default_utc")]
     pub timezone: String,
     /// Per-day windows, e.g.
@@ -131,6 +141,8 @@ fn json_shape_error(code: &'static str, message: String) -> ValidationError {
 ///   each value either `null` (closed), a single `{"start","end"}` window, or
 ///   an array of such windows; `start`/`end` are `HH:MM`(`:SS`) and `end` must
 ///   be strictly after `start`.
+// SPEC-7.86: accepts JSON null or {} as "no windows" and rejects
+// (422) any other non-object top-level value, keyed onto field "schedule".
 fn validate_business_schedule(schedule: &serde_json::Value) -> Result<(), ValidationError> {
     // Absent / explicitly empty: no schedule, engine falls back to 24/7.
     if schedule.is_null() {
@@ -145,6 +157,9 @@ fn validate_business_schedule(schedule: &serde_json::Value) -> Result<(), Valida
         ));
     };
     for (key, value) in map {
+        // SPEC-7.87, SPEC-7.90: rejects an unknown weekday key
+        // using the same clock::parse_weekday_key the read path uses, so the
+        // two cannot drift.
         if super::clock::parse_weekday_key(key).is_none() {
             return Err(json_shape_error(
                 "invalid_schedule",
@@ -160,6 +175,8 @@ fn validate_business_schedule(schedule: &serde_json::Value) -> Result<(), Valida
 
 /// Validate one weekday's value: `null` (closed), a single window object, or an
 /// array of window objects.
+// SPEC-7.88: each weekday's value must be null, a single {start,end}
+// object, or an array of such objects; any other shape is rejected.
 fn validate_schedule_day(day: &str, value: &serde_json::Value) -> Result<(), ValidationError> {
     match value {
         serde_json::Value::Null => Ok(()),
@@ -178,6 +195,8 @@ fn validate_schedule_day(day: &str, value: &serde_json::Value) -> Result<(), Val
 }
 
 /// Validate a single `{"start": "HH:MM", "end": "HH:MM"}` window object.
+// SPEC-7.89: a window missing a string start/end, an unparseable time,
+// or end <= start (including end == start) is rejected.
 fn validate_schedule_window(day: &str, window: &serde_json::Value) -> Result<(), ValidationError> {
     let obj = window.as_object().ok_or_else(|| {
         json_shape_error(
@@ -194,6 +213,8 @@ fn validate_schedule_window(day: &str, window: &serde_json::Value) -> Result<(),
             format!("schedule window for {day:?} needs string \"start\" and \"end\" times"),
         ));
     };
+    // SPEC-7.90: parses with clock::parse_hhmm, the same time parser
+    // the read path uses.
     let (Some(start_t), Some(end_t)) = (
         super::clock::parse_hhmm(start),
         super::clock::parse_hhmm(end),
@@ -241,6 +262,8 @@ pub struct UpsertHolidayCalendarRequest {
 /// - An array whose entries are each a bare `"YYYY-MM-DD"` string or a
 ///   `{"date": "YYYY-MM-DD", ...}` object. Any other shape or an unparseable
 ///   date is rejected with a 422 keyed onto the `holidays` field.
+// SPEC-7.91: accepts null or [] as no holidays, and rejects (422) a
+// non-array value.
 fn validate_holiday_list(holidays: &serde_json::Value) -> Result<(), ValidationError> {
     // Absent / explicitly empty: no holidays. Allowed.
     if holidays.is_null() {
@@ -254,6 +277,8 @@ fn validate_holiday_list(holidays: &serde_json::Value) -> Result<(), ValidationE
         ));
     };
     for item in items {
+        // SPEC-7.92: each entry must be a bare string or an object
+        // with a string "date" field, and the date must parse as %Y-%m-%d.
         let date_str = match item {
             serde_json::Value::String(s) => Some(s.as_str()),
             serde_json::Value::Object(_) => item.get("date").and_then(|v| v.as_str()),

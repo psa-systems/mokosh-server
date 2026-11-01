@@ -61,6 +61,8 @@ impl From<FieldRow> for FormFieldResponse {
             // A row whose `field_type` does not parse would mean the CHECK
             // constraint and this enum have drifted. Fall back to text rather
             // than panicking in a request path; the CHECK makes it unreachable.
+            // SPEC-7.236: an unparseable stored field_type falls back to Text rather than
+            // panicking (unreachable given the CHECK constraint).
             field_type: FieldType::from_str(&r.field_type).unwrap_or(FieldType::Text),
             is_required: r.is_required,
             min_length: r.min_length,
@@ -182,6 +184,8 @@ impl FormsService {
         active_only: bool,
     ) -> AppResult<Vec<FormDefinitionResponse>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.205: lists every definition for the tenant ordered by name ASC, including
+        // retired ones, unless active_only narrows to is_active = true (default false).
         let defs = sqlx::query_as::<_, DefinitionRow>(&format!(
             "SELECT {DEFINITION_SELECT} \
              FROM form_definitions d \
@@ -243,6 +247,8 @@ impl FormsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
+        // SPEC-7.206: a missing definition for the caller's tenant is 404 "Form
+        // definition".
         .ok_or_else(|| AppError::NotFound("Form definition".to_string()))?;
 
         let fields = fetch_fields(&mut tx, tenant_id, id).await?;
@@ -260,6 +266,8 @@ impl FormsService {
         check_rules(&req.rules, &req.fields)?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.211: a slug already in use by the same tenant fails with Conflict and
+        // the exact message below, rather than a generic duplicate-key error.
         let taken: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM form_definitions WHERE tenant_id = $1 AND slug = $2)",
         )
@@ -306,6 +314,9 @@ impl FormsService {
     ) -> AppResult<FormDefinitionResponse> {
         let existing = self.get(tenant_id, id).await?;
 
+        // SPEC-7.218: rule-vs-field consistency is re-checked whenever either `fields`
+        // or `rules` is present in the request, using the post-update value of each (the other
+        // side falls back to the existing stored value).
         // Rules are checked against whichever field set will be in force AFTER
         // this update, against whichever rule set will be in force after it.
         // Both halves matter: replacing the field set without touching the
@@ -341,6 +352,10 @@ impl FormsService {
         }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.216: an absent key leaves the corresponding column untouched
+        // (COALESCE / CASE), while description, contact_info and kb_article_id use "double
+        // option" deserialization so an explicit JSON null clears the column but an absent key
+        // does not.
         sqlx::query(
             "UPDATE form_definitions SET \
                name = COALESCE($3, name), \
@@ -370,6 +385,9 @@ impl FormsService {
         .execute(&mut *tx)
         .await?;
 
+        // SPEC-7.217: when `fields` is present, the entire existing field set is deleted
+        // and replaced wholesale, never merged; submissions already stored keep their own
+        // payload and are unaffected.
         // A field set is REPLACED wholesale, never merged: field identity is
         // the payload key, and a merge cannot express a rename or a deletion
         // unambiguously. Submissions already taken keep their own payload, so
@@ -395,6 +413,8 @@ impl FormsService {
     /// form for a tenant. `portal_visible = TRUE AND is_active = TRUE`;
     /// a retired form or one flagged internal-only stays out of the
     /// picker.
+    // SPEC-7.305: returns only definitions with both is_active = TRUE and
+    // portal_visible = TRUE, ordered by name ASC; a retired or internal-only form never appears.
     pub async fn list_portal_forms(
         &self,
         tenant_id: TenantId,
@@ -450,6 +470,8 @@ impl FormsService {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
+        // SPEC-7.306: 404 "Form" for a form_id that does not exist, is retired, or is
+        // not portal_visible, so this endpoint cannot be used to enumerate internal forms by id.
         if !exists {
             return Err(AppError::NotFound("Form".to_string()));
         }
@@ -467,8 +489,12 @@ impl FormsService {
         // path does so the payload stays a superset that a future portal
         // surface (or SDK consumer) can render if it wants.
         let org = crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await?;
+        // SPEC-7.307: contact_info falls back to the organisation's phrase when the
+        // definition sets none.
         let contact_info = def.contact_info.clone().or_else(|| org.phrase());
         Ok(super::models::PublicFormResponse {
+            // SPEC-7.308: people and person_number are always 1 on the portal path,
+            // since a portal form is filled in by one signed-in contact exactly once.
             // PMS-737: multi-person is a property of a request LINK. A portal
             // form is filled in by one signed-in contact, once.
             people: 1,
@@ -497,6 +523,8 @@ impl FormsService {
         })
     }
 
+    // SPEC-7.210: returns every submission for the definition's tenant, ordered by
+    // created_at DESC.
     pub async fn list_submissions(
         &self,
         tenant_id: TenantId,
@@ -527,6 +555,8 @@ fn build_response(d: DefinitionRow, fields: Vec<FormFieldResponse>) -> FormDefin
         contact_info: d.contact_info,
         kb_article_id: d.kb_article_id,
         kb_article_title: d.kb_article_title,
+        // SPEC-7.237: a rules JSON value that fails to deserialize falls back to an
+        // empty rule list rather than failing the read, so an unreadable rule shape still opens.
         // A rule shape this build does not understand is dropped rather than
         // failing the read: an unreadable rule must not make the form
         // unopenable. `check_rules` is what keeps the column well-formed.
@@ -593,6 +623,8 @@ async fn insert_fields(
 fn check_field_set(fields: &[CreateFormFieldRequest]) -> AppResult<()> {
     let mut errors = Vec::new();
     for (i, f) in fields.iter().enumerate() {
+        // SPEC-7.219: a duplicate field name (case-sensitive exact match) within one
+        // definition is rejected with code "duplicate".
         if fields.iter().take(i).any(|prior| prior.name == f.name) {
             errors.push(FieldError::new(
                 format!("fields[{i}].name"),
@@ -600,6 +632,8 @@ fn check_field_set(fields: &[CreateFormFieldRequest]) -> AppResult<()> {
                 "duplicate",
             ));
         }
+        // SPEC-7.220: a field_type that resolves to FieldType::Unknown is rejected at
+        // write time with code "unknown_field_type".
         // PMS-898: refuse a field type this build cannot name. The catch-all
         // exists so a READER older than a type still renders the form; storing
         // one would leave a field this server cannot validate and a column
@@ -611,6 +645,8 @@ fn check_field_set(fields: &[CreateFormFieldRequest]) -> AppResult<()> {
                 "unknown_field_type",
             ));
         }
+        // SPEC-7.221: a Select field with no options, or an empty options list, is
+        // rejected with code "required".
         if f.field_type == FieldType::Select && f.options.as_ref().is_none_or(|o| o.is_empty()) {
             errors.push(FieldError::new(
                 format!("fields[{i}].options"),
@@ -618,6 +654,8 @@ fn check_field_set(fields: &[CreateFormFieldRequest]) -> AppResult<()> {
                 "required",
             ));
         }
+        // SPEC-7.222: min_length > max_length (when both are set) is rejected with code
+        // "range".
         if let (Some(min), Some(max)) = (f.min_length, f.max_length) {
             if min > max {
                 errors.push(FieldError::new(
@@ -628,6 +666,8 @@ fn check_field_set(fields: &[CreateFormFieldRequest]) -> AppResult<()> {
             }
         }
     }
+    // SPEC-7.223: all field-set errors are collected and returned together as a single
+    // 422 validation error, not just the first.
     if errors.is_empty() {
         Ok(())
     } else {
@@ -677,6 +717,8 @@ fn check_rules_against_fields(rules: &[FormRule], known: &[RuleField]) -> AppRes
             equals,
         } = rule
         else {
+            // SPEC-7.228: the only authorable rule kind is RequiredIf; any other/unnamed
+            // rule kind is rejected at write time with code "unknown_rule_kind".
             errors.push(FieldError::new(
                 format!("rules[{i}].kind"),
                 "Unknown rule kind".to_string(),
@@ -684,6 +726,8 @@ fn check_rules_against_fields(rules: &[FormRule], known: &[RuleField]) -> AppRes
             ));
             continue;
         };
+        // SPEC-7.229: a rule's `field` that does not match any known field name is
+        // rejected with code "unknown_field".
         if !known.iter().any(|f| &f.name == field) {
             errors.push(FieldError::new(
                 format!("rules[{i}].field"),
@@ -692,11 +736,16 @@ fn check_rules_against_fields(rules: &[FormRule], known: &[RuleField]) -> AppRes
             ));
         }
         match known.iter().find(|f| &f.name == when_field) {
+            // SPEC-7.230: a rule's `when_field` that does not match any known field name
+            // is rejected with code "unknown_field".
             None => errors.push(FieldError::new(
                 format!("rules[{i}].when_field"),
                 format!("Rule reads unknown field `{when_field}`"),
                 "unknown_field",
             )),
+            // SPEC-7.231, SPEC-7.232, SPEC-7.233: equals is bounded to the
+            // condition field's domain (Select options, Boolean true/false) and unbounded for
+            // any other type; see equals_outside_domain.
             Some(condition) => {
                 if let Some(message) = equals_outside_domain(condition, equals) {
                     errors.push(FieldError::new(

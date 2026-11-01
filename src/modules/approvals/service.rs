@@ -83,6 +83,13 @@ impl From<ApprovalRow> for ApprovalResponse {
 
 /// Shared SELECT clause used by list / get / mutating returns so a
 /// schema-evolved field surfaces in every read path with one edit.
+//
+// SPEC-7.511: entity_reference resolves to ticket_number/quote_number
+// only, and is NULL for change_request/time_entry and for a deleted parent.
+// SPEC-7.512: entity_label falls back to the time_entry
+// duration/date string via `||` so a deleted parent propagates NULL.
+// SPEC-7.555: each *_name column is NULLIF(TRIM(CONCAT(...))) so a
+// blank or deleted name resolves to NULL, never an empty string.
 const SELECT_FIELDS: &str = "
     a.id, a.target, a.entity_id, a.ticket_id, a.requested_by_id,
     NULLIF(TRIM(CONCAT(rb.first_name, ' ', rb.last_name)), '') AS requested_by_name,
@@ -145,6 +152,10 @@ const SELECT_JOINS: &str = "
 /// so one unresolved id per row comes from whichever side is populated, never
 /// both. Grouping the two columns into one surface per logical field keeps a
 /// full response to at most three log calls instead of six.
+//
+// SPEC-7.556: an id set on a row whose resolved name column came
+// back NULL is collected here and logged, tagged per call site; this never
+// changes the HTTP response.
 fn unresolved_requested_by_ids(rows: &[ApprovalRow]) -> Vec<Uuid> {
     rows.iter()
         .flat_map(|r| {
@@ -187,6 +198,11 @@ fn unresolved_decided_by_ids(rows: &[ApprovalRow]) -> Vec<Uuid> {
 /// the `app.current_tenant` GUC transaction-locally, so `ticket_approvals` and
 /// `change_requests` are safe under the fail-closed `tenant_isolation` RLS
 /// policy (migration 095).
+//
+// SPEC-7.553: begin_with_tenant sets the app.current_tenant GUC
+// transaction-locally so reads respect the fail-closed RLS policy.
+// SPEC-7.557: every method also takes tenant_id explicitly and
+// filters on it in SQL, so no query here relies solely on RLS.
 #[derive(Clone)]
 pub struct ApprovalsService {
     db: Database,
@@ -207,6 +223,8 @@ impl ApprovalsService {
 
     /// PMS-470: list approvals for any `(target, entity_id)` parent.
     /// The legacy `list_for_ticket(ticket_id)` is a thin wrapper.
+    // SPEC-7.548: returns every approval for (tenant, target,
+    // entity_id) ordered requested_at DESC, no status filter, no pagination.
     pub async fn list_for_entity(
         &self,
         tenant_id: Uuid,
@@ -244,6 +262,8 @@ impl ApprovalsService {
     /// Pending approval queue for the given user. PMS-470 widens it
     /// to span every target; the SPA can filter client-side or via a
     /// future `?target=` query param.
+    // SPEC-7.549: status pending and (approver_user_id = caller OR
+    // approver_role = ANY(roles_held)), ordered requested_at ASC.
     pub async fn pending_for_user(
         &self,
         tenant_id: Uuid,
@@ -286,6 +306,8 @@ impl ApprovalsService {
     /// actually needs. Same WHERE as `pending_for_user` above, so
     /// `pending_count_for_user` and `pending_for_user` cannot report a
     /// different number of rows for the same tenant + user + roles.
+    // SPEC-7.551: identical WHERE predicate to pending_for_user, so
+    // the count and the list can never disagree for the same inputs.
     pub async fn pending_count_for_user(
         &self,
         tenant_id: Uuid,
@@ -334,6 +356,8 @@ impl ApprovalsService {
     /// only, the same shape and order as the staff queue so the SPA's
     /// one page serves both planes. The contact id comes from the
     /// session, never from the request.
+    // SPEC-7.552: filters strictly on status pending and
+    // approver_contact_id = contact_id, the id taken only from the session.
     pub async fn pending_for_contact(
         &self,
         tenant_id: Uuid,
@@ -377,6 +401,9 @@ impl ApprovalsService {
     /// requester-specified approver is intentionally not honoured on
     /// the contact plane because the contact does not know the MSP's
     /// user set.
+    // SPEC-7.522: always inserts requested_by_id NULL,
+    // requested_by_contact_id = contact_id, approver_role fixed to 'admin';
+    // a caller-specified approver is never honoured here.
     pub async fn create_contact_request(
         &self,
         tenant_id: Uuid,
@@ -411,6 +438,8 @@ impl ApprovalsService {
     /// decide, matching the contact-plane default. Staff who need to
     /// target a specific approver keep using the phase-1
     /// `/approvals` endpoint with `CreateApprovalRequest`.
+    // SPEC-7.523: 404s ("Ticket") when the ticket is absent from
+    // the caller's tenant, then delegates with the same fixed admin default.
     pub async fn create_staff_request(
         &self,
         tenant_id: Uuid,
@@ -459,6 +488,8 @@ impl ApprovalsService {
         requested_by_id: Uuid,
         req: CreateApprovalRequest,
     ) -> AppResult<ApprovalResponse> {
+        // SPEC-7.513, SPEC-7.524: the app layer requires
+        // exactly one of the three approver kinds set, before any DB write.
         let approver_kinds = usize::from(req.approver_user_id.is_some())
             + usize::from(req.approver_role.is_some())
             + usize::from(req.approver_contact_id.is_some());
@@ -467,6 +498,10 @@ impl ApprovalsService {
                 "Set exactly one of approver_user_id, approver_role or approver_contact_id".into(),
             ));
         }
+        // SPEC-7.510, SPEC-7.518: the legacy ticket_id
+        // column is populated only for a Ticket target; every other target
+        // inserts NULL, which is also why ApprovalResponse.ticket_id is
+        // Some only when target is "ticket".
         let legacy_ticket_id: Option<Uuid> = match target {
             ApprovalTarget::Ticket => Some(entity_id),
             _ => None,
@@ -476,6 +511,9 @@ impl ApprovalsService {
         // tenant. Checked here rather than left to the FK, because the
         // FK bypasses RLS and would let a foreign tenant's contact id
         // link silently (the PMS-333 reason).
+        // SPEC-7.517, SPEC-7.525: a non-null
+        // approver_contact_id must name a portal contact of this tenant;
+        // checked here (not left to the FK) because the FK bypasses RLS.
         if let Some(contact_id) = req.approver_contact_id {
             let ok: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM contacts \
@@ -491,6 +529,9 @@ impl ApprovalsService {
                 ));
             }
         }
+        // SPEC-7.520: this INSERT omits status, decided_by_id,
+        // decided_by_contact_id, and decided_at, so a new row always starts
+        // as the DB defaults: status 'pending' and those columns NULL.
         let insert = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO ticket_approvals \
                  (tenant_id, target, entity_id, ticket_id, requested_by_id, \
@@ -513,6 +554,8 @@ impl ApprovalsService {
         self.get(tenant_id, insert).await
     }
 
+    // SPEC-7.554: 404 ("Approval") when no row matches (tenant_id,
+    // id); every mutating call re-fetches through this to build its response.
     pub async fn get(&self, tenant_id: Uuid, id: Uuid) -> AppResult<ApprovalResponse> {
         let q = format!(
             "SELECT {SELECT_FIELDS} \
@@ -555,6 +598,8 @@ impl ApprovalsService {
         caller_role: &str,
         req: DecideApprovalRequest,
     ) -> AppResult<ApprovalResponse> {
+        // SPEC-7.526: only "approve"/"reject" are accepted;
+        // anything else is a 400, otherwise approved/rejected status.
         let new_status = match req.decision.as_str() {
             "approve" => "approved",
             "reject" => "rejected",
@@ -565,6 +610,8 @@ impl ApprovalsService {
             }
         };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.527: lock the row before authorization so two
+        // concurrent decisions cannot both read pending and both pass.
         // PMS-1236: lock the row before deciding. Without this, two
         // concurrent decisions (e.g. two role-holders both approving/
         // rejecting) both read `status = 'pending'`, both pass the
@@ -582,18 +629,28 @@ impl ApprovalsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-7.528: 404 ("Approval") when no row matches.
         let (status, by_user, by_role) = scope.ok_or(AppError::NotFound("Approval".into()))?;
+        // SPEC-7.529: 400 "Approval is already {status}" when the
+        // locked row is not pending.
         if status != "pending" {
             return Err(AppError::BadRequest(format!(
                 "Approval is already {status}"
             )));
         }
+        // SPEC-7.530: authorization checks only approver_user_id
+        // and approver_role, never approver_contact_id, so a contact-only
+        // row always yields 403 here regardless of staff role.
         let authorised = by_user == Some(caller_id) || by_role.as_deref() == Some(caller_role);
         if !authorised {
             return Err(AppError::Forbidden(
                 "Only the assigned approver may decide".into(),
             ));
         }
+        // SPEC-7.531: UPDATE is reconditioned on status='pending';
+        // zero rows affected means 400 "Approval is already decided".
+        // SPEC-7.532: writes status, decision_notes, decided_by_id
+        // and decided_at, and never decided_by_contact_id.
         let updated = sqlx::query(
             "UPDATE ticket_approvals SET status = $3, decision_notes = $4, \
                                           decided_by_id = $5, decided_at = NOW() \
@@ -613,6 +670,8 @@ impl ApprovalsService {
             ));
         }
         tx.commit().await?;
+        // SPEC-7.533: commits, then re-fetches via get() to build
+        // the response rather than constructing it from the UPDATE's data.
         self.get(tenant_id, id).await
     }
 
@@ -631,6 +690,8 @@ impl ApprovalsService {
         contact_id: Uuid,
         req: DecideApprovalRequest,
     ) -> AppResult<ApprovalResponse> {
+        // SPEC-7.538: decision-value validation identical to the
+        // staff path: only "approve"/"reject", same error text.
         let new_status = match req.decision.as_str() {
             "approve" => "approved",
             "reject" => "rejected",
@@ -641,6 +702,11 @@ impl ApprovalsService {
             }
         };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.535: scoped by (tenant_id, id, approver_contact_id
+        // = contact_id); a row not addressed to this contact is
+        // indistinguishable from a nonexistent id, so it is 404, never 403.
+        // SPEC-7.536: locks the row with FOR UPDATE before
+        // checking status, the same concurrency reason as the staff path.
         // PMS-1236: lock the row before deciding, the same race the staff
         // arm (`decide`) closes - see its comment.
         let status: Option<String> = sqlx::query_scalar(
@@ -653,11 +719,16 @@ impl ApprovalsService {
         .fetch_optional(&mut *tx)
         .await?;
         let status = status.ok_or(AppError::NotFound("Approval".into()))?;
+        // SPEC-7.537: 400 "Approval is already {status}" when not
+        // pending, and "Approval is already decided" if the UPDATE below
+        // affects zero rows.
         if status != "pending" {
             return Err(AppError::BadRequest(format!(
                 "Approval is already {status}"
             )));
         }
+        // SPEC-7.539: writes status, decision_notes,
+        // decided_by_contact_id and decided_at; never decided_by_id.
         let updated = sqlx::query(
             "UPDATE ticket_approvals SET status = $4, decision_notes = $5, \
                                           decided_by_contact_id = $3, decided_at = NOW() \
@@ -677,6 +748,8 @@ impl ApprovalsService {
             ));
         }
         tx.commit().await?;
+        // SPEC-7.540: writes a best-effort portal audit row; a
+        // failure to write it does not fail the decision, only logs a warn.
         if let Err(err) = crate::modules::audit::audit_portal_event(
             self.db.migrator_pool(),
             tenant_id,
@@ -703,6 +776,10 @@ impl ApprovalsService {
         // contact-filed row fail with a 500 on every cancel attempt instead
         // of the intended 403 (a staff caller is never the contact who
         // filed it).
+        // SPEC-7.545: requested_by_id must decode as
+        // Option<Uuid>, not a bare Uuid, since it is NULL on a
+        // contact-filed row (PMS-1236: decoding it non-optional made such
+        // a cancel 500 instead of the intended 403).
         let row: Option<(String, Option<Uuid>)> = sqlx::query_as(
             "SELECT status, requested_by_id FROM ticket_approvals \
              WHERE tenant_id = $1 AND id = $2",
@@ -711,15 +788,28 @@ impl ApprovalsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-7.542: 404 ("Approval") when no row matches.
         let (status, requester) = row.ok_or(AppError::NotFound("Approval".into()))?;
+        // SPEC-7.543: 400 "Approval is already {status}" when the
+        // row's status is not pending.
         if status != "pending" {
             return Err(AppError::BadRequest(format!(
                 "Approval is already {status}"
             )));
         }
+        // SPEC-7.544: 403 unless requested_by_id == caller_id, so
+        // a contact-filed row (requested_by_id NULL) is never cancellable by
+        // any staff caller through this route.
         if requester != Some(caller_id) {
             return Err(AppError::Forbidden("Only the requester may cancel".into()));
         }
+        // SPEC-7.546: sets status='cancelled' and decided_at=NOW()
+        // without touching any decided_by column; the row is retained, not
+        // deleted.
+        // SPEC-7.547: unlike decide/decide_as_contact, this UPDATE
+        // takes no row lock and is not reconditioned on status='pending', so
+        // a concurrent decide/cancel racing between the read above and this
+        // UPDATE can overwrite an already-decided row's status.
         sqlx::query(
             "UPDATE ticket_approvals SET status = 'cancelled', decided_at = NOW() \
              WHERE tenant_id = $1 AND id = $2",
@@ -752,6 +842,11 @@ impl ApprovalsService {
     /// ticket exists in the caller's tenant (mirrors the pre-phase-2
     /// guard) before delegating to the generic
     /// `create_for_entity(Ticket, ticket_id)`.
+    // SPEC-7.514: returns 404 ("Ticket") when no row in tickets
+    // matches (id, tenant_id), before any approver validation or insert.
+    // SPEC-7.521: this existence check and create_for_entity's
+    // insert run as separate transactions (the tx below is dropped before
+    // calling in), so the two are not atomic with each other.
     pub async fn create(
         &self,
         tenant_id: Uuid,

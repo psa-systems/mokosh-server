@@ -43,6 +43,7 @@ pub fn validate_submission(
     payload: &Value,
     today: NaiveDate,
 ) -> AppResult<Map<String, Value>> {
+    // SPEC-7.238: a non-object JSON payload is rejected with a field error on "payload".
     let Some(object) = payload.as_object() else {
         return Err(AppError::validation_field(
             "payload",
@@ -56,6 +57,8 @@ pub fn validate_submission(
     // Unknown keys are rejected rather than ignored. A typo'd key would
     // otherwise be silently dropped and the request worked from incomplete
     // data, which is the exact round-trip cost PMS-730 exists to remove.
+    // SPEC-7.239: every payload key that does not match a known field name is rejected
+    // (not silently dropped) with code "unknown_field".
     for key in object.keys() {
         if !fields.iter().any(|f| &f.name == key) {
             errors.push(FieldError::new(
@@ -69,8 +72,13 @@ pub fn validate_submission(
     for field in fields {
         let raw = object.get(&field.name);
         let present = normalise_present(field, raw);
+        // SPEC-7.242: a field is required when either its own is_required flag is true
+        // or a RequiredIf rule targeting it currently matches.
         let required = field.is_required || required_by_rule(field, rules, object);
 
+        // SPEC-7.245: a present-but-absent-after-normalisation value is simply omitted
+        // from the stored payload (never stored as an empty string); a missing required field
+        // produces code "required".
         let Some(value) = present else {
             if required {
                 errors.push(FieldError::new(
@@ -90,6 +98,8 @@ pub fn validate_submission(
         }
     }
 
+    // SPEC-7.244: all field errors are collected and returned together, e.g. three
+    // missing required fields report three errors, not just the first.
     if errors.is_empty() {
         Ok(normalised)
     } else {
@@ -110,6 +120,9 @@ fn normalise_present(field: &FormFieldResponse, raw: Option<&Value>) -> Option<V
         return None;
     }
     match raw {
+        // SPEC-7.240, SPEC-7.245: a string answer is trimmed; if the trimmed
+        // result is empty, it is treated as absent (same as a missing key or JSON null) and the
+        // trimmed (not raw) value is what gets stored when present.
         Value::String(s) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
@@ -118,7 +131,7 @@ fn normalise_present(field: &FormFieldResponse, raw: Option<&Value>) -> Option<V
                 Some(Value::String(trimmed.to_string()))
             }
         }
-        // A boolean field answered `false` IS an answer. Treating it as
+        // SPEC-7.241: a boolean field answered `false` IS an answer. Treating it as
         // absent would make a required checkbox impossible to say "no" to.
         other => {
             let _ = field;
@@ -129,8 +142,8 @@ fn normalise_present(field: &FormFieldResponse, raw: Option<&Value>) -> Option<V
 
 /// Whether a cross-field rule makes this field required for this submission.
 ///
-/// A rule naming a field that does not exist on the definition is inert here.
-/// The service rejects such a rule at write time, so this is defence in depth
+/// SPEC-7.235: a rule naming a field that does not exist on the definition is inert
+/// here. The service rejects such a rule at write time, so this is defence in depth
 /// for a definition that predates that check, not the primary guard.
 fn required_by_rule(
     field: &FormFieldResponse,
@@ -143,10 +156,10 @@ fn required_by_rule(
             when_field,
             equals,
         } => target == &field.name && condition_matches(object.get(when_field), equals),
-        // PMS-898: the read path is deliberately tolerant. A stored rule this
+        // SPEC-7.234: the read path is deliberately tolerant. A stored rule this
         // build cannot name makes no field required here; it is not evidence
         // that the submission is wrong, only that this binary is older than
-        // the rule. The write path refuses to create one in the first place,
+        // the rule (PMS-898). The write path refuses to create one in the first place,
         // so reaching this arm means a definition written by a newer server.
         FormRule::Unknown => false,
     })
@@ -159,6 +172,8 @@ fn required_by_rule(
 /// made a `true` answer on a boolean field yield `None` and the rule never
 /// fire, while the SPA (which holds every answer as a string) did fire it.
 /// PMS-842.
+// SPEC-7.243: string compared trimmed-equal; boolean compared via its to_string()
+// ("true"/"false"); number compared via its to_string(); any other/missing value never matches.
 fn condition_matches(value: Option<&Value>, equals: &str) -> bool {
     match value {
         Some(Value::String(s)) => s.trim() == equals,
@@ -177,6 +192,7 @@ fn validate_value(
     let err = |message: String, code: &str| FieldError::new(field.name.clone(), message, code);
 
     match field.field_type {
+        // SPEC-7.246: Boolean requires a JSON boolean value; otherwise code "type".
         FieldType::Boolean => {
             if !value.is_boolean() {
                 return Err(err(
@@ -185,9 +201,14 @@ fn validate_value(
                 ));
             }
         }
+        // SPEC-7.247, SPEC-7.253: Text/Textarea/Email require a JSON string (code
+        // "type" via as_string), honour min_length/max_length counted in Unicode characters, not
+        // bytes (check_length).
         FieldType::Text | FieldType::Textarea | FieldType::Email => {
             let s = as_string(field, value)?;
             check_length(field, s).map_err(|(m, c)| err(m, c))?;
+            // SPEC-7.248: Email additionally must pass validate_email; otherwise code
+            // "email".
             if field.field_type == FieldType::Email && validate_email(s).is_err() {
                 return Err(err(
                     format!("{} must be a valid email address", field.label),
@@ -195,10 +216,10 @@ fn validate_value(
                 ));
             }
         }
-        // PMS-898: a stored field type this build cannot name. It cannot have
+        // SPEC-7.249: a stored field type this build cannot name. It cannot have
         // been authored here (the write path refuses it, and `from_str` cannot
         // produce it), so reaching this arm means a definition written by a
-        // newer server. Accept the answer as a string and let that server's own
+        // newer server (PMS-898). Accept the answer as a string and let that server's own
         // validation be the authority, rather than rejecting a submission on
         // the strength of not recognising the question.
         FieldType::Unknown => {
@@ -206,12 +227,16 @@ fn validate_value(
         }
         FieldType::Date => {
             let s = as_string(field, value)?;
+            // SPEC-7.250: the value must be a string parseable as NaiveDate in exactly
+            // %Y-%m-%d; otherwise code "date_format".
             let Ok(parsed) = NaiveDate::parse_from_str(s, DATE_FORMAT) else {
                 return Err(err(
                     format!("{} must be a date in YYYY-MM-DD format", field.label),
                     "date_format",
                 ));
             };
+            // SPEC-7.251: with date_not_in_past = true, a date strictly before `today` is
+            // rejected with code "date_in_past"; a date equal to today is allowed.
             if field.date_not_in_past && parsed < today {
                 return Err(err(
                     format!("{} cannot be in the past", field.label),
@@ -219,6 +244,8 @@ fn validate_value(
                 ));
             }
         }
+        // SPEC-7.252: Select requires the value to be a string present (exact match) in
+        // field.options (empty slice if options is None); otherwise code "option".
         FieldType::Select => {
             let s = as_string(field, value)?;
             let permitted = field.options.as_deref().unwrap_or(&[]);
@@ -243,8 +270,10 @@ fn as_string<'v>(field: &FormFieldResponse, value: &'v Value) -> Result<&'v str,
     })
 }
 
-/// Length bounds count CHARACTERS, not bytes, so a limit means the same thing
+/// SPEC-7.253: length bounds count CHARACTERS, not bytes, so a limit means the same thing
 /// to a client counting what it typed as it does here.
+/// SPEC-7.227: enforced only when the field type honours_length() (Text, Textarea,
+/// Email); a bound set on any other type is inert, not an error.
 fn check_length(field: &FormFieldResponse, s: &str) -> Result<(), (String, &'static str)> {
     if !field.field_type.honours_length() {
         return Ok(());

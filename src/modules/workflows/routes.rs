@@ -55,6 +55,8 @@ pub fn workflow_routes(service: WorkflowsService) -> Router {
 // (which can encode business logic the rest of the org should not
 // see) inside the admin tier.
 
+// SPEC-7.155: GET /api/v1/workflow-rules requires an admin user and lists every
+// rule for the caller's tenant, ordered priority ASC, created_at ASC.
 async fn list(
     State(s): State<WorkflowsRouterState>,
     RequireAdminUser(u): RequireAdminUser,
@@ -62,6 +64,8 @@ async fn list(
     Ok(Json(s.service.list(u.tenant_id).await?))
 }
 
+// SPEC-7.156: GET /api/v1/workflow-rules/{id} requires an admin user and scopes
+// the lookup to the caller's tenant; a missing row surfaces as 404 "Workflow rule".
 async fn get_one(
     State(s): State<WorkflowsRouterState>,
     RequireAdminUser(u): RequireAdminUser,
@@ -70,6 +74,9 @@ async fn get_one(
     Ok(Json(s.service.get(u.tenant_id, id).await?))
 }
 
+// SPEC-7.157: POST /api/v1/workflow-rules requires an admin user and runs DTO
+// validation before calling the service, which binds the new row to the caller's tenant_id
+// and created_by_id.
 async fn create(
     State(s): State<WorkflowsRouterState>,
     RequireAdminUser(u): RequireAdminUser,
@@ -79,6 +86,10 @@ async fn create(
     Ok(Json(s.service.create(u.tenant_id, u.id, req).await?))
 }
 
+// SPEC-7.151: req.validate() re-runs the UpdateWorkflowRuleRequest validators
+// (including name's length 1..=200 when Some) before the service call.
+// SPEC-7.158: PATCH /api/v1/workflow-rules/{id} requires an admin user and
+// applies only the non-null fields in the request body.
 async fn update(
     State(s): State<WorkflowsRouterState>,
     RequireAdminUser(u): RequireAdminUser,
@@ -89,6 +100,8 @@ async fn update(
     Ok(Json(s.service.update(u.tenant_id, id, req).await?))
 }
 
+// SPEC-7.160: DELETE /api/v1/workflow-rules/{id} requires an admin user; on
+// success it returns {"deleted": true}.
 async fn delete_one(
     State(s): State<WorkflowsRouterState>,
     RequireAdminUser(u): RequireAdminUser,
@@ -101,6 +114,8 @@ async fn delete_one(
 /// `GET /api/v1/tickets/{id}/workflow-runs` - "what fired on this
 /// ticket". Admin-only because the rule definitions are admin-tier;
 /// surfacing which rule fired indirectly reveals them.
+// SPEC-7.161: requires an admin user and returns every workflow_rule_runs row
+// for this ticket, scoped to the caller's tenant, ordered ran_at DESC.
 async fn list_ticket_runs(
     State(s): State<WorkflowsRouterState>,
     RequireAdminUser(u): RequireAdminUser,
