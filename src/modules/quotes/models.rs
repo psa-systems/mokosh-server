@@ -23,10 +23,20 @@ use validator::Validate;
 ///   (any non-terminal state) -> cancelled
 /// ```
 ///
-/// `Submitted` / `Approved` / `Rejected` are the **internal** outcomes,
-/// driven by the existing polymorphic approvals surface. `Accepted` /
-/// `Declined` are the **client's** decision and are deliberately spelled
-/// differently so a reader can always tell the two apart.
+/// `Submitted` / `Approved` / `Rejected` are the **internal** outcomes.
+/// `Accepted` / `Declined` are the **client's** decision and are
+/// deliberately spelled differently so a reader can always tell the two
+/// apart.
+///
+/// Two things write the internal three. A staff user sets them through
+/// `PUT /quotes/{id}`, which is what [`Self::is_staff_settable`] permits, and
+/// since PMS-1624 a decision on a staff-addressed approval moves them too
+/// (`super::approval_sync`). The manual `approved` is refused while a
+/// decision is outstanding, so there is one authority at a time.
+///
+/// A contact-addressed approval is the CLIENT's sign-off and moves nothing
+/// here: that decision belongs in `Accepted` / `Declined`, which is the whole
+/// reason the two pairs are spelled differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuoteStatus {
