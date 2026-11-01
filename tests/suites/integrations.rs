@@ -4,9 +4,26 @@
 //! registry's shape and the subset rule as pure functions. What needs a database
 //! and a booted app is everything those cannot show: that the row is confined to
 //! its tenant, that a credential reaches the secrets provider and never the row,
-//! that the refusal for a provider managed elsewhere is what an operator gets
-//! back, and that the catalog a client renders agrees with what the server will
+//! and that the catalog a client renders agrees with what the server will
 //! accept.
+//!
+//! PMS-1571 took the four per-provider routes out, so three cases went with
+//! them. `a_provider_the_registry_does_not_know_is_a_404` pinned
+//! `parse_provider`'s message listing the known providers, and there is no
+//! handler left to parse a provider at all.
+//! `delegating_a_capability_to_a_planned_provider_is_refused` and
+//! `a_provider_managed_elsewhere_cannot_be_connected_here` each drove one path
+//! for one provider; `no_provider_can_be_connected_here_and_the_catalog_says_
+//! where_each_one_is` now drives all four paths for every provider in the
+//! catalog and asserts the same two things they did, that nothing is written
+//! and no credential is stored.
+//!
+//! What those cases also pinned was the refusal MESSAGE naming the owning
+//! surface. That message is gone with the route, and it was never read: the SPA
+//! renders its controls off `configurable_here`, so it never called these
+//! paths. The surface an operator needs is in the catalog, as `setup`, which
+//! the page does render, and that is where the "no two providers sent to the
+//! same page" rule is asserted now.
 
 use crate::common;
 
@@ -28,9 +45,6 @@ use sqlx::PgPool;
 /// MAPPS-1099 Phase A ships `billing/provider/xero.rs` and the registry entry
 /// flips to `Built`; they are in this file's history to restore from.
 const MANAGED_HERE: &str = "xero";
-/// The other planned provider, so the refusal is asserted as a rule rather than
-/// against one name.
-const ALSO_PLANNED: &str = "quickbooks";
 /// Google's connection still lives in `contact_sync_connections` until PMS-1315
 /// moves it, so it is the provider every refusal is exercised through. It was
 /// Stripe until PMS-1312 brought the payment providers over, and the refusal has
@@ -111,6 +125,14 @@ async fn row_count(pool: &PgPool, provider: &str) -> i64 {
 /// MAPPS-1129: `configurable_here` agrees with what the write route actually
 /// does, for every provider in the catalog.
 ///
+/// PMS-1571: what it does now is not exist. The field has to stay false while
+/// that is true, and the day a provider takes `CredentialHome::Integration`
+/// both have to move together - the route comes back and the field goes true
+/// for that provider. This is that pairing at the HTTP level;
+/// `registry::tests::an_integration_home_provider_needs_the_per_provider_routes_back`
+/// is the same pairing read off the source, which is what fails first and says
+/// what to do.
+///
 /// The client renders its one mutating control set - the capability
 /// checkboxes, Connect/Disconnect, the poll interval - exactly where it
 /// believes a change is accepted, and before this field it believed that
@@ -161,9 +183,10 @@ async fn the_catalog_says_which_providers_the_write_route_will_take(pool: PgPool
     assert_eq!(
         refused,
         entries.len(),
-        "MAPPS-1153: every provider is configured on its own surface now, so none of them is \
-         configurable here. A provider that WAS would be the exception and should be read \
-         twice, which is why this counts rather than sampling"
+        "PMS-1571: every provider is configured on its own surface, so none of them is \
+         configurable here and the per-provider routes are gone. A provider that WAS \
+         configurable needs those routes back in the same change, which is why this counts \
+         rather than sampling"
     );
 }
 
@@ -300,146 +323,111 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
         xero.get("managed_elsewhere").is_none(),
         "a provider managed here says nothing about being managed elsewhere: {xero}"
     );
-    // MAPPS-1098: payment providers (Stripe, PayPal) are not offered on
-    // the integrations surface at all. Their lifecycle lives entirely on
-    // Settings > Payment Gateways. The per-provider routes 404 for them.
-    for provider in ["stripe", "paypal"] {
-        let get = app
-            .client
-            .get(app.url(&format!("/api/v1/integrations/{provider}")))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .expect("get payment provider");
-        assert_eq!(
-            get.status(),
-            StatusCode::NOT_FOUND,
-            "GET /integrations/{provider} must 404 after MAPPS-1098"
-        );
-
-        let put = app
-            .client
-            .put(app.url(&format!("/api/v1/integrations/{provider}")))
-            .bearer_auth(&token)
-            .json(&json!({ "capabilities": ["payments"] }))
-            .send()
-            .await
-            .expect("put payment provider");
-        assert_eq!(
-            put.status(),
-            StatusCode::NOT_FOUND,
-            "PUT /integrations/{provider} must 404 after MAPPS-1098"
-        );
-
-        let connect = connect(&app, &token, provider, json!({})).await;
-        assert_eq!(
-            connect.status(),
-            StatusCode::NOT_FOUND,
-            "POST /integrations/{provider}/connect must 404 after MAPPS-1098"
-        );
-
-        let disconnect = app
-            .client
-            .post(app.url(&format!("/api/v1/integrations/{provider}/disconnect")))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .expect("disconnect payment provider");
-        assert_eq!(
-            disconnect.status(),
-            StatusCode::NOT_FOUND,
-            "POST /integrations/{provider}/disconnect must 404 after MAPPS-1098"
-        );
-    }
 }
 
-/// Nothing on this surface can be connected today, and each refusal says which
-/// of the two reasons it is.
+/// Nothing on this surface can be connected, and the catalog says where each
+/// provider IS set up.
 ///
-/// MAPPS-1121. The two reasons are not interchangeable and an operator acts on
-/// them differently: a planned provider is waiting on us to build it, and a
-/// provider managed elsewhere is waiting on the operator to go to the right
-/// page. Telling someone Microsoft 365 is "not available yet" would send them
-/// to wait for work that shipped.
+/// MAPPS-1121 asserted the two refusal reasons were different from each other,
+/// because an operator acts on them differently: a planned provider waits on
+/// us, a provider managed elsewhere waits on the operator to open another
+/// page. PMS-1571 removed the routes that carried those reasons, so the half
+/// that matters to an operator is read where it is actually rendered - the
+/// catalog's `setup` - and the half that matters to this subsystem is that
+/// the paths are gone and a request to one writes nothing.
 ///
-/// Asserted together, in one case, because what matters is that the four
-/// answers are DIFFERENT from each other: four separate tests would each pass
-/// against a server that gave the same refusal to everyone.
+/// Driven off the catalog rather than a list of provider names, because a
+/// second list is how the first one drifts: every provider the server lists is
+/// probed, so a provider added without a route is caught here whatever it is
+/// called.
 #[mokosh_test]
-async fn no_provider_can_be_connected_here_and_each_refusal_says_why(pool: PgPool) {
+async fn no_provider_can_be_connected_here_and_the_catalog_says_where_each_one_is(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
-    // MAPPS-1153: every provider is configured on its own surface, so the
-    // route refuses all seven BEFORE the service's own reasons are reached.
-    // The 404 is the registry's answer and the message carries the one thing
-    // an operator needs, which is the page that does own the lifecycle.
-    //
-    // The service-level refusals this case used to read through HTTP are
-    // still there and still different from each other - `assert_built` for a
-    // provider with nothing behind it, `assert_managed_here` for one owned by
-    // another subsystem - and they are unit-tested where they live. What
-    // changed is that nothing can reach them through this route, which is the
-    // statement below.
-    for (provider, surface) in [
-        (MANAGED_HERE, "Settings > Xero"),
-        (ALSO_PLANNED, "Settings > QuickBooks"),
-        (MANAGED_ELSEWHERE, "Settings > Google Contacts"),
-        (ALSO_ELSEWHERE, "Settings > Microsoft 365 Contacts"),
-        ("stripe", "Settings > Payment Gateways"),
-    ] {
-        let response = connect(&app, &token, provider, json!({ "credential": "anything" })).await;
+    let entries = list(&app, &token).await;
+    assert!(!entries.is_empty(), "the catalog is never empty");
+
+    for row in &entries {
+        let provider = row["provider"].as_str().expect("provider");
+        let base = format!("/api/v1/integrations/{provider}");
+
+        // All four, because they were four separate handlers and a partial
+        // removal is the mistake worth catching: three gone and one left is a
+        // surface that answers for a provider nothing can finish connecting.
+        let get = app
+            .client
+            .get(app.url(&base))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("get");
+        assert_eq!(get.status(), StatusCode::NOT_FOUND, "GET {base}");
+
+        let put = app
+            .client
+            .put(app.url(&base))
+            .bearer_auth(&token)
+            .json(&json!({ "capabilities": ["invoicing"] }))
+            .send()
+            .await
+            .expect("put");
+        assert_eq!(put.status(), StatusCode::NOT_FOUND, "PUT {base}");
+
+        let connected = connect(&app, &token, provider, json!({ "credential": "anything" })).await;
         assert_eq!(
-            response.status(),
+            connected.status(),
             StatusCode::NOT_FOUND,
-            "{provider} is configured on its own page, so this surface does not offer it"
+            "POST {base}/connect"
         );
-        let body: Value = response.json().await.expect("refusal json");
-        let message = body["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains(surface),
-            "{provider} must name the page that owns it, not another provider's: {message}"
+
+        let disconnected = app
+            .client
+            .post(app.url(&format!("{base}/disconnect")))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("disconnect");
+        assert_eq!(
+            disconnected.status(),
+            StatusCode::NOT_FOUND,
+            "POST {base}/disconnect"
         );
-        assert!(
-            !message.contains("MAPPS-"),
-            "an MSP admin has no use for our issue keys: {message}"
-        );
+
         assert_eq!(
             row_count(&pool, provider).await,
             0,
-            "a refused connect writes nothing"
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM secrets WHERE name LIKE 'INTEGRATION__%'"
-            )
-            .fetch_one(&pool)
-            .await
-            .expect("count integration secrets"),
-            0,
-            "and stores no credential for a provider it would not have read one for"
+            "a request to a route that does not exist still wrote a row for {provider}"
         );
     }
 
-    // The refusals still differ, which was this case's point when they were
-    // reachable: four providers, four pages, and none of them sent to
-    // another's.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM secrets WHERE name LIKE 'INTEGRATION__%'"
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count integration secrets"),
+        0,
+        "a credential was stored for a provider this surface cannot connect"
+    );
+
+    // The operator-facing half: each provider names its own page, and no two
+    // name the same one. This was asserted against the refusal messages while
+    // they existed; the catalog is where the SPA reads it, so it is where the
+    // rule belongs.
     let mut surfaces: Vec<String> = Vec::new();
-    for provider in [
-        MANAGED_HERE,
-        ALSO_PLANNED,
-        MANAGED_ELSEWHERE,
-        ALSO_ELSEWHERE,
-    ] {
-        let response = connect(&app, &token, provider, json!({})).await;
-        let body: Value = response.json().await.expect("refusal json");
-        surfaces.push(
-            body["error"]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+    for row in &entries {
+        let provider = row["provider"].as_str().expect("provider");
+        let label = row["setup"]["label"].as_str().unwrap_or_else(|| {
+            panic!("{provider} is configured nowhere this surface can name: {row}")
+        });
+        assert!(
+            !label.contains("MAPPS-") && !label.contains("PMS-"),
+            "an MSP admin has no use for our issue keys: {label}"
         );
+        surfaces.push(label.to_string());
     }
     let mut unique = surfaces.clone();
     unique.sort();
@@ -447,47 +435,7 @@ async fn no_provider_can_be_connected_here_and_each_refusal_says_why(pool: PgPoo
     assert_eq!(
         unique.len(),
         surfaces.len(),
-        "two providers were sent to the same page: {surfaces:?}"
-    );
-}
-
-/// A capability change is the same claim connect makes, in smaller print, and
-/// is refused for the same provider.
-///
-/// Separate from the case above because it is a separate handler: the first
-/// version of MAPPS-1121 gated `connect` alone, which left an operator able to
-/// tick Invoicing on Xero and be told it had been delegated.
-#[mokosh_test]
-async fn delegating_a_capability_to_a_planned_provider_is_refused(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, &email, &password).await;
-
-    let response = app
-        .client
-        .put(app.url(&format!("/api/v1/integrations/{MANAGED_HERE}")))
-        .bearer_auth(&token)
-        .json(&json!({ "capabilities": ["invoicing"] }))
-        .send()
-        .await
-        .expect("update");
-    assert_eq!(
-        response.status(),
-        StatusCode::NOT_FOUND,
-        "MAPPS-1153: Xero's lifecycle is its own page's, so this route does not offer it"
-    );
-    let body: Value = response.json().await.expect("refusal json");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Settings > Xero"),
-        "and says where the delegation IS changed: {body}"
-    );
-    assert_eq!(
-        row_count(&pool, MANAGED_HERE).await,
-        0,
-        "a refused update mints no row"
+        "two providers send an operator to the same page: {surfaces:?}"
     );
 }
 
@@ -531,8 +479,9 @@ async fn a_row_left_by_an_earlier_build_can_still_be_disconnected(pool: PgPool) 
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
-    // MAPPS-1153: this route does not offer Xero any more, and says where
-    // the lifecycle lives instead.
+    // PMS-1571: this route is gone, so the 404 is its absence rather than a
+    // refusal naming another page. That distinction is the reason the second
+    // half of this case exists and always did.
     let response = app
         .client
         .post(app.url(&format!("/api/v1/integrations/{MANAGED_HERE}/disconnect")))
@@ -586,48 +535,6 @@ async fn a_row_left_by_an_earlier_build_can_still_be_disconnected(pool: PgPool) 
     );
 }
 
-/// The guard that keeps one connection in one place while PMS-1315 is
-/// outstanding.
-///
-/// It answered 409 through this route until MAPPS-1153 - Google exists and
-/// is listed, and what was wrong was the surface. Now the registry refuses
-/// first with a 404, because Google is not configured here at all, and the
-/// message names the page that does own it. The 409 and its PMS-1315
-/// reference are still what `assert_managed_here` produces for a caller
-/// that reaches the service directly, and that is where they are pinned.
-///
-/// The case is kept rather than deleted because what it protects is
-/// unchanged: a credential for a provider owned by another subsystem must
-/// not be stored here, whatever the status code on the way out.
-#[mokosh_test]
-async fn a_provider_managed_elsewhere_cannot_be_connected_here(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, &email, &password).await;
-
-    let response = connect(
-        &app,
-        &token,
-        MANAGED_ELSEWHERE,
-        json!({ "credential": "refresh-token-x" }),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let body: Value = response.json().await.expect("refusal json");
-    let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("Settings > Google Contacts"),
-        "the refusal names the page that owns the connection: {message}"
-    );
-
-    assert_eq!(
-        row_count(&pool, MANAGED_ELSEWHERE).await,
-        0,
-        "no row is written for a provider whose home is elsewhere, so the two \
-         tables cannot disagree"
-    );
-}
-
 // MAPPS-1121 removed four cases here, all of which drove a write path through
 // Xero: the credential never reaching the row or the audit trail, narrowing a
 // delegation to empty while staying connected, disconnect keeping the row, and
@@ -638,27 +545,15 @@ async fn a_provider_managed_elsewhere_cannot_be_connected_here(pool: PgPool) {
 // disconnect's row-and-credential handling is covered above against a row an
 // earlier build left, and the rest come back with MAPPS-1099 Phase A, out of
 // this file's history.
-
-/// A provider the registry has no entry for is a 404 naming the ones it does,
-/// not a row with a provider nothing can serve.
-#[mokosh_test]
-async fn a_provider_the_registry_does_not_know_is_a_404(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, &email, &password).await;
-
-    let response = app
-        .client
-        .get(app.url("/api/v1/integrations/sage"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("unknown provider");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let body: Value = response.json().await.expect("refusal json");
-    let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("xero"), "{message}");
-}
+//
+// PMS-1571 removed two more for the same reason one layer up: there is no
+// route to drive. `a_provider_managed_elsewhere_cannot_be_connected_here`
+// asserted that a credential for Google reached neither the row nor the
+// secrets provider, and the case above now asserts that for every provider
+// the catalog lists. `a_provider_the_registry_does_not_know_is_a_404` pinned
+// `parse_provider`'s message listing the known providers, and there is no
+// handler left to parse one; an unknown provider and a known one are the same
+// unrouted path now, which is not a statement worth a case.
 
 /// Tenant scoping, through the app rather than through the policy alone: one
 /// tenant's row is invisible to the other, in both directions.
