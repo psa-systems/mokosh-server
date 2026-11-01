@@ -38,6 +38,8 @@ use quote::quote;
 /// either way, so the two were never different tests.
 #[proc_macro_attribute]
 pub fn mokosh_test(args: TokenStream, input: TokenStream) -> TokenStream {
+    // SPEC-1 and 2.158: the attribute takes no arguments; the template is always
+    // built from ./migrations, so a caller cannot ask for a different set.
     if !args.is_empty() {
         return syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -55,6 +57,8 @@ pub fn mokosh_test(args: TokenStream, input: TokenStream) -> TokenStream {
     let output = &input.sig.output;
     let body = &input.block;
 
+    // SPEC-1 and 2.157: the annotated fn must be async and take exactly one
+    // argument (the pool); any other shape is a compile error, not a runtime one.
     if input.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
             &input.sig,
@@ -83,6 +87,8 @@ pub fn mokosh_test(args: TokenStream, input: TokenStream) -> TokenStream {
                 #body
             }
 
+            // SPEC-1 and 2.156: a current-thread Tokio runtime with every driver
+            // enabled backs the body, matching what #[sqlx::test] built.
             let __test_path = ::std::concat!(module_path!(), "::", ::std::stringify!(#name));
             let __rt = ::mokosh_test::runtime();
             let __db = __rt.block_on(::mokosh_test::acquire(__test_path));
@@ -99,6 +105,9 @@ pub fn mokosh_test(args: TokenStream, input: TokenStream) -> TokenStream {
             let __ok = __outcome.is_ok();
             __rt.block_on(::mokosh_test::close_pool(&__pool, __test_path));
 
+            // SPEC-1 and 2.167: cleanup runs in this exact order (close pool, drop pool, drop runtime, then finish/drop the
+            // database); dropping the database before the runtime leaves a connected backend and Postgres refuses the DROP DATABASE.
+            //
             // The test's runtime goes before the database is tidied up, and
             // the order matters: a body that boots the API spawns an axum
             // server, that task holds its connection until it is dropped, and
