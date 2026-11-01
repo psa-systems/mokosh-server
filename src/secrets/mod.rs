@@ -152,7 +152,12 @@ pub struct SecretKey {
     kind: SecretKind,
 }
 
+// SPEC-3.16: constructible only through named constructors; every key
+// carries a tenant_id that is never part of SecretKind.
 impl SecretKey {
+    // SPEC-3.18: a ContactSync discriminator is
+    // {provider}_{connection_id.simple()}, so two connections for the same
+    // provider under the same tenant never share a secret name.
     /// PMS-1211: a contact-sync connection's refresh token.
     pub fn contact_sync(tenant_id: Uuid, provider: impl Into<String>, connection_id: Uuid) -> Self {
         Self {
@@ -215,6 +220,9 @@ impl SecretKey {
     ///
     /// Hyphens are dropped from the uuid and the discriminator is uppercased
     /// because an Infisical secret name is conventionally `A-Z0-9_`.
+    // SPEC-3.16: exact wire format {KIND_PREFIX}__{tenant_uuid.simple()}__
+    // {DISCRIMINATOR_UPPER}, pinned, since both the secrets table row name
+    // and the Infisical secret name depend on it.
     pub fn name(&self) -> AppResult<String> {
         let discriminator = self.kind.discriminator();
         validate_discriminator(&discriminator)?;
@@ -249,6 +257,8 @@ impl fmt::Display for SecretKey {
 /// the operator: `provider` is already constrained to an enum on the way in
 /// (PMS-966). It is defence against the next caller, who will pass something
 /// else.
+// SPEC-3.17: rejects an empty discriminator, one longer than 48 bytes, or
+// one containing anything other than lowercase ASCII, digits or underscore.
 fn validate_discriminator(value: &str) -> AppResult<()> {
     // PMS-1512: a `ContactSync` discriminator is `{provider}_{connection_id.simple()}`,
     // and the uuid alone is 32 of those characters, so the cap has to clear the
@@ -275,6 +285,8 @@ fn validate_discriminator(value: &str) -> AppResult<()> {
 /// everything is addressed by [`SecretKey`], so there is no call that can reach
 /// a secret belonging to another tenant.
 #[async_trait]
+// SPEC-3.19: get must return Ok(None) for "not configured" and Err for
+// "provider unreachable"; the two must never collapse into each other.
 pub trait SecretProvider: Send + Sync {
     /// The stored value, or `None` when nothing is stored for this key.
     ///
@@ -300,6 +312,8 @@ pub trait SecretProvider: Send + Sync {
     /// happens before it touches the row). An unconditional `put` from the
     /// mover can therefore land after a fresher save and silently revert it.
     /// Once anything is at an address, it wins over the mover's replay.
+    // SPEC-3.19: returns true only when this call performed the write,
+    // false when something was already there.
     async fn put_if_absent(&self, key: &SecretKey, value: &str) -> AppResult<bool>;
 
     /// Best-effort: a secret that is already gone is not an error, matching
@@ -331,6 +345,9 @@ impl SecretProviderKind {
     /// unset `SECRET_BACKEND` against the hosting profile's default before it
     /// gets here, so this arm cannot quietly become a second place that knows
     /// the default.
+    // SPEC-3.20: accepts only "database" and "infisical"; a name that is
+    // valid for the application tier only produces a distinct error naming
+    // APP_SECRET_BACKEND, separate from the generic unknown-provider error.
     pub fn parse_name(raw: &str) -> AppResult<Self> {
         match raw.trim() {
             provider::DATABASE => Ok(SecretProviderKind::Database),
@@ -389,6 +406,7 @@ impl SecretsConfig {
     /// degrade this module refuses everywhere else. The hosting profile's
     /// own strictness is the startup wiring's business, not this module's: it
     /// hands in an already-resolved name.
+    // SPEC-3.21: the sole reader of SECRET_BACKEND for the tenant tier.
     pub fn from_env(profile_default: &str) -> AppResult<Self> {
         Self::resolve(
             profile_default,

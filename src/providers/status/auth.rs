@@ -47,6 +47,15 @@ use crate::utils::error::AppError;
 /// configuration refresh whose actor is already the `RefreshRequest`'s own
 /// choice. A future handler that needs the caller identity should stack
 /// this next to a separate identity extractor.
+// SPEC-3.71: tries exactly two credential shapes in order: an HTTP
+// Basic credential matching BUNYIP_STATUS_CLIENT_ID/
+// BUNYIP_STATUS_CLIENT_SECRET compared in constant time, then a staff
+// admin session; a Basic credential that does not match both halves
+// is refused with 401 immediately and never falls through to the
+// staff-session check even if a valid admin session is also present;
+// when either configured credential variable is unset or empty, the
+// machine path is disabled entirely and every request falls through
+// to the staff-session check.
 pub struct RequireAdminOrBunyipMachine;
 
 impl<S> FromRequestParts<S> for RequireAdminOrBunyipMachine
@@ -104,6 +113,10 @@ where
 /// configured credential, and the staff-session fallback answers a bad
 /// header the same 401 anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// SPEC-3.72: a malformed Authorization: Basic header (bad base64,
+// non-UTF-8, missing colon) is classified distinctly from a wrong
+// credential and also falls through to the staff-session check,
+// rather than being treated as a failed machine-credential attempt.
 enum BunyipBasicOutcome {
     Accepted,
     Refused,
