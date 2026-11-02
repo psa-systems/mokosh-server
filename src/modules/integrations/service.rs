@@ -34,6 +34,25 @@
 //! [`connection::set_payment_connection`], which is the single writer shared with
 //! that surface.
 //!
+//! # What is still reachable, after PMS-1571
+//!
+//! Only [`Self::list`]. The four per-provider routes were removed because the
+//! only credential home this surface can connect is
+//! [`CredentialHome::Integration`] and no registry entry takes it, so
+//! [`Self::get`], [`Self::update`], [`Self::connect`] and [`Self::disconnect`]
+//! have no HTTP caller today.
+//!
+//! They are kept rather than deleted, which is a deliberate trade and not an
+//! oversight. The rules above are the subsystem's, not the route's: they are
+//! what a provider taking the `Integration` home would need on the day it
+//! does, and each is unit-tested here against a fixture descriptor carrying
+//! that home. Deleting them would make that day a redesign instead of four
+//! `.route(...)` lines, and would delete the tests with them.
+//!
+//! `registry::tests::an_integration_home_provider_needs_the_per_provider_routes_back`
+//! is what stops this being dead code nobody revisits: it fails the moment an
+//! entry takes that home, and says to put the routes back.
+//!
 //! Reads and writes go through [`Database::begin_with_tenant`], so the
 //! `tenant_isolation` policy on the table confines them and a missing GUC
 //! yields zero rows rather than another tenant's (PMS-285). Every statement
