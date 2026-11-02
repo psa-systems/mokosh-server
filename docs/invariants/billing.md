@@ -88,7 +88,7 @@ Product catalog and pricing (PMS-955): `products` is a tenant-scoped price list,
 
 ## Prepaid blocks
 
-A block is drawn down as time is logged (PMS-951), and the hours past it are billed at the block's own rate rather than re-invoiced (PMS-1035).
+A block is drawn down as time is logged (PMS-951), the hours past it are billed at the block's own rate rather than re-invoiced (PMS-1035), and the hours left in a closing period roll into the next one when the item says to (PMS-1572).
 
 ### Prepaid draw (PMS-951)
 
@@ -97,6 +97,18 @@ A prepaid block is drawn down when time is logged (PMS-951): `time_entries.contr
 ### Overage (PMS-1035)
 
 Prepaid block hours are not invoiced again, and overage bills at the overage rate (PMS-1035): the PMS-951 draw is also the billing signal. `consume_for_entry` stamps an entry fully inside the allotment `billing_status = 'prepaid'`, a fourth value beside `not_billed`, `ready_to_bill` and `billed` (migration 191), and `create_invoice_from_time_entries` selects `ready_to_bill` only, so the hours the customer already paid for never reach an hourly invoice; the refusal message names them as covered rather than as not ready. An entry that ran past the block keeps `ready_to_bill` and records `overage_hours` and `overage_rate` (the contract item's rate at the draw, NULL when it names none) beside `hours_consumed`, and the builder bills such an entry for the overage hours alone, at that rate else the entry's own, with `descriptions::time_entry_overage_line` saying so. `prepaid` is not sticky the way `billed` is: `release_for_entry` clears the overage columns and puts a prepaid entry back to `ready_to_bill`, and an edit's re-draw decides afresh. Not `billed`, because that means "on an invoice"; the SPA's `BillingStatus` comes from `mokosh-types`, so the label for the new value is a pin bump on the client (the MAPPS follow-up).
+
+### Rollover (PMS-1572)
+
+Unused prepaid hours roll into the opening period when the item has `rollover_enabled`, capped at its `max_rollover_hours` (PMS-1572). `ContractsService::roll_to_next_period` has done this since PMS-64 and had no caller for the life of the repository, so `rollover_enabled` was a column an API client could set and nothing read: the SPA cannot even set it, hardcoding `false` on create and round-tripping it on edit, while already rendering a `rollover_hours` column that could only ever be zero. The caller is now `generate_due_recurring_invoices`, because a period opening is the only period-close signal this system has and that run is the one thing that knows when one happens.
+
+It rolls in the run's loop and NOT inside `generate_one_recurring_invoice`, which returns early for a contract with no billable item. A prepaid block is exactly that: `BillingRule::derive("block_hours")` is `manual`, so a block with no separate retainer line bills nothing, and tying the roll to an invoice would have skipped the contracts most purely about prepaid hours. Rollover is a property of the period closing, not of an invoice being produced.
+
+Rolling the same close twice rolls once, and that is the function's own job rather than the caller's. The old doc comment said "Idempotency: the next-period row is UPSERTed", which is true of creating the row and reads as true of the effect; nothing zeroes the closing period's `hours_remaining`, so a second call read the same unused hours and the `DO UPDATE` added them again. The guard is `WHERE rollover_hours = 0` on that update: a period has exactly one predecessor, so a target already carrying rollover has been rolled into. A roll of zero leaves the guard open and is retried, which is right, because a closed period's unused hours can still change when an entry inside it is edited and `release_hours` gives hours back; the total rolled into one period is still bounded by the cap, because the first nonzero roll closes the guard.
+
+The closing row is left alone. Its `hours_included` and `hours_used` are the record of what that period held and what was drawn from it, and the hours that rolled are recorded on the next period as `rollover_hours`, so what was forfeited is still derivable and the row still satisfies `hours_remaining = hours_included - hours_used`.
+
+The two period functions have to cut the same windows, and `billing::service::pms1572_period_agreement_tests` is what makes that true rather than hoped: this run anchors periods with `current_billing_period` and the roll lands on the window `ContractsService::period_for` names. A day's disagreement would put the hours in a balance row nothing else uses, with no error and no log, leaving a customer short and a stray row that reads as a double allotment.
 
 ## Quote approval (PMS-1624)
 
@@ -109,6 +121,7 @@ Only staff-addressed rows count and only they drive it (`approver_contact_id IS 
 The manual `approved` is refused while a staff decision is outstanding, which is what makes "two writers" safe rather than a race whose loser is silently ignored. A manual `rejected` is deliberately still allowed: it is the same answer a veto gives, so it creates no conflicting claim, and refusing it would strand a quote whose named approver has gone on leave. Cancelling the approval returns the quote to the manual path.
 
 Before PMS-1624 the approvals surface wrote only `ticket_approvals` for all four of its targets, which is still true of the other three and is that surface's stated position (`src/modules/approvals/routes.rs`). Quotes are the exception because they were the case where two independent records of one idea could disagree in both directions, and PMS-1573 is where that surfaced: as a defect report saying `approved` was unreachable, filed after reading a doc comment that claimed the approvals surface already drove it.
+
 
 ## Currency (PMS-1028)
 
