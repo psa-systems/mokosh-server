@@ -39,6 +39,12 @@ on:
     branches:
       - main
 
+# PMS-1633: back-to-back merges only need the newest warm; drop in-flight runs
+# against the same ref so the shared cache reflects the latest main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   warm-check:
     name: warm check.yml cache

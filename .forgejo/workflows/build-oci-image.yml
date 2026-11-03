@@ -40,6 +40,16 @@ on:
         type: string
         default: ""
 
+# PMS-1633: collapse back-to-back main pushes (only the newest :latest matters)
+# but NEVER cancel a tag build. Each v* tag maps to one commit whose published
+# image is required, and a cancelled tag run leaves the registry missing that
+# version. Group includes the ref so tag runs are already isolated into their
+# own groups; gating cancel-in-progress on the ref kind is a belt-and-braces
+# second guard against a future group-key change silently taking tags with it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   build-and-push:
     name: Build and push mokosh-server image

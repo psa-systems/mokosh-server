@@ -41,6 +41,13 @@ on:
     branches:
       - main
 
+# PMS-1633: supersede obsolete PR runs. `github.ref` is unique per PR on
+# pull_request events (refs/pull/<N>/merge), so two open PRs never share a
+# group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     name: fmt + clippy + build + tests

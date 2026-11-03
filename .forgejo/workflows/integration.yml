@@ -46,6 +46,11 @@ on:
     branches:
       - main
 
+# PMS-1633: supersede obsolete PR runs. See check.yml for the ref-shape note.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: build nextest archive
