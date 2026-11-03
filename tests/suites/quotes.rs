@@ -446,6 +446,11 @@ async fn sent_quote_rejects_every_edit(pool: PgPool) {
     assert_eq!(cancel.status(), StatusCode::CONFLICT);
 }
 
+/// PMS-1573 cites this case: it drives draft to submitted to approved to
+/// rejected over HTTP, which is the whole of the internal approval workflow
+/// and the evidence that `approved` is reachable. The ticket read `src/` for
+/// a statement writing the literal string, and `update_quote` writes
+/// `status = COALESCE($10, status)` from the request instead.
 #[mokosh_test]
 async fn content_freezes_at_submitted_but_status_still_advances(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;

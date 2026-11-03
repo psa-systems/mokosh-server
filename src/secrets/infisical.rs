@@ -60,6 +60,8 @@ impl InfisicalSecretsConfig {
     /// but unset variable arrives as `""` (PMS-836), so treating empty as
     /// present would produce an authentication failure at first use instead of
     /// a clear error at boot.
+    // SPEC-3.23: fixed folder /mokosh/integrations; requires 4 variables
+    // (blank counts as missing); INFISICAL_ENVIRONMENT defaults to "dev".
     pub fn from_env() -> AppResult<Self> {
         fn required(name: &str) -> AppResult<String> {
             std::env::var(name)
@@ -124,6 +126,9 @@ impl InfisicalSecretProvider {
 
 #[async_trait]
 impl SecretProvider for InfisicalSecretProvider {
+    // SPEC-3.24: cache TTL is a fixed 5 minutes; a cache miss that also
+    // fails at the network level is always Err, never collapsed into
+    // Ok(None); a confirmed absence is cached as None too.
     async fn get(&self, key: &SecretKey) -> AppResult<Option<String>> {
         let name = key.name()?;
 
@@ -170,6 +175,10 @@ impl SecretProvider for InfisicalSecretProvider {
         Ok(())
     }
 
+    // SPEC-3.25: put and delete write through to Infisical first, then
+    // invalidate (never update in place) the cache entry; put_if_absent
+    // bypasses the cache entirely for its existence check, a check-then-act
+    // rather than a true compare-and-set.
     async fn put_if_absent(&self, key: &SecretKey, value: &str) -> AppResult<bool> {
         let name = key.name()?;
         // Bypass the cache: a stale cached `None` here would write over a

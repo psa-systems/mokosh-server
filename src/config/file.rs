@@ -64,6 +64,8 @@ impl FileProvider {
     /// directory is a construction input for THIS provider, which is the
     /// PMS-1009 rule for a provider of record. `src/config/guard.rs`
     /// documents the exemption.
+    // SPEC-1 and 2.133: reads CONFIG_FILE_DIR directly as the provider's own
+    // construction input, per the guard.rs provider-of-record exemption.
     pub fn from_env() -> Self {
         let dir = std::env::var("CONFIG_FILE_DIR")
             .ok()
@@ -80,6 +82,8 @@ impl FileProvider {
 
     /// Load a directory explicitly. Public so tests drive it without touching
     /// process-global env under a concurrent test runner.
+    // SPEC-1 and 2.134: a missing directory is silent-empty (enablement); an
+    // unreadable one logs an error. Both collapse to an empty provider.
     pub fn load(dir: PathBuf) -> Self {
         let mut values = BTreeMap::new();
 
@@ -189,6 +193,8 @@ impl ConfigProvider for FileProvider {
     /// refuses the write with a named `AppError::Configuration`, so an
     /// operator asking to migrate TO the file provider without pointing it
     /// anywhere gets a clear message rather than a silent success.
+    // SPEC-1 and 2.136: set/delete both refuse a bootstrap-tier key before
+    // touching the filesystem.
     async fn set(&self, key: &str, value: &str) -> AppResult<()> {
         if registry::tier_of(key) == Some(Tier::Bootstrap) {
             return Err(AppError::Configuration(format!(
@@ -258,6 +264,8 @@ impl ConfigProvider for FileProvider {
 /// "insert final newline" leaves one. Anything more is a value the operator
 /// wrote on purpose - preserving embedded whitespace matters for compose
 /// keys like `SMTP_FROM` and multi-line PEM material.
+// SPEC-1 and 2.135: exactly one trailing newline is stripped per file; anything
+// else in the value is preserved.
 fn strip_trailing_newline(input: &str) -> String {
     let stripped = input
         .strip_suffix("\r\n")

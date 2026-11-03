@@ -14,6 +14,8 @@ mod models;
 mod routes;
 mod service;
 
+// SPEC-7.509: the approvals surface supports exactly these four
+// parent entity kinds (ticket, change_request, quote, time_entry).
 pub use models::{ApprovalResponse, ApprovalTarget};
 pub use routes::{approval_routes, ApprovalsRouterState};
 pub use service::ApprovalsService;

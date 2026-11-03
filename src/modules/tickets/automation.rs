@@ -246,6 +246,7 @@ impl AutomationEngine {
 
         let expected = condition.value.as_str().unwrap_or("").to_string();
 
+        // SPEC-7.44: supported condition operators are exactly equals/not_equals/contains/starts_with/ends_with/is_null/is_not_null over status/priority/company_id/assigned_to_id/source/is_billable; any other operator or field does not silently match.
         match condition.operator.as_str() {
             "equals" => value == expected,
             "not_equals" => value != expected,
@@ -266,6 +267,8 @@ impl AutomationEngine {
     /// whole run: every DB-writing action here runs on it rather than
     /// opening its own transaction (PMS-1246). PMS-1379: nothing in this
     /// method awaits a network call, so `tx` is never held open across one.
+    // SPEC-7.39: set_status/set_priority/assign_to/set_queue/add_note run inside the one shared transaction used for the triggering ticket mutation (PMS-1246).
+    // SPEC-7.40: webhook/send_notification are collected as DeferredAction values here rather than dispatched, so the network call happens only after the triggering transaction has committed (PMS-1379).
     async fn execute_db_actions(
         &self,
         tx: &mut sqlx::PgConnection,
@@ -412,6 +415,7 @@ impl AutomationEngine {
                                 body,
                             });
                         }
+                        // SPEC-7.43: an action referencing a missing required parameter is skipped (not applied, not erroring the whole rule evaluation) and the skip is logged.
                         _ => tracing::warn!(
                             %ticket_id, rule = %rule.name,
                             "send_notification action missing 'to' param",
@@ -617,7 +621,9 @@ async fn send_guarded_webhook(
     payload: &serde_json::Value,
 ) -> Result<reqwest::StatusCode, WebhookError> {
     let mut url = target.clone();
+    // SPEC-7.42: redirect-following stops and fails after WEBHOOK_MAX_HOPS (5) hops.
     for _ in 0..=WEBHOOK_MAX_HOPS {
+        // SPEC-7.41: the outbound URL passes guard_outbound_url (SSRF guard) before the first request and again before following each redirect hop.
         // A tenant integration may legitimately listen on its own port, so the
         // port set is not pinned here; the resolved address is what is screened.
         guard_outbound_url(resolver, &url, None, allowlist).await?;
