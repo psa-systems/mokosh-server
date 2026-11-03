@@ -133,6 +133,17 @@ jobs:
         # `--lib` above does not execute doctests.
         run: cargo test --workspace --doc
 
+      - name: Cache cargo-machete tarball
+        # PMS-1641: version-keyed tarball cache. A hit skips the ~5s
+        # download; a version bump misses the key, downloads once, and
+        # the sha256 check below is the safety net if a wrong-version
+        # file somehow comes back. Bump this key literal in step with
+        # MACHETE_VERSION in the next step.
+        uses: https://github.com/actions/cache@v4
+        with:
+          path: /tmp/machete.tar.gz
+          key: cargo-machete-tarball-0.9.2-linux
+
       - name: Unused dependencies
         # PMS-780: `pulldown-cmark` and `minijinja` were declared with no call
         # site and compiled on every cold build. The manifest is clean now, so
@@ -156,8 +167,10 @@ jobs:
         run: |
           set -euo pipefail
           archive="cargo-machete-v${MACHETE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
-          curl --silent --fail --location --output /tmp/machete.tar.gz \
-            "https://github.com/bnjbvr/cargo-machete/releases/download/v${MACHETE_VERSION}/${archive}"
+          if [ ! -s /tmp/machete.tar.gz ]; then
+            curl --silent --fail --location --output /tmp/machete.tar.gz \
+              "https://github.com/bnjbvr/cargo-machete/releases/download/v${MACHETE_VERSION}/${archive}"
+          fi
           echo "${MACHETE_SHA256}  /tmp/machete.tar.gz" | sha256sum --check --strict
           tar --extract --gzip --file /tmp/machete.tar.gz --directory /tmp
           cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"

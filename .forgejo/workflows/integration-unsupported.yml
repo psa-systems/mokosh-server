@@ -87,6 +87,17 @@ jobs:
           shared-key: integration
           cache-on-failure: true
 
+      - name: Cache cargo-nextest tarball
+        # PMS-1641: same version-keyed tarball cache as integration.yml.
+        # The weekly cron runs infrequently enough that a fresh download
+        # on key miss is not a hot path, but a key hit (same version
+        # restored from the warm or PR runs on the same runner) still
+        # saves the ~5s this step would otherwise spend on curl.
+        uses: https://github.com/actions/cache@v4
+        with:
+          path: /tmp/nextest.tar.gz
+          key: cargo-nextest-tarball-0.9.145-linux
+
       - name: Install cargo-nextest
         # PMS-1177: nextest schedules test CASES from every archived binary
         # concurrently instead of running one suite to
@@ -114,8 +125,10 @@ jobs:
           NEXTEST_SHA256: "32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867"
         run: |
           set -euo pipefail
-          curl --silent --fail --location --output /tmp/nextest.tar.gz \
-            "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          if [ ! -s /tmp/nextest.tar.gz ]; then
+            curl --silent --fail --location --output /tmp/nextest.tar.gz \
+              "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          fi
           echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum --check --strict
           cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
           mkdir -p "${cargo_bin}"
