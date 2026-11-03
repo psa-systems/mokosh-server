@@ -1425,7 +1425,7 @@ fn not_a_frontend_body(hub_link: &str) -> String {
          <title>API endpoint</title>\n\
          <meta name=\"robots\" content=\"noindex\">\n\
          {viewport}\n\
-         <style>{shell_css}a{{color:#0066cc}}</style>\n\
+         <style>{shell_css}a{{color:light-dark(#0066cc,#6cb4ff)}}</style>\n\
          </head>\n\
          <body>\n\
          <h1>This is an API endpoint.</h1>\n\
@@ -1734,6 +1734,18 @@ mod tests {
         assert!(body.contains("margin:2rem auto"));
         assert!(body.contains("color-scheme:light dark"));
         assert!(body.contains("max-width:36rem"));
+    }
+
+    /// PMS-1629: the body's `color-scheme: light dark` makes a dark browser
+    /// paint a near-black canvas, so the shell's `color`/`background-color`
+    /// pair and the page's own link color must both carry a dark-mode value
+    /// instead of a fixed light-mode one.
+    #[test]
+    fn not_a_frontend_pairs_colors_for_dark_mode() {
+        let body = not_a_frontend_body("https://example.com");
+        assert!(body.contains("background-color:light-dark(#fff,#121212)"));
+        assert!(body.contains("color:light-dark(#1a1a1a,#e8e8e8)"));
+        assert!(body.contains("a{color:light-dark(#0066cc,#6cb4ff)}"));
     }
 
     // SPEC-1 and 2.78: this test is itself the enforcement site. It textually scans tickets/routes.rs (mounted at `/tickets`) and tickets/attachments.rs (merged at the top level) for `.route(...)` calls, computes
