@@ -1501,10 +1501,6 @@ GET                    /api/v1/email-intake-log/{id}
 
 ```text
 GET                    /api/v1/integrations
-GET                    /api/v1/integrations/{provider}
-PUT                    /api/v1/integrations/{provider}
-POST                   /api/v1/integrations/{provider}/connect
-POST                   /api/v1/integrations/{provider}/disconnect
 GET, POST              /api/v1/rmm/connections
 GET, PUT, DELETE       /api/v1/rmm/connections/{id}
 POST                   /api/v1/rmm/connections/{id}/test
