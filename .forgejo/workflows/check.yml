@@ -356,13 +356,12 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
+        # PMS-1635: clippy IS the compile+lint gate; a separate `cargo check`
+        # revalidates fingerprints clippy just computed. `--workspace` matters
+        # per PMS-893: without it, mokosh-types' test target silently stops
+        # compiling (its fixture lost a field in PMS-730 and no gate caught it
+        # until `--workspace` landed on this step).
         run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Compile check
-        # PMS-893: `--workspace`, because without it this checks the root
-        # package only. crates/mokosh-types' test target had not compiled since
-        # PMS-730 added a field its fixture never got, and no gate noticed.
-        run: cargo check --workspace --all-targets
 
       - name: Unit tests
         # PMS-893: `--workspace` runs the shared crate's 83 tests, which had
