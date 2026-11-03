@@ -76,8 +76,15 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v5
 
       - name: Cache Rust build
+        # PMS-1639: share the key with integration.yml's PR job and
+        # cache-warm.yml's warm-integration job. Workspace fingerprints
+        # are identical between the supported and unsupported profiles
+        # (`.config/nextest.toml` partitions which cases RUN, not what
+        # COMPILES), so the weekly run restores what the merge gate
+        # already compiled on main instead of starting cold.
         uses: https://github.com/Swatinem/rust-cache@v2
         with:
+          shared-key: integration
           cache-on-failure: true
 
       - name: Install cargo-nextest
