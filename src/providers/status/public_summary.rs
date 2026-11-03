@@ -45,6 +45,17 @@ use super::ProviderStatusReport;
 /// Reduce a [`ProviderStatusReport`] to the outward summary. Pure over its
 /// input, so the endpoint that calls `super::collect().summarize()` and the
 /// tests that build a report by hand share one derivation.
+// SPEC-3.73: exposes exactly five kinds (configuration, application
+// secrets, storage, authentication, email) and permanently excludes
+// tenant secrets, because a tenant-chosen provider has no single
+// per-instance identity to report; for each exposed kind it carries
+// only the list of enabled provider names, nothing else observable.
+// SPEC-3.74: every string leaf anywhere in the serialized public
+// summary must be one of the hosting-profile strings, the schema
+// version "1", or one of the nine known short provider identifiers;
+// no numeric or boolean leaf may appear anywhere in the summary; this
+// whitelist is the security boundary for the endpoint being
+// unauthenticated.
 pub fn summarize(report: &ProviderStatusReport) -> PublicProviderSummary {
     let names_for = |kind: &str| -> Vec<String> {
         report

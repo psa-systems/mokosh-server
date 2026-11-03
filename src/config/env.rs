@@ -18,6 +18,8 @@ impl ConfigProvider for EnvProvider {
         provider::ENVIRONMENT
     }
 
+    // SPEC-1 and 2.131: a non-UTF8 env var is treated as unset-with-error-log,
+    // distinct from genuinely absent.
     fn get(&self, key: &str) -> Option<String> {
         match std::env::var(key) {
             Ok(value) => Some(value),
@@ -46,6 +48,8 @@ impl ConfigProvider for EnvProvider {
     /// process. A presence matrix is about configuration this application
     /// reads; `PATH` and `HOSTNAME` are not that, and listing them would make
     /// the report unreadable and leak the host's own environment into it.
+    // SPEC-1 and 2.132: enumerates only declared REGISTRY keys, never the raw
+    // process environment.
     fn list(&self) -> Enumeration {
         Enumeration::Keys(
             REGISTRY

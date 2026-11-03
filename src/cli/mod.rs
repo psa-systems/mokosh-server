@@ -48,6 +48,12 @@ const DEFAULT_ADMIN_LAST_NAME: &str = "Admin";
 /// Whether `name` (argv's first token) selects an operator subcommand handled
 /// by [`run`] rather than the long-running HTTP server. The caller starts the
 /// server when this returns `false`.
+// SPEC-3.78: recognizes exactly these first-argument tokens:
+// bootstrap-infisical, qa-seed, qa-teardown, showcase-seed,
+// showcase-refresh, showcase-teardown, provider-status,
+// provider-set, provider-migrate, provider-purge, verify-providers;
+// any other token (including none) starts the HTTP server instead
+// of dispatching.
 pub fn is_subcommand(name: &str) -> bool {
     matches!(
         name,
@@ -95,6 +101,11 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
 
 // --- bootstrap-infisical --------------------------------------------------
 
+// SPEC-3.79: requires INFISICAL_ADMIN_EMAIL and
+// INFISICAL_ADMIN_PASSWORD, naming the missing variable if either is
+// absent, and otherwise falls back to fixed defaults for every other
+// input (address http://localhost:28002, project mokosh, identity
+// mokosh-machine, environment dev, env file .env, admin name Mokosh Admin).
 async fn run_bootstrap_infisical() -> anyhow::Result<()> {
     let admin_email = require_env("INFISICAL_ADMIN_EMAIL")?;
     let admin_password = require_env("INFISICAL_ADMIN_PASSWORD")?;
@@ -221,6 +232,11 @@ fn parse_tenant_arg(args: &[String]) -> anyhow::Result<uuid::Uuid> {
 /// Resolve a tenant id from `--tenant <uuid>`, falling back to the named env
 /// var. `label` names the dataset for the error message. Errors if neither is
 /// present or the value is not a UUID.
+// SPEC-3.80: resolves the tenant id from --tenant <uuid> first,
+// falling back to MOKOSH_QA_TENANT_ID (or MOKOSH_SHOWCASE_TENANT_ID
+// for showcase subcommands, using the same resolution order);
+// absence of both sources is a distinct error from a value that
+// fails to parse as a UUID.
 fn parse_tenant_arg_env(args: &[String], env_key: &str, label: &str) -> anyhow::Result<uuid::Uuid> {
     let raw = args
         .iter()

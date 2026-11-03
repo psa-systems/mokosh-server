@@ -21,6 +21,9 @@ pub use dunite_provider_status::envelope::SCHEMA_VERSION;
 /// [`ProviderStatusReport`] through its derives, so adding a field to the
 /// report automatically reaches the wire without a second serialiser to
 /// keep in step.
+// SPEC-3.69: the JSON envelope's top level is exactly
+// {schema_version: "1", generated_at, report: {hosting_profile, kinds}};
+// the JSON and HTML renderings must name the exact same set of kind ids.
 pub fn render_json(report: &ProviderStatusReport) -> Value {
     envelope::envelope(report, Utc::now())
 }

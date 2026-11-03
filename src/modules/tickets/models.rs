@@ -69,6 +69,7 @@ pub enum NoteEditPolicy {
 impl NoteEditPolicy {
     /// The stored spelling, which `validate_setting_value` refuses anything
     /// outside of. `None` for a value that is none of them.
+    // SPEC-7.37: parse accepts only "off"/"author_or_admin"/"author_or_manager" and returns None otherwise; the unset-tenant default is AuthorOrAdmin.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "off" => Some(Self::Off),
@@ -89,6 +90,7 @@ impl NoteEditPolicy {
 
     /// May `user` edit a note `author` wrote under this policy? The row's own
     /// state is not consulted here; see `TicketService::note_editable_by`.
+    // SPEC-7.38: AuthorOrAdmin permits author or admin, AuthorOrManager permits author or can_manage_users, Off never permits anyone including the author.
     pub fn permits(self, user: &mokosh_types::auth::CurrentUser, author: uuid::Uuid) -> bool {
         match self {
             Self::Off => false,

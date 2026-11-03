@@ -52,6 +52,9 @@ impl AppSecretProvider for FileProvider {
         "file"
     }
 
+    // SPEC-3.8: a missing directory or a missing file inside an existing
+    // directory both read as unheld silently; an existing but unreadable
+    // file is logged at error.
     fn get(&self, secret: GovernedSecret) -> Option<String> {
         let path = self.path_for(secret);
         // `metadata` distinguishes "the directory is not there" from "the

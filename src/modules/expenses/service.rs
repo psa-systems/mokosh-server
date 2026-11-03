@@ -1,13 +1,14 @@
-//! MAPPS-1100 Phases A + B: the writer for the Bills and Expenses
-//! subsystem.
+//! MAPPS-1100 Phases A + B, plus delegation: the writer for the Bills
+//! and Expenses subsystem.
 //!
 //! Phase A shipped the leaf lookups (`vendors`, `expense_categories`).
 //! Phase B shipped the bill + expense headers with their own lifecycle:
 //! bills (`draft -> approved -> paid`, `void`) and expenses
 //! (`draft -> submitted -> approved -> reimbursed`, `rejected`), each
 //! atomic with its lines in one transaction. Delegation to Xero /
-//! QuickBooks is Phase C: it builds on the OAuth + webhook infrastructure
-//! MAPPS-1099 shipped, and has not yet been started.
+//! QuickBooks has since shipped on both sides: bills (MAPPS-1155) and
+//! reimbursed expense claims (PMS-1541), both on the OAuth + webhook
+//! infrastructure MAPPS-1099 shipped.
 //!
 //! Every mutation runs inside `begin_with_tenant` and writes an
 //! `audit_log` row in the same transaction, matching the billing
