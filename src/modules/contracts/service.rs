@@ -1268,11 +1268,38 @@ impl ContractsService {
     /// `max_rollover_hours`. No-op (returns `Decimal::ZERO`) when the
     /// item has `rollover_enabled = false`.
     ///
-    /// Idempotency: the next-period row is UPSERTed. If it does not exist
-    /// it is created with `hours_included = included + rolled` and the
-    /// matching `hours_remaining`; if it already exists its
-    /// `rollover_hours` / `hours_included` / `hours_remaining` are bumped
-    /// by the rolled amount. Returns the number of hours actually rolled.
+    /// The next-period row is UPSERTed. If it does not exist it is created
+    /// with `hours_included = included + rolled` and the matching
+    /// `hours_remaining`; if it already exists its `rollover_hours` /
+    /// `hours_included` / `hours_remaining` are bumped by the rolled
+    /// amount. Returns the hours actually rolled.
+    ///
+    /// # Called twice, this rolls once (PMS-1572)
+    ///
+    /// The doc here used to say "Idempotency: the next-period row is
+    /// UPSERTed", which is true of creating the row and was read as true of
+    /// the effect. It was not. Nothing zeroes the closing period's
+    /// `hours_remaining`, so a second call for the same closing period read
+    /// the same unused hours and the `DO UPDATE` added them again: the
+    /// hours a customer gets would have grown by the cap on every run of
+    /// whatever called this. It had no caller, so nothing was ever
+    /// double-credited.
+    ///
+    /// The guard is the `DO UPDATE`'s own `WHERE rollover_hours = 0`: a
+    /// period has exactly one predecessor, so a target already carrying
+    /// rollover has already been rolled into, and the update does not
+    /// apply. The closing row is deliberately left alone - its
+    /// `hours_included` and `hours_used` are the record of what that period
+    /// was and what was drawn from it, and the hours that rolled are
+    /// recorded on the next period as `rollover_hours`, so nothing is lost
+    /// by not mutating it.
+    ///
+    /// A roll of zero leaves `rollover_hours = 0` and so is retried on the
+    /// next run, which is the right answer: that period's unused hours can
+    /// still change afterwards, when an entry inside it is edited and
+    /// `release_hours` gives hours back. The total rolled into one period is
+    /// still bounded by the cap, because the first NONZERO roll closes the
+    /// guard.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contract_id = %contract_id))]
     pub async fn roll_to_next_period(
         &self,
@@ -1336,7 +1363,11 @@ impl ContractsService {
             Self::period_for(item.start_date, billing_cycle, next_start);
 
         let id = Uuid::new_v4();
-        sqlx::query(
+        // `RETURNING id` is how the caller learns whether the guarded
+        // `DO UPDATE` applied: a conflicting row that already carries
+        // rollover fails the `WHERE` and Postgres returns no row at all,
+        // which is this roll having already happened.
+        let applied: Option<Uuid> = sqlx::query_scalar(
             r#"INSERT INTO contract_hour_balances
                (id, tenant_id, contract_id, contract_item_id, period_start, period_end,
                 hours_included, hours_used, hours_remaining, rollover_hours)
@@ -1346,7 +1377,9 @@ impl ContractsService {
                    hours_included = contract_hour_balances.hours_included + EXCLUDED.rollover_hours,
                    hours_remaining = contract_hour_balances.hours_remaining + EXCLUDED.rollover_hours,
                    rollover_hours = contract_hour_balances.rollover_hours + EXCLUDED.rollover_hours,
-                   updated_at = NOW()"#,
+                   updated_at = NOW()
+               WHERE contract_hour_balances.rollover_hours = 0
+               RETURNING id"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -1356,10 +1389,18 @@ impl ContractsService {
         .bind(period_end)
         .bind(included + rolled)
         .bind(rolled)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
 
         tx.commit().await?;
+        if applied.is_none() {
+            tracing::debug!(
+                %contract_id,
+                %closing_period_end,
+                "the next period already carries rollover; this close was already rolled"
+            );
+            return Ok(Decimal::ZERO);
+        }
         Ok(rolled)
     }
 
@@ -1385,7 +1426,14 @@ impl ContractsService {
     /// `period_end` is the last day of the window (the day before the
     /// next window's start), matching the DATE columns' inclusive
     /// `period_start`/`period_end` semantics.
-    fn period_for(
+    ///
+    /// `pub(crate)` since PMS-1572: the recurring-invoicing run anchors its
+    /// periods with its own `current_billing_period`, and the roll it now
+    /// performs lands on the window this function names. The two walking the
+    /// same windows is load-bearing, so
+    /// `billing::service::pms1572_period_agreement_tests` asserts it rather
+    /// than leaving two private functions to drift.
+    pub(crate) fn period_for(
         anchor: NaiveDate,
         billing_cycle: &str,
         when: NaiveDate,
