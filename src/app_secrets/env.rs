@@ -38,6 +38,9 @@ impl AppSecretProvider for EnvironmentProvider {
     /// open) is logged at `error` and read as `None`; the classification
     /// then reports "no provider holds this" honestly rather than a silent
     /// success.
+    // SPEC-3.7: reads only {NAME}_FILE, never the plain variable; blank path,
+    // missing file or empty trimmed contents all read as unheld; unreadable
+    // path logs error and also reads as unheld.
     fn get(&self, secret: GovernedSecret) -> Option<String> {
         let file_var = format!("{}_FILE", secret.name());
         let path = std::env::var(&file_var).ok()?;

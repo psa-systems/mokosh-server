@@ -182,6 +182,7 @@ async fn list_tickets(
             (user.tenant(), Some(user.id))
         }
         CallerContext::Contact(session) => {
+            // SPEC-7.58: portal callers are gated per-action by this DB-loaded capability check, never by trusting the JWT's own claims (the JWT is UI-only).
             caller.require_capability(caps::TICKETS_READ, &db).await?;
             filter.company_id = Some(session.company_id);
             (caller.tenant(), None)
@@ -731,6 +732,7 @@ async fn reopen_ticket(
                 .await?
         }
         CallerContext::Contact(session) => {
+            // SPEC-7.17: reopen_ticket requires the TICKETS_REOPEN capability on the contact plane; the shared implementation clears closed_at/resolved_at and moves the ticket to a non-closed status.
             caller.require_capability(caps::TICKETS_REOPEN, &db).await?;
             state
                 .ticket_service

@@ -66,6 +66,8 @@ impl DatabaseProvider {
     /// `app_config`. Refuses any bootstrap-tier key naming it, before
     /// touching the pool: an operator who wired the DB provider up for a
     /// bootstrap key gets a startup error, never a boot that fails midway.
+    // SPEC-1 and 2.137: refuses any bootstrap-tier key before any pool I/O, and
+    // the cache only ever holds the app-tier keys it was given.
     pub async fn build(db: &Database, keys: &[&'static ConfigKey]) -> AppResult<Self> {
         refuse_bootstrap(keys)?;
 
@@ -169,6 +171,8 @@ impl ConfigProvider for DatabaseProvider {
     /// cache. The row and the cache move together, so a read that follows
     /// a write sees the new value. A failing DB write leaves the cache and
     /// the previous value serving.
+    // SPEC-1 and 2.138: set writes app_config through the migrator pool (not the
+    // request-serving pool) and syncs the cache so a read-after-write sees it.
     async fn set(&self, key: &str, value: &str) -> AppResult<()> {
         if super::registry::tier_of(key) == Some(Tier::Bootstrap) {
             return Err(AppError::Configuration(format!(

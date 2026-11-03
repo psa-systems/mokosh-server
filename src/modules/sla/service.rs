@@ -72,6 +72,8 @@ impl SlaService {
     /// Returns `rows_affected` (0 = already claimed by a prior tick or a
     /// racing replica). Lives here because the worker cannot reach the
     /// private `db` field directly.
+    // SPEC-7.140: claims (ticket_id, kind) via INSERT ... ON CONFLICT DO NOTHING in the
+    // ticket's own tenant-scoped transaction, then commits.
     pub(crate) async fn claim_sla_notification(
         &self,
         tenant_id: Uuid,
@@ -108,6 +110,8 @@ impl SlaService {
                 .fetch_one(&mut *tx)
                 .await?;
 
+        // SPEC-7.69: scoped to the caller's tenant and ordered by
+        // is_default DESC, name ascending.
         let rows = sqlx::query_as::<_, PolicyRow>(
             r#"SELECT id, name, description, business_hours_id, is_default
                FROM sla_policies WHERE tenant_id = $1
@@ -130,6 +134,8 @@ impl SlaService {
         ctx: &AuditCtx,
     ) -> AppResult<SlaPolicyResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.72: clear is_default on every other tenant policy
+        // first, so at most one policy per tenant is ever default.
         if request.is_default {
             sqlx::query("UPDATE sla_policies SET is_default = FALSE WHERE tenant_id = $1")
                 .bind(tenant_id)
@@ -151,6 +157,8 @@ impl SlaService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-7.73: writes an audit record inside the same
+        // transaction as the insert, with `after` set to the row snapshot.
         audit_write(
             &mut *tx,
             tenant_id,
@@ -183,6 +191,8 @@ impl SlaService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
+        // SPEC-7.74: 404 when no row with that id exists for the
+        // caller's tenant.
         .ok_or_else(|| AppError::NotFound("SLA policy".to_string()))?;
         Ok(row.into())
     }
@@ -195,6 +205,8 @@ impl SlaService {
         request: &UpsertSlaPolicyRequest,
     ) -> AppResult<SlaPolicyResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.75: clears other defaults with id <> $2, so this update never un-defaults
+        // the row it is itself promoting.
         if request.is_default {
             sqlx::query(
                 "UPDATE sla_policies SET is_default = FALSE WHERE tenant_id = $1 AND id <> $2",
@@ -218,6 +230,8 @@ impl SlaService {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        // SPEC-7.76: 404 when the UPDATE affects 0 rows, and the
+        // transaction is never committed in that case.
         if n == 0 {
             return Err(AppError::NotFound("SLA policy".to_string()));
         }
@@ -231,6 +245,8 @@ impl SlaService {
         })
     }
 
+    // SPEC-7.77: requires RequireAdmin (routes.rs) and 404s when 0
+    // rows are deleted.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_policy(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -255,7 +271,8 @@ impl SlaService {
         policy_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<SlaTargetResponse>, u64)> {
-        // Tenant scoping via the policy join so a caller cannot list another tenant's targets.
+        // SPEC-7.81: tenant-scopes via the policy join (p.tenant_id = $1 AND p.id = $2),
+        // so a caller cannot enumerate another tenant's targets by guessing a policy id.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM sla_targets t
@@ -306,6 +323,8 @@ impl SlaService {
         if !exists {
             return Err(AppError::NotFound("SLA policy".to_string()));
         }
+        // SPEC-7.83: ON CONFLICT (sla_policy_id, priority_id) DO UPDATE keeps at most one
+        // target row per pair; a second call for the same pair overwrites, not duplicates.
         let id: Uuid = sqlx::query_scalar(
             r#"INSERT INTO sla_targets
                (sla_policy_id, priority_id, first_response_hours, resolution_hours, operational_hours)
@@ -332,6 +351,8 @@ impl SlaService {
         })
     }
 
+    // SPEC-7.84: scopes the delete through the owning policy's
+    // tenant and 404s when 0 rows are deleted.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_target(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -387,6 +408,8 @@ impl SlaService {
         ctx: &AuditCtx,
     ) -> AppResult<BusinessHoursResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.93: clears is_default on every other row of the tenant before inserting,
+        // in the same transaction as the insert's audit record below.
         if request.is_default {
             sqlx::query("UPDATE business_hours SET is_default = FALSE WHERE tenant_id = $1")
                 .bind(tenant_id)
@@ -454,6 +477,8 @@ impl SlaService {
             .execute(&mut *tx)
             .await?;
         }
+        // SPEC-7.94: excludes the target row (id <> $2) above when
+        // clearing other defaults, and 404s below on 0 rows affected.
         let n = sqlx::query(
             r#"UPDATE business_hours SET name = $3, timezone = $4, schedule = $5,
                    is_default = $6, updated_at = NOW()
@@ -481,6 +506,8 @@ impl SlaService {
         })
     }
 
+    // SPEC-7.95: requires RequireAdmin (routes.rs) and 404s when 0
+    // rows are deleted.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_business_hours(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -511,6 +538,7 @@ impl SlaService {
                 .fetch_one(&mut *tx)
                 .await?;
 
+        // SPEC-7.97: scoped to tenant and ordered by name ascending.
         let rows = sqlx::query_as::<_, HolidayRow>(
             r#"SELECT id, name, holidays FROM holiday_calendars
                WHERE tenant_id = $1
@@ -551,6 +579,8 @@ impl SlaService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-7.96: writes an audit record inside the insert
+        // transaction (body validated by the handler before this call).
         audit_write(
             &mut *tx,
             tenant_id,
@@ -570,6 +600,8 @@ impl SlaService {
         })
     }
 
+    // SPEC-7.98: update and delete both require RequireAdmin
+    // (routes.rs) and 404 when 0 rows are affected.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_holiday_calendar(
         &self,
@@ -641,10 +673,14 @@ impl SlaService {
         .bind(ticket_id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-7.120: silent no-op (Ok(()), no write) when the ticket
+        // id does not exist for the tenant.
         let Some((sla_id, priority_id, created_at)) = row else {
             return Ok(());
         };
 
+        // SPEC-7.121: applicable policy is the ticket's own sla_id if set, else the
+        // tenant's is_default policy (LIMIT 1 if more than one default row exists).
         // Resolve the applicable policy and its business-hours id in one
         // query so we do not round-trip twice.
         let policy: Option<(Uuid, Option<Uuid>)> = match sla_id {
@@ -665,6 +701,8 @@ impl SlaService {
                 .await?
             }
         };
+        // SPEC-7.122: no policy resolved (explicit sla_id not found,
+        // or no default policy) is a no-op with no write to the ticket.
         let Some((policy_id, business_hours_id)) = policy else {
             return Ok(()); // no policy configured; nothing to evaluate
         };
@@ -682,6 +720,8 @@ impl SlaService {
         .fetch_optional(&mut *tx)
         .await?;
         drop(tx);
+        // SPEC-7.123: no sla_targets row for (policy_id, priority_id)
+        // is a no-op with no write.
         let Some((fr, res, op_hours)) = target else {
             return Ok(());
         };
@@ -693,14 +733,20 @@ impl SlaService {
         let (schedule, holidays) = self
             .load_schedule_and_holidays(tenant_id, business_hours_id)
             .await?;
+        // SPEC-7.124: NULL operational_hours defaults to "business_hours" here, unlike
+        // the "24x7" request-DTO default used when a client omits the field on write.
         let operational =
             OperationalHours::from_db(op_hours.as_deref().unwrap_or("business_hours"));
 
+        // SPEC-7.127: each due field is computed via clock::due_at only when its hours
+        // value is non-NULL and parses to f64, else left unset (None -> NULL).
         let fr_due = decimal_to_hours(fr)
             .map(|h| clock::due_at(created_at, h, &schedule, &holidays, operational));
         let res_due = decimal_to_hours(res)
             .map(|h| clock::due_at(created_at, h, &schedule, &holidays, operational));
 
+        // SPEC-7.128: the final UPDATE runs in its own tenant-scoped transaction,
+        // separate from and committed independently of the read above.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"UPDATE tickets SET first_response_due = $3, resolution_due = $4,
@@ -729,6 +775,8 @@ impl SlaService {
     ) -> AppResult<(BusinessSchedule, HashSet<NaiveDate>)> {
         // No business hours on the policy: an empty (all-closed) schedule
         // that `clock::due_at` degrades to 24x7, plus no holidays.
+        // SPEC-7.125: a missing or nonexistent business_hours_id degrades to an
+        // all-closed schedule and no holidays, which clock::due_at treats as 24x7.
         let empty = || {
             (
                 BusinessSchedule::parse("UTC", &serde_json::json!({})),
@@ -756,6 +804,8 @@ impl SlaService {
 
         let schedule = BusinessSchedule::parse(&timezone, &schedule_json);
 
+        // SPEC-7.126: holidays are the union of every holiday_calendars row referenced by
+        // the holidays UUID[] column, tenant-scoped; empty or NULL skips the query.
         let mut holidays: HashSet<NaiveDate> = HashSet::new();
         if let Some(ids) = holiday_calendar_ids {
             if !ids.is_empty() {
@@ -779,6 +829,8 @@ impl SlaService {
 
 /// Convert a `DECIMAL` hours value (e.g. `1.50`) into `f64` hours for the
 /// clock. Returns `None` for NULL or unparseable values.
+// SPEC-7.129: converts via a string round-trip; a value whose string
+// form cannot parse as f64 is treated as None rather than erroring.
 fn decimal_to_hours(d: Option<Decimal>) -> Option<f64> {
     d.and_then(|h| h.to_string().parse::<f64>().ok())
 }

@@ -54,6 +54,8 @@ impl InfisicalClient {
     ///
     /// This does not authenticate immediately; authentication happens
     /// on the first API call.
+    // SPEC-3.26: new/connect perform no network I/O and do not
+    // authenticate at construction; authentication happens on first use.
     pub async fn new(
         base_url: &str,
         client_id: &str,
@@ -68,6 +70,8 @@ impl InfisicalClient {
     /// `new` was only ever async by signature. PMS-968 needs a client from
     /// `create_api_router`, which is sync, so the body moved here and `new`
     /// delegates rather than every existing caller changing.
+    // SPEC-3.27: base_url has any trailing slash stripped exactly once at
+    // construction, so route building never produces a doubled slash.
     pub fn connect(base_url: &str, client_id: &str, client_secret: &str) -> Result<Self, AppError> {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -88,6 +92,9 @@ impl InfisicalClient {
         })
     }
 
+    // SPEC-3.28: logs in with a form-urlencoded clientId/clientSecret
+    // body, never JSON; a non-2xx response produces an error naming the
+    // status and body.
     async fn authenticate(&self) -> Result<AuthToken, AppError> {
         info!("Authenticating with Infisical");
 
@@ -138,6 +145,10 @@ impl InfisicalClient {
     }
 
     /// Ensure we have a valid token, refreshing if necessary.
+    // SPEC-3.29: a token is treated as invalid, and refreshed, once
+    // now + 300s >= expires_at; the validity check runs once under a
+    // read lock and again after the write lock, so two concurrent callers
+    // never both re-authenticate when one already found a valid token.
     pub async fn ensure_authenticated(&self) -> Result<String, AppError> {
         {
             let token = self.token.read().await;
@@ -171,6 +182,10 @@ impl InfisicalClient {
     /// token is minted via `ensure_authenticated`, and the request is
     /// replayed once. A second 401 falls through to `check_response`,
     /// which surfaces it as an authentication error.
+    // SPEC-3.30: retries a request exactly once, and only when the first
+    // attempt returns HTTP 401: clears the cached token, re-authenticates,
+    // and resends the identical request; a 401 on the retry is not
+    // retried again.
     async fn send_with_retry<F>(&self, build: F) -> Result<reqwest::Response, AppError>
     where
         F: Fn(&str) -> reqwest::RequestBuilder,
@@ -261,6 +276,11 @@ impl InfisicalClient {
         .await
     }
 
+    // SPEC-3.31: classifies a non-success status as exactly one of: 401
+    // clears the cached token and returns a fixed message with no body
+    // echoed; 403 returns a fixed access-denied message; 404 returns
+    // AppError::NotFound naming the resource; any other status returns
+    // AppError::external_service naming the status and body.
     async fn check_response(
         &self,
         response: reqwest::Response,
@@ -324,6 +344,9 @@ impl InfisicalClient {
     /// the integration" is the ordinary case. Every other failure stays an
     /// error, because an unreachable backend must never read as an absent
     /// secret (see `crate::secrets`).
+    // SPEC-3.32: treats HTTP 404 as Ok(None) and propagates every other
+    // failure as Err, so an unreachable Infisical is never silently read
+    // as an absent secret.
     pub async fn get_secret(
         &self,
         project_id: &str,
@@ -364,6 +387,8 @@ impl InfisicalClient {
     /// reverse: replacing an existing secret is the common call once a tenant
     /// has connected an integration, and it keeps the create path off the hot
     /// path.
+    // SPEC-3.32: attempts PATCH first and falls back to POST only on
+    // AppError::NotFound; this ordering must not be reversed.
     pub async fn put_secret(
         &self,
         project_id: &str,
@@ -387,6 +412,7 @@ impl InfisicalClient {
     }
 
     /// Remove a secret. A secret that is already gone is not an error.
+    // SPEC-3.32: treats AppError::NotFound as success.
     pub async fn delete_secret(
         &self,
         project_id: &str,
@@ -431,6 +457,9 @@ struct SecretWrite<'a> {
     secret_value: Option<&'a str>,
 }
 
+// SPEC-3.33: redacts client_secret as the literal string "[REDACTED]";
+// no logging call in this file ever includes the client secret or a
+// bearer token value.
 impl std::fmt::Debug for InfisicalClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InfisicalClient")

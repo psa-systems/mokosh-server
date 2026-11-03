@@ -134,8 +134,10 @@ mokosh-server provider-migrate --from database --to file
 The command copies every key the source holds into the target, one key at
 a time, with a read-back and compare. The source is NEVER cleared; that is
 what makes the migration reversible up to the purge step. A key the target
-already holds is reported as `already-present`; a write or read-back that
-fails is named with the reason and the key stays in the source.
+already holds is reported as `skipped: target already holds this key`; a
+key the source does not hold is reported as `skipped: source does not hold
+this key`; a write or read-back that fails is named with the reason and the
+key stays in the source.
 
 ## Step 4: verify
 

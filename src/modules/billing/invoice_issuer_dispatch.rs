@@ -15,10 +15,8 @@
 //! A missing mapping or a client-side refusal is `Err(AppError)` so
 //! the caller never writes a half-committed invoice row.
 //!
-//! Wiring into `create_invoice` lands in a follow-up PR; shipping the
-//! dispatcher alone keeps the Phase 2b explicit refusal in place
-//! while the integration-test env catches up to the shape it has to
-//! exercise.
+//! Called from `BillingService::issue_externally` (`service.rs`), itself
+//! called from `create_invoice`, gated on `Feature::DelegatedInvoiceIssuer`.
 
 use std::sync::Arc;
 

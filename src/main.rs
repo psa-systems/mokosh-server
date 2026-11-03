@@ -125,6 +125,8 @@ const DEV_BUNYIP_WEBHOOK_SECRET: &str = "development-bunyip-webhook-secret-chang
 /// Anything else (staging, production, or an unrecognized value) fails
 /// safe: it must supply real secrets. Mirrors [`AppConfig::is_dev_or_test`]
 /// but works on the raw env string before the struct is built.
+// SPEC-1 and 2.2: a secret resolved via resolve_secret (JWT_SECRET, ENCRYPTION_KEY, BUNYIP_WEBHOOK_SECRET, called from AppConfig::from_env) falls back to its
+// hardcoded dev value when unset ONLY in development/dev/ test; every other environment value, including the dev value set explicitly, is a fatal boot error.
 fn env_allows_dev_secrets(environment: &str) -> bool {
     matches!(environment, "development" | "dev" | "test")
 }
@@ -137,6 +139,8 @@ const MIN_JWT_SECRET_LEN: usize = 32;
 /// Outside dev/test, reject a `JWT_SECRET` below the HS256 32-byte security
 /// margin. `resolve_secret` already rejected the unset / dev-default cases
 /// (PMS-499); this adds the length floor (PMS-497).
+// SPEC-1 and 2.3: outside development/dev/test, JWT_SECRET below 32 bytes is a
+// fatal boot error; dev/test accept any length.
 fn check_jwt_secret_len(secret: &str, environment: &str) -> Result<(), Box<dyn std::error::Error>> {
     if !env_allows_dev_secrets(environment) && secret.len() < MIN_JWT_SECRET_LEN {
         return Err(format!(
@@ -152,6 +156,8 @@ fn check_jwt_secret_len(secret: &str, environment: &str) -> Result<(), Box<dyn s
 /// `ENCRYPTION_KEY` form (32 bytes, hex-encoded) required outside dev/test
 /// (PMS-498). A raw 32-byte key is ambiguous and weaker to mistype, so it is
 /// accepted only in dev/test.
+// SPEC-1 and 2.4: outside development/dev/test, ENCRYPTION_KEY must be exactly 64 ASCII hex
+// characters (32 bytes hex-encoded); dev/test also accept a raw 32-byte key.
 fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -202,6 +208,8 @@ struct DeploymentRequirement {
 /// because `db::provision::provision_roles` refuses them at exactly the
 /// moment they are needed, which is the first boot on a database that has
 /// never been provisioned.
+// SPEC-1 and 2.5: outside development/dev/test, MOKOSH_DEPLOYMENT_MODE, MOKOSH_APP_DATABASE_URL, BASE_URL, CLIENT_ORIGIN and SPA_BASE_URL are a closed, ordered list;
+// check_deployment_requirements (invoked from main) collects every one left unset (or blank) and raises a single combined fatal error naming each one's purpose, legal options and an example.
 const ESSENTIAL_DEPLOYMENT_REQUIREMENTS: &[DeploymentRequirement] = &[
     DeploymentRequirement {
         name: "MOKOSH_DEPLOYMENT_MODE",
@@ -512,6 +520,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // token selects one (`mokosh-server bootstrap-infisical|clients|qa-seed|
     // qa-teardown`), run that one-shot task and exit instead of starting the
     // long-running HTTP server. The server path continues below otherwise.
+    // SPEC-1 and 2.6: a recognized argv[1] subcommand short-circuits to run_cli
+    // and returns before tracing/dotenv/config/DB are touched.
     let args: Vec<String> = std::env::args().collect();
     if args
         .get(1)
@@ -526,6 +536,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // back to `info` when it is unset so production runs at info, not debug.
     // This also stops tower_http from logging request URIs (query strings can
     // carry OAuth `code`/`state`) at info by default (PMS-504 L13).
+    // SPEC-1 and 2.7: the server path's tracing subscriber reads RUST_LOG, defaulting to "info" when unset
+    // or unparsable; this init is skipped entirely on the CLI-dispatch path (run_cli installs its own).
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -533,6 +545,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // SPEC-1 and 2.8: two unconditional info-level lines (version banner, then a hardcoded
+    // "multi-tenant mode" line) are logged before any config, env file or database is touched.
     tracing::info!("Starting {}", VersionInfo::current().banner());
 
     tracing::info!("Running in multi-tenant mode");
@@ -540,6 +554,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The env file has to land before ANYTHING reads a variable: the hosting
     // profile below chooses the configuration provider, and that provider then
     // resolves every declared key out of this process's environment.
+    // SPEC-1 and 2.9: `.env` is loaded via dotenvy::dotenv().ok(), so a missing
+    // file is silently ignored rather than failing startup.
     dotenvy::dotenv().ok();
 
     // PMS-1011: the same variable, read strictly, because this answer chooses
@@ -547,6 +563,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ends startup before the database is touched, with a message naming the
     // legal values, instead of surfacing from whichever provider resolved
     // first. `config.deployment_mode` keeps the lenient reading for mail.
+    // SPEC-1 and 2.10: an unrecognized MOKOSH_DEPLOYMENT_MODE value ends startup here (via `?`),
+    // naming the legal values, before the database or any provider is touched.
     let hosting_profile = DeploymentMode::from_env_for_providers()?;
 
     // PMS-1443: the alias grace period for storage names is over. If a
@@ -555,6 +573,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // can edit the compose file. This runs before any config read so a
     // half-migrated deployment fails loud at startup instead of silently
     // using a stale default.
+    // SPEC-1 and 2.11: a retired storage env var name ends startup: the message is printed to
+    // stderr (not just the tracing log) and returned as the process's fatal error.
     if let Err(msg) = mokosh_server::storage::env::check_boot_env_from_process() {
         eprintln!("{msg}");
         return Err(msg.into());
@@ -564,9 +584,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // generation, before `AppConfig` or any feature asks for a value. An
     // unrecognised CONFIG_BACKEND ends startup here naming the legal values,
     // rather than silently serving from the default.
+    // SPEC-1 and 2.12: an unrecognised CONFIG_BACKEND, or a failure resolving the
+    // first configuration generation, ends startup here via `?`.
     let config_selection =
         config::init_from_env(hosting_profile.default_provider_for(ProviderKind::Configuration)?)?;
 
+    // SPEC-1 and 2.13: an AppConfig::from_env failure panics (`.expect`) rather than returning a
+    // typed error, unlike every other fatal boot step in this function.
     let config = AppConfig::from_env().expect("Failed to load configuration");
 
     // PMS-1160: refuse to start when an essential deployment-shape variable
@@ -578,6 +602,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // AppConfig::from_env so ENVIRONMENT decides whether the check gates.
     check_deployment_requirements(&config.environment)?;
 
+    // SPEC-1 and 2.14: DB role self-provisioning runs before either request pool is opened, and is skipped
+    // entirely when mokosh_migrator can already log in; failure propagates via `?` as a fatal boot error.
     // PMS-489: self-provision the split DB roles (mokosh_migrator / mokosh_app)
     // from MOKOSH_ADMIN_DATABASE_URL on first boot, before connecting the
     // request pools. Skipped entirely when the migrator role already logs in,
@@ -586,6 +612,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // step - one mechanism, identical in dev and prod, env-driven.
     mokosh_server::db::provision::provision_roles(&config.database_url).await?;
 
+    // SPEC-1 and 2.15: Database::new opens both the app and migrator pools in one call; a
+    // connection failure propagates via `?` as a fatal boot error before migrations ever run.
     let db = Database::new(&config.app_database_url, &config.database_url).await?;
 
     // A migration failure is fatal: exit non-zero rather than serve a
@@ -596,6 +624,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // consistent with the other startup checks (SMTP/ENCRYPTION_KEY/CORS
     // all hard-fail). `RUN_MIGRATIONS=false` still skips the step entirely for
     // operators who manage migrations out of band.
+    // SPEC-1 and 2.16: a migration failure is fatal: logged at error level and returned, ending startup without serving on a half-migrated database.
+    // SPEC-1 and 2.17: RUN_MIGRATIONS=false skips the whole block silently; main.rs logs no explicit "migrations skipped" line in that case.
     if config.run_migrations {
         if let Err(e) = db.run_migrations().await {
             tracing::error!("Failed to run database migrations: {e}");
@@ -604,8 +634,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Database migrations complete");
     }
 
+    // SPEC-1 and 2.18: "Database connected" is logged unconditionally here,
+    // whether or not run_migrations ran the block above.
     tracing::info!("Database connected");
 
+    // SPEC-1 and 2.19: a platform-admin bootstrap failure is logged at warn
+    // level and boot continues; it is never fatal.
     if let Err(e) = mokosh_server::modules::auth::bootstrap::maybe_bootstrap_admin(&db).await {
         tracing::warn!("Admin bootstrap failed: {}", e);
     }
@@ -615,10 +649,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Resource-Server path (OIDC_ISSUER / OIDC_AUDIENCE, wired below) and the
     // legacy HS256 cookie path. There is no second OP and no /oauth2/* surface
     // hosted by mokosh; bunyip is the sole OP.
+    // SPEC-1 and 2.20: a single hardcoded info line names the two auth
+    // mechanisms; it is not derived from which providers actually resolved.
     tracing::info!(
         "Auth: bunyip-as-OP Resource-Server + legacy HS256 cookie (mokosh-auth removed)"
     );
 
+    // SPEC-1 and 2.21: a malformed ENCRYPTION_KEY (already validated in shape by AppConfig::from_env,
+    // but re-parsed here into raw bytes) panics via `.expect` rather than returning a typed boot error.
     let encryption_key = mokosh_server::utils::crypto::parse_encryption_key(&config.encryption_key)
         .expect("ENCRYPTION_KEY must be 32 bytes (or 64 hex chars)");
 
@@ -641,6 +679,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // PMS-1537: the profile's per-secret declarations travel with the
     // process-wide one. On `saas` that is the Google client pair, which bunyip
     // serves for the whole suite.
+    // SPEC-1 and 2.22: application-tier secret provider construction (the per-secret defaults and the process-wide
+    // installation) is fatal via `?`; a failure here ends startup before any provider-backed secret can be read.
     let per_secret = mokosh_server::app_secrets::per_secret_defaults(
         hosting_profile.default_secret_providers(),
     )?;
@@ -658,6 +698,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // id and forgot its secret must not discover it when a customer presses
     // Connect. Both unset is a deployment that cannot connect Google Contacts,
     // which the app-secret survey has already warned about by name.
+    // SPEC-1 and 2.23: a half-configured Google OAuth client pair (id set, secret missing, or
+    // vice versa) is a fatal boot error via `?`; both unset resolves to `None` with no error.
     let google_client = match mokosh_server::app_secrets::current() {
         Some(secrets) => {
             mokosh_server::modules::contact_sync::OauthClient::from_app_secrets(secrets.as_ref())?
@@ -668,6 +710,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // here for the same reason the Google pair is. A host holding one half of
     // a pair is a boot error naming the missing key, raised where an operator
     // is present to read it rather than at a customer's first click.
+    // SPEC-1 and 2.24: a half-configured Xero or Intuit application pair is a fatal boot error via `?`, same posture
+    // as the Google client above; app_secrets unavailable falls back to IssuerApps::default() with no error.
     let issuer_apps = std::sync::Arc::new(match mokosh_server::app_secrets::current() {
         Some(secrets) => {
             mokosh_server::modules::billing::invoice_issuer_app::IssuerApps::from_app_secrets(
@@ -709,6 +753,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // through these. `init_from_env` above installed them, so `current()` is
     // Some; the error path exists because an `expect` in `main` would be a
     // panic with no sentence for an operator.
+    // SPEC-1 and 2.25: app_secrets::current() returning None here (meaning the init_from_env
+    // call above silently failed to install) is a fatal anyhow error via `?`, not a panic.
     let app_secrets = mokosh_server::app_secrets::current().ok_or_else(|| {
         anyhow::anyhow!(
             "the application-tier secret providers were not installed, so no deployment-wide \
@@ -720,6 +766,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // before anything can render it. Warn-and-continue rather than hard-fail:
     // the consumers are display strings with a working default, and refusing to
     // boot over one would be a worse failure than showing "Mokosh".
+    // SPEC-1 and 2.26: a failure loading the product-name setting is logged at
+    // warn level and boot continues with the built-in default name.
     if let Err(e) = mokosh_server::modules::settings::app_name::resolve_and_cache(&db).await {
         tracing::warn!(error = %e, "could not load the app-name setting; using the default");
     }
@@ -738,6 +786,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // boot (the class of misconfiguration this seam exists to catch), and the
     // selected kind is recorded so `rebuild_and_swap` cannot silently change
     // it at runtime.
+    // SPEC-1 and 2.27: an unrecognised MAIL_PROVIDER, or MAIL_PROVIDER=smtp with no SMTP_HOST, ends startup
+    // via `?`; the resolved provider and its source (explicit vs. profile default) are logged at info level.
     let mail_profile_default = hosting_profile.default_provider_for(ProviderKind::Email)?;
     let mail_config = mokosh_server::utils::email::EmailConfig::from_env(mail_profile_default)?;
     let mail_provider_explicit = mail_config.explicit_providers();
@@ -747,12 +797,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         source = mail_config.source.as_str(),
         "email provider selected"
     );
+    // SPEC-1 and 2.28: a failure loading the mailer config (DB setting or
+    // SMTP_* env) panics via `.expect`.
     let mailer_config =
         mokosh_server::modules::settings::email::resolve_mailer_config(&db, &encryption_key)
             .await
             .expect(
                 "Failed to load Mailer config from DB settings / SMTP_* env (see .env.example)",
             );
+    // SPEC-1 and 2.29: a failure constructing the Mailer for the selected
+    // provider panics via `.expect`.
     let initial_mailer =
         mokosh_server::utils::email::build_mailer(mail_config.provider, mailer_config).expect(
             "Failed to build Mailer for the selected MAIL_PROVIDER; see the error above and \
@@ -763,6 +817,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // first send is the failure mode PMS-1013 exists to remove. `LogMailer`'s
     // verify is trivially Ok(()), so this line adds a NOOP round-trip on the
     // SMTP path and nothing otherwise.
+    // SPEC-1 and 2.30: the mailer transport is verified at boot, not on first send; a verify failure is
+    // logged at error level and is fatal (returned, ending startup). LogMailer's verify is a no-op Ok(()).
     if let Err(e) = initial_mailer.verify().await {
         tracing::error!(error = %e, "email provider verify failed");
         return Err(e.into());
@@ -776,6 +832,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // OIDC_AUDIENCE are set; otherwise the middleware falls back to the legacy
     // HS256 cookie path. See
     // docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md.
+    // SPEC-1 and 2.31: the Bunyip RS verifier is optional; a missing or invalid OIDC_ISSUER/OIDC_AUDIENCE config
+    // logs an info-level reason and leaves it None (the legacy HS256 path still serves); it is never fatal.
     let bunyip_verifier = match mokosh_server::modules::auth::oidc_rs::VerifierConfig::from_env() {
         Ok(cfg) => {
             tracing::info!(issuer = %cfg.issuer, audience = %cfg.audience, "Bunyip RS verifier mounted");
@@ -796,6 +854,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // skip that provider as if its underlying capability were not
     // configured, so a rejected credential reads exactly like an
     // invalid one and never discloses the configured set.
+    // SPEC-1 and 2.32: an invalid AUTH_PROVIDERS selection ends startup via `?`; a valid one is logged (`record()`) and
+    // installed process-wide before the router is built, so every later reader of the selection sees the same value.
     let auth_profile_default = hosting_profile.default_providers_for(ProviderKind::Authentication);
     let auth_chain = mokosh_server::modules::auth::providers::from_env_with(
         auth_profile_default,
@@ -880,6 +940,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The hosting profile's default is resolved HERE and handed in as a name
     // (PMS-1011). `secrets` never holds the deployment shape, which is what
     // keeps PMS-904's boundary intact.
+    // SPEC-1 and 2.33: tenant-secret provider construction panics via `.expect("secret provider
+    // configuration")` on misconfiguration, rather than returning a typed boot error.
     let (secrets, secrets_config) = mokosh_server::secrets::provider_from_env(
         db.clone(),
         encryption_key,
@@ -899,6 +961,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage_default = hosting_profile
         .default_provider_for(ProviderKind::Storage)
         .expect("storage profile default");
+    // SPEC-1 and 2.34: object storage provider construction panics via `.expect("storage
+    // provider configuration")` on misconfiguration, same posture as the secret provider above.
     let (storage_provider, storage_source) = mokosh_server::storage::init_from_env(storage_default)
         .expect("storage provider configuration");
 
@@ -937,6 +1001,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .with_opt(ProviderKind::Email, mail_provider_explicit),
     );
+    // SPEC-1 and 2.35: provider_selection.record() logs, for all five capability kinds, whether the hosting
+    // profile's default stands or an operator's explicit override took effect; it performs no validation of its own.
     provider_selection.record();
 
     // PMS-1414: ONE feature-toggle snapshot, shared by the refresh job and both
@@ -947,9 +1013,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // It starts every feature off, which is also what a database with no rows
     // means, and the scheduler fires each job once immediately at startup, so the
     // first real load happens before the port is bound rather than a minute in.
+    // SPEC-1 and 2.36: the FeatureSnapshot starts with every toggle off; the scheduler's first (immediate) tick of FeatureToggleRefresh
+    // is what first populates it, so a request served before that tick sees every feature off regardless of the database's rows.
     let features = mokosh_server::modules::features::FeatureSnapshot::default();
 
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
+    // SPEC-1 and 2.37: main.rs registers the feature-toggle refresh and (below) the asset-signature-detector refresh at
+    // their own job-module constant intervals, not a literal duration, unlike every other job registered in this function.
     scheduler.register(
         mokosh_server::modules::features::FeatureToggleRefresh::new(db.clone(), features.clone()),
         std::time::Duration::from_secs(
@@ -969,7 +1039,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // PMS-198: the notifications dispatcher (5s) and RMM sync (60s) workers
     // now run on the Scheduler too; the intervals match their former raw
     // `tokio::spawn(run_forever(..))` cadences.
+    // SPEC-1 and 2.38: the notification dispatcher is registered on a
+    // hardcoded 5s interval, the only job in main.rs at that cadence.
     scheduler.register(dispatcher, std::time::Duration::from_secs(5));
+    // SPEC-1 and 2.39: RMM sync is registered on a hardcoded 60s interval.
     scheduler.register(rmm_worker, std::time::Duration::from_secs(60));
 
     // PMS-1215: Google Contacts import runs. Every 60s the worker resumes runs
@@ -1004,6 +1077,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // router's service holds this handle and wakes the worker the moment a run
     // is committed; the request still does not run the import, so a closed tab
     // still cannot stop one.
+    // SPEC-1 and 2.40: the contact-sync runner is registered as a wakeable job on a hardcoded 60s interval AND woken on demand via
+    // contact_sync_wake (also handed to create_api_router below), so a request that commits a sync run need not wait for the next tick.
     let contact_sync_wake = mokosh_server::scheduler::JobWake::new();
     scheduler.register_wakeable(
         mokosh_server::modules::contact_sync::runs::ContactSyncRunner::new(
@@ -1019,11 +1094,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::time::Duration::from_secs(60),
         &contact_sync_wake,
     );
+    // SPEC-1 and 2.41: contract lifecycle and recurring invoicing are each
+    // registered on a hardcoded 3600s (1h) interval.
     scheduler.register(contract_worker, std::time::Duration::from_secs(3600));
     scheduler.register(
         recurring_invoicing_worker,
         std::time::Duration::from_secs(3600),
     );
+    // SPEC-1 and 2.42: SLA sweep is registered on a hardcoded 60s interval.
+    // SPEC-7.130: SlaSweepWorker runs on a 60-second fixed interval.
     scheduler.register(sla_worker, std::time::Duration::from_secs(60));
 
     // Appointment-reminder worker (PMS-58 follow-up). Each 60s tick
@@ -1047,6 +1126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             calendar_notifications,
         ),
     );
+    // SPEC-1 and 2.43: calendar reminders are registered on a hardcoded 60s
+    // interval.
     scheduler.register(calendar_reminder_worker, std::time::Duration::from_secs(60));
 
     // PMS-1208: hourly expiry sweep for pending grant invitations. The
@@ -1061,6 +1142,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // pass, so the bare pool is the correct one.
             std::sync::Arc::new(db.pool().clone()),
         );
+    // SPEC-1 and 2.44: the grant-invitation expiry sweep is registered using the module's own
+    // GRANT_INVITATIONS_SWEEP_INTERVAL constant rather than a literal duration written in main.rs.
     scheduler.register(
         grant_invitations_sweep,
         mokosh_server::modules::auth::grant_invitations_worker::GRANT_INVITATIONS_SWEEP_INTERVAL,
@@ -1078,6 +1161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mokosh_server::modules::saved_reports::SavedReportsService::new(db.clone()),
             ),
         );
+    // SPEC-1 and 2.45: scheduled reports are registered on a hardcoded 60s
+    // interval.
     scheduler.register(scheduled_reports_worker, std::time::Duration::from_secs(60));
 
     // PMS-471: scheduled-dashboard worker. Same shape as the
@@ -1090,6 +1175,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 db.clone(),
             )),
         );
+    // SPEC-1 and 2.46: scheduled dashboards are registered on a hardcoded 60s
+    // interval.
     scheduler.register(
         scheduled_dashboards_worker,
         std::time::Duration::from_secs(60),
@@ -1121,6 +1208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // given up against the old hourly tick is retrying a transient failure an
     // hour later instead of at the next restart, against a WARN line either
     // way.
+    // SPEC-1 and 2.47: main.rs spawns five one-shot movers via spawn_once (KB attachment, tenant logo, branding assets, gateway credential, Google client-secret
+    // cleanup) without awaiting any of them; a failure inside one is handled by spawn_once/the mover itself, not surfaced to main's own control flow.
     use mokosh_server::scheduler::one_shot::spawn_once;
 
     // PMS-960: a KB attachment used to be stored at a flat `kb-articles/{id}`
@@ -1187,6 +1276,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             secrets.clone(),
         ),
     );
+    // SPEC-1 and 2.48: invoice reminders are registered on a hardcoded 3600s
+    // (1h) interval.
     scheduler.register(
         invoice_reminder_worker,
         std::time::Duration::from_secs(3600),
@@ -1200,16 +1291,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let status_retention_worker = mokosh_server::modules::status::StatusRetentionWorker::new(
         mokosh_server::modules::status::StatusService::new(db.clone()),
     );
+    // SPEC-1 and 2.49: status-observation retention is registered on a
+    // hardcoded 21600s (6h) interval.
     scheduler.register(
         status_retention_worker,
         std::time::Duration::from_secs(6 * 3600),
     );
 
+    // SPEC-1 and 2.50: scheduler.start() is called exactly once, after every job above is registered; its returned handles are bound to
+    // `_scheduler_handles` and held for the rest of `main`, so the spawned tasks stay alive rather than being dropped before the server starts serving.
     let _scheduler_handles = scheduler.start();
 
     // PMS-657: build the IP -> country resolver for login-location alerts.
     // Optional: an unset path or a failed .BIN load leaves it None and the
     // alerts stay disabled (login is never affected).
+    // SPEC-1 and 2.51: an unset IP2LOCATION_DB_PATH, or a failed .BIN load,
+    // leaves geoip None and logs info/warn respectively; never fatal.
     let geoip = match config.ip2location_db_path.as_deref() {
         Some(path) => match mokosh_server::utils::geoip::GeoIpService::new(path) {
             Ok(svc) => {
@@ -1231,6 +1328,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dunite-ipenrich crate). Optional and independent of geoip: an unset path or
     // a failed .BIN load leaves it None and the admin enrichment lookup reports
     // nothing (never fatal, mirroring geoip).
+    // SPEC-1 and 2.52: an unset IP2PROXY_DB_PATH, or a failed .BIN load, leaves ip_enrich None
+    // and logs info/warn respectively; never fatal, independent of the geoip service above.
     let ip_enrich: Option<std::sync::Arc<dunite_ipenrich::IpEnrichService>> = match config
         .ip2proxy_db_path
         .as_deref()
@@ -1251,6 +1350,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // SPEC-1 and 2.53: the router is built with one create_api_router call, after every provider,
+    // worker and secret above is ready; it is the last construction step before the listener binds.
     let psa_router = create_api_router(
         db.clone(),
         config.jwt_secret,
@@ -1278,10 +1379,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let router = psa_router;
 
+    // SPEC-1 and 2.54: the bind address is `{HOST}:{PORT}` (defaults "0.0.0.0" / 8080 per
+    // AppConfig::from_env); a malformed combination fails the `SocketAddr` parse and is fatal via `?`.
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
+    // SPEC-1 and 2.55: a bind failure (e.g. the port already in use)
+    // propagates via `?` as a fatal startup error.
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("Server listening on http://{}", addr);
 
+    // SPEC-1 and 2.56: axum::serve runs with no graceful-shutdown handler attached (no `.with_graceful_shutdown`, no SIGTERM/SIGINT
+    // handling in main.rs); the process relies entirely on the default OS signal behavior and drains no in-flight connection on exit.
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -1298,9 +1405,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// and use a plain `info`-default tracing filter (not the server's `debug`
 /// one). Dispatch lives in [`mokosh_server::cli`].
 async fn run_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    // SPEC-1 and 2.57: run_cli loads `.env.infisical` then `.env`, each via `let _ =` so either file's absence is
+    // silently ignored; this is a different source order than the server path (SPEC-1 and 2.9), which loads only `.env`.
     let _ = dotenvy::from_filename(".env.infisical");
     let _ = dotenvy::dotenv();
 
+    // SPEC-1 and 2.58: run_cli installs its own tracing subscriber (same RUST_LOG-with-"info"-default rule as SPEC-1
+    // and 2.7) because the CLI dispatch at the top of `main` returns before `main`'s own subscriber is installed.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1308,6 +1419,8 @@ async fn run_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // SPEC-1 and 2.59: a subcommand error is printed to stderr and the process exits via `std::process::exit(1)`,
+    // not returned as this function's `Result`, so `main`'s own error formatting never sees it.
     if let Err(e) = mokosh_server::cli::run(args).await {
         eprintln!("error: {e:#}");
         std::process::exit(1);
