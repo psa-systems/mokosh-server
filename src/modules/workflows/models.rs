@@ -24,6 +24,7 @@ pub const TRIGGER_TICKET_PRIORITY_CHANGED: &str = "ticket.priority_changed";
 /// Service-side allow-list of triggers the Phase 2 executor knows
 /// how to fire. Anything else is rejected at create-rule time so
 /// an operator does not silently land a never-firing rule.
+// SPEC-7.152: only these three trigger names are recognised by the service.
 pub const RECOGNISED_TRIGGERS: &[&str] = &[
     TRIGGER_TICKET_CREATED,
     TRIGGER_TICKET_STATUS_CHANGED,
@@ -51,28 +52,37 @@ pub struct CreateWorkflowRuleRequest {
     /// Phase 1 only accepts `ticket.created`. The service rejects
     /// anything else with 400 so an operator does not silently
     /// create a never-firing rule.
+    // SPEC-7.147: trigger_event is validated as a string of length 1..=50.
     #[validate(length(min = 1, max = 50))]
     pub trigger_event: String,
+    // SPEC-7.148: name is validated as a string of length 1..=200.
     #[validate(length(min = 1, max = 200))]
     pub name: String,
     pub description: Option<String>,
     /// AND across keys, IN across array values. See the migration
     /// header for the full shape. Empty object matches every new
     /// ticket of that tenant.
+    // SPEC-7.149: conditions defaults to {} when omitted from the create request.
     #[serde(default = "default_empty_object")]
     pub conditions: serde_json::Value,
     /// Applied in iteration order. See the migration header for the
     /// full shape.
+    // SPEC-7.149: actions defaults to {} when omitted from the create request.
     #[serde(default = "default_empty_object")]
     pub actions: serde_json::Value,
+    // SPEC-7.150: priority defaults to 100 when omitted from the create request.
     #[serde(default = "default_priority")]
     pub priority: i32,
+    // SPEC-7.150: is_active defaults to true when omitted from the create request.
     #[serde(default = "default_true")]
     pub is_active: bool,
 }
 
+// SPEC-7.154: this DTO has no trigger_event field at all, so an existing rule's
+// trigger event is immutable after creation (it cannot be changed via update).
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateWorkflowRuleRequest {
+    // SPEC-7.151: on update, name (when Some) must still satisfy length 1..=200.
     #[validate(length(min = 1, max = 200))]
     pub name: Option<String>,
     pub description: Option<String>,

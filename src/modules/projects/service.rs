@@ -33,6 +33,7 @@ impl ProjectsService {
     /// counts and the sum describe the same instant - a client rendering them
     /// side by side should not be able to show a budget that includes a
     /// project the counts do not.
+    // SPEC-7.452: counts_by_status and total_budget are computed in one transaction, so both describe the same instant
     pub async fn project_summary(&self, tenant_id: TenantId) -> AppResult<ProjectSummaryResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
@@ -75,6 +76,8 @@ impl ProjectsService {
         // $1 tenant only, so filters bind at $2+. (Sharing one clause made
         // the count query reference $4/$5 with only 3 binds -> 500. Same
         // bug class as PMS-145.)
+        // SPEC-7.410: both data and count queries scope to tenant_id = $1
+        // SPEC-7.443: independently-numbered placeholders per query, so an added filter never reuses an index between the two
         let mut data_conds = vec!["tenant_id = $1".to_string()];
         let mut count_conds = vec!["tenant_id = $1".to_string()];
         let mut data_idx = 4;
@@ -100,6 +103,7 @@ impl ProjectsService {
         // PMS-895: name search. Last, so the placeholder numbering above is
         // untouched; the binds below go in this same order, which is the
         // invariant this whole parallel-clause dance exists to hold.
+        // SPEC-7.445: q filters name ILIKE '%<q>%', applied as the last optional condition in both queries
         if filter.q.is_some() {
             data_conds.push(format!("name ILIKE ${data_idx}"));
             count_conds.push(format!("name ILIKE ${count_idx}"));
@@ -108,15 +112,18 @@ impl ProjectsService {
         let count_where = count_conds.join(" AND ");
         // Bare column only (order_by appends the direction); "created_at DESC"
         // produced "... DESC DESC" -> 500 (PMS-145).
+        // SPEC-7.444: default sort is created_at; order_by rejects any key outside mokosh_types::sort::PROJECTS
         let order_by = pagination.order_by("created_at", mokosh_types::sort::PROJECTS)?;
         let query = format!(
             r#"
             SELECT id, name, description, project_number, company_id,
+                   -- SPEC-7.438: company_name via tenant-scoped correlated subquery; NULL if no company_id or the company row is gone
                    (SELECT co.name FROM companies co
                      WHERE co.id = projects.company_id
                        AND co.tenant_id = projects.tenant_id) AS company_name,
                    contract_id,
                    project_type, project_type_id, status, project_manager_id,
+                   -- SPEC-7.439: project_manager_name via tenant-scoped correlated subquery, NULLIF(TRIM(...), '')
                    (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
                       FROM users u
                      WHERE u.id = projects.project_manager_id
@@ -126,10 +133,12 @@ impl ProjectsService {
                    -- PMS-944: see the note on the task query. Approval is no
                    -- longer the gate on anything, so a project's actuals count
                    -- every live entry rather than only countersigned ones.
+                   -- SPEC-7.440: actual_hours sums duration_minutes/60.0 over non-rejected time entries
                    COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                              WHERE te.project_id = projects.id
                                AND te.approval_status <> 'rejected'), 0)::numeric / 60.0
                        AS actual_hours,
+                   -- SPEC-7.441: actual_amount sums total_amount over the same non-rejected entry set
                    COALESCE((SELECT SUM(te.total_amount) FROM time_entries te
                              WHERE te.project_id = projects.id
                                AND te.approval_status <> 'rejected'), 0) AS actual_amount,
@@ -189,6 +198,7 @@ impl ProjectsService {
                 -- Resolve the lookup id from the legacy string so new rows
                 -- carry project_type_id too (PMS-322); NULL if the tenant has
                 -- no matching type row.
+                -- SPEC-7.435: project_type_id is resolved from the legacy project_type string, NULL if no matching project_types row
                 (SELECT id FROM project_types WHERE tenant_id = $2 AND name = $8),
                 $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
             )
@@ -222,6 +232,7 @@ impl ProjectsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-7.436: the Create audit row is written in the same transaction as the INSERT, before = NULL
         audit_write(
             &mut *tx,
             tenant_id,
@@ -234,6 +245,7 @@ impl ProjectsService {
         )
         .await?;
         tx.commit().await?;
+        // SPEC-7.437: the create response is the freshly re-read project, so derived fields are populated, not reconstructed
         self.get_project(tenant_id, id).await
     }
 
@@ -273,6 +285,7 @@ impl ProjectsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
+        // SPEC-7.442: a missing or foreign-tenant project id 404s
         .ok_or_else(|| AppError::NotFound("Project".to_string()))?;
         Ok(row.into())
     }
@@ -289,6 +302,7 @@ impl ProjectsService {
         // Overview's edits are captured in the change-history feed just like
         // tasks and tickets.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.446: before/after snapshots are taken inside one transaction, for the audit diff
         let before: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(p) FROM projects p WHERE tenant_id = $1 AND id = $2",
         )
@@ -297,6 +311,7 @@ impl ProjectsService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // SPEC-7.447: every field uses COALESCE($n, column), so an omitted field in the request leaves the stored value unchanged
         let affected = sqlx::query(
             r#"
             UPDATE projects SET
@@ -335,6 +350,7 @@ impl ProjectsService {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        // SPEC-7.448: zero rows affected (missing or foreign-tenant id) 404s
         if affected == 0 {
             return Err(AppError::NotFound("Project".to_string()));
         }
@@ -351,6 +367,7 @@ impl ProjectsService {
         // unwrap the TenantId at the boundary.
         // PMS-349: skip the audit entry when the only change is task-list
         // checkbox flips in the description (a checklist toggle, not an edit).
+        // SPEC-7.449: a description-only change that is purely a checklist checkbox toggle writes no audit row
         if !crate::modules::audit::is_task_marker_only_change(&before, &after) {
             audit_write(
                 &mut *tx,
@@ -371,6 +388,7 @@ impl ProjectsService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_project(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.451: deletes only the row matching both tenant_id and id; zero rows affected 404s
         let n = sqlx::query("DELETE FROM projects WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -389,6 +407,7 @@ impl ProjectsService {
     // ========================================================================
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.457: lists only phases scoped to tenant_id and project_id, ordered by sort_order, paginated
     pub async fn list_project_phases(
         &self,
         tenant_id: TenantId,
@@ -424,6 +443,8 @@ impl ProjectsService {
     /// the caller's tenant-scoped tx so the status read and the subsequent
     /// INSERT share one transaction (the RLS GUC is set for both). A missing
     /// row is a 404; a cancelled project is a 409.
+    // SPEC-7.454,7.455,7.456: 404 if missing, 409 if cancelled, else attach; runs inside the
+    // caller's tenant tx, shared with the subsequent INSERT.
     async fn ensure_project_open(
         &self,
         tx: &mut sqlx::PgConnection,
@@ -456,7 +477,8 @@ impl ProjectsService {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         self.ensure_project_open(&mut tx, tenant_id, project_id)
-            .await?; // &mut tx auto-derefs to &mut PgConnection
+            .await?; // &mut tx auto-derefs to &mut PgConnection; SPEC-7.455: guard and insert share this transaction
+                     // SPEC-7.460: audit row written in the same transaction, and the returned phase is built from the request, not re-read
         sqlx::query(
             r#"INSERT INTO project_phases (id, tenant_id, project_id, name, description, sort_order, start_date, end_date, status)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
@@ -497,6 +519,8 @@ impl ProjectsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.461: a full-field UPDATE (not COALESCE'd) scoped by tenant_id and id; no matching row 404s; no audit row is written on update
+    // SPEC-7.462: does not call ensure_project_open, so a phase under a now-cancelled project can still be edited
     pub async fn update_project_phase(
         &self,
         tenant_id: TenantId,
@@ -536,6 +560,7 @@ impl ProjectsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.463: deletes by tenant_id + id; zero rows affected 404s; no audit row is written on delete
     pub async fn delete_project_phase(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM project_phases WHERE tenant_id = $1 AND id = $2")
@@ -556,6 +581,7 @@ impl ProjectsService {
     // ========================================================================
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.464: lists rows scoped to tenant_id, ordered by sort_order, name, paginated
     pub async fn list_task_statuses(
         &self,
         tenant_id: TenantId,
@@ -609,6 +635,7 @@ impl ProjectsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-7.466: Create audit row written in the same transaction as the INSERT; response is built from the request, not re-read
         audit_write(
             &mut *tx,
             tenant_id,
@@ -631,6 +658,7 @@ impl ProjectsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.467: a full-field UPDATE scoped by tenant_id + id; zero rows affected 404s; no audit row is written on update
     pub async fn update_task_status(
         &self,
         tenant_id: TenantId,
@@ -666,6 +694,7 @@ impl ProjectsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.468: deletes by tenant_id + id; zero rows affected 404s; no audit row written, and no FK-violation mapping (contrast with delete_project_type)
     pub async fn delete_task_status(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM task_statuses WHERE tenant_id = $1 AND id = $2")
@@ -689,6 +718,7 @@ impl ProjectsService {
     // ========================================================================
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.469: lists rows scoped to tenant_id, ordered by sort_order, name, paginated
     pub async fn list_project_types(
         &self,
         tenant_id: TenantId,
@@ -723,6 +753,7 @@ impl ProjectsService {
     ) -> AppResult<ProjectTypeResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.471: creating a default clears is_default on every other tenant row first, in the same transaction
         if request.is_default {
             sqlx::query("UPDATE project_types SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE")
                 .bind(tenant_id)
@@ -760,6 +791,7 @@ impl ProjectsService {
         )
         .await?;
         tx.commit().await?;
+        // SPEC-7.473: a Create audit row is written; the new row's is_system is always false (API-created types are never system rows)
         Ok(ProjectTypeResponse {
             id,
             name: request.name.clone(),
@@ -778,6 +810,7 @@ impl ProjectsService {
         request: &UpsertProjectTypeRequest,
     ) -> AppResult<ProjectTypeResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.472: updating to is_default = true clears is_default on every other tenant row except the one being updated, in the same transaction
         if request.is_default {
             sqlx::query("UPDATE project_types SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE AND id <> $2")
                 .bind(tenant_id)
@@ -787,6 +820,7 @@ impl ProjectsService {
         }
         // RETURNING is_system so we echo the stored (read-only) flag rather than
         // guessing it.
+        // SPEC-7.474: zero rows is 404 "Project type"; no audit row is written on update
         let row: Option<ProjectTypeRow> = sqlx::query_as(
             r#"UPDATE project_types
                SET name = $3, is_default = $4, is_active = $5, sort_order = $6, updated_at = NOW()
@@ -820,6 +854,7 @@ impl ProjectsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-7.475: a missing row 404s; a row with is_system = true 409s and the DELETE is never attempted
         match is_system {
             None => return Err(AppError::NotFound("Project type".to_string())),
             Some(true) => {
@@ -835,6 +870,7 @@ impl ProjectsService {
             .execute(&mut *tx)
             .await;
         if let Err(e) = result {
+            // SPEC-7.476: a foreign-key violation (23503, a project still references this type) maps to 409 instead of propagating a 500
             if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23503") {
                 return Err(AppError::Conflict(
                     "Cannot delete this project type: it is still referenced by a project"
@@ -869,6 +905,7 @@ impl ProjectsService {
 
         let rows = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
+                      -- SPEC-7.477: status_name and status_is_completed are resolved via a tenant-scoped correlated subquery against task_statuses, not a join
                       (SELECT ts.name FROM task_statuses ts
                         WHERE ts.id = tasks.status_id
                           AND ts.tenant_id = tasks.tenant_id) AS status_name,
@@ -876,11 +913,13 @@ impl ProjectsService {
                         WHERE ts.id = tasks.status_id
                           AND ts.tenant_id = tasks.tenant_id) AS status_is_completed,
                       priority, assigned_to_id,
+                      -- SPEC-7.487: assigned_to_name is a tenant-scoped correlated subquery against users, NULL when unassigned
                       (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
                          FROM users u
                         WHERE u.id = tasks.assigned_to_id
                           AND u.tenant_id = tasks.tenant_id) AS assigned_to_name,
                       estimated_hours,
+                      -- SPEC-7.488: actual_hours and logged_hours are computed identically, summing duration_minutes/60.0 for every time entry whose approval_status is not 'rejected' (PMS-944: approval state is not a fact about whether the work happened)
                       -- PMS-944: actual hours are the hours worked. They used
                       -- to count only `approved` time, which reads zero on a
                       -- tenant with timesheets off, because nothing there ever
@@ -906,6 +945,8 @@ impl ProjectsService {
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
         .await?;
+        // SPEC-7.489: tasks are scoped to tenant_id and project_id, ordered by sort_order then created_at, paginated
+        // SPEC-7.490: this query (and its row mapping) is identical to get_task's single-row query below
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
@@ -919,6 +960,7 @@ impl ProjectsService {
         ctx: &AuditCtx,
     ) -> AppResult<TaskResponse> {
         let id = Uuid::new_v4();
+        // SPEC-7.483: an omitted due_date defaults from today + N business days, where N is the project's default_due_business_days override (0 disables it) if set, else the tenant-wide scheduling default; a supplied due_date is used as-is
         // PMS-345: when no due date is given, fall back to the standard due
         // date (today + N business days; N = 0 disables it). The offset is
         // sourced from the project first - its `default_due_business_days`
@@ -959,6 +1001,7 @@ impl ProjectsService {
             }
         };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.484: creating a task shares the ensure_project_open guard from phase creation, so a task cannot be attached to a cancelled or missing project
         self.ensure_project_open(&mut tx, tenant_id, project_id)
             .await?; // &mut tx auto-derefs to &mut PgConnection
         sqlx::query(
@@ -984,6 +1027,7 @@ impl ProjectsService {
         .execute(&mut *tx)
         .await?;
 
+        // SPEC-7.485: the Create audit row is written in the same transaction as the INSERT, before = NULL
         // PMS-318: emit the Create audit row inside the same tx as the INSERT
         // (mirrors update_task above and the PMS-117 create_user pattern) so the
         // task's change-history feed shows the create event, and a rollback
@@ -1007,6 +1051,7 @@ impl ProjectsService {
         )
         .await?;
         tx.commit().await?;
+        // SPEC-7.486: the create response is the freshly re-read task, so derived fields (status_name, assigned_to_name, actual_hours, logged_hours) are populated, not reconstructed
         self.get_task(tenant_id, id).await
     }
 
@@ -1049,6 +1094,7 @@ impl ProjectsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
+        // SPEC-7.491: a missing or foreign-tenant task id 404s
         .ok_or_else(|| AppError::NotFound("Task".to_string()))?;
         Ok(row.into())
     }
@@ -1061,6 +1107,7 @@ impl ProjectsService {
         request: &UpdateTaskRequest,
         ctx: &AuditCtx,
     ) -> AppResult<TaskResponse> {
+        // SPEC-7.492: before/after snapshots are taken inside one transaction, for the audit diff
         // Mutation + audit row in one transaction (PMS-184, mirrors the
         // tickets path): snapshot the row before and after with `to_jsonb`
         // so the change-history feed can diff which columns moved, and write
@@ -1073,6 +1120,7 @@ impl ProjectsService {
                 .fetch_optional(&mut *tx)
                 .await?;
 
+        // SPEC-7.493: an effective start/due range combining the request's supplied fields with the stored row's existing values is validated before the UPDATE runs, so a partial PUT cannot invert the range against unsupplied stored dates
         // PMS-398: a partial PUT can invert the start/due range against the
         // stored row even when the request alone passes the per-request
         // validator (which only sees the fields the caller supplied). Combine
@@ -1094,6 +1142,8 @@ impl ProjectsService {
             ));
         }
 
+        // SPEC-7.494: every field except completed_at uses COALESCE($n, column), so an omitted field in the request leaves the stored value unchanged
+        // SPEC-7.495: completed_at is inferred from the supplied status_id's is_completed flag via a CASE, not a second read: moving to a completed status stamps it (if not already stamped), moving to a non-completed status clears it, and an omitted status_id leaves it untouched
         // When the new status is completed, stamp completed_at; clearing
         // back to non-completed clears it. Two reads (status flag check)
         // would be more correct but require a join; we instead infer
@@ -1112,6 +1162,7 @@ impl ProjectsService {
                   sort_order = COALESCE($12, sort_order),
                   completed_at = CASE
                       WHEN $5::uuid IS NOT NULL AND EXISTS (
+                          -- SPEC-7.496: completed_at only stamps NOW() the first time (COALESCE keeps an existing timestamp), so re-saving an already-completed task does not move its completion time
                           SELECT 1 FROM task_statuses ts
                           WHERE ts.id = $5 AND ts.is_completed = TRUE
                       ) THEN COALESCE(completed_at, NOW())
@@ -1136,6 +1187,7 @@ impl ProjectsService {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        // SPEC-7.497: zero rows affected (missing or foreign-tenant id) 404s
         if n == 0 {
             return Err(AppError::NotFound("Task".to_string()));
         }
@@ -1147,6 +1199,7 @@ impl ProjectsService {
                 .fetch_optional(&mut *tx)
                 .await?;
 
+        // SPEC-7.498: unlike update_project's task-marker-only skip, every task update writes an audit row, with no equivalent description-only exemption
         // PMS-139: audit_write is a cross-module hub still on Uuid (swept last);
         // unwrap the TenantId at the boundary.
         audit_write(
@@ -1161,11 +1214,13 @@ impl ProjectsService {
         )
         .await?;
         tx.commit().await?;
+        // SPEC-7.499: as with create, the update response is the freshly re-read task, not reconstructed from the request
         self.get_task(tenant_id, id).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_task(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        // SPEC-7.500: deletes by tenant_id + id; zero rows affected 404s; no audit row is written on delete
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM tasks WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -1192,16 +1247,20 @@ impl ProjectsService {
         depends_on: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
+        // SPEC-7.502: a task cannot depend on itself; rejected before any transaction opens
         if task_id == depends_on {
             return Err(AppError::BadRequest(
                 "Task cannot depend on itself".to_string(),
             ));
         }
+        // SPEC-7.503: a recursive CTE walks the existing depends_on chain from the candidate dependency back toward the task; if task_id is already reachable, adding the edge would close a cycle and is rejected with 409
+        // SPEC-7.508: the cycle check and the self-dependency check are the only guards; there is no FK existence pre-check for task_id or depends_on before the INSERT (a foreign-tenant or missing task id surfaces as a database FK error, not an AppError)
         // Reject if adding this edge would create a cycle: there must
         // not already be a path depends_on -> ... -> task_id.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let creates_cycle: bool = sqlx::query_scalar(
             r#"
+            -- SPEC-7.504: the recursive chain and its join are scoped to tenant_id = $1 at every step, so a cross-tenant dependency chain can never mask or create a cycle
             WITH RECURSIVE chain AS (
                 SELECT depends_on_task_id FROM task_dependencies
                 WHERE tenant_id = $1 AND task_id = $2
@@ -1224,6 +1283,7 @@ impl ProjectsService {
             ));
         }
         let dep_id = Uuid::new_v4();
+        // SPEC-7.505: ON CONFLICT DO NOTHING makes re-adding an existing (task_id, depends_on_task_id) edge a silent no-op rather than a duplicate row or an error
         sqlx::query(
             r#"INSERT INTO task_dependencies (id, tenant_id, task_id, depends_on_task_id)
                VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING"#,
@@ -1234,6 +1294,7 @@ impl ProjectsService {
         .bind(depends_on)
         .execute(&mut *tx)
         .await?;
+        // SPEC-7.506: on the no-op path above, this re-read finds no row with the freshly generated dep_id (the existing row kept its own id), so `after` is None and a Create audit row is still written with before = after = None
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM task_dependencies t WHERE tenant_id = $1 AND id = $2",
         )
@@ -1263,6 +1324,7 @@ impl ProjectsService {
         task_id: Uuid,
         depends_on: Uuid,
     ) -> AppResult<()> {
+        // SPEC-7.507: deletes the edge by tenant_id, task_id and depends_on_task_id; this is idempotent (no error, no audit row) whether or not the edge existed
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "DELETE FROM task_dependencies WHERE tenant_id = $1 AND task_id = $2 AND depends_on_task_id = $3",
@@ -1303,6 +1365,7 @@ struct ProjectRow {
     updated_at: chrono::DateTime<Utc>,
 }
 
+// SPEC-7.453: billing_method defaults to "time_and_materials" and is_billable defaults to true when the stored column is NULL (predating a NOT NULL default)
 impl From<ProjectRow> for ProjectResponse {
     fn from(r: ProjectRow) -> Self {
         Self {
@@ -1431,6 +1494,7 @@ struct TaskRow {
     sort_order: Option<i32>,
 }
 
+// SPEC-7.501: priority defaults to "medium" and sort_order defaults to 0 when the stored column is NULL
 impl From<TaskRow> for TaskResponse {
     fn from(r: TaskRow) -> Self {
         Self {

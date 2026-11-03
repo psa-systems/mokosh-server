@@ -17,6 +17,7 @@ The public documentation set. The repository [`README.md`](../README.md) is deli
 | --- | --- |
 | [`architecture.md`](architecture.md) | Runtime shape, module layout, repository layout, database migrations, the two Docker images, how a release is cut, and the auth, contact-plane, routing and migration rules moved out of `CLAUDE.md`. |
 | [`invariants/`](invariants/) | The repo conventions `CLAUDE.md` indexes, one file per topic (billing, documents, time, identity and auth, config and providers, CI and release, KB, contacts), each rule in full with its issue ids. |
+| [`speciffications.md`](speciffications.md) | The technical requirements document: platform infrastructure, then every feature module with its data model, API surface, behaviour, background jobs and configuration, derived from the code. |
 | [`binaries.md`](binaries.md) | The two binaries, and the operator subcommands `mokosh-server` dispatches instead of serving. |
 | [`postgres-security.md`](postgres-security.md) | How Postgres roles are provisioned, extensions installed, and row-level security enforced, kept in the question-and-answer form the design conversation took. |
 | [`rls-per-user-isolation.md`](rls-per-user-isolation.md) | The per-user data isolation reference: schema inventory, the chosen model, and the table classification. |
@@ -27,6 +28,7 @@ The public documentation set. The repository [`README.md`](../README.md) is deli
 | [`upgrade-blocked-by-duplicates.md`](upgrade-blocked-by-duplicates.md) | What to do when an upgrade stops because a migration cannot build a unique index over rows that predate it: the detect and repair queries for all five such indexes, and why the fix cannot live in a migration. |
 | [`operator-provider-runbook.md`](operator-provider-runbook.md) | The six-step operator workflow for moving a governed secret to a new provider. |
 | [`runbooks/release-and-deploy.md`](runbooks/release-and-deploy.md) | Cutting and deploying a release across the three-repo chain (Mokosh server, Mokosh apps, Bunyip): prerequisites, `just create-release`, what merging the PR triggers per repo, image tags and the registry, staging-then-production promotion, and the known 2026-09-18 failure modes. |
+| [`runbooks/delegated-invoicing.md`](runbooks/delegated-invoicing.md) | Turning on delegated invoicing (Xero, QuickBooks): the four gates from deployment app registration to per-client provider mapping, and what each missing gate looks like. |
 
 ## Internal notes
 

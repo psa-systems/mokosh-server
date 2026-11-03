@@ -157,6 +157,11 @@ struct CreateFolderReq<'a> {
 ///
 /// Each Mokosh module gets its own top-level folder so the admin UI in
 /// Infisical groups them naturally.
+// SPEC-3.35: folder pre-creation runs between project creation and
+// identity creation, using the org-scoped admin token; a create call
+// whose error text contains "already exists" or "409" is treated as
+// success, which is what makes re-running against a partially-set-up
+// project idempotent for this step.
 const MOKOSH_FOLDERS: &[(&str, &str)] = &[
     ("/", "mokosh"),
     ("/mokosh", "tenants"),
@@ -244,6 +249,8 @@ struct BootstrapClient {
 /// without a User-Agent on some endpoints (for example,
 /// `/api/v3/auth/select-organization` returns a 401 with
 /// `"User-Agent header is required"`).
+// SPEC-3.36: every bootstrap HTTP request sends this fixed User-Agent;
+// at least select-organization rejects a request that lacks one.
 const USER_AGENT: &str = concat!("mokosh-bootstrap/", env!("CARGO_PKG_VERSION"));
 
 impl BootstrapClient {
@@ -372,6 +379,11 @@ impl BootstrapClient {
 
 /// Run the full first-run bootstrap. See the module-level documentation
 /// for the exact API calls performed.
+// SPEC-3.34: performs its setup against a fresh Infisical instance as 7
+// numbered API calls in the fixed order: admin signup, select
+// organization, create project, create machine identity, promote
+// membership to admin, attach Universal Auth, create client secret;
+// folder pre-creation issues additional calls not counted in that number.
 pub async fn bootstrap_infisical(
     base_url: &str,
     input: &BootstrapInput,
@@ -421,6 +433,8 @@ pub async fn bootstrap_infisical(
         )
         .await?;
     let project = project_resp.project;
+    // SPEC-3.39: environment_slug, when None, defaults to the literal
+    // "dev" for both the output and the folder-creation calls below.
     let environment = input
         .environment_slug
         .clone()
@@ -457,6 +471,8 @@ pub async fn bootstrap_infisical(
         .await?;
     let identity_id = identity_resp.identity.id;
 
+    // SPEC-3.38: membership promotion to admin runs before the
+    // Universal Auth attach and client-secret creation calls.
     // 5. Promote the project membership to admin. Without this, every
     //    secret-write call from the runtime returns a 403 "Cannot execute
     //    create on secrets" because the default no-access role grants
@@ -480,6 +496,10 @@ pub async fn bootstrap_infisical(
     // 6. Attach Universal Auth (returns the new client ID).
     //    `0.0.0.0/0` is the wildcard form that does not trip Infisical's
     //    paid-plan "IP access range" gate; a bare `0.0.0.0` is read as `/32`.
+    // SPEC-3.37: sets both clientSecretTrustedIps and
+    // accessTokenTrustedIps to the CIDR wildcard 0.0.0.0/0, never a
+    // bare IP, since a bare IP is read as /32 and trips Infisical's
+    // paid-plan IP-restriction gate.
     info!("Attaching Universal Auth to identity {}", identity_id);
     let wildcard = [TrustedIp {
         ip_address: "0.0.0.0/0",

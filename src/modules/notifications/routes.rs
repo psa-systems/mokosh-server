@@ -1,5 +1,6 @@
 //! Notifications HTTP routes.
 //!
+//! SPEC-7.630: documents that every route in this file is admin-surface API with no SPA caller as of the 2026-09-22 parity record, and lists the exempted paths below.
 //! parity record 2026-09-22: every route in this file is admin-surface API
 //! for notification channels, templates, rules and the per-user preferences
 //! page. None has a SPA caller today; the Settings > Notifications screens
@@ -90,6 +91,7 @@ pub fn notifications_routes(service: NotificationsService) -> Router {
         .with_state(state)
 }
 
+// SPEC-7.628: every channel/template/rule write route requires RequireAuth + RequireAdmin; every GET/list route needs only RequireAuth except list_channels, which also requires RequireAdmin.
 async fn list_channels(
     State(s): State<NotificationsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -234,13 +236,16 @@ async fn list_inbox(
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<NotificationInboxItemResponse>>> {
+    // SPEC-7.613: reject_unsupported_sort() runs at the route layer before the service query.
     pagination.reject_unsupported_sort()?;
     let tenant = caller.tenant();
     let (items, total) = match &caller {
+        // SPEC-7.610: the staff arm requires CallerContext::Staff plus auth.user to be Some (staff_user), else AppError::Unauthorized.
         CallerContext::Staff(auth) => {
             let user = staff_user(auth)?;
             s.service.list_inbox(tenant, user.id, &pagination).await?
         }
+        // SPEC-7.611: the contact arm additionally requires a DB-loaded require_capability(caps::NOTIFICATIONS_READ) check, separate from session resolution.
         CallerContext::Contact(session) => {
             caller
                 .require_capability(caps::NOTIFICATIONS_READ, &db)
@@ -346,6 +351,7 @@ async fn delete_rule(
 /// exposes the caller's own tenant's templates and rule recipients,
 /// which `GET /notification-templates` and `GET /notification-rules`
 /// already return to any authenticated user.
+// SPEC-7.583: preview requires only RequireAuth, not RequireAdmin, because it exposes only the caller's own tenant's templates/rule-recipients, already exposed by the list routes.
 async fn preview_event(
     State(s): State<NotificationsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -370,5 +376,6 @@ async fn dispatch_event(
         .service
         .dispatch(u.tenant(), &req.event_type, &req.context)
         .await?;
+    // SPEC-7.578: the JSON body is exactly {"fanout": <u64>} where the value is the count dispatch returned.
     Ok(Json(serde_json::json!({"fanout": count})))
 }

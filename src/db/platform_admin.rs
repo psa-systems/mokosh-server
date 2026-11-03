@@ -7,6 +7,8 @@
 //! Table is RLS-exempt (cross-cutting on the pre-auth login path); all
 //! reads/writes run on the migrator pool.
 
+// SPEC-1 and 2.119: platform_admins is RLS-exempt and every read/write here runs on the migrator
+// pool; its credential lifecycle is independent of users/identities/tenant_memberships.
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -118,6 +120,8 @@ impl PlatformAdminRepo {
     /// Stage a sealed TOTP secret WITHOUT flipping `mfa_enabled`. Enable is
     /// a second call after a live code proves the authenticator works, so a
     /// mis-set app cannot lock the operator out of the platform.
+    // SPEC-1 and 2.120: stages the secret without flipping mfa_enabled, so a misconfigured
+    // authenticator cannot lock an operator out before enable_mfa confirms it with a live code.
     pub async fn stage_mfa_secret(
         pool: &PgPool,
         admin_id: Uuid,
@@ -182,6 +186,8 @@ impl PlatformAdminRepo {
     /// true when the row's set actually changed (the code was live and is
     /// now gone), false when the hash was already absent (an unknown code,
     /// or a replay after a concurrent login spent it).
+    // SPEC-1 and 2.121: rows_affected == 1 distinguishes a genuine spend from a
+    // replay or unknown code.
     pub async fn spend_recovery_code(
         pool: &PgPool,
         admin_id: Uuid,

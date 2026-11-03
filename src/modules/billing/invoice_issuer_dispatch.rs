@@ -15,10 +15,8 @@
 //! A missing mapping or a client-side refusal is `Err(AppError)` so
 //! the caller never writes a half-committed invoice row.
 //!
-//! Wiring into `create_invoice` lands in a follow-up PR; shipping the
-//! dispatcher alone keeps the Phase 2b explicit refusal in place
-//! while the integration-test env catches up to the shape it has to
-//! exercise.
+//! Called from `BillingService::issue_externally` (`service.rs`), itself
+//! called from `create_invoice`, gated on `Feature::DelegatedInvoiceIssuer`.
 
 use std::sync::Arc;
 
@@ -218,11 +216,19 @@ impl IssuerDispatcher {
         };
         let xero = self
             .integrations
-            .get(tenant_id, IntegrationProvider::Xero)
+            .get(
+                tenant_id,
+                IntegrationProvider::Xero,
+                Capability::BillsAndExpenses,
+            )
             .await?;
         let quickbooks = self
             .integrations
-            .get(tenant_id, IntegrationProvider::Quickbooks)
+            .get(
+                tenant_id,
+                IntegrationProvider::Quickbooks,
+                Capability::BillsAndExpenses,
+            )
             .await?;
         // Xero before QuickBooks, the tie-break `select_issuer_with`
         // already uses for invoices, so a tenant with both connected does
@@ -402,11 +408,19 @@ impl IssuerDispatcher {
         };
         let xero = self
             .integrations
-            .get(tenant_id, IntegrationProvider::Xero)
+            .get(
+                tenant_id,
+                IntegrationProvider::Xero,
+                Capability::BillsAndExpenses,
+            )
             .await?;
         let quickbooks = self
             .integrations
-            .get(tenant_id, IntegrationProvider::Quickbooks)
+            .get(
+                tenant_id,
+                IntegrationProvider::Quickbooks,
+                Capability::BillsAndExpenses,
+            )
             .await?;
         // Xero before QuickBooks, the tie-break the invoice and bill paths
         // already use, so a tenant with both connected does not see one
@@ -654,7 +668,10 @@ impl IssuerDispatcher {
         tenant_id: TenantId,
         provider: IntegrationProvider,
     ) -> AppResult<bool> {
-        let integration = self.integrations.get(tenant_id, provider).await?;
+        let integration = self
+            .integrations
+            .get(tenant_id, provider, Capability::Invoicing)
+            .await?;
         let live = matches!(
             integration.status,
             crate::modules::integrations::IntegrationStatus::Connected

@@ -23,6 +23,7 @@ pub struct ResolvedRequestToken {
     /// The MSP user who issued the link. Becomes the created ticket's
     /// `created_by_id`, since the submitter is a client with no `users` row
     /// and that column is NOT NULL.
+    // SPEC-7.291: the created ticket's created_by_id is the issuing MSP user, never the client.
     pub created_by_id: Uuid,
     /// PMS-737: how many people the link covers, how many submissions are
     /// still open, and the parent the children are filed under. `1`, `1` and

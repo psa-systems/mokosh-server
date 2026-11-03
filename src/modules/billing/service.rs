@@ -8,7 +8,7 @@ use crate::modules::settings::read_default_currency;
 use chrono::{DateTime, NaiveDate, Utc};
 use mokosh_types::datetime::user_today;
 
-use crate::modules::contracts::service::CycleStep;
+use crate::modules::contracts::service::{ContractsService, CycleStep};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -1157,6 +1157,16 @@ impl BillingService {
         // deployment that has not flipped `DelegatedInvoiceIssuer` runs
         // exactly the statements it ran before, in the same order and
         // the same number of them.
+        // PMS-1561 (F5): when the pre-pass below runs, it already asserts
+        // the company, the payment term and every line's product
+        // sellability against this exact tenant and request, which cannot
+        // have changed by the time the main transaction opens a few lines
+        // down. Carrying its due date and payment term forward, and
+        // skipping the main transaction's copies of those three guards
+        // when they already ran, is what stops a delegated create from
+        // paying for the full guard set twice. The non-delegated path
+        // (`prevalidated` stays `None`) is unchanged.
+        let mut prevalidated: Option<(NaiveDate, Option<Uuid>)> = None;
         let external = match self.invoice_dispatch.as_ref() {
             Some(dispatcher) if dispatcher.delegation_enabled() => {
                 let mut pre = self.db.begin_with_tenant(tenant_id).await?;
@@ -1176,7 +1186,7 @@ impl BillingService {
                         Self::assert_product_sellable(&mut pre, tenant_id, product_id).await?;
                     }
                 }
-                let (due_date, _) = Self::resolve_due_date(
+                let (due_date, payment_term_id) = Self::resolve_due_date(
                     &mut pre,
                     tenant_id,
                     request.invoice_date,
@@ -1189,6 +1199,7 @@ impl BillingService {
                     None => read_default_currency(&mut pre, tenant_id).await?,
                 };
                 pre.commit().await?;
+                prevalidated = Some((due_date, payment_term_id));
 
                 let shape =
                     crate::modules::billing::invoice_issuer_dispatch::CreateInvoiceRequestShape {
@@ -1224,20 +1235,27 @@ impl BillingService {
         let total = subtotal + tax - discount;
 
         // PMS-1367: before anything is written, and before the contact is
-        // resolved against it.
-        Self::assert_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
-        if let Some(pt) = request.payment_term_id {
-            Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
-        }
-        // PMS-990: the due date the caller gave, or the one the term implies.
-        let (due_date, payment_term_id) = Self::resolve_due_date(
-            &mut tx,
-            tenant_id,
-            request.invoice_date,
-            request.payment_term_id,
-            request.due_date,
-        )
-        .await?;
+        // resolved against it. Skipped when the pre-pass above already ran
+        // these same two guards against this tenant and request (PMS-1561
+        // F5): the non-delegated path, where `prevalidated` is `None`,
+        // still runs them here exactly as before.
+        let (due_date, payment_term_id) = if let Some(prevalidated) = prevalidated {
+            prevalidated
+        } else {
+            Self::assert_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
+            if let Some(pt) = request.payment_term_id {
+                Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
+            }
+            // PMS-990: the due date the caller gave, or the one the term implies.
+            Self::resolve_due_date(
+                &mut tx,
+                tenant_id,
+                request.invoice_date,
+                request.payment_term_id,
+                request.due_date,
+            )
+            .await?
+        };
 
         // PMS-1016: the contact the caller named, else the company's default.
         let billing_contact_id = Self::resolve_billing_contact(
@@ -1322,9 +1340,13 @@ impl BillingService {
         // line is written, so a bad id on the third line does not leave the
         // first two behind. RLS does not cover this: an FK check bypasses it,
         // so a foreign-tenant product would link silently (PMS-333's lesson).
-        for line in &request.lines {
-            if let Some(product_id) = line.product_id {
-                Self::assert_product_sellable(&mut tx, tenant_id, product_id).await?;
+        // Skipped when the pre-pass already ran this same loop against this
+        // tenant and these lines (PMS-1561 F5).
+        if prevalidated.is_none() {
+            for line in &request.lines {
+                if let Some(product_id) = line.product_id {
+                    Self::assert_product_sellable(&mut tx, tenant_id, product_id).await?;
+                }
             }
         }
 
@@ -1918,7 +1940,7 @@ impl BillingService {
         // Candidate contracts: active, recurring (not one_time), already
         // started. `end_date` is checked per-period below (a contract may
         // still be due for a period that began before it expired).
-        let contracts = sqlx::query_as::<_, RecurringContractRow>(
+        let contracts_due = sqlx::query_as::<_, RecurringContractRow>(
             r#"
             SELECT id, company_id, billing_cycle, start_date, end_date
             FROM contracts
@@ -1936,7 +1958,11 @@ impl BillingService {
         drop(tx);
 
         let mut created = Vec::new();
-        for contract in contracts {
+        // PMS-1572: rolling prepaid hours forward is the other thing that
+        // happens when a period opens, so it happens here, where this run
+        // already knows which period that is and anchors it the same way.
+        let contracts = ContractsService::new(self.db.clone());
+        for contract in contracts_due {
             let cycle = contract.billing_cycle.as_deref().unwrap_or("monthly");
             let Some((period_start, period_end)) =
                 current_billing_period(cycle, contract.start_date, today)
@@ -1953,6 +1979,42 @@ impl BillingService {
             if let Some(end) = contract.end_date {
                 if period_start > end {
                     continue;
+                }
+            }
+
+            // PMS-1572: the hours unused in the period that just closed roll
+            // into this one, capped at the item's `max_rollover_hours`, before
+            // anything is billed for it.
+            //
+            // Here rather than inside `generate_one_recurring_invoice`,
+            // because that returns early for a contract with no billable item
+            // and a contract whose only item is the block itself is exactly
+            // that: `BillingRule::derive("block_hours")` is `Manual`, so a
+            // prepaid block with no separate retainer line bills nothing and
+            // would never have rolled. Rollover is a property of the period
+            // closing, not of an invoice being produced.
+            //
+            // Outside the invoice's transaction for the same reason, which
+            // costs nothing: `roll_to_next_period` carries its own
+            // repeat-safety (see its doc), so a run that dies between the two
+            // rolls on the next tick instead of double-crediting.
+            if let Some(closing_end) = period_start.pred_opt() {
+                match contracts
+                    .roll_to_next_period(tenant_id, contract.id, closing_end)
+                    .await
+                {
+                    Ok(rolled) if rolled > Decimal::ZERO => tracing::info!(
+                        contract_id = %contract.id,
+                        %closing_end,
+                        rolled = %rolled,
+                        "rolled unused prepaid hours into the opening period"
+                    ),
+                    Ok(_) => {}
+                    // No block-hours item on the contract, or no balance row
+                    // for the period that closed: there is nothing to roll,
+                    // which is most contracts.
+                    Err(AppError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
                 }
             }
 
@@ -8167,7 +8229,9 @@ struct RecurringItemRow {
 /// which clamps end-of-month overflow (e.g. Jan 31 + 1 month ->
 /// Feb 28/29), so a contract that starts on the 31st still produces one
 /// period per cycle (PMS-404).
-fn current_billing_period(
+/// `pub(crate)` for `pms1572_period_agreement_tests` alone; every caller is
+/// in this file.
+pub(crate) fn current_billing_period(
     billing_cycle: &str,
     start_date: NaiveDate,
     today: NaiveDate,
@@ -8664,6 +8728,75 @@ impl From<PaymentTermRow> for PaymentTermResponse {
             is_active: r.is_active.unwrap_or(true),
             sort_order: r.sort_order.unwrap_or(0),
             net_days: r.net_days,
+        }
+    }
+}
+
+/// PMS-1572: this run and the contracts service must cut periods the same way.
+///
+/// The roll the run performs hands `roll_to_next_period` a closing date and
+/// lets it name the window that follows, with `ContractsService::period_for`.
+/// This file names the same window with `current_billing_period`. If the two
+/// disagree by a day, the hours roll into a balance row for a period nothing
+/// else uses: no error, no log, a customer short of the hours they were owed
+/// and a stray row that looks like a double allotment.
+///
+/// Two functions, both private to their own module, walking the same windows
+/// from the same anchor with the same `CycleStep`. That is the kind of
+/// agreement that holds until somebody fixes an off-by-one in one of them.
+#[cfg(test)]
+mod pms1572_period_agreement_tests {
+    use super::current_billing_period;
+    use crate::modules::contracts::service::ContractsService;
+    use chrono::NaiveDate;
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).expect("a real date")
+    }
+
+    /// Every cycle the generator bills, across a year of days, anchored on
+    /// dates that stress month-end clamping.
+    #[test]
+    fn both_period_functions_cut_the_same_windows() {
+        for cycle in ["weekly", "bi_weekly", "monthly", "quarterly", "annually"] {
+            for anchor in [
+                date(2026, 1, 1),
+                date(2026, 1, 31),
+                date(2026, 2, 28),
+                date(2026, 3, 15),
+                date(2024, 2, 29),
+            ] {
+                let mut when = anchor;
+                for _ in 0..400 {
+                    let billing = current_billing_period(cycle, anchor, when)
+                        .expect("a known cycle on or after the anchor has a period");
+                    let contracts = ContractsService::period_for(anchor, cycle, when);
+                    assert_eq!(
+                        billing, contracts,
+                        "{cycle} anchored {anchor} disagrees at {when}: the run says \
+                         {billing:?} and the roll targets {contracts:?}"
+                    );
+                    when = when.succ_opt().expect("the next day");
+                }
+            }
+        }
+    }
+
+    /// And the specific question the roll asks: the window after a closing
+    /// date is the window the run calls current on the day that window opens.
+    #[test]
+    fn the_window_after_a_close_is_the_window_the_run_opens() {
+        let anchor = date(2026, 1, 1);
+        for cycle in ["weekly", "monthly", "quarterly"] {
+            let (period_start, _) =
+                current_billing_period(cycle, anchor, date(2026, 6, 10)).expect("a period");
+            let closing_end = period_start.pred_opt().expect("a day before");
+            let next_start = closing_end.succ_opt().expect("the day after");
+            let (rolled_into, _) = ContractsService::period_for(anchor, cycle, next_start);
+            assert_eq!(
+                rolled_into, period_start,
+                "{cycle}: the roll would land on {rolled_into}, the run opened {period_start}"
+            );
         }
     }
 }
