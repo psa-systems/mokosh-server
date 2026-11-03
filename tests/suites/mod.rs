@@ -38,6 +38,7 @@ pub mod company_deletion_preview;
 pub mod company_scoped_filtering;
 pub mod company_scoped_portal_roles;
 pub mod concurrent_login_health_latency;
+pub mod config_from_bunyip;
 pub mod contact_and_company_notes;
 pub mod contact_approvals;
 pub mod contact_audit;

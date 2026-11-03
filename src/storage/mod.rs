@@ -49,8 +49,8 @@
 //! renaming it breaks every existing deployment for a vocabulary change.
 
 // PMS-1317: the `STORAGE_`-prefixed variables an operator sets. PMS-1443
-// ended the alias grace period: setting an older name refuses boot rather
-// than being honoured.
+// retired the older alias names; a non-blank value on one now fails boot
+// instead of being honoured.
 pub mod env;
 mod ledger;
 pub mod s3;
@@ -89,6 +89,9 @@ use crate::utils::error::{AppError, AppResult};
 /// and the failure is a 500 on the first upload. PMS-910 picked the wrong
 /// survivor of the two and CI caught it on the tenant-logo upload, which
 /// configures no root at all.
+// SPEC-3.48: must remain a relative path, never an absolute one,
+// because the container image's working directory and non-root user
+// depend on relativity.
 const DEFAULT_ROOT: &str = "./attachments";
 
 /// Where a stored object lives, relative to the root.
@@ -210,6 +213,9 @@ pub enum ObjectKind {
 /// than not writing it at all, so it says so here and the test below pins that
 /// no caller treats it as a delete authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// SPEC-3.49: declared per ObjectKind and not enforced by any reaper;
+// this requirement states the current, deliberately advisory-only
+// state.
 pub enum Retention {
     /// Keep while something references it. An attachment, a logo: the feature
     /// row's own lifetime decides, and deleting the row deletes the object.
@@ -387,10 +393,10 @@ impl StorageConfig {
     /// The ONE reader of the storage root. Three modules used to have their
     /// own, with two different fallbacks between them.
     ///
-    /// PMS-1317 renamed the variable to `STORAGE_ROOT`. `ATTACHMENT_DIR` was
-    /// honoured as a deprecated alias for one release; PMS-1443 ended that
-    /// grace period, so setting it now refuses to boot instead of supplying
-    /// a value. [`env::resolve`] is the rule.
+    /// PMS-1317 renamed the variable to `STORAGE_ROOT`; as of PMS-1443 the
+    /// deprecated alias `ATTACHMENT_DIR` no longer supplies a value and a
+    /// non-blank value on it instead fails boot. [`env::resolve`] is the
+    /// rule.
     pub fn from_env() -> Self {
         let root = env::from_env(env::ROOT).unwrap_or_else(|| DEFAULT_ROOT.to_string());
         Self {
@@ -466,6 +472,10 @@ impl ObjectKey {
     /// It is also what makes a backfill possible: a relative path is derivable
     /// in SQL from the ids a feature table already holds, where an absolute one
     /// would need the running process's configuration.
+    // SPEC-3.42: puts the tenant id as the first path component for
+    // every kind except the two Legacy* variants, which must not,
+    // because those address pre-existing layouts from before tenant
+    // scoping was added.
     pub fn relative_path(&self) -> AppResult<PathBuf> {
         let path = match &self.kind {
             ObjectKind::TicketAttachment { id } => {
@@ -516,6 +526,8 @@ impl ObjectKey {
 /// whole isolation. The check is an allowlist rather than a search for bad
 /// sequences, because a denylist of traversal spellings is the kind that gets
 /// one wrong.
+// SPEC-3.43: a file-extension segment must be 1-16 ASCII alphanumeric
+// or '-' characters or the request is rejected as bad input.
 fn validate_segment(segment: &str) -> AppResult<()> {
     if segment.is_empty()
         || segment.len() > 16
@@ -536,6 +548,9 @@ fn validate_segment(segment: &str) -> AppResult<()> {
 /// caller computes this value rather than receiving it: a digest that is not 64
 /// hex characters did not come from `Sha256`, so refusing it is refusing a bug
 /// rather than inconveniencing a user.
+// SPEC-3.43: a digest segment must be exactly 64 ASCII hex characters
+// or the request is rejected as an internal error, since a malformed
+// digest there can only come from a bug or an attack, not user input.
 fn validate_digest(digest: &str) -> AppResult<()> {
     if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(AppError::Internal(format!(
@@ -559,6 +574,9 @@ impl ObjectProvider for LocalProvider {
             .map_err(|e| AppError::Internal(format!("could not write object: {e}")))
     }
 
+    // SPEC-3.44: a missing object returns AppError::NotFound here, while
+    // open (below) returns AppError::Internal for the same condition;
+    // this asymmetry is deliberate, not a bug to unify.
     async fn read(&self, key: &ObjectKey) -> AppResult<Vec<u8>> {
         let path = self.path_for(key)?;
         tokio::fs::read(&path)
@@ -574,6 +592,9 @@ impl ObjectProvider for LocalProvider {
         Ok(Box::pin(file))
     }
 
+    // SPEC-3.45: best-effort; a missing file is swallowed and reports
+    // success, since every caller has already deleted the owning
+    // database row first.
     async fn delete(&self, key: &ObjectKey) -> AppResult<()> {
         let path = self.path_for(key)?;
         match tokio::fs::remove_file(&path).await {
@@ -588,6 +609,10 @@ impl ObjectProvider for LocalProvider {
         Ok(tokio::fs::metadata(&path).await.is_ok())
     }
 
+    // SPEC-3.45: not best-effort; a missing source is a hard
+    // AppError::Internal, because the caller has just established the
+    // source exists and a silent success would wrongly mark an object
+    // as migrated.
     async fn rename(&self, from: &ObjectKey, to: &ObjectKey) -> AppResult<()> {
         let from_path = self.path_for(from)?;
         let to_path = self.path_for(to)?;
@@ -640,8 +665,9 @@ impl StorageProviderKind {
     /// The hosting profile's own strictness is the startup wiring's business:
     /// it hands in an already-resolved provider name.
     ///
-    /// PMS-1317 renamed the variable from `STORAGE_BACKEND`, which is still
-    /// honoured as a deprecated alias; see [`env`].
+    /// PMS-1317 renamed the variable from `STORAGE_BACKEND`; as of PMS-1443
+    /// that alias no longer supplies a value and a non-blank value on it
+    /// fails boot instead; see [`env`].
     pub fn from_env(profile_default: &str) -> AppResult<(Self, EnablementSource)> {
         Self::resolve(
             profile_default,
@@ -675,6 +701,11 @@ impl StorageProviderKind {
     /// is not a name; [`resolve`](Self::resolve) settles it against the
     /// profile before it reaches here, so this cannot become a second place
     /// that knows the default.
+    // SPEC-3.46: accepts only "local" or "s3" and otherwise returns
+    // AppError::Configuration naming the bad value, never falling back
+    // to local; resolve takes the hosting profile's default only when
+    // the input is blank, and an unparseable non-blank value is always
+    // a hard error, never a silent fallback.
     pub fn parse(raw: &str) -> AppResult<Self> {
         match raw.trim() {
             provider::LOCAL => Ok(StorageProviderKind::Local),
@@ -777,6 +808,10 @@ pub async fn purge_attachment_blobs(
     }
 }
 
+// SPEC-3.47: builds the process-wide provider exactly once behind a
+// OnceLock; on a path that never called init_from_env first, a build
+// failure here panics rather than returning an error, because there is
+// no request or startup caller to answer with one.
 pub fn shared() -> Arc<dyn ObjectProvider> {
     SHARED
         .get_or_init(|| {

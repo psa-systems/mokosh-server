@@ -207,8 +207,9 @@ in PMS-1012 as subcommands of `mokosh-server`, so an external migration tool can
 
 1. Enable the new provider at a higher priority. Leave the old one enabled and lower.
 2. `mokosh-server provider-migrate --from <old> --to <new>`. It writes, reads back, compares, and never deletes
-   from the source. A key the target already holds is skipped and reported as `already-present`; a key the
-   source does not hold is silently skipped; a write or read-back failure is named with the key and the reason.
+   from the source. A key the target already holds is reported as `skipped: target already holds this key`; a
+   key the source does not hold is reported as `skipped: source does not hold this key`; a write or read-back
+   failure is named with the key and the reason.
 3. `mokosh-server provider-status`. Every key must be present in the new provider before going further. The
    report is a per-key, per-provider presence matrix plus the provider now serving each key; `--json` outputs
    the same shape for a supervisor to aggregate across a fleet.
@@ -319,6 +320,26 @@ a one-key allow-list, made with `bunyip-api machine-client register --name mokos
 mokosh/google_oauth_client`, and it is presented as HTTP Basic: Bunyip's `/oauth2/token` implements
 `authorization_code` and `refresh_token` only, so there is no machine bearer to obtain. Both credential halves
 honour the `{NAME}_FILE` convention and should use it in production.
+
+### What the Bunyip configuration provider serves (PMS-1553)
+
+The configuration kind lists Bunyip, and until PMS-1553 that entry could not have worked: it read
+`GET /v1/config/{KEY}` with a bearer from `POST /v1/oauth2/token`, and Bunyip serves neither (its token endpoint is
+root-level and mints nothing for a machine). BUNYIP-1011 added `GET /v1/host/config/{KEY}` and the provider now reads
+that with the machine credential as HTTP Basic.
+
+It serves the facts Bunyip OWNS, not every declared key. The mapping lives in `src/config/bunyip.rs`
+(`SERVED_KEYS`), and today it is one row: `ABUSE_CONTACT_EMAIL` from Bunyip's `mokosh/abuse_contact_email`, the
+suite's monitored support mailbox. Asking Bunyip for every declared key, which is what the original loop did, is
+over a hundred requests per build and more than Bunyip's own per-app cap allows in a minute.
+
+The credential is a separate registration from the host-SECRETS one, with its own allow-list, because a credential
+that may read a suite fact is not thereby allowed to read a secret (BUNYIP-855 D9). A 403 from this provider names
+that trap, since pointing `BUNYIP_CONFIG_CLIENT_ID` at the secrets registration is the likely mistake.
+
+A failure is classified the way the secret tier classifies one: a refused credential or a refused key stops the
+build with the remedy named, while a 404 leaves that one key unheld, because the provider is working and Bunyip
+simply holds no value for it.
 
 ## Authentication, and what its modes are called
 

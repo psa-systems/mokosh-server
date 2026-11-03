@@ -73,6 +73,8 @@ pub use infisical::InfisicalProvider;
 /// Google with an error nobody can place, and the four-way classification below
 /// then reports each half separately, which is what makes a half-configured
 /// host a boot error naming the missing key.
+// SPEC-3.1: exactly 11 variants; a client-id/client-secret pair is two
+// independent variants, each resolving from its own provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GovernedSecret {
     /// `SMTP_PASSWORD` / `smtp_password` / the `app_secrets` row named
@@ -168,6 +170,8 @@ impl GovernedSecret {
     /// types, and an unrecognised value is a hard error naming the legal ones
     /// rather than a no-op: a typo that wrote nothing while reporting success
     /// is the shape this CLI exists to prevent.
+    // SPEC-3.2: case-insensitive match against ALL; an unrecognised name is a
+    // hard error naming every legal value, never a fallback.
     pub fn parse_name(raw: &str) -> AppResult<Self> {
         let wanted = raw.trim();
         Self::ALL
@@ -308,6 +312,7 @@ pub trait AppSecretProvider: Send + Sync {
 }
 
 /// Which provider holds the application-tier secrets for this deployment.
+// SPEC-3.3: exactly 5 variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppSecretProviderKind {
     /// The process environment, read as `{NAME}_FILE` compose secrets.
@@ -364,6 +369,8 @@ impl AppSecretProviderKind {
     /// with a typo asked for the file provider, and quietly giving them the
     /// database is the same silent degrade this model exists to remove
     /// everywhere else.
+    // SPEC-3.3: an unrecognised value is a hard error naming the legal list,
+    // never a fallback to the hosting profile's default.
     pub fn parse_name(raw: &str) -> AppResult<Self> {
         match raw.trim() {
             provider::ENVIRONMENT => Ok(Self::Environment),
@@ -457,6 +464,8 @@ impl AppSecretsSelection {
     /// through [`crate::config::get`]: provider enablement is bootstrap
     /// configuration, and configuration that says where to find configuration
     /// cannot live inside the thing it locates (`docs/providers.md`).
+    // SPEC-3.3: the sole reader of APP_SECRET_BACKEND, independent of the
+    // tenant tier's SECRET_BACKEND (PMS-1424).
     pub fn from_env(profile_default: &str) -> AppResult<Self> {
         Self::resolve(
             profile_default,
@@ -516,6 +525,8 @@ impl AppSecrets {
 
     /// The provider that serves ONE secret: its own declaration when the
     /// deployment gave it one, else the process's (PMS-1537).
+    // SPEC-3.5: a secret's own declaration (PMS-1537) wins over the
+    // process-wide declared provider.
     pub fn declared_for(&self, secret: GovernedSecret) -> AppSecretProviderKind {
         self.per_secret
             .iter()
@@ -681,6 +692,8 @@ impl AppSecretsSurvey {
 /// The pure classification decision for one secret: which provider was
 /// declared, which providers hold a value. Kept free of IO and free of the
 /// tracing so the four cases stay unit-tested against `classify` alone.
+// SPEC-3.4: exactly five classifications (Used/Missing/Shadowed/Misplaced/
+// Unavailable); only Misplaced and Unavailable are fatal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Classification {
     /// The declared provider holds it and no other built provider does.
@@ -747,6 +760,8 @@ pub fn classify_built(
 /// one line per secret into an `AppError::Configuration` the caller returns
 /// from boot; `main` then exits non-zero, which is the whole point of the
 /// contract.
+// SPEC-3.4: Used/Shadowed log at info/warn; Missing warns with feature();
+// Misplaced/Unavailable accumulate into a fatal AppError::Configuration.
 pub fn enforce(survey: &AppSecretsSurvey) -> AppResult<()> {
     let mut fatal: Vec<String> = Vec::new();
     for row in &survey.rows {
@@ -783,10 +798,13 @@ pub fn enforce(survey: &AppSecretsSurvey) -> AppResult<()> {
                         secret = row.secret.name(),
                         declared = declared.as_str(),
                         duplicate = other.as_str(),
-                        "{} is also held by {}; run secrets-migrate --to {} then secrets-purge to remove it",
+                        "{} is also held by {}; run `provider-migrate --from {} --to {}` then \
+                         `provider-purge --provider {} --confirm` to remove it",
                         row.secret.name(),
                         other.as_str(),
+                        other.as_str(),
                         declared.as_str(),
+                        other.as_str(),
                     );
                 }
             }
@@ -794,8 +812,9 @@ pub fn enforce(survey: &AppSecretsSurvey) -> AppResult<()> {
                 fatal.push(format!(
                     "{} is absent from the declared {} provider but present in the {}. \
                      mokosh will not silently use a provider the deployment did not \
-                     declare. Copy it with `mokosh-server secrets-migrate --to {}`, \
-                     or set APP_SECRET_BACKEND to the provider that holds it.",
+                     declare. Copy it with `mokosh-server provider-migrate --from <provider> \
+                     --to {}`, naming one of the providers above as <provider>, or set \
+                     APP_SECRET_BACKEND to the provider that holds it.",
                     row.secret.name(),
                     declared.as_str(),
                     provider_list(&elsewhere),
@@ -943,6 +962,9 @@ pub fn per_secret_defaults(
 /// Async because the database, Infisical and bunyip providers load their
 /// contents once at construction and serve from that cache afterwards; the
 /// alternative (`block_on` on the current runtime) deadlocks.
+// SPEC-3.6: environment always built; file only if APP_SECRETS_DIR is set;
+// database always built; infisical only if INFISICAL_ADDRESS is set; bunyip
+// only if BunyipSecretsConfig::from_env returns Ok(Some(_)).
 pub async fn init_from_env(
     profile_default: &str,
     per_secret_defaults: &[(GovernedSecret, &str)],
@@ -1273,7 +1295,7 @@ mod tests {
         assert!(message.contains("infisical"), "{message}");
         assert!(message.contains("database"), "{message}");
         assert!(
-            message.contains("secrets-migrate --to infisical"),
+            message.contains("provider-migrate --from <provider> --to infisical"),
             "{message}"
         );
     }
