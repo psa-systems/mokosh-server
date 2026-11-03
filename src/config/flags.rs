@@ -116,6 +116,8 @@ pub enum FlagDefault<T: FlagValue> {
 /// of the default (`Constant` or `PerProfile`), never the flag's
 /// resolved value. A boolean is not sensitive on its own, but the
 /// pattern holds for future non-bool flags whose value may be.
+// SPEC-1 and 2.143: a Flag is a declared application-tier key plus a typed default, distinct
+// from a ConfigKey's own Tier (a flag always stays on Application so it is refresh-visible).
 pub struct Flag<T: FlagValue> {
     key: &'static ConfigKey,
     default: FlagDefault<T>,
@@ -145,6 +147,8 @@ impl<T: FlagValue> Flag<T> {
     /// value (trimmed length zero) is treated as unset for the same
     /// reason [`AppConfig::from_env`] treats blanks as unset: a
     /// compose key forwarded but unset arrives as `""` (PMS-836).
+    // SPEC-1 and 2.144: the one read path for a flag; a blank or unparsable raw
+    // value falls back to the flag's default rather than failing the read.
     pub fn read(&self) -> T {
         match config::get(self.key) {
             Some(raw) if !raw.trim().is_empty() => match T::parse(&raw) {
@@ -197,6 +201,8 @@ impl<T: FlagValue> Flag<T> {
     /// `MOKOSH_DEPLOYMENT_MODE`, and PMS-902 already argued the case
     /// for the lenient reader when the answer only gates behaviour
     /// with a safe default.
+    // SPEC-1 and 2.145: FlagDefault::PerProfile resolves against the current
+    // DeploymentMode on every read rather than freezing a mode at construction.
     pub fn resolved_default(&self) -> T {
         match self.default {
             FlagDefault::Constant(value) => value,

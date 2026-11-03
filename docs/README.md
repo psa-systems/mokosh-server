@@ -28,6 +28,7 @@ The public documentation set. The repository [`README.md`](../README.md) is deli
 | [`upgrade-blocked-by-duplicates.md`](upgrade-blocked-by-duplicates.md) | What to do when an upgrade stops because a migration cannot build a unique index over rows that predate it: the detect and repair queries for all five such indexes, and why the fix cannot live in a migration. |
 | [`operator-provider-runbook.md`](operator-provider-runbook.md) | The six-step operator workflow for moving a governed secret to a new provider. |
 | [`runbooks/release-and-deploy.md`](runbooks/release-and-deploy.md) | Cutting and deploying a release across the three-repo chain (Mokosh server, Mokosh apps, Bunyip): prerequisites, `just create-release`, what merging the PR triggers per repo, image tags and the registry, staging-then-production promotion, and the known 2026-09-18 failure modes. |
+| [`runbooks/delegated-invoicing.md`](runbooks/delegated-invoicing.md) | Turning on delegated invoicing (Xero, QuickBooks): the four gates from deployment app registration to per-client provider mapping, and what each missing gate looks like. |
 
 ## Internal notes
 

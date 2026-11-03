@@ -207,8 +207,9 @@ in PMS-1012 as subcommands of `mokosh-server`, so an external migration tool can
 
 1. Enable the new provider at a higher priority. Leave the old one enabled and lower.
 2. `mokosh-server provider-migrate --from <old> --to <new>`. It writes, reads back, compares, and never deletes
-   from the source. A key the target already holds is skipped and reported as `already-present`; a key the
-   source does not hold is silently skipped; a write or read-back failure is named with the key and the reason.
+   from the source. A key the target already holds is reported as `skipped: target already holds this key`; a
+   key the source does not hold is reported as `skipped: source does not hold this key`; a write or read-back
+   failure is named with the key and the reason.
 3. `mokosh-server provider-status`. Every key must be present in the new provider before going further. The
    report is a per-key, per-provider presence matrix plus the provider now serving each key; `--json` outputs
    the same shape for a supervisor to aggregate across a fleet.

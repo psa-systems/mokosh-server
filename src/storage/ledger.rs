@@ -73,6 +73,9 @@ impl FileLedger {
     /// The row id IS the object id where there is one, so a feature that knows
     /// its attachment id can find the ledger row without a second lookup, and a
     /// double-write cannot produce two rows for one file.
+    // SPEC-3.52: upserts (ON CONFLICT (id) DO UPDATE) rather than
+    // insert-only, because a tenant logo is written to the same row id
+    // on every replace.
     pub async fn record(
         &self,
         tenant_id: Uuid,
@@ -94,6 +97,9 @@ impl FileLedger {
     /// storage for a document that was never issued. It also avoids taking a
     /// second pool connection while one is already held, which is a deadlock
     /// waiting for a busy pool.
+    // SPEC-3.52: runs inside the caller's own transaction when storing
+    // a financial document, so the ledger row and the issuing
+    // transaction commit or roll back together.
     pub async fn record_in_tx(
         tx: &mut crate::db::TenantTransaction<'_>,
         tenant_id: Uuid,
@@ -158,6 +164,9 @@ impl FileLedger {
     /// no longer exists overstates a tenant's usage rather than breaking
     /// anything. Failing the request over it would turn a successful delete
     /// into an error.
+    // SPEC-3.53: best-effort; a failure to remove a ledger row for an
+    // object whose blob delete may already have failed does not fail
+    // the caller's request.
     pub async fn forget(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query("DELETE FROM files WHERE tenant_id = $1 AND id = $2")

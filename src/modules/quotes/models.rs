@@ -23,10 +23,24 @@ use validator::Validate;
 ///   (any non-terminal state) -> cancelled
 /// ```
 ///
-/// `Submitted` / `Approved` / `Rejected` are the **internal** outcomes,
-/// driven by the existing polymorphic approvals surface. `Accepted` /
-/// `Declined` are the **client's** decision and are deliberately spelled
-/// differently so a reader can always tell the two apart.
+/// `Submitted` / `Approved` / `Rejected` are the **internal** outcomes.
+/// `Accepted` / `Declined` are the **client's** decision and are
+/// deliberately spelled differently so a reader can always tell the two
+/// apart.
+///
+/// PMS-1573: this used to say the internal three were "driven by the
+/// existing polymorphic approvals surface". They are not, and reading that
+/// and then finding no writer in `src/modules/approvals/` is what got a
+/// defect filed saying `approved` is unreachable. It is reachable: a staff
+/// user sets all three through `PUT /quotes/{id}`, which is what
+/// [`Self::is_staff_settable`] permits and what Settings-side "Submit for
+/// Approval" and "Mark approved" call.
+///
+/// The approvals surface is deliberately not the writer, for any of its
+/// four targets: `ApprovalsService::decide` writes only its own table, so
+/// a sign-off there is offered and never required (see the header of
+/// `src/modules/approvals/routes.rs`). Wiring it to move a quote's status
+/// would be a product decision, not a repair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuoteStatus {

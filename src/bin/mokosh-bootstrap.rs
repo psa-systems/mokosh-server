@@ -25,6 +25,14 @@ const DEFAULT_ENV_FILE: &str = ".env";
 const DEFAULT_ADMIN_FIRST_NAME: &str = "Mokosh";
 const DEFAULT_ADMIN_LAST_NAME: &str = "Admin";
 
+// SPEC-3.92: loads .env.infisical then .env before parsing arguments,
+// silently ignoring either file's absence; its subcommand set
+// (bootstrap-infisical, qa-seed, qa-teardown, dev-seed-portal,
+// normalize-company-industries, --version/-V, --help/-h/no-args) is
+// disjoint from mokosh-server's operator set apart from the three
+// names both share: it never implements a provider-* command or
+// verify-providers, and mokosh-server never implements dev-seed-portal
+// or normalize-company-industries.
 #[tokio::main]
 async fn main() -> ExitCode {
     // Load .env / .env.infisical so values can be read via env vars without
@@ -107,6 +115,9 @@ async fn main() -> ExitCode {
             print_help();
             ExitCode::SUCCESS
         }
+        // SPEC-3.93: an unknown subcommand prints an error naming the
+        // unrecognised token, then the help text, then exits with
+        // ExitCode::FAILURE.
         Some(other) => {
             eprintln!("error: unknown subcommand '{}'\n", other);
             print_help();
@@ -258,6 +269,8 @@ async fn run_dev_seed_portal() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("failed to connect to database: {e}"))?;
 
+    // SPEC-3.93: runs pending database migrations before seeding, so it
+    // tolerates a fresh database with no `tenants` table yet.
     // Run migrations before seeding so a fresh dev DB (no `tenants` table
     // yet) still succeeds. Cheap on a warm DB (sqlx no-ops when the
     // checksum ledger says every migration already ran) and covers the

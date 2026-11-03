@@ -21,6 +21,7 @@ use super::models::*;
 /// additionally clip to the requested `to` bound. This cap is the
 /// belt-and-braces guard so a pathological rule (e.g. `FREQ=SECONDLY`)
 /// over a wide range cannot blow up memory.
+// SPEC-7.384: caps a single series' expanded occurrences at 1000.
 const MAX_OCCURRENCES_PER_SERIES: u16 = 1000;
 
 /// One bound filter value, in the shapes the appointment reads use.
@@ -164,6 +165,7 @@ impl CalendarService {
     /// Returns `true` if this call won the uniqueness race (the row was
     /// inserted), `false` if a prior tick or sibling replica already
     /// claimed it.
+    // SPEC-7.389: the INSERT's ON CONFLICT DO NOTHING enforces at most one claimed row per (appointment_id, occurrence_start, reminder_minutes); returns true only when this call's insert won.
     pub(crate) async fn claim_reminder(
         &self,
         tenant_id: Uuid,
@@ -287,6 +289,7 @@ impl CalendarService {
         filter: &AppointmentFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AppointmentResponse>, u64)> {
+        // SPEC-7.383: a ranged read (both from and to, no appointment_type) expands recurring series and paginates the expanded set; otherwise it is a plain SQL-paginated list of stored rows.
         // Bounded range query (both ends supplied) => expand recurring
         // series in-memory and paginate the expanded set. Recurrence has
         // no meaning without an upper bound, so the unbounded path below
@@ -498,6 +501,7 @@ impl CalendarService {
         // each sets the GUC via `begin_with_tenant`.
         // Largest configured offset across the whole table bounds the
         // expansion window. NULL (no appointment has reminders) => no work.
+        // SPEC-7.390: due_reminders scans across all tenants (no tenant GUC) via the migrator pool; the window end is now + the largest configured reminder_minutes across the whole table, and no appointment having reminders configured (NULL max) short-circuits to an empty result.
         let max_offset_min: Option<i32> = sqlx::query_scalar(
             r#"SELECT MAX(m) FROM appointments a, unnest(a.reminder_minutes) AS m
                WHERE a.reminder_minutes IS NOT NULL"#,
@@ -549,6 +553,7 @@ impl CalendarService {
                 vec![row.start_time]
             };
 
+            // SPEC-7.391: an occurrence is never reported due once its start is at or before now; a negative reminder offset is skipped entirely.
             for occ_start in occ_starts {
                 // Past-start occurrences never owe a reminder (don't
                 // remind for events that already began).
@@ -584,11 +589,13 @@ impl CalendarService {
         request: &CreateAppointmentRequest,
         ctx: &AuditCtx,
     ) -> AppResult<AppointmentResponse> {
+        // SPEC-7.379: create_appointment rejects an end_time that is not strictly after start_time.
         if !appointment_range_ok(request.start_time, request.end_time) {
             return Err(AppError::BadRequest(
                 "end_time must be after start_time".to_string(),
             ));
         }
+        // SPEC-7.381: a non-blank recurrence_rule must parse as an RFC 5545 RRULE anchored on start_time.
         // PMS-374: reject a non-RFC-5545 recurrence_rule with a 422 field
         // error so garbage text is never persisted. Validate with the same
         // parser the read-time expander uses, anchored on this request's
@@ -606,6 +613,7 @@ impl CalendarService {
                 ));
             }
         }
+        // SPEC-7.382: create_appointment rejects any referenced id that does not belong to this tenant.
         // PSA audit: every foreign id from the request body must belong to
         // this tenant before it is linked.
         // PMS-791 phase 3: reject a cross-tenant team_id (mirrors the
@@ -712,6 +720,7 @@ impl CalendarService {
         id: Uuid,
         request: &UpdateAppointmentRequest,
     ) -> AppResult<AppointmentResponse> {
+        // SPEC-7.382: update_appointment rejects any referenced id that does not belong to this tenant.
         // PSA audit: validate the foreign id being set so an update cannot
         // re-link this appointment to another tenant's user.
         // PMS-791 phase 3: same cross-tenant guard for team_id.
@@ -738,6 +747,7 @@ impl CalendarService {
         let Some((cur_start, cur_end)) = current else {
             return Err(AppError::NotFound("Appointment".to_string()));
         };
+        // SPEC-7.380: validates the effective range (request value, else stored), so a partial update cannot invert the stored range.
         let eff_start = request.start_time.unwrap_or(cur_start);
         let eff_end = request.end_time.unwrap_or(cur_end);
         if !appointment_range_ok(eff_start, eff_end) {
@@ -777,6 +787,7 @@ impl CalendarService {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        // SPEC-7.388: update_appointment returns 404 when no row matches (tenant_id, id).
         if n == 0 {
             return Err(AppError::NotFound("Appointment".to_string()));
         }
@@ -793,6 +804,7 @@ impl CalendarService {
             .execute(&mut *tx)
             .await?
             .rows_affected();
+        // SPEC-7.388: delete_appointment returns 404 when no row matches (tenant_id, id).
         if n == 0 {
             return Err(AppError::NotFound("Appointment".to_string()));
         }
@@ -840,6 +852,7 @@ impl CalendarService {
     /// the calendar UI typically presents the whole week as one form,
     /// so atomic replacement matches the user workflow.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.397: full-replace is atomic (delete then insert in one transaction); a window with end_time <= start_time aborts the whole replace and the transaction rolls back any prior inserts in this call.
     pub async fn replace_user_availability(
         &self,
         tenant_id: TenantId,
@@ -953,6 +966,7 @@ impl CalendarService {
         request: &CreateTimeOffRequest,
         ctx: &AuditCtx,
     ) -> AppResult<TimeOffResponse> {
+        // SPEC-7.399: create_time_off rejects end_date < start_date.
         if request.end_date < request.start_date {
             return Err(AppError::BadRequest(
                 "end_date must be >= start_date".to_string(),
@@ -1014,6 +1028,7 @@ impl CalendarService {
         approver_id: Uuid,
         status: &str,
     ) -> AppResult<TimeOffResponse> {
+        // SPEC-7.401: approve_time_off rejects a status other than exactly "approved" or "rejected".
         if !matches!(status, "approved" | "rejected") {
             return Err(AppError::BadRequest(format!(
                 "Status must be approved | rejected; got `{status}`."
@@ -1202,6 +1217,7 @@ impl CalendarService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn on_call_now(&self, tenant_id: TenantId) -> AppResult<Vec<OnCallNowResponse>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.403: on_call_now considers only schedules with is_active = true, resolving exactly one OnCallNowResponse per schedule.
         let rows = sqlx::query_as::<_, OnCallRow>(
             r#"SELECT id, name, team_id, rotation_type, rotation_config, is_active
                FROM on_call_schedules WHERE tenant_id = $1 AND is_active = TRUE"#,
@@ -1217,6 +1233,7 @@ impl CalendarService {
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
+            // SPEC-7.404: weekly picks user_ids[ISO_week(now) % len], daily picks user_ids[day_of_year(now) % len], any other rotation_type picks user_ids[0], and an empty user_ids resolves to null.
             let on_call_user_id = match (users.first(), r.rotation_type.as_str(), Utc::now()) {
                 (Some(_), "weekly", now) => {
                     // weekly: index = ISO week mod len(users).
@@ -1268,6 +1285,7 @@ impl CalendarService {
     /// Availability is week-relative (`day_of_week` + start/end TIME), so
     /// it is returned as-is rather than projected onto the range; the UI
     /// overlays it against each day in the window.
+    // SPEC-7.387: the dispatch board combines, for [from, to]: appointments (recurring expanded), weekly availability, approved time off, and current on-call coverage.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dispatch_view(
         &self,
@@ -1312,6 +1330,7 @@ impl CalendarService {
         // range bounds.
         let from_date = from.date_naive();
         let to_date = to.date_naive();
+        // SPEC-7.402: only status = 'approved' time off rows block dispatch; pending and rejected requests never block.
         let time_off_rows = if let Some(uid) = assigned_to_id {
             sqlx::query_as::<_, TimeOffRow>(
                 r#"SELECT id, user_id, start_date, end_date, type, status, approved_by_id, notes, created_at
@@ -1430,6 +1449,7 @@ impl CalendarService {
         request: &CreateSchedulingTemplateRequest,
         ctx: &AuditCtx,
     ) -> AppResult<SchedulingTemplateResponse> {
+        // SPEC-7.408: create_template rejects a default_ticket_id that does not belong to this tenant.
         // A linked ticket from the request body must belong to this tenant.
         self.validate_fk_opt(tenant_id, "tickets", request.default_ticket_id)
             .await?;
@@ -1486,6 +1506,7 @@ impl CalendarService {
         request: &UpdateSchedulingTemplateRequest,
         ctx: &AuditCtx,
     ) -> AppResult<SchedulingTemplateResponse> {
+        // SPEC-7.408: update_template rejects a default_ticket_id that does not belong to this tenant.
         // A re-linked ticket must belong to this tenant.
         self.validate_fk_opt(tenant_id, "tickets", request.default_ticket_id)
             .await?;
@@ -1500,6 +1521,7 @@ impl CalendarService {
         if before.is_none() {
             return Err(AppError::NotFound("Scheduling template".to_string()));
         }
+        // SPEC-7.409: a field omitted from the PUT body is left unchanged (COALESCE against the stored row), never nulled.
         sqlx::query(
             r#"UPDATE scheduling_templates SET
                 name = COALESCE($3, name),
@@ -1631,6 +1653,7 @@ fn expand_recurrence(
         return Vec::new();
     };
 
+    // SPEC-7.384: the series is anchored on the master's stored start_time, and a master whose recurrence_rule fails to parse is dropped (logged at warn) rather than failing the query.
     let set = match parse_recurrence_rule(rule_raw, base.start_time) {
         Ok(s) => s,
         Err(e) => {
@@ -1669,6 +1692,7 @@ fn expand_recurrence(
         .into_iter()
         .map(|occ| occ.with_timezone(&Utc))
         .filter(|start| *start >= from && *start <= to)
+        // SPEC-7.385: each expanded occurrence carries recurrence_parent_id set to the master's id and recurrence_rule cleared; the master row itself is never emitted.
         .map(|start| AppointmentResponse {
             start_time: start,
             end_time: start + duration,
