@@ -66,6 +66,10 @@ impl DatabaseProvider {
     /// classification then reports "database does not hold this" honestly
     /// rather than pretending to hold a value it cannot use, which is the
     /// same rule Bunyip's `decrypt_column` follows (BUNYIP-621).
+    // SPEC-3.9: loads every GovernedSecret row once; a row that fails to
+    // decrypt, or decrypts to an empty string, is treated as unheld, not a
+    // load failure; a row named outside GovernedSecret::ALL is warned and
+    // skipped.
     pub async fn load(db: &Database, encryption_key: [u8; 32]) -> AppResult<Self> {
         let names: Vec<&'static str> = GovernedSecret::ALL
             .iter()
@@ -79,6 +83,8 @@ impl DatabaseProvider {
         // a single-row-per-secret read.
         // SAFETY (PMS-285): app-tier is not tenant scoped and the table
         // carries no RLS; there is no GUC to set.
+        // SPEC-3.11: load and writes both use a pool exempt from tenant RLS,
+        // never the tenant-scoped request pool.
         let rows: Vec<(String, Vec<u8>)> =
             sqlx::query_as("SELECT name, ciphertext FROM app_secrets WHERE name = ANY($1)")
                 .bind(&names)
@@ -169,6 +175,8 @@ impl AppSecretProvider for DatabaseProvider {
     /// it. The row and the cache are updated in the same call and the cache
     /// is only touched on a successful write, so a failing DB write leaves
     /// the previous value serving.
+    // SPEC-3.10: upserts via ON CONFLICT (name) DO UPDATE and updates the
+    // in-memory cache only after the write succeeds.
     async fn set(&self, secret: GovernedSecret, value: &str) -> AppResult<()> {
         let (db, key) = match &self.writer {
             WriteBackend::Real { db, key } => (db, key),

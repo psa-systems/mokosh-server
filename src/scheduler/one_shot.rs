@@ -61,6 +61,7 @@ use crate::utils::error::AppResult;
 /// The returned handle is usually dropped, the same fire-and-forget the
 /// scheduler's handles get; a caller that wants to await or abort the pass can
 /// keep it.
+// SPEC-1 and 2.100: a one-shot pass runs exactly once per process start, never on a recurring Scheduler interval.
 pub fn spawn_once<F>(name: &'static str, task: F) -> JoinHandle<()>
 where
     F: Future<Output = AppResult<()>> + Send + 'static,
@@ -130,6 +131,7 @@ mod tests {
     /// secrets, and calling its variable a mover to satisfy a grep would have
     /// been the wrong half of the convention to bend.
     /// The variable suffixes that name a one-shot pass in `main.rs`.
+    // SPEC-1 and 2.101: a main.rs local variable named `*_mover` or `*_cleanup` must never be scheduler.register()'d.
     const ONE_SHOT_SUFFIXES: [&str; 2] = ["_mover", "_cleanup"];
 
     #[test]

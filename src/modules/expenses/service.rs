@@ -1,13 +1,14 @@
-//! MAPPS-1100 Phases A + B: the writer for the Bills and Expenses
-//! subsystem.
+//! MAPPS-1100 Phases A + B, plus delegation: the writer for the Bills
+//! and Expenses subsystem.
 //!
 //! Phase A shipped the leaf lookups (`vendors`, `expense_categories`).
 //! Phase B shipped the bill + expense headers with their own lifecycle:
 //! bills (`draft -> approved -> paid`, `void`) and expenses
 //! (`draft -> submitted -> approved -> reimbursed`, `rejected`), each
 //! atomic with its lines in one transaction. Delegation to Xero /
-//! QuickBooks is Phase C: it builds on the OAuth + webhook infrastructure
-//! MAPPS-1099 shipped, and has not yet been started.
+//! QuickBooks has since shipped on both sides: bills (MAPPS-1155) and
+//! reimbursed expense claims (PMS-1541), both on the OAuth + webhook
+//! infrastructure MAPPS-1099 shipped.
 //!
 //! Every mutation runs inside `begin_with_tenant` and writes an
 //! `audit_log` row in the same transaction, matching the billing
@@ -499,46 +500,94 @@ impl ExpensesService {
             .filter(|s| !s.is_empty());
         let pattern = search_pattern(filter.q.as_deref());
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let total: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM bills
-               WHERE tenant_id = $1
-                 AND ($2::text IS NULL OR status = $2)
-                 AND ($3::text IS NULL OR bill_number ILIKE $3 OR EXISTS (
-                       SELECT 1 FROM vendors v
-                       WHERE v.tenant_id = bills.tenant_id
-                         AND v.id = bills.vendor_id
+        // A non-empty `q` is served by UNIONing two single-relation,
+        // individually-indexable branches rather than `bill_number ILIKE
+        // $2 OR EXISTS (... v.name ILIKE $2)`: Postgres cannot push an
+        // index scan into one disjunct of an `OR` when the other disjunct
+        // is a correlated subquery on a different relation, so that shape
+        // forced a Seq Scan over every row regardless of either trigram
+        // index. Each UNION branch here is a plain ILIKE on one relation,
+        // so the planner can route it through `idx_bills_bill_number_trgm`
+        // or `idx_vendors_name_trgm` directly, and the branch is a
+        // standalone query (not a subquery `bills` is joined back
+        // against), so there is no outer full-table scan either. The `q`
+        // is absent case keeps the original, simpler query shape: it never
+        // touches these indexes and does not need the UNION's cost.
+        let (total, rows) = if let Some(pattern) = pattern.as_deref() {
+            let total: i64 = sqlx::query_scalar(
+                r#"SELECT COUNT(*) FROM (
+                       SELECT id FROM bills
+                       WHERE tenant_id = $1
+                         AND ($2::text IS NULL OR status = $2)
+                         AND bill_number ILIKE $3
+                       UNION
+                       SELECT b.id FROM bills b
+                       JOIN vendors v ON v.tenant_id = b.tenant_id AND v.id = b.vendor_id
+                       WHERE b.tenant_id = $1
+                         AND ($2::text IS NULL OR b.status = $2)
                          AND v.name ILIKE $3
-                     ))"#,
-        )
-        .bind(tenant_id)
-        .bind(status)
-        .bind(pattern.as_deref())
-        .fetch_one(&mut *tx)
-        .await?;
-        let rows: Vec<Bill> = sqlx::query_as(
-            r#"SELECT id, tenant_id, vendor_id, bill_number, issue_date, due_date,
-                      currency, subtotal_minor, tax_minor, total_minor, paid_minor,
-                      status, notes, external_provider, external_bill_id,
-                      created_at, updated_at
-               FROM bills
-               WHERE tenant_id = $1
-                 AND ($2::text IS NULL OR status = $2)
-                 AND ($3::text IS NULL OR bill_number ILIKE $3 OR EXISTS (
-                       SELECT 1 FROM vendors v
-                       WHERE v.tenant_id = bills.tenant_id
-                         AND v.id = bills.vendor_id
+                     ) matched"#,
+            )
+            .bind(tenant_id)
+            .bind(status)
+            .bind(pattern)
+            .fetch_one(&mut *tx)
+            .await?;
+            let rows: Vec<Bill> = sqlx::query_as(
+                r#"SELECT id, tenant_id, vendor_id, bill_number, issue_date, due_date,
+                          currency, subtotal_minor, tax_minor, total_minor, paid_minor,
+                          status, notes, external_provider, external_bill_id,
+                          created_at, updated_at
+                   FROM (
+                       SELECT bills.* FROM bills
+                       WHERE tenant_id = $1
+                         AND ($2::text IS NULL OR status = $2)
+                         AND bill_number ILIKE $3
+                       UNION
+                       SELECT b.* FROM bills b
+                       JOIN vendors v ON v.tenant_id = b.tenant_id AND v.id = b.vendor_id
+                       WHERE b.tenant_id = $1
+                         AND ($2::text IS NULL OR b.status = $2)
                          AND v.name ILIKE $3
-                     ))
-               ORDER BY issue_date DESC, created_at DESC
-               LIMIT $4 OFFSET $5"#,
-        )
-        .bind(tenant_id)
-        .bind(status)
-        .bind(pattern.as_deref())
-        .bind(pagination.limit() as i64)
-        .bind(pagination.offset() as i64)
-        .fetch_all(&mut *tx)
-        .await?;
+                   ) matched
+                   ORDER BY issue_date DESC, created_at DESC
+                   LIMIT $4 OFFSET $5"#,
+            )
+            .bind(tenant_id)
+            .bind(status)
+            .bind(pattern)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(&mut *tx)
+            .await?;
+            (total, rows)
+        } else {
+            let total: i64 = sqlx::query_scalar(
+                r#"SELECT COUNT(*) FROM bills
+                   WHERE tenant_id = $1 AND ($2::text IS NULL OR status = $2)"#,
+            )
+            .bind(tenant_id)
+            .bind(status)
+            .fetch_one(&mut *tx)
+            .await?;
+            let rows: Vec<Bill> = sqlx::query_as(
+                r#"SELECT id, tenant_id, vendor_id, bill_number, issue_date, due_date,
+                          currency, subtotal_minor, tax_minor, total_minor, paid_minor,
+                          status, notes, external_provider, external_bill_id,
+                          created_at, updated_at
+                   FROM bills
+                   WHERE tenant_id = $1 AND ($2::text IS NULL OR status = $2)
+                   ORDER BY issue_date DESC, created_at DESC
+                   LIMIT $3 OFFSET $4"#,
+            )
+            .bind(tenant_id)
+            .bind(status)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(&mut *tx)
+            .await?;
+            (total, rows)
+        };
         Ok((rows, total as u64))
     }
 
@@ -1036,6 +1085,98 @@ impl ExpensesService {
         Ok(payment.payments.into_iter().next())
     }
 
+    /// Record a payment an operator is making, and tell the provider when
+    /// it holds the bill (PMS-1545).
+    ///
+    /// The outer half of [`Self::record_bill_payment`], which stays the
+    /// one writer and is deliberately NOT the thing that pushes. The
+    /// inbound receiver calls the inner method (PMS-1543), so a payment
+    /// that arrived FROM a provider can never be pushed back to it: the
+    /// loop is prevented by which method each caller holds rather than by
+    /// a flag somebody has to set correctly. A test asserts the inner one
+    /// sends nothing even on a service that has a dispatcher.
+    ///
+    /// The push runs BEFORE the local write, like every other push in this
+    /// subsystem: a provider that refuses leaves no local payment row, so
+    /// the operator sees a failure and retries rather than ending up with
+    /// a payment Mokosh believes in and the provider does not.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, bill_id = %bill_id))]
+    pub async fn pay_bill(
+        &self,
+        tenant_id: TenantId,
+        bill_id: Uuid,
+        request: &RecordBillPaymentRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<BillWithPayments> {
+        let delegated = match self.bill_dispatch.as_ref() {
+            Some(dispatcher) if dispatcher.bills_delegation_enabled() => {
+                // Read first so the push has the bill's provider pair and
+                // its vendor, and so a bill in a state that cannot take a
+                // payment is refused before any wire call. The inner
+                // method checks the state again under its row lock, which
+                // is what actually guards it.
+                let bill = self.get_bill(tenant_id, bill_id).await?.bill;
+                match (
+                    bill.external_provider.as_deref(),
+                    bill.external_bill_id.as_deref(),
+                ) {
+                    (Some(provider), Some(external_id)) => {
+                        crate::modules::billing::invoice_issuer::InvoiceProviderKind::parse(
+                            provider,
+                        )
+                        .map(|kind| (kind, external_id.to_string(), bill.vendor_id))
+                    }
+                    // A bill no provider holds: the local path unchanged,
+                    // which is every bill on a deployment that has not
+                    // delegated.
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        let external_payment_id = match (delegated.as_ref(), self.bill_dispatch.as_ref()) {
+            (Some((provider, external_id, vendor_id)), Some(dispatcher)) => Some(
+                dispatcher
+                    .pay_bill_in_provider(
+                        tenant_id,
+                        *provider,
+                        external_id,
+                        *vendor_id,
+                        request.amount_minor,
+                        request.paid_on,
+                    )
+                    .await?,
+            ),
+            _ => None,
+        };
+
+        // The provider's own payment id goes in the note rather than a
+        // column of its own. PMS-1543 reconciles against the provider's
+        // running total, so nothing keys on this id; what it is for is a
+        // human holding two ledgers, and a migration for a value only a
+        // person reads is a column every consumer then has to learn.
+        let request = match external_payment_id.as_deref() {
+            Some(id) => {
+                let provider = delegated
+                    .as_ref()
+                    .map(|(kind, _, _)| kind.as_str())
+                    .unwrap_or("the provider");
+                let mut annotated = request.clone();
+                annotated.notes = Some(match request.notes.as_deref() {
+                    Some(note) if !note.trim().is_empty() => {
+                        format!("{note}\n\nRecorded in {provider} as payment {id}.")
+                    }
+                    _ => format!("Recorded in {provider} as payment {id}."),
+                });
+                annotated
+            }
+            None => request.clone(),
+        };
+        self.record_bill_payment(tenant_id, bill_id, &request, ctx)
+            .await
+    }
+
     /// Every payment against one bill, newest first.
     pub async fn list_bill_payments(
         &self,
@@ -1105,51 +1246,104 @@ impl ExpensesService {
             .filter(|s| !s.is_empty());
         let pattern = search_pattern(filter.q.as_deref());
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let total: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM expenses
-               WHERE tenant_id = $1
-                 AND ($2::uuid IS NULL OR user_id = $2)
-                 AND ($3::text IS NULL OR status = $3)
-                 AND ($4::text IS NULL OR notes ILIKE $4 OR EXISTS (
-                       SELECT 1 FROM expense_lines el
-                       WHERE el.tenant_id = expenses.tenant_id
-                         AND el.expense_id = expenses.id
+        // Same UNIONed, single-relation-per-branch shape as `list_bills`:
+        // `notes ILIKE $4 OR EXISTS (... el.description ILIKE $4)` is a
+        // correlated subquery on a different relation inside an `OR`,
+        // which Postgres cannot serve from either trigram index. Each
+        // branch below is a standalone query (not a subquery `expenses`
+        // is joined back against), so the planner can reach
+        // `idx_expenses_notes_trgm` and `idx_expense_lines_description_trgm`
+        // directly with no outer full-table scan. The `q`-absent case
+        // keeps the original, simpler query shape.
+        let (total, rows) = if let Some(pattern) = pattern.as_deref() {
+            let total: i64 = sqlx::query_scalar(
+                r#"SELECT COUNT(*) FROM (
+                       SELECT id FROM expenses
+                       WHERE tenant_id = $1
+                         AND ($2::uuid IS NULL OR user_id = $2)
+                         AND ($3::text IS NULL OR status = $3)
+                         AND notes ILIKE $4
+                       UNION
+                       SELECT e.id FROM expenses e
+                       JOIN expense_lines el ON el.tenant_id = e.tenant_id AND el.expense_id = e.id
+                       WHERE e.tenant_id = $1
+                         AND ($2::uuid IS NULL OR e.user_id = $2)
+                         AND ($3::text IS NULL OR e.status = $3)
                          AND el.description ILIKE $4
-                     ))"#,
-        )
-        .bind(tenant_id)
-        .bind(submitter)
-        .bind(status)
-        .bind(pattern.as_deref())
-        .fetch_one(&mut *tx)
-        .await?;
-        let rows: Vec<Expense> = sqlx::query_as(
-            r#"SELECT id, tenant_id, user_id, incurred_on, currency,
-                      subtotal_minor, tax_minor, total_minor, status,
-                      approver_id, approved_at, reimbursed_at, notes,
-                      external_provider, external_expense_id,
-                      created_at, updated_at
-               FROM expenses
-               WHERE tenant_id = $1
-                 AND ($2::uuid IS NULL OR user_id = $2)
-                 AND ($3::text IS NULL OR status = $3)
-                 AND ($4::text IS NULL OR notes ILIKE $4 OR EXISTS (
-                       SELECT 1 FROM expense_lines el
-                       WHERE el.tenant_id = expenses.tenant_id
-                         AND el.expense_id = expenses.id
+                     ) matched"#,
+            )
+            .bind(tenant_id)
+            .bind(submitter)
+            .bind(status)
+            .bind(pattern)
+            .fetch_one(&mut *tx)
+            .await?;
+            let rows: Vec<Expense> = sqlx::query_as(
+                r#"SELECT id, tenant_id, user_id, incurred_on, currency,
+                          subtotal_minor, tax_minor, total_minor, status,
+                          approver_id, approved_at, reimbursed_at, notes,
+                          external_provider, external_expense_id,
+                          created_at, updated_at
+                   FROM (
+                       SELECT expenses.* FROM expenses
+                       WHERE tenant_id = $1
+                         AND ($2::uuid IS NULL OR user_id = $2)
+                         AND ($3::text IS NULL OR status = $3)
+                         AND notes ILIKE $4
+                       UNION
+                       SELECT e.* FROM expenses e
+                       JOIN expense_lines el ON el.tenant_id = e.tenant_id AND el.expense_id = e.id
+                       WHERE e.tenant_id = $1
+                         AND ($2::uuid IS NULL OR e.user_id = $2)
+                         AND ($3::text IS NULL OR e.status = $3)
                          AND el.description ILIKE $4
-                     ))
-               ORDER BY incurred_on DESC, created_at DESC
-               LIMIT $5 OFFSET $6"#,
-        )
-        .bind(tenant_id)
-        .bind(submitter)
-        .bind(status)
-        .bind(pattern.as_deref())
-        .bind(pagination.limit() as i64)
-        .bind(pagination.offset() as i64)
-        .fetch_all(&mut *tx)
-        .await?;
+                   ) matched
+                   ORDER BY incurred_on DESC, created_at DESC
+                   LIMIT $5 OFFSET $6"#,
+            )
+            .bind(tenant_id)
+            .bind(submitter)
+            .bind(status)
+            .bind(pattern)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(&mut *tx)
+            .await?;
+            (total, rows)
+        } else {
+            let total: i64 = sqlx::query_scalar(
+                r#"SELECT COUNT(*) FROM expenses
+                   WHERE tenant_id = $1
+                     AND ($2::uuid IS NULL OR user_id = $2)
+                     AND ($3::text IS NULL OR status = $3)"#,
+            )
+            .bind(tenant_id)
+            .bind(submitter)
+            .bind(status)
+            .fetch_one(&mut *tx)
+            .await?;
+            let rows: Vec<Expense> = sqlx::query_as(
+                r#"SELECT id, tenant_id, user_id, incurred_on, currency,
+                          subtotal_minor, tax_minor, total_minor, status,
+                          approver_id, approved_at, reimbursed_at, notes,
+                          external_provider, external_expense_id,
+                          created_at, updated_at
+                   FROM expenses
+                   WHERE tenant_id = $1
+                     AND ($2::uuid IS NULL OR user_id = $2)
+                     AND ($3::text IS NULL OR status = $3)
+                   ORDER BY incurred_on DESC, created_at DESC
+                   LIMIT $4 OFFSET $5"#,
+            )
+            .bind(tenant_id)
+            .bind(submitter)
+            .bind(status)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(&mut *tx)
+            .await?;
+            (total, rows)
+        };
         Ok((rows, total as u64))
     }
 
@@ -1525,6 +1719,7 @@ pub struct CreateBillRequest {
     #[validate(length(max = 2000))]
     pub notes: Option<String>,
     #[validate(length(min = 1, max = 200))]
+    #[validate(nested)]
     pub lines: Vec<BillLineInput>,
 }
 
@@ -1535,10 +1730,14 @@ pub struct BillLineInput {
     #[validate(length(min = 1, max = 500))]
     pub description: String,
     /// Quantity in hundredths, matching the schema and the invoice-line
-    /// convention (so 1.25 = 125).
+    /// convention (so 1.25 = 125). A non-positive quantity is degenerate
+    /// (PMS-1550).
+    #[validate(range(min = 1))]
     pub quantity_hundredths: i64,
+    #[validate(range(min = 0))]
     pub unit_price_minor: i64,
     #[serde(default)]
+    #[validate(range(min = 0))]
     pub tax_minor: i64,
     #[serde(default)]
     pub position: i32,
@@ -1553,6 +1752,7 @@ pub struct CreateExpenseRequest {
     #[validate(length(max = 2000))]
     pub notes: Option<String>,
     #[validate(length(min = 1, max = 200))]
+    #[validate(nested)]
     pub lines: Vec<ExpenseLineInput>,
 }
 
@@ -1562,8 +1762,10 @@ pub struct ExpenseLineInput {
     pub category_id: Option<Uuid>,
     #[validate(length(min = 1, max = 500))]
     pub description: String,
+    #[validate(range(min = 0))]
     pub amount_minor: i64,
     #[serde(default)]
+    #[validate(range(min = 0))]
     pub tax_minor: i64,
     #[serde(default)]
     pub position: i32,

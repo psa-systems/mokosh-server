@@ -64,12 +64,15 @@ pub fn email_intake_routes(service: EmailIntakeService) -> Router {
 /// Idempotent: repeated POSTs with the same Message-Id return the
 /// same ticket id with `deduplicated=true`. The mail gateway can
 /// retry safely.
+// SPEC-7.325: a gateway retry of an identical message_id on an already-created ticket is idempotent, returning the same ticket_id with deduplicated=true rather than erroring or creating a second ticket.
 async fn intake(
     State(s): State<EmailIntakeRouterState>,
     headers: HeaderMap,
     Json(req): Json<EmailIntakeRequest>,
 ) -> AppResult<Json<EmailIntakeResponse>> {
+    // SPEC-7.317: req.validate() runs, mapped through AppError::from, before the bearer is resolved or intake runs; an invalid payload never reaches resolve_token or intake.
     req.validate().map_err(AppError::from)?;
+    // SPEC-7.318: authentication is a bearer token read directly off the request, not the normal user-session/cookie auth middleware.
     let bearer = extract_bearer(&headers)?;
     let resolved = s.service.resolve_token(&bearer).await?;
     let response = s.service.intake(resolved.tenant_id, req).await?;
@@ -79,6 +82,8 @@ async fn intake(
 /// `GET /api/v1/intake-tokens`. Admin-only. Returns every token
 /// (active + revoked) for the caller's tenant so the operator can
 /// audit + revoke.
+// SPEC-7.367: GET /intake-tokens requires an admin user and returns every token (active and revoked) for the caller's tenant.
+// SPEC-7.377: admin-facing routes derive their TenantId via TenantId::from_trusted(u.tenant_id) from the authenticated admin user, not from any request body field.
 async fn list_tokens(
     State(s): State<EmailIntakeRouterState>,
     RequireAdminUser(u): RequireAdminUser,
@@ -95,6 +100,7 @@ async fn list_tokens(
 /// hash is stored. The SPA must surface the plaintext in a copy-
 /// to-clipboard modal with "this is the last time you can see
 /// this" copy.
+// SPEC-7.368: POST /intake-tokens requires an admin user and validates the request before calling the service.
 async fn create_token(
     State(s): State<EmailIntakeRouterState>,
     RequireAdminUser(u): RequireAdminUser,
@@ -115,6 +121,7 @@ async fn create_token(
 /// `revoked_at`. Soft-delete because a hard delete would also
 /// erase the audit trail the gateway depends on for "who used what
 /// token and when".
+// SPEC-7.372: DELETE /intake-tokens/{id} requires an admin user, scopes to the caller's tenant, and revokes idempotently.
 async fn revoke_token(
     State(s): State<EmailIntakeRouterState>,
     RequireAdminUser(u): RequireAdminUser,
@@ -132,6 +139,7 @@ async fn revoke_token(
 /// `GET /api/v1/email-intake-log/{id}`. Admin-only. Returns the
 /// audit row for one inbound intake (raw headers + body, the
 /// resulting ticket id if any, the error string if the flow failed).
+// SPEC-7.366: GET /email-intake-log/{id} requires an admin user and scopes the lookup to the caller's tenant.
 async fn get_intake_log(
     State(s): State<EmailIntakeRouterState>,
     RequireAdminUser(u): RequireAdminUser,
@@ -152,6 +160,7 @@ async fn get_intake_log(
 /// layer keeps the email-intake route free of the normal user-auth
 /// middleware (which would 401 because there is no `users` row to
 /// resolve from a tenant_intake_token).
+// SPEC-7.319: returns AppError::Unauthorized when the Authorization header is absent, is not valid header-string text, does not start with "Bearer " or "bearer " (other casings rejected), or has an empty token after stripping the prefix.
 fn extract_bearer(headers: &HeaderMap) -> AppResult<String> {
     let value = headers
         .get(header::AUTHORIZATION)

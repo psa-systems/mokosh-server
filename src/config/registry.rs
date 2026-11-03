@@ -52,6 +52,7 @@ use std::fmt;
 ///
 /// The line is bootstrap ORDER, not how secret a value is: bootstrap is what a
 /// provider is made from, so it cannot be served by one.
+// SPEC-1 and 2.123: the two-tier split a provider read is built on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
     /// Resolved exactly once per process, and carried across a
@@ -188,6 +189,8 @@ pub fn tier_of(name: &str) -> Option<Tier> {
 /// name what will not work if no provider holds the key. Keys without a
 /// feature attribute are legitimately-unset by design; see the module-level
 /// note for why silence is the default.
+// SPEC-1 and 2.122: the one declaration site a ConfigKey and its Tier/since/required
+// facts come from; a flag or a read naming a key it does not emit cannot compile.
 macro_rules! declare_keys {
     ($(
         $(#[doc = $doc:literal])*

@@ -338,6 +338,14 @@ services:
       # Empty means the file provider is not built; the `:-` default reproduces
       # the code's own behaviour when APP_SECRETS_DIR is unset.
       APP_SECRETS_DIR: ${APP_SECRETS_DIR:-}
+      # PMS-1537: bunyip's host-secrets route and the machine credential that
+      # reads it. Empty in dev, which is what every self-hosted deployment
+      # reads: no URL means the bunyip provider is not built, and the Google
+      # client pair comes from whatever APP_SECRET_BACKEND names. A dev box
+      # pointing at a real bunyip sets all three.
+      BUNYIP_SECRETS_URL: ${BUNYIP_SECRETS_URL:-}
+      BUNYIP_SECRETS_CLIENT_ID: ${BUNYIP_SECRETS_CLIENT_ID:-}
+      BUNYIP_SECRETS_CLIENT_SECRET: ${BUNYIP_SECRETS_CLIENT_SECRET:-}
       # PMS-982: `environment`, the only kind reachable via the SINGLE-provider
       # slot today. The `:-` default reproduces the code's own fallback in
       # ConfigSelection::from_env.

@@ -57,13 +57,15 @@ pub fn sla_routes(service: SlaService) -> Router {
             "/sla/holiday-calendars/{id}",
             put(update_holiday_calendar).delete(delete_holiday_calendar),
         )
-        // PMS-112 evaluator (manual trigger; ticket service calls
-        // SlaService::evaluate_for_ticket on create/status change in a
-        // follow-up wire-up commit)
+        // PMS-112 evaluator (manual trigger; PMS-1564 wires the ticket
+        // service to call SlaService::evaluate_for_ticket on create and
+        // on status change)
         .route("/sla/tickets/{id}/evaluate", post(evaluate_for_ticket))
         .with_state(state)
 }
 
+// SPEC-7.68: requires auth and rejects an unsupported sort query param
+// before the listing query runs.
 async fn list_policies(
     State(s): State<SlaRouterState>,
     RequireAuth(u): RequireAuth,
@@ -78,6 +80,8 @@ async fn list_policies(
     )))
 }
 
+// SPEC-7.70: non-admin callers are rejected by RequireAdmin before
+// reaching the service.
 async fn create_policy(
     State(s): State<SlaRouterState>,
     RequireAuth(u): RequireAuth,
@@ -132,6 +136,8 @@ async fn list_targets(
     )))
 }
 
+// SPEC-7.82: upsert_target requires RequireAdmin and validates the
+// body before the service's tenant-ownership check and write.
 async fn upsert_target(
     State(s): State<SlaRouterState>,
     RequireAuth(u): RequireAuth,
@@ -264,6 +270,8 @@ async fn delete_holiday_calendar(
     s.service.delete_holiday_calendar(u.tenant(), id).await
 }
 
+// SPEC-7.119: evaluate_for_ticket requires RequireAdmin; the handler
+// recomputes and persists the ticket's SLA due fields via the service.
 async fn evaluate_for_ticket(
     State(s): State<SlaRouterState>,
     RequireAuth(u): RequireAuth,

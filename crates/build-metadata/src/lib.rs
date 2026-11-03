@@ -41,6 +41,7 @@ pub fn emit(git_dir: &str) {
     println!("cargo:rerun-if-changed={git_dir}/index");
 }
 
+// SPEC-1 and 2.152: resolution order is the pre-set env var first, a `git` shell-out second, a hardcoded fallback last.
 fn resolve_git_hash() -> String {
     if let Ok(value) = std::env::var("MOKOSH_GIT_HASH") {
         if !value.trim().is_empty() {

@@ -48,6 +48,12 @@ use uuid::Uuid;
 const XERO_CONTACT: &str = "3f6c6a2e-9d41-4a39-9f6a-6d1a1c2b3d4e";
 const QBO_VENDOR: &str = "56";
 const QBO_ACCOUNT: &str = "7";
+/// PMS-1545: the account a payment leaves, which PMS-1541 put on the
+/// integration row. Its own copy rather than a shared one: a suite that
+/// reaches into another suite's constants couples two files that are
+/// otherwise independent.
+const XERO_BANK_ACCOUNT: &str = "13918178-849a-247f-8ed7-c7b1f5e7e71c";
+const QBO_BANK_ACCOUNT: &str = "35";
 
 /// What a stub provider was asked for, and what it answers.
 ///
@@ -59,6 +65,11 @@ const QBO_ACCOUNT: &str = "7";
 struct Calls {
     bills: Vec<Value>,
     refuse_with: Option<StatusCode>,
+    /// PMS-1545: every payment the provider was told about. Counting them
+    /// is half the point: the inbound path must add none.
+    payments: Vec<Value>,
+    /// When set, the payment endpoints answer this status instead.
+    payment_refuses_with: Option<StatusCode>,
 }
 
 type Stub = Arc<Mutex<Calls>>;
@@ -96,6 +107,42 @@ async fn quickbooks_bill(State(stub): State<Stub>, Json(body): Json<Value>) -> i
     )
 }
 
+/// `PUT /Payments` (PMS-1545): Xero attaches the payment to the document
+/// it settles.
+async fn xero_payment(State(stub): State<Stub>, Json(body): Json<Value>) -> impl IntoResponse {
+    let mut calls = stub.lock().unwrap();
+    calls.payments.push(body);
+    if let Some(status) = calls.payment_refuses_with {
+        return (status, Json(json!({ "Message": "the provider refused" })));
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "Payments": [{ "PaymentID": "6a1d0f8e-2c3b-4d5a-9e7f-8b0c1d2e3f44" }]
+        })),
+    )
+}
+
+/// `POST /billpayment` (PMS-1545): QuickBooks keeps it as its own
+/// document, linked to the bill.
+async fn quickbooks_bill_payment(
+    State(stub): State<Stub>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let mut calls = stub.lock().unwrap();
+    calls.payments.push(body);
+    if let Some(status) = calls.payment_refuses_with {
+        return (
+            status,
+            Json(json!({ "Fault": { "type": "ValidationFault" } })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "BillPayment": { "Id": "7731", "SyncToken": "0" } })),
+    )
+}
+
 async fn token() -> impl IntoResponse {
     Json(json!({
         "access_token": "refreshed-access",
@@ -115,6 +162,11 @@ async fn start_stub() -> (Stub, String) {
         .route(
             "/v3/company/{realm}/bill",
             axum::routing::post(quickbooks_bill),
+        )
+        .route("/api.xro/2.0/Payments", axum::routing::put(xero_payment))
+        .route(
+            "/v3/company/{realm}/billpayment",
+            axum::routing::post(quickbooks_bill_payment),
         )
         .route("/connect/token", axum::routing::post(token))
         .route("/oauth2/v1/tokens/bearer", axum::routing::post(token))
@@ -681,4 +733,304 @@ async fn a_categoryless_line_is_refused_for_quickbooks(pool: PgPool) {
     );
     assert_eq!(stub.lock().unwrap().bills.len(), 0, "nothing was sent");
     assert_eq!(bill_count(&pool).await, 0, "and no local row was written");
+}
+
+// ── Paying a delegated bill (PMS-1545) ───────────────────────────────────
+
+/// The account a reimbursement or a payment leaves, as PMS-1541 stores it
+/// on the integration row.
+async fn set_payment_account(pool: &PgPool, provider: &str, account: &str) {
+    sqlx::query(
+        "UPDATE integrations SET external_payment_account_id = $3 \
+         WHERE tenant_id = $1 AND provider = $2",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(provider)
+    .bind(account)
+    .execute(pool)
+    .await
+    .expect("set the payment account");
+}
+
+fn payment(
+    amount_minor: i64,
+) -> mokosh_server::modules::expenses::service::RecordBillPaymentRequest {
+    mokosh_server::modules::expenses::service::RecordBillPaymentRequest {
+        paid_on: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+        amount_minor,
+        payment_method: "ach".to_string(),
+        reference: Some("ACH-77".to_string()),
+        notes: None,
+    }
+}
+
+/// A delegated bill, approved and ready to pay, with the provider's id on
+/// it.
+async fn delegated_approved_bill(
+    svc: &ExpensesService,
+    pool: &PgPool,
+    db: Database,
+    provider: InvoiceProviderKind,
+    external_vendor: &str,
+) -> (Uuid, Uuid) {
+    let vendor_id = seed_vendor(svc).await;
+    let category_id = seed_category(svc).await;
+    let mappings = InvoiceIssuerMappingService::new(db);
+    mappings
+        .upsert_vendor_mapping(tenant(), provider, vendor_id, external_vendor)
+        .await
+        .expect("map the vendor");
+    if provider == InvoiceProviderKind::Quickbooks {
+        // A QuickBooks bill line posts to an account, so raising the bill
+        // at all needs the category mapped first.
+        mappings
+            .upsert_expense_account_mapping(tenant(), provider, category_id, QBO_ACCOUNT)
+            .await
+            .expect("map the category to an account");
+    }
+    let bill = svc
+        .create_bill(tenant(), &bill_body(vendor_id, Some(category_id)), &ctx())
+        .await
+        .expect("create the bill");
+    svc.approve_bill(tenant(), bill.bill.id, &ctx())
+        .await
+        .expect("approve");
+    assert!(
+        external_columns(pool, bill.bill.id)
+            .await
+            .and_then(|c| c.1)
+            .is_some(),
+        "the bill is delegated, which is what makes paying it a push"
+    );
+    (bill.bill.id, vendor_id)
+}
+
+/// Paying a delegated bill tells Xero, and the local row records which
+/// payment over there it was.
+#[mokosh_test]
+async fn paying_a_delegated_bill_tells_xero(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _pw) = common::seed_admin(&pool).await;
+    let (svc, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    connect(&pool, "xero", &["bills_and_expenses"]).await;
+    set_payment_account(&pool, "xero", XERO_BANK_ACCOUNT).await;
+    seed_xero_blob(&secrets).await;
+    let (bill_id, _vendor) =
+        delegated_approved_bill(&svc, &pool, db, InvoiceProviderKind::Xero, XERO_CONTACT).await;
+
+    let paid = svc
+        .pay_bill(tenant(), bill_id, &payment(70_00), &ctx())
+        .await
+        .expect("pay the bill");
+
+    let sent = {
+        let calls = stub.lock().unwrap();
+        assert_eq!(calls.payments.len(), 1, "Xero is told exactly once");
+        calls.payments[0].clone()
+    };
+    assert_eq!(sent["Amount"], "70.00");
+    assert_eq!(sent["Account"]["AccountID"], XERO_BANK_ACCOUNT);
+    assert_eq!(sent["Date"], "2026-11-01");
+    assert!(
+        sent["Invoice"]["InvoiceID"].is_string(),
+        "the payment names the bill it settles: {sent}"
+    );
+
+    assert_eq!(paid.bill.status, "paid");
+    let note = paid.payments[0].notes.clone().unwrap_or_default();
+    assert!(
+        note.contains("6a1d0f8e-2c3b-4d5a-9e7f-8b0c1d2e3f44"),
+        "the provider's payment id is kept where a human reconciling will find it: {note}"
+    );
+}
+
+/// QuickBooks keeps a bill payment as its own document, linked to the
+/// bill and naming the vendor it pays.
+#[mokosh_test]
+async fn paying_a_delegated_bill_tells_quickbooks(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _pw) = common::seed_admin(&pool).await;
+    let (svc, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    connect(&pool, "quickbooks", &["bills_and_expenses"]).await;
+    set_payment_account(&pool, "quickbooks", QBO_BANK_ACCOUNT).await;
+    seed_quickbooks_blob(&secrets).await;
+    let (bill_id, _vendor) =
+        delegated_approved_bill(&svc, &pool, db, InvoiceProviderKind::Quickbooks, QBO_VENDOR).await;
+
+    svc.pay_bill(tenant(), bill_id, &payment(70_00), &ctx())
+        .await
+        .expect("pay the bill");
+
+    let sent = {
+        let calls = stub.lock().unwrap();
+        assert_eq!(calls.payments.len(), 1);
+        calls.payments[0].clone()
+    };
+    assert_eq!(sent["VendorRef"]["value"], QBO_VENDOR);
+    assert_eq!(sent["TotalAmt"], "70.00");
+    assert_eq!(sent["PayType"], "Check");
+    assert_eq!(
+        sent["CheckPayment"]["BankAccountRef"]["value"], QBO_BANK_ACCOUNT,
+        "the account the money left: {sent}"
+    );
+    assert_eq!(
+        sent["Line"][0]["LinkedTxn"][0]["TxnType"], "Bill",
+        "and the link that makes it settle the bill rather than float"
+    );
+}
+
+/// A provider that refuses leaves no local payment row.
+///
+/// The push runs before the write for this reason: the operator sees a
+/// failure and retries, rather than Mokosh believing in a payment the
+/// provider never took.
+#[mokosh_test]
+async fn a_refused_payment_leaves_no_local_row(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _pw) = common::seed_admin(&pool).await;
+    let (svc, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    connect(&pool, "xero", &["bills_and_expenses"]).await;
+    set_payment_account(&pool, "xero", XERO_BANK_ACCOUNT).await;
+    seed_xero_blob(&secrets).await;
+    let (bill_id, _vendor) =
+        delegated_approved_bill(&svc, &pool, db, InvoiceProviderKind::Xero, XERO_CONTACT).await;
+    stub.lock().unwrap().payment_refuses_with = Some(StatusCode::BAD_REQUEST);
+
+    let err = svc
+        .pay_bill(tenant(), bill_id, &payment(70_00), &ctx())
+        .await
+        .expect_err("the provider refused");
+
+    assert!(
+        !stub.lock().unwrap().payments.is_empty(),
+        "the provider WAS asked: {err:?}"
+    );
+    let bill = svc.get_bill(tenant(), bill_id).await.expect("read").bill;
+    assert_eq!(bill.paid_minor, 0, "and nothing local was written");
+    assert_eq!(bill.status, "approved");
+    assert_eq!(
+        svc.list_bill_payments(tenant(), bill_id)
+            .await
+            .expect("list")
+            .len(),
+        0
+    );
+}
+
+/// No account to pay from is refused by name, before any wire call.
+#[mokosh_test]
+async fn paying_without_an_account_is_refused_by_name(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _pw) = common::seed_admin(&pool).await;
+    let (svc, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    connect(&pool, "xero", &["bills_and_expenses"]).await;
+    seed_xero_blob(&secrets).await;
+    let (bill_id, _vendor) =
+        delegated_approved_bill(&svc, &pool, db, InvoiceProviderKind::Xero, XERO_CONTACT).await;
+
+    let err = svc
+        .pay_bill(tenant(), bill_id, &payment(70_00), &ctx())
+        .await
+        .expect_err("no account to pay from");
+    let AppError::Conflict(message) = &err else {
+        panic!("a client-stated conflict is not a server fault: {err:?}");
+    };
+    assert!(
+        message.contains("payment-account"),
+        "the refusal names the route that fixes it: {message}"
+    );
+    assert_eq!(stub.lock().unwrap().payments.len(), 0, "nothing was sent");
+    assert_eq!(
+        svc.get_bill(tenant(), bill_id)
+            .await
+            .expect("read")
+            .bill
+            .paid_minor,
+        0
+    );
+}
+
+/// A bill no provider holds is the local path, untouched.
+#[mokosh_test]
+async fn paying_a_local_bill_calls_nothing(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _pw) = common::seed_admin(&pool).await;
+    let (svc, _db, _secrets) = service_with_dispatch(&pool, &base, true).await;
+    // No connection, so `create_bill` wrote no external pair.
+    let vendor_id = seed_vendor(&svc).await;
+    let bill = svc
+        .create_bill(tenant(), &bill_body(vendor_id, None), &ctx())
+        .await
+        .expect("create the bill");
+    svc.approve_bill(tenant(), bill.bill.id, &ctx())
+        .await
+        .expect("approve");
+
+    let paid = svc
+        .pay_bill(tenant(), bill.bill.id, &payment(70_00), &ctx())
+        .await
+        .expect("pay the bill");
+
+    assert_eq!(stub.lock().unwrap().payments.len(), 0);
+    assert_eq!(paid.bill.status, "paid", "and the local path still works");
+    assert!(
+        paid.payments[0].notes.is_none(),
+        "with no provider note, because no provider was told"
+    );
+}
+
+/// An inbound payment is never pushed back out, even on a service that
+/// HAS a dispatcher.
+///
+/// The loop PMS-1543 and this ticket could have made between them. It is
+/// prevented by which method each caller holds: the receiver calls the
+/// inner writer, the route calls `pay_bill`. This asserts the inner one
+/// stays silent rather than trusting the wiring to stay as it is.
+#[mokosh_test]
+async fn a_payment_that_came_from_the_provider_is_not_pushed_back(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _pw) = common::seed_admin(&pool).await;
+    let (svc, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    connect(&pool, "xero", &["bills_and_expenses"]).await;
+    set_payment_account(&pool, "xero", XERO_BANK_ACCOUNT).await;
+    seed_xero_blob(&secrets).await;
+    let (bill_id, _vendor) =
+        delegated_approved_bill(&svc, &pool, db, InvoiceProviderKind::Xero, XERO_CONTACT).await;
+
+    let recorded = svc
+        .reconcile_external_bill_payment(
+            tenant(),
+            &mokosh_server::modules::expenses::service::ExternalBillPaymentReport {
+                provider: "xero",
+                external_bill_id: &external_columns(&pool, bill_id)
+                    .await
+                    .and_then(|c| c.1)
+                    .expect("the provider's id"),
+                provider_paid_minor: 70_00,
+                paid_on: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            },
+            &ctx(),
+        )
+        .await
+        .expect("record what the provider already did");
+
+    assert!(recorded.is_some(), "the payment was recorded locally");
+    assert_eq!(
+        stub.lock().unwrap().payments.len(),
+        0,
+        "and the provider was NOT told about its own payment"
+    );
+    assert_eq!(
+        svc.get_bill(tenant(), bill_id)
+            .await
+            .expect("read")
+            .bill
+            .status,
+        "paid"
+    );
 }
