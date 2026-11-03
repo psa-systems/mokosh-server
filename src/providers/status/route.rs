@@ -45,6 +45,13 @@ use crate::modules::auth::RequireAdminUser;
 /// The admin router carrying all three endpoints. Mounted under `/api/v1` by
 /// `create_api_router` so the shared auth middleware and error envelope
 /// layers already wrap it.
+// SPEC-3.76: exactly three admin endpoints are mounted: GET
+// /admin/providers/status (JSON) and GET /admin/providers/status.html
+// (HTML), both gated by RequireAdminOrBunyipMachine; POST
+// /admin/providers/status/refresh, gated by a staff admin session
+// only (never the machine credential), because the refresh handler
+// must record an operator login as the refresh actor and a machine
+// caller has no operator identity to record.
 pub fn provider_status_admin_routes() -> Router {
     Router::new()
         .route("/admin/providers/status", get(status_json))
@@ -83,6 +90,10 @@ async fn status_html(_gate: RequireAdminOrBunyipMachine) -> impl IntoResponse {
 /// Rejected arm is written and returns 409 anyway, because [`try_refresh`]
 /// grows required-key rejections in follow-up work (PMS-1012's per-key
 /// refresh from the admin surface) and the shape must survive that.
+// SPEC-3.77: calls try_refresh with no required keys; on
+// RefreshOutcome::Applied the response is 200 with {status:
+// "applied", generation_number}; on RefreshOutcome::Rejected it is
+// 409 with {status: "rejected", previous_generation_number, reason}.
 async fn refresh_status(RequireAdminUser(user): RequireAdminUser) -> impl IntoResponse {
     let outcome = try_refresh(RefreshRequest::operator(user.email.clone()));
     let report = super::collect();

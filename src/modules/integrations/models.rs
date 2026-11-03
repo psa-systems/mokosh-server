@@ -99,16 +99,23 @@ pub struct IntegrationResponse {
     /// Whether this provider's lifecycle can be CHANGED through this surface
     /// (MAPPS-1129).
     ///
-    /// `false` means the four per-provider routes answer 404 for it and the
-    /// panel's job here is to say what it is connected to and link to the
-    /// surface in `setup`. Served rather than derived, for the reason
-    /// `available` and `credential_elsewhere` are (PMS-1447): a client cannot
-    /// work it out from a provider name, and the one that tried rendered
-    /// capability checkboxes, Connect and Disconnect on Stripe and PayPal,
-    /// whose every call `parse_provider` refuses.
+    /// `false` for every provider since PMS-1571, which took the four
+    /// per-provider routes out: there was nothing left for them to serve, so
+    /// the panel's whole job here is to say what a tenant is connected to and
+    /// link to the surface in `setup`.
     ///
-    /// It is the same predicate that route refuses on, so the two cannot drift
-    /// into a surface that offers a control the server will not take.
+    /// Served rather than derived, for the reason `available` and
+    /// `credential_elsewhere` are (PMS-1447): a client cannot work it out from
+    /// a provider name, and the one that tried rendered capability
+    /// checkboxes, Connect and Disconnect on Stripe and PayPal, whose every
+    /// call came back 404.
+    ///
+    /// It stays on the response rather than becoming a constant `false`
+    /// because it is the registry's answer, not this surface's: the day a
+    /// provider takes `CredentialHome::Integration` this goes true for that
+    /// provider and the routes come back with it, which
+    /// `registry::tests::an_integration_home_provider_needs_the_per_provider_routes_back`
+    /// is what enforces.
     pub configurable_here: bool,
     /// Whether this build has anything behind the provider (MAPPS-1121).
     /// `false` means the entry exists so its capabilities can be named, and
@@ -271,6 +278,11 @@ pub struct IntegrationRow {
 /// is accepted, unlike a portal role's, because handing a provider nothing
 /// while keeping it connected is a real state: it is how an operator suspends a
 /// delegation without throwing the credential away.
+///
+/// PMS-1571: no HTTP route deserialises it any more. It is
+/// [`IntegrationsService::update`](super::service::IntegrationsService::update)'s
+/// argument type, kept with that method for the reason the service module doc
+/// gives.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateIntegrationRequest {
     pub capabilities: Option<Vec<String>>,
@@ -289,6 +301,10 @@ pub struct UpdateIntegrationRequest {
 /// logged and never served back, which is what lets each provider ticket decide
 /// its own shape (an API key, a token pair, an OAuth grant) without this code
 /// learning any of them.
+///
+/// PMS-1571: likewise no route's body any more, and
+/// [`IntegrationsService::connect`](super::service::IntegrationsService::connect)'s
+/// argument type.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct ConnectIntegrationRequest {
     /// The credential to store, for a provider whose
