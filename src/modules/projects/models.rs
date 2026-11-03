@@ -20,6 +20,7 @@ mod decimal_opt {
     use serde::{Deserialize, Deserializer};
     use std::str::FromStr;
 
+    // SPEC-7.431: accepts a JSON number, a numeric string, or null; any other JSON type is rejected
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
     where
         D: Deserializer<'de>,
@@ -53,6 +54,7 @@ mod decimal_opt {
 /// one page. The counts alone are already answerable with
 /// `?status=X&per_page=1` and `meta.total`; the sum is not, and a sum is the
 /// one a page cannot approximate from a page.
+// SPEC-7.452: counts_by_status and total_budget are computed together in one transaction so both describe the same instant
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectSummaryResponse {
     /// Count per `projects.status`, one entry per status actually present.
@@ -157,14 +159,17 @@ impl From<ProjectResponse> for ContactProjectResponse {
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateProjectRequest {
     #[validate(length(min = 1, max = 80))]
+    // SPEC-7.426: project name must be 1 to 80 characters
     pub name: String,
     pub description: Option<String>,
     pub project_number: Option<String>,
     pub company_id: Option<Uuid>,
     pub contract_id: Option<Uuid>,
     #[serde(default = "default_client")]
+    // SPEC-7.427: project_type defaults to "client" when omitted
     pub project_type: String,
     #[serde(default = "default_planning")]
+    // SPEC-7.428: status defaults to "planning" when omitted
     pub status: String,
     pub project_manager_id: Option<Uuid>,
     pub start_date: Option<NaiveDate>,
@@ -175,20 +180,24 @@ pub struct CreateProjectRequest {
     pub actual_end_date: Option<NaiveDate>,
     #[serde(default, deserialize_with = "decimal_opt::deserialize")]
     #[validate(custom(function = crate::utils::validation::validate_budget_hours))]
+    // SPEC-7.432: budget_hours must be non-negative, at most 2 decimal places, and under the column's magnitude
     pub budget_hours: Option<Decimal>,
     #[serde(default, deserialize_with = "decimal_opt::deserialize")]
     #[validate(custom(function = crate::utils::validation::validate_budget_amount))]
+    // SPEC-7.433: budget_amount must be non-negative, at most 2 decimal places, and under the column's magnitude
     pub budget_amount: Option<Decimal>,
     #[serde(default = "default_tm")]
+    // SPEC-7.429: billing_method defaults to "time_and_materials" when omitted
     pub billing_method: String,
     #[validate(custom(function = mokosh_types::validation::validate_rate))]
     pub hourly_rate: Option<Decimal>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true")] // SPEC-7.430: is_billable defaults to true when omitted
     pub is_billable: bool,
     /// PMS-345: per-project override of the standard due date offset in
     /// business days (0..=365, 0 disables). `None` inherits the tenant
     /// `scheduling/default_due_business_days` setting.
     #[validate(range(min = 0, max = 365))]
+    // SPEC-7.434: default_due_business_days, if present, must be in 0..=365
     pub default_due_business_days: Option<i16>,
 }
 
@@ -207,6 +216,7 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateProjectRequest {
+    // SPEC-7.450: name (1 to 80 chars), default_due_business_days (0..=365), and budget_hours/budget_amount follow the same validation as create
     #[validate(length(min = 1, max = 80))]
     pub name: Option<String>,
     pub description: Option<String>,
@@ -260,6 +270,7 @@ pub struct ProjectPhaseResponse {
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertProjectPhaseRequest {
     #[validate(length(min = 1, max = 100))]
+    // SPEC-7.458: phase name must be 1 to 100 characters
     pub name: String,
     pub description: Option<String>,
     #[serde(default)]
@@ -267,6 +278,7 @@ pub struct UpsertProjectPhaseRequest {
     pub start_date: Option<NaiveDate>,
     pub end_date: Option<NaiveDate>,
     #[serde(default = "default_not_started")]
+    // SPEC-7.459: phase status defaults to "not_started" when omitted
     pub status: String,
 }
 
@@ -283,6 +295,7 @@ pub struct TaskStatusResponse {
     pub sort_order: i32,
 }
 
+// SPEC-7.465: name must be 1 to 50 characters, color 1 to 7 characters; is_completed and sort_order default to false/0 when omitted
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertTaskStatusRequest {
     #[validate(length(min = 1, max = 50))]
@@ -310,6 +323,7 @@ pub struct ProjectTypeResponse {
 
 /// Create/update body for a `project_types` lookup row. `is_system` is not
 /// settable from the wire.
+// SPEC-7.470: name must be 1 to 50 characters; is_active defaults to true, is_default/sort_order default to false/0; is_system is never settable from the wire
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertProjectTypeRequest {
     #[validate(length(min = 1, max = 50))]
@@ -376,6 +390,7 @@ pub(crate) fn task_dates_ok(start: Option<NaiveDate>, due: Option<NaiveDate>) ->
 /// rejected with a 422 at the request layer. The error is re-keyed onto
 /// `due_date` so the SPA renders it inline against that field rather than as a
 /// generic banner (PMS-364).
+// SPEC-7.481: rejects an inverted start_date/due_date range with a 422 keyed onto due_date (equal dates and either side None are accepted)
 fn validate_create_task_dates(req: &CreateTaskRequest) -> Result<(), validator::ValidationError> {
     if !task_dates_ok(req.start_date, req.due_date) {
         return Err(crate::utils::validation::cross_field_error(
@@ -390,6 +405,7 @@ fn validate_create_task_dates(req: &CreateTaskRequest) -> Result<(), validator::
 /// Cross-field check for `UpdateTaskRequest`. A partial PUT that supplies both
 /// dates is validated the same way as a create; one-sided updates fall through
 /// to the service layer, which combines the request values with the stored row.
+// SPEC-7.482: applies the identical cross-field date check when both dates are supplied in the same PUT
 fn validate_update_task_dates(req: &UpdateTaskRequest) -> Result<(), validator::ValidationError> {
     if !task_dates_ok(req.start_date, req.due_date) {
         return Err(crate::utils::validation::cross_field_error(
@@ -405,15 +421,17 @@ fn validate_update_task_dates(req: &UpdateTaskRequest) -> Result<(), validator::
 #[validate(schema(function = validate_create_task_dates))]
 pub struct CreateTaskRequest {
     #[validate(length(min = 1, max = 255))]
+    // SPEC-7.478: title must be 1 to 255 characters
     pub title: String,
     pub description: Option<String>,
     pub status_id: Uuid,
     pub phase_id: Option<Uuid>,
     pub parent_task_id: Option<Uuid>,
-    #[serde(default = "default_medium")]
+    #[serde(default = "default_medium")] // SPEC-7.479: priority defaults to "medium" when omitted
     pub priority: String,
     pub assigned_to_id: Option<Uuid>,
     #[validate(custom(function = mokosh_types::validation::validate_hours))]
+    // SPEC-7.480: estimated_hours, if present, must pass the shared hours validator
     pub estimated_hours: Option<Decimal>,
     pub start_date: Option<NaiveDate>,
     pub due_date: Option<NaiveDate>,

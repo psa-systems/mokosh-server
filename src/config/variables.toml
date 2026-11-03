@@ -1,3 +1,5 @@
+# SPEC-1 and 2.148: documentation data for scripts/config-docs.nu, not read by declare_keys! or any
+# Rust code; it carries since/required/changelog facts for variables read outside the registry.
 # Release facts `declare_keys!` cannot carry (PMS-1442); `just config-docs` renders them.
 # [[variable]]: read outside crate::config::get; `required` = boot refuses it outside dev/test.
 

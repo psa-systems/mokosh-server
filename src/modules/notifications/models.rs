@@ -19,6 +19,7 @@ pub struct NotificationChannelResponse {
 pub struct UpsertNotificationChannelRequest {
     /// "email" | "sms" | "slack" | "teams" | "discord" | "google_chat"
     /// | "mattermost" | "in_app"
+    // SPEC-7.591: channel_type is a free-form String here; nothing in create_channel/update_channel enforces the documented set.
     pub channel_type: String,
     #[validate(length(min = 1, max = 100))]
     pub name: String,
@@ -72,6 +73,7 @@ pub struct UserNotificationPreferenceResponse {
 pub struct UpsertUserNotificationPreferenceRequest {
     pub event_type: String,
     pub channel_types: Vec<String>,
+    // SPEC-7.587: is_enabled defaults to true when omitted from the request JSON.
     #[serde(default = "default_true")]
     pub is_enabled: bool,
 }
@@ -130,6 +132,7 @@ pub struct UpsertNotificationRuleRequest {
 /// `POST /notifications/preview` (PMS-808) takes the same body: the
 /// preview answers "what would this dispatch say?", so asking for it
 /// with a different shape would only invite the two to drift.
+// SPEC-7.629: DispatchNotificationRequest derives Validate but declares no field-level #[validate(...)] attributes, so req.validate()? at both the dispatch and preview routes is a structural no-op.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct DispatchNotificationRequest {
     pub event_type: String,
@@ -146,6 +149,7 @@ pub struct DispatchNotificationRequest {
 /// rather than being filled with a sample value, because they are the
 /// send-time values (a minted token and its link) that the preview
 /// deliberately does not create.
+// SPEC-7.582: unresolved names the exact {{key}} placeholders that did not resolve; those keys stay literal in subject/body_text/body_html rather than being fabricated as a sample send-time value.
 #[derive(Debug, Clone, Serialize)]
 pub struct NotificationPreviewResponse {
     pub rule_name: String,
