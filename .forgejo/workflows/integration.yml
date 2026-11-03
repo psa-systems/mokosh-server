@@ -42,9 +42,22 @@
 name: Integration
 
 on:
+  # PMS-1634: integration tests read no Markdown and no `docs/` file, so a
+  # pull request touching only those paths cannot regress what this suite
+  # proves. `paths-ignore` skips the run when EVERY changed path matches;
+  # one non-doc edit still triggers the full suite. `check.yml` is NOT
+  # treated the same way because several of its guards exist to run on
+  # doc changes.
   pull_request:
     branches:
       - main
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+      - ".editorconfig"
+      - "renovate.json"
 
 # PMS-1633: supersede obsolete PR runs. See check.yml for the ref-shape note.
 concurrency:
