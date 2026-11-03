@@ -148,7 +148,7 @@ One line per rule, or per group of rules answering one subject, linking its full
 - Sending emails the invoice; `sent` means it went ([PMS-991, PMS-992](docs/invariants/billing.md#sending-pms-991-pms-992))
 - `net_days` derives the default due date ([PMS-990](docs/invariants/billing.md#net-terms-pms-990))
 - Lines copy prices; `billing_rule` decides billing ([PMS-955](docs/invariants/billing.md#products-pms-955))
-- A prepaid block draws down, and overage bills at its rate ([PMS-951, PMS-1035](docs/invariants/billing.md#prepaid-blocks))
+- A prepaid block draws down, overage bills at its rate, and unused hours roll at the period close ([PMS-951, PMS-1035, PMS-1572](docs/invariants/billing.md#prepaid-blocks))
 - An invoice uses the tenant's currency ([PMS-1028](docs/invariants/billing.md#currency-pms-1028))
 - A billing read is gated by extractor, dual-plane routes in the body ([PMS-962, PMS-1041](docs/invariants/billing.md#financial-read-gates))
 
