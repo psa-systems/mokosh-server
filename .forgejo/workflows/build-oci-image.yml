@@ -154,21 +154,15 @@ jobs:
           print $"git_hash=($git_hash) git_describe=($git_describe) build_date=($build_date)"
 
       - name: Set up buildx builder
-        # The `docker-container` driver is required for any cache export;
-        # the default `docker` driver only carries inline metadata, which
-        # misses the dependency-build layer ("OCI build workflow" in CI.md of
-        # dev.a8n.run/niceguyit/governance, GOV-20; not a file in this
-        # repository).
-        #
-        # PMS-1638: idempotent. `buildx inspect` is cheap and fails only
-        # when the builder is absent or broken, in which case we recreate.
-        # On a persistent runner this reuses the running builder container
-        # across jobs rather than starting a fresh `docker-container` on
-        # every run (3-5s saved and no stopped containers accumulating).
-        run: |
-          docker buildx inspect container-builder > /dev/null 2>&1 \
-            || docker buildx create --name container-builder --driver docker-container
-          docker buildx use container-builder
+        # PMS-1638: delegate to the shared composite in common/.forgejo/
+        # actions/setup-buildx (idempotent create-or-reuse, per-job naming,
+        # bootstrap retry on a slow BuildKit). The `docker-container`
+        # driver is required for any cache export (`type=gha,mode=max`);
+        # the default `docker` driver only carries inline metadata and
+        # misses the dependency-build layer (GOV-20).
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/setup-buildx@main
+        with:
+          name: build-oci-image
 
       - name: Export Actions runtime env for buildx gha cache
         # A raw `docker buildx build` (unlike docker/build-push-action) does
