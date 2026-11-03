@@ -159,7 +159,16 @@ jobs:
         # misses the dependency-build layer ("OCI build workflow" in CI.md of
         # dev.a8n.run/niceguyit/governance, GOV-20; not a file in this
         # repository).
-        run: docker buildx create --name container-builder --driver docker-container --use
+        #
+        # PMS-1638: idempotent. `buildx inspect` is cheap and fails only
+        # when the builder is absent or broken, in which case we recreate.
+        # On a persistent runner this reuses the running builder container
+        # across jobs rather than starting a fresh `docker-container` on
+        # every run (3-5s saved and no stopped containers accumulating).
+        run: |
+          docker buildx inspect container-builder > /dev/null 2>&1 \
+            || docker buildx create --name container-builder --driver docker-container
+          docker buildx use container-builder
 
       - name: Export Actions runtime env for buildx gha cache
         # A raw `docker buildx build` (unlike docker/build-push-action) does
