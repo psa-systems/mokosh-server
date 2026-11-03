@@ -30,6 +30,8 @@ pub struct EntryPoint {
 /// This is NOT a list of reads waiting to be migrated. There is no such list:
 /// PMS-982 landed the seam and every read together, and the guard's own
 /// `MIGRATED_READS` is empty with a test saying so.
+// SPEC-1 and 2.146: the complete, named allowlist of files permitted to read the
+// environment directly instead of through crate::config::get.
 pub const ENTRY_POINTS: &[EntryPoint] = &[
     EntryPoint {
         path: "src/bin/mokosh-bootstrap.rs",
@@ -82,6 +84,13 @@ pub const ENTRY_POINTS: &[EntryPoint] = &[
                  declared configuration keys; the environment provider is what a config-served \
                  declaration would have been built out of, so it reads env directly for the \
                  same reason SECRET_BACKEND does",
+    },
+    EntryPoint {
+        path: "src/app_secrets/bunyip.rs",
+        reason: "the bunyip URL and machine credential the app-tier bunyip provider is BUILT \
+                 from (PMS-1537): a provider cannot be constructed out of a value served by \
+                 the thing being constructed, and the credential honours the {NAME}_FILE \
+                 convention the environment provider insists on",
     },
     EntryPoint {
         path: "src/secrets/infisical.rs",
@@ -192,6 +201,8 @@ mod tests {
     /// The acceptance criterion in executable form: a configuration read added
     /// outside the provider and `ENTRY_POINTS` fails the build.
     #[test]
+    // SPEC-1 and 2.147: the acceptance criterion in executable form; a new
+    // direct environment read outside the seam and ENTRY_POINTS fails the build.
     fn every_env_read_goes_through_the_provider() {
         let needle = needle();
         let root = crate_root();

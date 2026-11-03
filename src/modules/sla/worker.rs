@@ -83,7 +83,8 @@ impl SlaSweepWorker {
     /// notifications dispatched this tick.
     #[tracing::instrument(skip_all)]
     pub async fn run_tick(&self) -> AppResult<u64> {
-        // Nothing to do without a dispatcher wired in (the `new`
+        // SPEC-7.131: returns Ok(0) immediately, performing no DB
+        // query, when no NotificationsService is wired (the `new`
         // constructor path). Bail before touching the DB.
         let Some(notifications) = self.service.notifications() else {
             return Ok(0);
@@ -93,6 +94,8 @@ impl SlaSweepWorker {
         // a single `app.current_tenant` GUC and runs on the BYPASSRLS migrator
         // pool. Per-ticket alert-ledger writes that follow are tenant-scoped via
         // `begin_with_tenant`.
+        // SPEC-7.132: scans ALL tenants in one query on the BYPASSRLS migrator pool,
+        // since the scan itself builds the per-tenant work list.
         let pool = self.service.migrator_pool();
         let now = Utc::now();
 
@@ -110,6 +113,8 @@ impl SlaSweepWorker {
         // `begin_with_tenant`. When the app moves to an unprivileged
         // NOBYPASSRLS role (parent PMS-255), this scan must move to a
         // BYPASSRLS-scoped path.
+        // SPEC-7.133: selects only open tickets (resolved_at/closed_at NULL, status not
+        // closed) that have at least one due field set.
         let rows = sqlx::query_as::<_, TicketRow>(
             r#"SELECT t.id, t.tenant_id, t.assigned_to_id, t.created_at,
                       t.first_response_due, t.first_response_at, t.resolution_due
@@ -128,10 +133,14 @@ impl SlaSweepWorker {
             // No assignee => nobody to notify. Skip rather than fan out
             // to an empty recipient set (the rule carries no recipients
             // of its own).
+            // SPEC-7.134: no assignee skips the ticket entirely this tick, no milestone
+            // evaluated.
             let Some(assignee_id) = t.assigned_to_id else {
                 continue;
             };
 
+            // SPEC-7.135: first_response (breach and at-risk) is skipped once
+            // first_response_at is set; resolution has no such flag, always evaluated.
             let milestones = [
                 Milestone {
                     due: t.first_response_due,
@@ -151,12 +160,14 @@ impl SlaSweepWorker {
                 if m.satisfied {
                     continue;
                 }
+                // SPEC-7.136: a milestone with due = NULL is skipped,
+                // performing no evaluation.
                 let Some(due) = m.due else {
                     continue;
                 };
 
-                // Breach takes precedence: once past due there is no
-                // point emitting the at-risk alert for the same field.
+                // SPEC-7.137: fires *_breached if now >= due, else *_at_risk if now >=
+                // due - sla_at_risk_lead, else no alert; breach takes precedence.
                 let (kind, event_type) = if now >= due {
                     (m.breached_kind, "sla.breached")
                 } else if now >= due - sla_at_risk_lead(t.created_at, due) {
@@ -178,10 +189,14 @@ impl SlaSweepWorker {
                     .service
                     .claim_sla_notification(t.tenant_id, t.id, kind)
                     .await?;
+                // SPEC-7.141: rows_affected() == 0 (already claimed by a prior tick or
+                // a racing worker) skips the dispatch for that milestone entirely.
                 if claimed == 0 {
                     continue;
                 }
 
+                // SPEC-7.144: dispatch context JSON includes recipient_user_id, ticket_id,
+                // kind, due (RFC3339), entity_type "ticket", and entity_id.
                 let context = json!({
                     "recipient_user_id": assignee_id.to_string(),
                     "ticket_id": t.id.to_string(),
@@ -201,11 +216,15 @@ impl SlaSweepWorker {
                 // set to exactly the tenant being processed for every
                 // per-tenant query. `from_trusted` is the sanctioned bridge for
                 // this DB-derived worker scope.
+                // SPEC-7.145: uses TenantId::from_trusted(t.tenant_id), a DB-derived
+                // (not user-input) value: the sanctioned trusted-construction use here.
                 match notifications
                     .dispatch(TenantId::from_trusted(t.tenant_id), event_type, &context)
                     .await
                 {
                     Ok(n) => {
+                        // SPEC-7.143: a successful dispatch logs at INFO with ticket_id,
+                        // kind and fanout (n); dispatched is incremented by n.
                         dispatched += n;
                         tracing::info!(
                             ticket_id = %t.id, %kind, fanout = n,
@@ -213,10 +232,8 @@ impl SlaSweepWorker {
                         );
                     }
                     Err(e) => {
-                        // The ledger row is already committed, so this
-                        // milestone will not be retried. Log loudly; a
-                        // missed heads-up is preferable to a tight retry
-                        // loop hammering the queue.
+                        // SPEC-7.142: the ledger row is already committed so this
+                        // milestone is not retried; logs loudly instead of retrying.
                         tracing::warn!(
                             ticket_id = %t.id, %kind, error = ?e,
                             "sla sweep dispatch failed; ledger row kept, milestone not retried",
@@ -235,6 +252,8 @@ impl Job for SlaSweepWorker {
         "sla_sweep"
     }
 
+    // SPEC-7.146: logs at INFO with field `dispatched` only when dispatched > 0; a
+    // zero-dispatch tick logs nothing beyond the per-tick tracing span.
     async fn run(&self) -> AppResult<()> {
         let dispatched = self.run_tick().await?;
         if dispatched > 0 {
