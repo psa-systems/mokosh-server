@@ -91,3 +91,32 @@ already implements most of what phases 5 and 8 add here.
 
 The status contract is versioned and defined once, in BUNYIP-634. All three applications serve the same shape, so
 Bunyip can show them on one page and a discrepancy is visible without anyone knowing to go looking for it.
+
+## Specification
+
+Epic: [PMS-1592](https://youtrack.a8n.run/issue/PMS-1592).
+
+### Why
+
+`docs/specification.md` was prose with no requirement ids, and nothing in the source tree cited it, so a reader
+had no way to tell a described behavior from an undescribed one, or a requirement from the code that satisfies
+it. The fix is a numbered, normative requirement set with a `// SPEC-<section>.<n>` comment at every implementing
+site, built one module group at a time so each PR stays small enough to read in full.
+
+### Sequencing
+
+Each phase owns its own sections of `docs/specification.md` and its own slice of the source tree, so the phases
+can land in any order without colliding on content; only this file and `CLAUDE.md`'s one-line pointer to the
+specification are shared.
+
+1. [PMS-1593](https://youtrack.a8n.run/issue/PMS-1593): sections 1-2, foundation and server core.
+2. [PMS-1594](https://youtrack.a8n.run/issue/PMS-1594): section 3, providers and secrets.
+3. [PMS-1595](https://youtrack.a8n.run/issue/PMS-1595): section 4, utilities, PDF and wire types.
+4. [PMS-1596](https://youtrack.a8n.run/issue/PMS-1596): section 5, identity, tenancy and audit.
+5. [PMS-1597](https://youtrack.a8n.run/issue/PMS-1597): section 6, billing and time.
+6. [PMS-1598](https://youtrack.a8n.run/issue/PMS-1598): section 7, service desk.
+7. [PMS-1599](https://youtrack.a8n.run/issue/PMS-1599): section 8, remaining modules.
+8. [PMS-1600](https://youtrack.a8n.run/issue/PMS-1600): section 9, data model and migrations. Done.
+9. [PMS-1601](https://youtrack.a8n.run/issue/PMS-1601): section 10, build, CI and deployment.
+10. [PMS-1602](https://youtrack.a8n.run/issue/PMS-1602): section 11, the cross-cutting index, sequenced last
+    because it is the only phase that reads every other section's final id range.

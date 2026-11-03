@@ -57,6 +57,7 @@ const TEMPLATE_SELECT: &str = "
 /// PMS-683: every query runs inside `Database::begin_with_tenant`, which sets
 /// the `app.current_tenant` GUC transaction-locally, so `ticket_templates` is
 /// safe under the fail-closed `tenant_isolation` RLS policy (migration 095).
+// SPEC-7.64: every TicketTemplatesService method opens its own Database::begin_with_tenant(tenant_id) transaction (PMS-683), never sharing the caller's.
 #[derive(Clone)]
 pub struct TicketTemplatesService {
     db: Database,
@@ -70,6 +71,7 @@ impl TicketTemplatesService {
     /// List templates for the tenant. When `active_only` is true the
     /// list is narrowed to the picker's view (active templates only);
     /// the admin management screen passes false to see retired ones.
+    // SPEC-7.66: list orders results by name ASC and applies the active_only filter only when the caller passes true; false (the admin default) returns retired templates too.
     pub async fn list(
         &self,
         tenant_id: Uuid,
@@ -113,6 +115,7 @@ impl TicketTemplatesService {
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?
+            // SPEC-7.63: get/update/delete all return 404 with the exact literal "Ticket template" when the row is absent or belongs to another tenant.
             .ok_or(AppError::NotFound("Ticket template".into()))?;
         if row.created_by_name.is_none() {
             crate::utils::unresolved_person::log_unresolved_person_names(
@@ -123,6 +126,7 @@ impl TicketTemplatesService {
         Ok(row.into())
     }
 
+    // SPEC-7.67: create INSERTs and commits, then re-fetches the row through get() rather than relying on RETURNING to build the response.
     pub async fn create(
         &self,
         tenant_id: Uuid,
@@ -157,6 +161,7 @@ impl TicketTemplatesService {
     /// can express "clear this FK" (explicit JSON null) distinctly from
     /// "leave it" (key absent). Returns 404 if the row is absent or
     /// belongs to another tenant.
+    // SPEC-7.65: update does a read-modify-write, merging each field via unwrap_or(current.field) before issuing one full UPDATE of every column.
     pub async fn update(
         &self,
         tenant_id: Uuid,

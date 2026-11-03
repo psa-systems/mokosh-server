@@ -23,6 +23,9 @@ use axum::{Json, Router};
 /// inherits the shared middleware stack (error envelope, CORS) without
 /// picking up the request-authentication middleware every authenticated
 /// endpoint needs.
+// SPEC-3.75: GET /api/v1/providers is mounted unauthenticated, as a
+// peer of /version and /health, by design, and does nothing beyond
+// collect() then summarize() then serializing the result.
 pub fn provider_public_summary_routes() -> Router {
     Router::new().route("/providers", get(public_summary))
 }

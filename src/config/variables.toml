@@ -1,3 +1,5 @@
+# SPEC-1 and 2.148: documentation data for scripts/config-docs.nu, not read by declare_keys! or any
+# Rust code; it carries since/required/changelog facts for variables read outside the registry.
 # Release facts `declare_keys!` cannot carry (PMS-1442); `just config-docs` renders them.
 # [[variable]]: read outside crate::config::get; `required` = boot refuses it outside dev/test.
 
@@ -24,6 +26,24 @@ name = "APP_SECRET_BACKEND"
 since = "v0.16.0"
 required = false
 reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "BUNYIP_SECRETS_URL"
+since = "v0.18.0"
+required = false
+reader = "src/app_secrets/bunyip.rs"
+
+[[variable]]
+name = "BUNYIP_SECRETS_CLIENT_ID"
+since = "v0.18.0"
+required = false
+reader = "src/app_secrets/bunyip.rs"
+
+[[variable]]
+name = "BUNYIP_SECRETS_CLIENT_SECRET"
+since = "v0.18.0"
+required = false
+reader = "src/app_secrets/bunyip.rs"
 
 [[variable]]
 name = "GOOGLE_CONTACTS_CLIENT_ID"
@@ -467,3 +487,10 @@ variables = ["JWT_SECRET", "ENCRYPTION_KEY"]
 issue = "PMS-499"
 breaking = "wont-start"
 action = "Now required outside dev/test: boot refuses an unset value or the built-in dev value. Set a real secret before restarting."
+
+[[change]]
+release = "v0.18.0"
+group = "Added"
+variables = ["BUNYIP_SECRETS_URL", "BUNYIP_SECRETS_CLIENT_ID", "BUNYIP_SECRETS_CLIENT_SECRET"]
+issue = "PMS-1537"
+action = "Optional, and set together or not at all. A hosted deployment points these at bunyip's host-secrets route and the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is then read from there instead of from this deployment's own provider: an operator sets it once in bunyip under Admin > Mokosh. A URL with only one half of the credential refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says."

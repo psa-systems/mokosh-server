@@ -18,21 +18,25 @@ pub struct EmailIntakeRequest {
     /// (the surrounding `<...>` is preserved verbatim so the gateway
     /// does not have to normalise). Used as the dedup key on
     /// (tenant_id, email_message_id).
+    // SPEC-7.309: message_id must be 1-255 chars; the <...> wrapper is preserved verbatim.
     #[validate(length(min = 1, max = 255))]
     pub message_id: String,
     /// From: address (mailbox, no display name). Lowercased at the
     /// service boundary before the contact lookup so casing in the
     /// header does not produce a miss.
+    // SPEC-7.310: from_email must be a syntactically valid email address of at most 254 chars.
     #[validate(email, length(max = 254))]
     pub from_email: String,
     /// Optional From: display name. Not used for contact matching;
     /// passed through onto the ticket's description prologue so the
     /// agent reading the ticket sees who sent it without an extra
     /// header lookup.
+    // SPEC-7.311: from_name, when present, must be at most 200 chars.
     #[validate(length(max = 200))]
     pub from_name: Option<String>,
     /// Subject: header, becomes the ticket title. RFC 2047 decoding
     /// is the gateway's job; we treat it as opaque text.
+    // SPEC-7.312: subject must be 1-500 chars and becomes the created ticket's title verbatim.
     #[validate(length(min = 1, max = 500))]
     pub subject: String,
     /// text/plain body. Becomes the ticket description.
@@ -40,6 +44,7 @@ pub struct EmailIntakeRequest {
     /// text/html body. Currently ignored by Phase 1 (description
     /// stays plaintext); Phase 2 will store it in the audit log so
     /// rich-text replies are preserved.
+    // SPEC-7.313: body_html is never used to build the ticket description or the reply comment content; only body_text feeds those paths.
     #[allow(dead_code)]
     pub body_html: Option<String>,
     /// Concatenation of `In-Reply-To` + `References` headers. If any
@@ -47,11 +52,13 @@ pub struct EmailIntakeRequest {
     /// treats this as a reply and (PMS-469) appends the body to that
     /// ticket as a `note_type='public'` row attributed to the
     /// matched sender contact.
+    // SPEC-7.314: references defaults to an empty list when omitted; it is the concatenation of In-Reply-To + References header values.
     #[serde(default)]
     pub references: Vec<String>,
     /// PMS-469: structured header bag persisted into `email_intake_log`
     /// for debugging. Treated as opaque JSON; the gateway can ship
     /// whatever subset is convenient. Defaults to `{}` when absent.
+    // SPEC-7.315: raw_headers defaults to {} when absent from the payload.
     #[serde(default = "default_empty_object")]
     pub raw_headers: RawHeaders,
     /// PMS-450 AC3: inbound MIME attachments. The gateway decodes the
@@ -60,6 +67,7 @@ pub struct EmailIntakeRequest {
     /// note on a threading hit) via the shared `ticket_attachments`
     /// blob path. Defaults to an empty list; a body with no attachments
     /// is unchanged from the Phase 1 shape.
+    // SPEC-7.316: attachments defaults to an empty list when absent; each element is nested-validated and req.validate() rejects the whole request if any entry fails its own constraints.
     #[serde(default)]
     #[validate(nested)]
     pub attachments: Vec<EmailIntakeAttachment>,
@@ -74,6 +82,7 @@ pub struct EmailIntakeAttachment {
     /// Original filename from the MIME part's `Content-Disposition`.
     /// Sanitised again at the storage boundary, so a hostile name
     /// cannot escape the per-tenant directory.
+    // SPEC-7.353: file_name must be 1-255 chars; mime_type, if present, at most 100 chars; content_base64 must be non-empty.
     #[validate(length(min = 1, max = 255))]
     pub file_name: String,
     /// MIME type from the part's `Content-Type`. Optional; the storage
@@ -120,6 +129,7 @@ pub struct EmailIntakeResponse {
     /// effort: a part that fails to decode or exceeds the size cap is
     /// skipped and not counted, so this can be less than the number of
     /// `attachments` the gateway sent.
+    // SPEC-7.358: attachments_stored equals the count of attachments actually persisted, which can be less than req.attachments.len() when a part was skipped, and is never greater.
     #[serde(default)]
     pub attachments_stored: u32,
 }
@@ -161,6 +171,7 @@ pub struct CreateIntakeTokenRequest {
     /// with 400 so an admin does not silently create a never-used
     /// token. The column is VARCHAR(50) so future surfaces
     /// (rmm-intake, billing-webhook) can land without a migration.
+    // SPEC-7.368: POST /intake-tokens validates kind (1-50 chars) and label (1-200 chars) before the service is called.
     #[validate(length(min = 1, max = 50))]
     pub kind: String,
     /// Operator-facing label ("Cloudron mail hook", "Helpdesk inbox
@@ -176,6 +187,7 @@ pub struct CreateIntakeTokenRequest {
 /// SHA-256 hash is stored on the DB and the list endpoint surfaces
 /// metadata, not the secret. A subsequent GET on the same id will
 /// have no `token` field at all (see `IntakeTokenResponse`).
+// SPEC-7.371: the plaintext token is present on this response exactly once; IntakeTokenResponse (list/get) has no token field.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreatedIntakeTokenResponse {
     /// The row metadata, same shape as the list endpoint returns.
