@@ -5,6 +5,7 @@ pub mod attachments;
 
 pub mod mentions;
 pub mod models;
+pub mod render;
 pub mod routes;
 pub mod service;
 

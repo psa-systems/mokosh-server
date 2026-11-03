@@ -159,6 +159,7 @@ pub struct UserAvailabilityResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct AvailabilityWindow {
+    // SPEC-7.398: day_of_week must be in [0,6]; violating it fails request validation before the service is called.
     #[validate(range(min = 0, max = 6))]
     pub day_of_week: i32,
     pub start_time: NaiveTime,
@@ -333,10 +334,12 @@ pub struct SchedulingTemplateResponse {
 pub struct CreateSchedulingTemplateRequest {
     #[validate(length(min = 1, max = 100))]
     pub name: String,
+    // SPEC-7.406: kind must be one of the values accepted by validate_scheduling_template_kind ("dispatch" | "calendar").
     #[validate(custom(function = crate::utils::validation::validate_scheduling_template_kind))]
     pub kind: String,
     #[serde(default = "default_other")]
     pub appointment_type: String,
+    // SPEC-7.407: duration_minutes must be >= 1; travel_before_minutes / travel_after_minutes must be >= 0.
     #[validate(range(min = 1))]
     pub duration_minutes: i32,
     #[serde(default)]
@@ -358,9 +361,11 @@ pub struct CreateSchedulingTemplateRequest {
 pub struct UpdateSchedulingTemplateRequest {
     #[validate(length(min = 1, max = 100))]
     pub name: Option<String>,
+    // SPEC-7.406: kind must be one of the values accepted by validate_scheduling_template_kind ("dispatch" | "calendar").
     #[validate(custom(function = crate::utils::validation::validate_scheduling_template_kind))]
     pub kind: Option<String>,
     pub appointment_type: Option<String>,
+    // SPEC-7.407: duration_minutes must be >= 1; travel_before_minutes / travel_after_minutes must be >= 0.
     #[validate(range(min = 1))]
     pub duration_minutes: Option<i32>,
     #[validate(range(min = 0))]

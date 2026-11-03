@@ -664,3 +664,280 @@ async fn an_item_that_never_billed_does_not_start(pool: PgPool) {
         "none of these was billing before and none of them starts"
     );
 }
+
+/// PMS-1572: the run rolls the previous period's unused prepaid hours into
+/// the period it is opening.
+///
+/// Rollover existed and worked since PMS-64 and had no caller, so
+/// `rollover_enabled` on a contract item did nothing at run time. The period
+/// close is where it belongs, and this run is the only thing that knows when
+/// one happens.
+///
+/// Driven through the generator rather than by calling
+/// `roll_to_next_period` directly, because what was missing was never the
+/// function.
+async fn seed_block_item_with_rollover(
+    pool: &PgPool,
+    contract_id: Uuid,
+    included: Decimal,
+    max_rollover: Option<Decimal>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        // `billing_rule` left at the default `manual`, which is what
+        // `BillingRule::derive("block_hours")` answers: a block is an
+        // allotment, not a recurring charge.
+        r#"INSERT INTO contract_items
+           (id, tenant_id, contract_id, name, item_type, quantity, unit_price, total_price,
+            included_hours, overage_rate, rollover_enabled, max_rollover_hours)
+           VALUES ($1, $2, $3, 'Monthly Block', 'block_hours', 1, 0, 0, $4, 100, TRUE, $5)"#,
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contract_id)
+    .bind(included)
+    .bind(max_rollover)
+    .execute(pool)
+    .await
+    .expect("seed block item");
+    id
+}
+
+/// Seed the closing period's balance row directly: this suite is about the
+/// run, and `consume_hours` is covered in `suites::contracts`.
+async fn seed_balance(
+    pool: &PgPool,
+    contract_id: Uuid,
+    item_id: Uuid,
+    period: (NaiveDate, NaiveDate),
+    included: Decimal,
+    used: Decimal,
+) {
+    sqlx::query(
+        r#"INSERT INTO contract_hour_balances
+           (id, tenant_id, contract_id, contract_item_id, period_start, period_end,
+            hours_included, hours_used, hours_remaining, rollover_hours)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0)"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contract_id)
+    .bind(item_id)
+    .bind(period.0)
+    .bind(period.1)
+    .bind(included)
+    .bind(used)
+    .bind(included - used)
+    .execute(pool)
+    .await
+    .expect("seed balance");
+}
+
+async fn balance_of(
+    pool: &PgPool,
+    contract_id: Uuid,
+    period_start: NaiveDate,
+) -> Option<(Decimal, Decimal, Decimal)> {
+    sqlx::query_as(
+        r#"SELECT hours_included, hours_remaining, rollover_hours
+           FROM contract_hour_balances
+           WHERE contract_id = $1 AND period_start = $2"#,
+    )
+    .bind(contract_id)
+    .bind(period_start)
+    .fetch_optional(pool)
+    .await
+    .expect("read the balance")
+}
+
+#[mokosh_test]
+async fn the_run_rolls_unused_prepaid_hours_into_the_opening_period(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let company = common::seed_company(&pool).await;
+    let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let contract = seed_contract(&pool, company, "monthly", start, None).await;
+    // A retainer line so the contract also bills, which is the common shape:
+    // a monthly fee beside the allotment it buys.
+    seed_recurring_item(
+        &pool,
+        contract,
+        "Retainer",
+        common::dec("1"),
+        common::dec("500"),
+        0,
+    )
+    .await;
+    let item =
+        seed_block_item_with_rollover(&pool, contract, common::dec("10"), Some(common::dec("3")))
+            .await;
+
+    // January: 10 included, 4 used, so 6 unused and the cap takes 3.
+    seed_balance(
+        &pool,
+        contract,
+        item,
+        (
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+        ),
+        common::dec("10"),
+        common::dec("4"),
+    )
+    .await;
+
+    let svc = BillingService::new(Database::from_pool(pool.clone()));
+    let ctx = AuditCtx::system(tenant);
+    let feb = Utc.with_ymd_and_hms(2026, 2, 10, 12, 0, 0).unwrap();
+    let created = svc
+        .generate_due_recurring_invoices(TenantId::from_trusted(tenant), feb, &ctx)
+        .await
+        .expect("generate");
+    assert_eq!(created.len(), 1, "February's retainer invoice");
+
+    let feb_start = NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+    let (included, remaining, rolled) = balance_of(&pool, contract, feb_start)
+        .await
+        .expect("February's balance row, created by the roll");
+    assert_eq!(included, common::dec("13"), "10 included plus 3 rolled");
+    assert_eq!(remaining, common::dec("13"));
+    assert_eq!(rolled, common::dec("3"), "6 unused, capped at 3");
+
+    // January is left as the record of January: what it held and what was
+    // drawn from it. The hours that rolled are recorded on February.
+    let (jan_included, jan_remaining, jan_rolled) = balance_of(&pool, contract, start)
+        .await
+        .expect("January's balance row");
+    assert_eq!(jan_included, common::dec("10"));
+    assert_eq!(jan_remaining, common::dec("6"));
+    assert_eq!(jan_rolled, common::dec("0"));
+
+    // The second run of the same period bills nothing again, and must not
+    // roll again either: February would otherwise climb to 16.
+    let created = svc
+        .generate_due_recurring_invoices(TenantId::from_trusted(tenant), feb, &ctx)
+        .await
+        .expect("generate again");
+    assert!(created.is_empty(), "the period was already billed");
+    let (included, remaining, rolled) = balance_of(&pool, contract, feb_start)
+        .await
+        .expect("February's balance row");
+    assert_eq!(included, common::dec("13"), "rolled once, not twice");
+    assert_eq!(remaining, common::dec("13"));
+    assert_eq!(rolled, common::dec("3"));
+}
+
+/// A contract whose only item is the block still rolls.
+///
+/// This is why the roll is in the run's loop and not inside
+/// `generate_one_recurring_invoice`: that returns early for a contract with
+/// nothing billable, and a prepaid block is exactly that, since
+/// `BillingRule::derive("block_hours")` is `manual`. Rollover is a property
+/// of the period closing, not of an invoice being produced, and this case is
+/// what says so.
+#[mokosh_test]
+async fn a_contract_that_bills_nothing_still_rolls(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let company = common::seed_company(&pool).await;
+    let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let contract = seed_contract(&pool, company, "monthly", start, None).await;
+    let item = seed_block_item_with_rollover(&pool, contract, common::dec("8"), None).await;
+    seed_balance(
+        &pool,
+        contract,
+        item,
+        (
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+        ),
+        common::dec("8"),
+        common::dec("2"),
+    )
+    .await;
+
+    let svc = BillingService::new(Database::from_pool(pool.clone()));
+    let ctx = AuditCtx::system(tenant);
+    let created = svc
+        .generate_due_recurring_invoices(
+            TenantId::from_trusted(tenant),
+            Utc.with_ymd_and_hms(2026, 2, 10, 12, 0, 0).unwrap(),
+            &ctx,
+        )
+        .await
+        .expect("generate");
+    assert!(
+        created.is_empty(),
+        "there is nothing on this contract to bill"
+    );
+
+    let (included, remaining, rolled) = balance_of(
+        &pool,
+        contract,
+        NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
+    )
+    .await
+    .expect("February's balance row, created by the roll alone");
+    // No cap, so all six unused hours carry.
+    assert_eq!(included, common::dec("14"));
+    assert_eq!(remaining, common::dec("14"));
+    assert_eq!(rolled, common::dec("6"));
+}
+
+/// A contract with rollover off gets no row minted for it.
+///
+/// The no-op path has to be a no-op all the way: a balance row for the next
+/// period would be a silent change of shape for every prepaid contract in
+/// the system, and `consume_hours` creating that row on first draw is what
+/// should keep doing it.
+#[mokosh_test]
+async fn rollover_off_leaves_the_next_period_untouched(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    let company = common::seed_company(&pool).await;
+    let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let contract = seed_contract(&pool, company, "monthly", start, None).await;
+    let item = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO contract_items
+           (id, tenant_id, contract_id, name, item_type, quantity, unit_price, total_price,
+            included_hours, overage_rate, rollover_enabled)
+           VALUES ($1, $2, $3, 'Block', 'block_hours', 1, 0, 0, 10, 100, FALSE)"#,
+    )
+    .bind(item)
+    .bind(tenant)
+    .bind(contract)
+    .execute(&pool)
+    .await
+    .expect("seed block item with rollover off");
+    seed_balance(
+        &pool,
+        contract,
+        item,
+        (
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+        ),
+        common::dec("10"),
+        common::dec("1"),
+    )
+    .await;
+
+    let svc = BillingService::new(Database::from_pool(pool.clone()));
+    let ctx = AuditCtx::system(tenant);
+    svc.generate_due_recurring_invoices(
+        TenantId::from_trusted(tenant),
+        Utc.with_ymd_and_hms(2026, 2, 10, 12, 0, 0).unwrap(),
+        &ctx,
+    )
+    .await
+    .expect("generate");
+
+    assert!(
+        balance_of(
+            &pool,
+            contract,
+            NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()
+        )
+        .await
+        .is_none(),
+        "rollover is off, so nothing about February exists yet"
+    );
+}

@@ -19,7 +19,7 @@
 //! So each entry names the subsystem that owns its connection, and
 //! [`IntegrationsService`](super::service::IntegrationsService) refuses
 //! `connect`, `disconnect` and a capability change for a provider whose home is
-//! still elsewhere, naming where it is configured and the issue that moves it.
+//! still elsewhere, naming where it is configured instead.
 //! No `integrations` row exists for such a provider at all, so the two tables
 //! cannot diverge in the meantime. PMS-1315 flips the remaining entry (Google)
 //! and backfills its rows in the same change.
@@ -53,18 +53,25 @@ use mokosh_types::integrations::{Capability, IntegrationProvider};
 /// Which subsystem owns whether a provider is connected for a tenant.
 ///
 /// Not a boolean, because the useful thing to say to an operator staring at the
-/// integrations page is WHERE to go instead, and the useful thing to say to the
-/// next reader is which issue moves it.
+/// integrations page is WHERE to go instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionHome {
     /// The `integrations` table. `connect` and `disconnect` here do the work.
     Integrations,
-    /// Another table, with its own settings surface. `table` is the table, and
-    /// `issue` is the issue that brings it under this subsystem.
+    /// Another table, with its own settings surface. `table` is the table and
+    /// `configured_at` is the page that owns the lifecycle.
+    ///
+    /// PMS-1315 carried a third field naming the issue that would bring the
+    /// connection under this subsystem. The three contact-sync providers were
+    /// the only entries that used it, and for them the answer turned out to be
+    /// "it does not move": connecting one is an OAuth round trip plus a label
+    /// selection, which is a flow with its own page, and the connected fact
+    /// belongs with the flow that creates it. So this says where the
+    /// connection lives and why nothing here changes it, with no issue
+    /// pointing at work nobody intends to do.
     Elsewhere {
         table: &'static str,
         configured_at: &'static str,
-        issue: &'static str,
     },
 }
 
@@ -174,11 +181,6 @@ pub const DEFAULT_POLL_INTERVAL_MINUTES: i32 = 15;
 /// The floor, mirroring the CHECK on `integrations.poll_interval_minutes`.
 pub const MIN_POLL_INTERVAL_MINUTES: i32 = 5;
 
-const POLLED: PollingSpec = PollingSpec {
-    default_minutes: DEFAULT_POLL_INTERVAL_MINUTES,
-    min_minutes: MIN_POLL_INTERVAL_MINUTES,
-};
-
 /// Whether there is anything behind a registry entry (MAPPS-1121).
 ///
 /// PMS-1310 built the capability model before the providers, which is a
@@ -243,8 +245,13 @@ impl ProviderDescriptor {
     ///
     /// A payment provider's credential, test/live mode and active toggle live
     /// entirely on `Settings > Payment Gateways`, and a second connect button
-    /// here on top of that is the redundancy MAPPS-1098 removed, so the four
-    /// per-provider routes still refuse it.
+    /// here on top of that is the redundancy MAPPS-1098 removed.
+    ///
+    /// PMS-1571: it now answers `false` for every entry, and the four
+    /// per-provider routes it gated are gone rather than refusing. What the
+    /// predicate still does is tell a client not to draw a control, and
+    /// decide whether those routes have to come back - see
+    /// [`tests::an_integration_home_provider_needs_the_per_provider_routes_back`].
     ///
     /// MAPPS-1122 split this from being LISTED. MAPPS-1098 used one predicate
     /// for both and dropped the payment providers out of `GET /integrations`
@@ -365,7 +372,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         description: "Hand the accounting over: QuickBooks issues the invoice the customer \
                       receives and holds what the MSP is billed for.",
         supported_capabilities: &[Capability::Invoicing, Capability::BillsAndExpenses],
-        polling: Some(POLLED),
+        polling: None,
         connection_home: ConnectionHome::Integrations,
         credential_home: CredentialHome::InvoiceIssuer,
         build: ProviderBuild::Built,
@@ -376,7 +383,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         description: "Hand the accounting over: Xero issues the invoice the customer \
                       receives and holds what the MSP is billed for.",
         supported_capabilities: &[Capability::Invoicing, Capability::BillsAndExpenses],
-        polling: Some(POLLED),
+        polling: None,
         connection_home: ConnectionHome::Integrations,
         credential_home: CredentialHome::InvoiceIssuer,
         build: ProviderBuild::Built,
@@ -387,11 +394,10 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         description: "Synchronise people and organisations with Google Contacts, so a \
                       directory the MSP already maintains is not maintained twice.",
         supported_capabilities: &[Capability::Contacts],
-        polling: Some(POLLED),
+        polling: None,
         connection_home: ConnectionHome::Elsewhere {
             table: "contact_sync_connections",
             configured_at: "Settings > Contact sync",
-            issue: "PMS-1315",
         },
         credential_home: CredentialHome::ContactSync,
         build: ProviderBuild::Built,
@@ -403,7 +409,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
                       the same bargain as Google against the directory most MSP customers \
                       are already on.",
         supported_capabilities: &[Capability::Contacts],
-        polling: Some(POLLED),
+        polling: None,
         // MAPPS-1121: this entry said the connection was made here, with a
         // credential pasted into the integrations page. MAPPS-1101 shipped the
         // real thing and it is the Entra consent round trip in `contact_sync`:
@@ -414,7 +420,6 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         connection_home: ConnectionHome::Elsewhere {
             table: "contact_sync_connections",
             configured_at: "Settings > Microsoft 365 Contacts",
-            issue: "MAPPS-1124",
         },
         credential_home: CredentialHome::ContactSync,
         build: ProviderBuild::Built,
@@ -425,7 +430,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         description: "Import contacts from an iCloud account over CardDAV, with an Apple ID \
                       and an app-specific password. Read-only: nothing is written back.",
         supported_capabilities: &[Capability::Contacts],
-        polling: Some(POLLED),
+        polling: None,
         // MAPPS-1122: listed so the panel can answer "what is this organization
         // connected to" for a source that has always had its own surface and
         // never had an entry here. Like Google and Microsoft 365, the
@@ -434,7 +439,6 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         connection_home: ConnectionHome::Elsewhere {
             table: "contact_sync_connections",
             configured_at: "Settings > iCloud Contacts",
-            issue: "PMS-1315",
         },
         credential_home: CredentialHome::ContactSync,
         build: ProviderBuild::Built,
@@ -593,6 +597,47 @@ mod tests {
                 entry.provider.as_str()
             );
         }
+    }
+
+    /// PMS-1571: the `Integration` home and the per-provider routes stand or
+    /// fall together.
+    ///
+    /// That home is the only one whose credential arrives in a connect
+    /// request, which is the only way `/integrations/{provider}/connect` can
+    /// connect anything. No entry carries it, so those four routes answered
+    /// 404 for every provider and were removed; `GET /integrations` stays,
+    /// because listing is not connecting.
+    ///
+    /// Asserted in both directions, because each direction is a real mistake.
+    /// An entry that takes this home with no route to serve it is a provider
+    /// an operator cannot connect anywhere. A route back with no entry taking
+    /// the home is what this ticket was filed about. The registry is still the
+    /// one place that decides; this is what makes deciding reach the HTTP
+    /// surface.
+    #[test]
+    fn an_integration_home_provider_needs_the_per_provider_routes_back() {
+        let home_taken = REGISTRY
+            .iter()
+            .any(|entry| matches!(entry.credential_home, CredentialHome::Integration));
+        // The leading quote is what distinguishes a mounted path from this
+        // file's prose about one: a `.route(...)` literal always opens with
+        // it, and the docs name the same paths in backticks.
+        let mounted = include_str!("routes.rs").contains("\"/integrations/{provider}");
+        assert_eq!(
+            home_taken,
+            mounted,
+            "{}",
+            if home_taken {
+                "a provider now takes CredentialHome::Integration, so its credential arrives in \
+                 a connect request and there is no route to send it to. Restore the four \
+                 per-provider routes in routes.rs (PMS-1571 removed them); the service methods \
+                 and request DTOs are still there."
+            } else {
+                "the per-provider routes are mounted and no entry takes \
+                 CredentialHome::Integration, so they answer 404 for every provider. That is \
+                 PMS-1571: either give a provider that home or take the routes out again."
+            }
+        );
     }
 
     /// MAPPS-1098: the two current payment providers (Stripe, PayPal) must

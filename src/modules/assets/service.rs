@@ -1052,12 +1052,62 @@ impl AssetsService {
 
         tx.commit().await?;
 
-        // Fetch each row through the standard `get_asset` so the
-        // response shape matches the single-POST result (company_name
-        // + assigned_user_name resolved via join).
+        // PMS-1517: fetch the full response set in one batched read instead
+        // of calling `get_asset` once per created row. The join shape
+        // mirrors `get_asset`'s and the predicate is `a.id = ANY($2)`,
+        // following the pattern PMS-806 and PMS-1499 already established.
+        // Postgres gives no row-order guarantee for `= ANY`, so the rows
+        // are keyed into a `HashMap` and emitted in `created_ids` order.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<AssetRow> = sqlx::query_as::<_, AssetRow>(
+            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
+                      a.company_id, co.name AS company_name,
+                      a.site_id, a.contact_id,
+                      NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
+                      a.status, a.manufacturer, a.model, a.serial_number,
+                      a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
+                      a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
+                      a.ip_address::text AS ip_address, a.hostname, a.mac_address,
+                      a.installed_date, a.department, a.in_transit_ticket_id,
+                      a.itil_lifecycle_stage,
+                      a.license_vendor, a.license_seat_count, a.license_expiry,
+                      a.tags, a.notes,
+                      a.created_at, a.updated_at
+               FROM assets a
+               LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
+               LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
+               LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
+               LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
+               WHERE a.tenant_id = $1 AND a.id = ANY($2)"#,
+        )
+        .bind(tenant_id)
+        .bind(&created_ids[..])
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let unresolved: Vec<Uuid> = rows
+            .iter()
+            .filter_map(|r| {
+                r.assigned_user_id
+                    .filter(|_| r.assigned_user_name.is_none())
+            })
+            .collect();
+        if !unresolved.is_empty() {
+            crate::utils::unresolved_person::log_unresolved_person_names(
+                "assets.bulk_create",
+                &unresolved,
+            );
+        }
+
+        let mut by_id: std::collections::HashMap<Uuid, AssetRow> =
+            rows.into_iter().map(|r| (r.id, r)).collect();
         let mut created = Vec::with_capacity(created_ids.len());
-        for id in created_ids {
-            created.push(self.get_asset(tenant_id, id).await?);
+        for id in &created_ids {
+            let row = by_id
+                .remove(id)
+                .ok_or_else(|| AppError::NotFound("Asset".to_string()))?;
+            created.push(row.into());
         }
         Ok(created)
     }
