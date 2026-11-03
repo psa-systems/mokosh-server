@@ -79,6 +79,26 @@ jobs:
           # immutability and is unrelated.
           submodules: true
 
+      - name: Detect routing-relevant changes
+        # PMS-1637: the mokosh-apps clone + route-consumers check below
+        # cost 5-15s on every PR but only matter when THIS repo changes
+        # a mounted route or the guard script itself. Gate both on an
+        # explicit git-diff against the base ref (fetch-depth: 0 above
+        # makes origin/<base> reachable). A PR that touches none of
+        # these paths skips both; one that touches any of them runs
+        # them. Grep over --name-only rather than a path-filter action:
+        # no new dependency and the pattern is reviewable in place.
+        id: routes
+        run: |
+          set -euo pipefail
+          base="origin/${{ github.base_ref }}"
+          if git diff --name-only "$base...HEAD" \
+               | grep --quiet -E '^(src/modules/[^/]+/.*\.rs|src/api/router\.rs|scripts/check-route-consumers\.nu)$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Clone the mokosh-apps sibling
         # check-route-consumers.nu compares mounted routes against the SPA
         # source. Without this checkout the guard skips loudly and drift
@@ -86,6 +106,7 @@ jobs:
         # token: the runner's own credentials are scoped to mokosh-server,
         # so a bare checkout stalls at "Determining the default branch"
         # rather than reading anything from psa-systems/mokosh-apps.
+        if: steps.routes.outputs.run == 'true'
         uses: https://code.forgejo.org/actions/checkout@v5
         with:
           repository: psa-systems/mokosh-apps
@@ -345,7 +366,10 @@ jobs:
         # Every mounted route needs an SPA caller or a dated parity record.
         # The mokosh-apps sibling checkout above supplies the SPA source;
         # MOKOSH_APPS_DIR points the script at it, and the script itself
-        # fails rather than skips when CI is set.
+        # fails rather than skips when CI is set. PMS-1637: gated on the
+        # same change-detection step that gates the sibling checkout, so
+        # a PR touching nothing route-shaped skips both halves.
+        if: steps.routes.outputs.run == 'true'
         shell: nu {0}
         env:
           MOKOSH_APPS_DIR: mokosh-apps
