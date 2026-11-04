@@ -111,6 +111,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const DROP_ATTEMPTS: u32 = 60;
 const DROP_RETRY_DELAY: Duration = Duration::from_millis(50);
 
+// A peer's clone briefly holds the template, so Postgres returns 55006 ("source
+// database is being accessed by other users") under concurrent shards; wait and
+// retry rather than failing the test outright.
+const CLONE_RETRY_ATTEMPTS: u32 = 3;
+const CLONE_RETRY_DELAY: Duration = Duration::from_millis(100);
+
 /// A database cloned from the template, owned by one test.
 pub struct TestDatabase {
     name: String,
@@ -230,10 +236,20 @@ pub async fn acquire(test_path: &str) -> TestDatabase {
     let mut admin = PgConnection::connect(&admin_url)
         .await
         .expect("connect to the maintenance database");
-    admin
-        .execute(format!(r#"CREATE DATABASE "{name}" TEMPLATE "{template}""#).as_str())
-        .await
-        .unwrap_or_else(|e| panic!("clone {name} from template {template}: {e}"));
+    let stmt = format!(r#"CREATE DATABASE "{name}" TEMPLATE "{template}""#);
+    let mut attempt: u32 = 0;
+    loop {
+        match admin.execute(stmt.as_str()).await {
+            Ok(_) => break,
+            Err(sqlx::Error::Database(e))
+                if e.code().as_deref() == Some("55006") && attempt + 1 < CLONE_RETRY_ATTEMPTS =>
+            {
+                tokio::time::sleep(CLONE_RETRY_DELAY * (1u32 << attempt)).await;
+                attempt += 1;
+            }
+            Err(e) => panic!("clone {name} from template {template}: {e}"),
+        }
+    }
     drop(admin);
 
     let pool = PgPoolOptions::new()
