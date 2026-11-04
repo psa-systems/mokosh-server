@@ -200,8 +200,8 @@ async fn evaluate_for_ticket_uses_business_hours(pool: PgPool) {
     sqlx::query(
         r#"INSERT INTO tickets
            (id, tenant_id, ticket_number, title, status_id, priority_id, queue_id,
-            company_id, sla_id, created_by_id, created_at)
-           VALUES ($1, $2, 'PMS-106-1', 'Friday late ticket', $3, $4, $5, $6, $7, $8,
+            company_id, sla_id, sla_id_explicit, created_by_id, created_at)
+           VALUES ($1, $2, 'PMS-106-1', 'Friday late ticket', $3, $4, $5, $6, $7, TRUE, $8,
                    '2026-06-05T20:00:00Z')"#,
     )
     .bind(ticket_id)
