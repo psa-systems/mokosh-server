@@ -40,6 +40,16 @@ on:
         type: string
         default: ""
 
+# PMS-1633: collapse back-to-back main pushes (only the newest :latest matters)
+# but NEVER cancel a tag build. Each v* tag maps to one commit whose published
+# image is required, and a cancelled tag run leaves the registry missing that
+# version. Group includes the ref so tag runs are already isolated into their
+# own groups; gating cancel-in-progress on the ref kind is a belt-and-braces
+# second guard against a future group-key change silently taking tags with it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   build-and-push:
     name: Build and push mokosh-server image
@@ -144,12 +154,15 @@ jobs:
           print $"git_hash=($git_hash) git_describe=($git_describe) build_date=($build_date)"
 
       - name: Set up buildx builder
-        # The `docker-container` driver is required for any cache export;
-        # the default `docker` driver only carries inline metadata, which
-        # misses the dependency-build layer ("OCI build workflow" in CI.md of
-        # dev.a8n.run/niceguyit/governance, GOV-20; not a file in this
-        # repository).
-        run: docker buildx create --name container-builder --driver docker-container --use
+        # PMS-1638: delegate to the shared composite in common/.forgejo/
+        # actions/setup-buildx (idempotent create-or-reuse, per-job naming,
+        # bootstrap retry on a slow BuildKit). The `docker-container`
+        # driver is required for any cache export (`type=gha,mode=max`);
+        # the default `docker` driver only carries inline metadata and
+        # misses the dependency-build layer (GOV-20).
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/setup-buildx@main
+        with:
+          name: build-oci-image
 
       - name: Export Actions runtime env for buildx gha cache
         # A raw `docker buildx build` (unlike docker/build-push-action) does
