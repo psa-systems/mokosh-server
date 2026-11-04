@@ -11,7 +11,7 @@ Mokosh Server: PSA (Professional Services Automation) REST API for MSPs. Rust + 
 
 ## Common commands
 
-All driven through `just` (see `justfile`). Required tooling: `just`, Nushell `0.112.2`, Docker + Compose v2, Rust `1.98.1` (the exact patch `rust-toolchain.toml` pins, so rustfmt and clippy match CI), `sqlx-cli` for migrations, `cargo-machete` for the unused-dependency gate (`cargo install --locked cargo-machete`).
+All driven through `just` (see `justfile`). Needs `just`, Nushell `0.112.2`, Docker + Compose v2, Rust `1.98.1` (the patch `rust-toolchain.toml` pins, so rustfmt and clippy match CI), `sqlx-cli`, and `cargo-machete` for the unused-dependency gate.
 
 ```
 just                       # list recipes
@@ -31,7 +31,7 @@ just check-config-docs     # docs/configuration.md matches the registry's since/
 just check-doc-links       # every relative Markdown link resolves to a path that exists
 just check-claude-md       # CLAUDE.md stays under 20,000 bytes and its docs/ links resolve (PMS-1437)
 just fmt                   # cargo fmt --all
-just test                  # cargo test --workspace --lib --bins (unit tests; the Postgres suite is test-integration, nextest-only per PMS-1523)
+just test                  # unit tests (the Postgres suite is test-integration, nextest-only per PMS-1523)
 just test-integration      # Postgres-backed tests/suites/*.rs suite (mirrors CI integration.yml)
 just install-hooks         # install the git pre-commit and pre-push hooks -> run `just pre-commit` and `just pre-push` (from common)
 just pre-commit            # fmt check plus check-tree-ownership only; the full suite moved to `just pre-push`
@@ -43,9 +43,9 @@ just check-docker          # validate OCI image builder stage (NOT part of `just
 just build-docker          # build production OCI image (oci-build/Dockerfile)
 ```
 
-`just check` and `just pre-push` are complements: together they cover `check.yml` except its doc tests. `pre-commit`, `pre-push`, `install-hooks` and `create-release` come from the `common` submodule, so a fresh clone runs `git submodule update --init` first. Details: [local vs CI checks](docs/dev-docs/local-vs-ci-checks.md#how-the-two-recipes-relate).
+`just check` and `just pre-push` together cover `check.yml` except its doc tests ([details](docs/dev-docs/local-vs-ci-checks.md#how-the-two-recipes-relate)). `pre-commit`, `pre-push`, `install-hooks` and `create-release` come from the `common` submodule, so a fresh clone runs `git submodule update --init` first.
 
-Adding a step to `check.yml` means adding the matching recipe to `just check` (or `just pre-push`), the row in that file, and its line in `docs/recipes.md`.
+A new `check.yml` step needs its recipe in `just check` or `just pre-push`, and its line in `docs/recipes.md`.
 
 Single test: `cargo test -p <crate> <test_name>` (workspace), e.g. `cargo test -p mokosh-server utils::totp::tests::rfc6238_vector`.
 
@@ -62,9 +62,9 @@ just dev-clean             # stop + wipe volumes + remove .env (keeps .env.infis
 just infisical-bootstrap   # one-time after `just dev-infisical`, fills INFISICAL_* in .env
 ```
 
-OIDC client registration recipes (`register-client`, etc.) were removed with mokosh-auth in PMS-295: bunyip is the sole OP and owns its own client registry, so RPs register with bunyip, not mokosh.
+The OIDC client-registration recipes went with mokosh-auth in PMS-295: bunyip is the sole OP and owns its client registry, so RPs register with bunyip.
 
-`just dev` rewrites `USER` in `.env` on each run, generates `.env` from `.env.example` once per clone (PMS-490), needs the external `network-traefik-public`, and runs as compose project `dev-mokosh-${USER}` (PMS-1281). Details: [dev stack notes](docs/internal.md#dev-stack-notes).
+`just dev` rewrites `USER` in `.env` each run, generates `.env` once per clone (PMS-490), needs the external `network-traefik-public`, and runs as project `dev-mokosh-${USER}` (PMS-1281). Details: [dev stack notes](docs/internal.md#dev-stack-notes).
 
 ## Architecture
 
@@ -74,19 +74,19 @@ OIDC client registration recipes (`register-client`, etc.) were removed with mok
 src/
   main.rs               mokosh-server entrypoint: AppConfig::from_env, build router
   lib.rs                library crate root
-  api/router.rs         create_api_router: builds every /api/v1 nest (see "Routing model"), wires middleware + CORS
-  app_secrets/          AppSecretProviderKind: application-tier secrets (database, file, env, Infisical), chosen by APP_SECRET_BACKEND (PMS-988, split from the tenant tier by PMS-1424)
+  api/router.rs         create_api_router: every /api/v1 nest, middleware, CORS
+  app_secrets/          AppSecretProviderKind: application-tier secrets, chosen by APP_SECRET_BACKEND (PMS-988, PMS-1424)
   bin/mokosh-bootstrap.rs CLI: bootstrap-infisical, qa-seed/qa-teardown, normalize-company-industries
-  cli/                  Operator subcommands mokosh-server dispatches before binding a port (PMS-494); providers.rs and verify.rs add the four provider subcommands (PMS-1012/1013)
+  cli/                  Operator subcommands dispatched before binding a port (PMS-494), the provider four included (PMS-1012/1013)
   config/               ConfigProvider: the declared key registry and the one configuration read path (PMS-982)
   db/                   Database wrapper around sqlx::PgPool
   infisical/            Infisical HTTP client + first-run bootstrap
   modules/<name>/       Feature modules (see "Modules" below)
   pdf/                  Document model, and the one place it becomes PDF bytes (PMS-876)
-  providers/status/     ProviderStatusReport: collects and renders which provider each capability kind is using; itself selected by no env var (PMS-989)
-  scheduler/            Registry for the interval background jobs (PMS-135); `one_shot` for work that runs once per process start (PMS-1320)
+  providers/status/     ProviderStatusReport: which provider each kind is using; itself selected by no env var (PMS-989)
+  scheduler/            The interval background jobs (PMS-135); `one_shot` runs once per process start (PMS-1320)
   secrets/              SecretProvider: database (default) or Infisical, chosen by SECRET_BACKEND (PMS-967)
-  storage/              File storage seam; the provider of record for STORAGE_ROOT (PMS-910); branding/ also reads it through the config seam for local-path assets
+  storage/              File storage seam; the provider of record for STORAGE_ROOT (PMS-910)
   utils/                error, email (Mailer trait + SmtpMailer/LogMailer), crypto, validation, pagination
   version.rs            VersionInfo (build-time git hash/describe via build.rs)
   version_check.rs      Opt-in self-hosted update check against MOKOSH_UPDATE_CHECK_URL (PMS-238)
@@ -97,12 +97,12 @@ oci-build/Dockerfile    Production multi-stage Alpine + musl
 Dockerfile              Dev image (debug build, source-mounted)
 compose.dev.yml         Traefik-routed dev stack (per-developer *.a8n.run)
 .forgejo/workflows/     CI (Forgejo)
-docs/                   Contributor/user docs; docs/dev-docs/ = internal notes (codebase-state.md = frozen 2026-05-06 route catalog)
+docs/                   Contributor/user docs; dev-docs/ = internal notes
 ```
 
 ### Auth: two independent mechanisms (PMS-295)
 
-Two parallel paths: bunyip `at+jwt` Bearers checked against bunyip's JWKS, and legacy HS256 Bearers on `user_sessions`. Both run the PMS-698 principal gate; a caller's own tenant comes from membership state, never a claim (PMS-244). [Full text](docs/architecture.md#auth-two-independent-mechanisms-pms-295).
+Two parallel paths: bunyip `at+jwt` Bearers against bunyip's JWKS, and legacy HS256 Bearers on `user_sessions`. Both run the PMS-698 principal gate; a caller's tenant comes from membership state, never a claim (PMS-244). [Full text](docs/architecture.md#auth-two-independent-mechanisms-pms-295).
 
 ### The contact plane is a third, fully separate identity plane
 
@@ -110,16 +110,9 @@ A contact (`contacts` row) owns its credential lifecycle on `/api/v1/contact/*` 
 
 ### Providers (PMS-1009)
 
-[`docs/providers.md`](docs/providers.md) is the contract for every selectable-implementation seam: the kinds, the
-three tiers, where each is configured, priority, the four boot classifications, refresh, and migrate-verify-purge.
-Read it before adding a seam or a second implementation of one. `src/config/`, `src/secrets/` and `src/storage/`
-follow it; application secrets, authentication and email do not yet ([`docs/ROADMAP.md`](docs/ROADMAP.md) sequences
-them).
+[`docs/providers.md`](docs/providers.md) is the contract for every selectable-implementation seam. Read it before adding a seam or a second implementation of one. `src/config/`, `src/secrets/` and `src/storage/` follow it; application secrets, authentication and email do not yet ([`docs/ROADMAP.md`](docs/ROADMAP.md) sequences them).
 
-Two rules from it bind any change here. Provider enablement is bootstrap configuration, never served by a provider,
-because configuration that locates configuration cannot live inside what it locates. And a key read outside its
-provider is the defect the model exists to prevent: Bunyip had a working Infisical client and still served secrets
-from the database, because nothing forced the read through the seam.
+Two of its rules bind any change here: provider enablement is bootstrap configuration, never served by a provider, and a key read outside its provider is the defect the model exists to prevent.
 
 ### Routing model
 
@@ -127,15 +120,15 @@ from the database, because nothing forced the read through the seam.
 
 ### Multi-tenancy
 
-No middleware-level tenant scoping: every service method takes a `TenantId` whose constructor is reachable only through `CurrentUser::tenant()`, so a handler that forgets the caller's tenant does not compile. `TenantId::from_trusted` is the listed escape hatch for the paths whose scope is not a session claim. [Full text](docs/architecture.md#multi-tenancy).
+No middleware-level tenant scoping: every service method takes a `TenantId` whose constructor is reachable only through `CurrentUser::tenant()`, so a handler that forgets the caller's tenant does not compile. `TenantId::from_trusted` is the listed escape hatch. [Full text](docs/architecture.md#multi-tenancy).
 
 ### Migrations
 
-Embedded via `sqlx::migrate!` and run at startup. Committed migrations are immutable; guarded content UPDATEs assert row counts (PMS-1117); a GRANTed role must exist in tests (PMS-988); a new table is granted to `mokosh_app` (PMS-1265). [Full text](docs/architecture.md#migration-rules).
+Embedded via `sqlx::migrate!`, run at startup. Committed migrations are immutable; guarded content UPDATEs assert row counts (PMS-1117); a GRANTed role must exist in tests (PMS-988); a new table is granted to `mokosh_app` (PMS-1265). [Full text](docs/architecture.md#migration-rules).
 
 ### Module status
 
-Around thirty modules are mounted and the 501 placeholder mechanism is gone; the schema is still ahead of the handler layer in places. `docs/dev-docs/codebase-state.md` is a frozen 2026-05-06 snapshot (PMS-849), not a current status: read `src/api/router.rs` and the Routing model list for what is mounted. [Full text](docs/architecture.md#module-status).
+Around thirty modules are mounted, the 501 placeholder mechanism is gone, and the schema is still ahead of the handler layer in places. `docs/dev-docs/codebase-state.md` is a frozen 2026-05-06 snapshot (PMS-849), not a status: read `src/api/router.rs` for what is mounted. [Full text](docs/architecture.md#module-status).
 
 ## Conventions specific to this repo
 
@@ -234,6 +227,7 @@ One line per rule, or per group of rules answering one subject, linking its full
 
 - A KB version records who, what kind and why ([PMS-1126](docs/invariants/kb.md#versions-pms-1126))
 - KB comments are staff-only ([PMS-1128, PMS-1129, PMS-1130](docs/invariants/kb.md#comments-pms-1128-pms-1129-pms-1130))
+- Templated articles render dual-plane, validated server-side ([PMS-1450](docs/invariants/kb.md#template-rendering-pms-1450))
 
 ### Contacts and mail
 
