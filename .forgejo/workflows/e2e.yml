@@ -120,10 +120,16 @@ jobs:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
         with:
-          # wait-for-deploy.mjs walks `git log` from GITHUB_SHA back to the
-          # most recent commit that touched a build-trigger path. A shallow
-          # clone would stop at depth 1 and the walk would miss or fail.
-          fetch-depth: 0
+          # PMS-1636: full history only on the paths that actually need it.
+          # `wait-for-deploy.mjs` (push + staging dispatch) walks `git log`
+          # from GITHUB_SHA back to the most recent commit touching a
+          # build-trigger path; a shallow clone would stop at depth 1 and
+          # the walk would miss or fail. The pull_request and production
+          # dispatch paths run `health-check.mjs` instead, which hits
+          # `/api/v1/health` and does not touch git log. Keep this
+          # expression in step with the `if:` on the Wait-for-deploy step
+          # below.
+          fetch-depth: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')) && 0 || 1 }}
 
       # No Node setup step: the opensuse-dev runner image (PMS-423) ships
       # nodejs24 and bun, so the runtime is already on disk. Using the
