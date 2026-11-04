@@ -1870,7 +1870,7 @@ Polled providers: default 15 minutes, floor 5.
 
 ### knowledge_base
 
-**Purpose.** Staff knowledge base: categories, articles with monotonic versions, per-user drafts, one-level client-specific variants, template variables, votes, inline images, staff-only threaded comments with mentions and anchors, plus a published read slice for portal contacts. Files: `src/modules/knowledge_base/{routes,service,models,attachments,attachment_move,render,mentions,anchor}.rs`. Rules for versions and comments are in [KB invariants](invariants/kb.md).
+**Purpose.** Staff knowledge base: categories, articles with monotonic versions, per-user drafts, one-level client-specific variants, template variables, votes, inline images, staff-only threaded comments with mentions and anchors, plus a published read slice for portal contacts. Files: `src/modules/knowledge_base/{routes,service,models,attachments,attachment_move,render,mentions,anchor}.rs`. Rules for versions, comments and template rendering are in [KB invariants](invariants/kb.md).
 
 **Data model** (`012`, `026`, `032`, `068`, `099`, `114`, `115`, `200`, `201`, `202`, `251`, `292`):
 - `kb_categories`: `name` (1-100), `slug` (1-100), `parent_id`, `visibility` CHECK in (`public`,`internal`,`client_specific`) default `internal`, `sort_order`; UNIQUE `(tenant_id, slug)`.
