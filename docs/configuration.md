@@ -200,8 +200,8 @@ No configuration changes.
 | <a id="var-config-providers"></a>`CONFIG_PROVIDERS` | no, default the hosting profile's provider | v0.14.0 | `.env` | Comma-separated priority list of configuration providers, e.g. `file,database,environment`. Today it powers the `provider-status`, `provider-migrate` and `provider-purge` subcommands (PMS-1012); request-serving reads still go through `CONFIG_BACKEND`. |
 | <a id="var-config-file-dir"></a>`CONFIG_FILE_DIR` | no, unset disables the file provider | v0.14.0 | `.env` | Directory the file configuration provider reads, one file per key. |
 | <a id="var-bunyip-config-url"></a>`BUNYIP_CONFIG_URL` | no, unset disables the Bunyip provider | v0.14.0 | `.env` | Base URL of the Bunyip API the Bunyip configuration provider reads. |
-| <a id="var-bunyip-config-client-id"></a>`BUNYIP_CONFIG_CLIENT_ID` | no, needed only with `BUNYIP_CONFIG_URL` | v0.14.0 | `.env` | Machine-credential client id for Bunyip's `POST /v1/oauth2/token`. |
-| <a id="var-bunyip-config-client-secret"></a>`BUNYIP_CONFIG_CLIENT_SECRET` | no, needed only with `BUNYIP_CONFIG_URL` | v0.14.0 | `.env` | Machine-credential client secret for the same token call. |
+| <a id="var-bunyip-config-client-id"></a>`BUNYIP_CONFIG_CLIENT_ID` | no, needed only with `BUNYIP_CONFIG_URL` | v0.14.0 | `.env` | Machine-credential client id this deployment presents to Bunyip's `GET /v1/host/config/{KEY}`, as HTTP Basic. |
+| <a id="var-bunyip-config-client-secret"></a>`BUNYIP_CONFIG_CLIENT_SECRET` | no, needed only with `BUNYIP_CONFIG_URL` | v0.14.0 | `.env` | Machine-credential client secret for the same HTTP Basic credential. |
 
 ### Server and public URLs
 
