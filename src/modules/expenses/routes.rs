@@ -28,18 +28,13 @@
 //! `/settings/vendors`, `/settings/expense-categories` and `/bills` in
 //! mokosh-apps (MAPPS-1157), so the record that exempted them is gone.
 //!
-//! parity record 2026-10-26 (PMS-1534): the six expense-claim paths below
-//! have no SPA caller yet. MAPPS-1163 builds it; MAPPS-1157 shipped the
-//! rest of this module's surfaces and left claims out deliberately,
-//! because a claim from a person has a submitter and an approver where a
-//! bill has neither. The MAPPS-1083 recorded-exemption rule matches each
-//! path literally, so each one gets its own line:
-//! - /expenses
-//! - /expenses/{id}
-//! - /expenses/{id}/submit
-//! - /expenses/{id}/approve
-//! - /expenses/{id}/reject
-//! - /expenses/{id}/reimburse
+//! The claim routes are called by `/expenses` in mokosh-apps
+//! (MAPPS-1163), so the record that exempted them is gone with them.
+//!
+//! The payment routes are called by `/bills/{id}` in mokosh-apps
+//! (MAPPS-1166), so the last record in this file is gone too: every route
+//! it mounts now has a caller, and `check-route-consumers` checks them
+//! all again.
 
 use std::sync::Arc;
 
@@ -52,12 +47,15 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::service::{
-    BillWithLines, CreateBillRequest, CreateExpenseRequest, ExpenseCategoryResponse,
-    ExpenseWithLines, ExpensesService, UpsertExpenseCategoryRequest, UpsertVendorRequest,
+    BillWithLines, BillWithPayments, CreateBillRequest, CreateExpenseRequest,
+    ExpenseCategoryResponse, ExpenseWithLines, ExpensesService, RecordBillPaymentRequest,
+    UpsertExpenseCategoryRequest, UpsertVendorRequest,
 };
 use crate::modules::audit::AuditCtx;
 use crate::modules::auth::{CurrentUser, RequireBilling, RequireFinance, TenantScoped};
-use crate::modules::expenses::models::{Bill, Expense, Vendor};
+use crate::modules::expenses::models::{
+    Bill, BillFilter, BillPayment, Expense, ExpenseFilter, Vendor,
+};
 use crate::utils::error::AppResult;
 use crate::utils::json::Json;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
@@ -93,6 +91,12 @@ pub fn expenses_routes(service: ExpensesService) -> Router {
         .route("/bills/{id}", get(get_bill))
         .route("/bills/{id}/approve", post(approve_bill))
         .route("/bills/{id}/void", post(void_bill))
+        // PMS-1536: what the MSP has actually paid. `paid` is reached
+        // through here and nowhere else.
+        .route(
+            "/bills/{id}/payments",
+            get(list_bill_payments).post(record_bill_payment),
+        )
         // ── Expenses ────────────────────────────────────────────────
         .route("/expenses", get(list_expenses).post(create_expense))
         .route("/expenses/{id}", get(get_expense))
@@ -232,10 +236,15 @@ async fn list_bills(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
+    Query(filter): Query<BillFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<Bill>>> {
     pagination.reject_unsupported_sort()?;
-    let (rows, total) = state.service.list_bills(user.tenant(), &pagination).await?;
+    filter.validate()?;
+    let (rows, total) = state
+        .service
+        .list_bills(user.tenant(), &filter, &pagination)
+        .await?;
     Ok(Json(PaginatedResponse::from_params(
         rows,
         &pagination,
@@ -290,6 +299,36 @@ async fn void_bill(
     Ok(Json(b))
 }
 
+async fn record_bill_payment(
+    State(state): State<ExpensesRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Path(id): Path<Uuid>,
+    ctx: AuditCtx,
+    Json(request): Json<RecordBillPaymentRequest>,
+) -> AppResult<Json<BillWithPayments>> {
+    request.validate()?;
+    // PMS-1545: the operator-facing method, which pushes to the provider
+    // when one holds the bill. The inner `record_bill_payment` is what the
+    // webhook receiver calls, so a payment that arrived FROM a provider is
+    // never pushed back to it.
+    let b = state
+        .service
+        .pay_bill(user.tenant(), id, &request, &ctx)
+        .await?;
+    Ok(Json(b))
+}
+
+async fn list_bill_payments(
+    State(state): State<ExpensesRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<BillPayment>>> {
+    let rows = state.service.list_bill_payments(user.tenant(), id).await?;
+    Ok(Json(rows))
+}
+
 // ── Expenses ──────────────────────────────────────────────────────────
 
 /// Whose claims this caller may see: `None` for every claim in the tenant,
@@ -320,9 +359,11 @@ fn assert_may_read(user: &CurrentUser, submitter: Uuid) -> AppResult<()> {
 async fn list_expenses(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
+    Query(filter): Query<ExpenseFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<Expense>>> {
     pagination.reject_unsupported_sort()?;
+    filter.validate()?;
     // PMS-1535: a claim belongs to the person who made it. Finance sees
     // every claim because deciding them is their job; everybody else sees
     // their own, and the filter is forced here rather than offered as a
@@ -330,7 +371,7 @@ async fn list_expenses(
     // caller can widen.
     let (rows, total) = state
         .service
-        .list_expenses(user.tenant(), own_claims_only(&user), &pagination)
+        .list_expenses(user.tenant(), own_claims_only(&user), &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         rows,

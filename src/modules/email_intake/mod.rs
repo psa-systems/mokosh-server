@@ -19,6 +19,7 @@
 //! call writes an `email_intake_log` row at the top of the flow that
 //! the admin GET `/email-intake-log/{id}` endpoint reads.
 
+// SPEC-7.323: this module evaluates, in order, dedup by Message-Id, threading by references, contact resolution, creator lookup, and ticket creation; the first of dedup/threading that hits short-circuits the rest.
 mod models;
 mod routes;
 mod service;

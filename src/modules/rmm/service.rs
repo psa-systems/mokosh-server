@@ -761,6 +761,11 @@ impl RmmService {
                 continue;
             }
             let Some(company_id) = mapping_company else {
+                tracing::warn!(
+                    rule = %rule.name,
+                    rmm_connection_id = %request.rmm_connection_id,
+                    "no mapped company for device",
+                );
                 continue;
             };
             if alert_suppressed(rule.suppression_rules.as_ref(), request) {
@@ -811,6 +816,11 @@ impl RmmService {
             }
 
             let Some(default_creator) = self.default_creator(tenant_id).await? else {
+                tracing::warn!(
+                    rule = %rule.name,
+                    rmm_connection_id = %request.rmm_connection_id,
+                    "no default ticket creator",
+                );
                 continue;
             };
             let req = CreateTicketRequest {

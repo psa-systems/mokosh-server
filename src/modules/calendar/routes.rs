@@ -105,6 +105,7 @@ async fn dispatch_view(
     RequireCalendar { user: u, .. }: RequireCalendar,
     Query(f): Query<DispatchFilter>,
 ) -> AppResult<Json<DispatchResponse>> {
+    // SPEC-7.386: dispatch_view requires both from and to query parameters, and rejects to < from.
     f.validate()?;
     let (from, to) = match (f.from, f.to) {
         (Some(from), Some(to)) => (from, to),
@@ -211,6 +212,7 @@ async fn replace_user_availability(
     Json(req): Json<ReplaceAvailabilityRequest>,
 ) -> AppResult<Json<PaginatedResponse<UserAvailabilityResponse>>> {
     pagination.reject_unsupported_sort()?;
+    // SPEC-7.396: a non-admin caller editing another user's availability is rejected with 403.
     // Non-admins can only edit their own availability.
     if !u.role.is_admin() && user_id != u.id {
         return Err(crate::utils::error::AppError::Forbidden(
@@ -253,6 +255,7 @@ async fn create_time_off(
     ctx: crate::modules::audit::AuditCtx,
     Json(mut req): Json<CreateTimeOffRequest>,
 ) -> AppResult<Json<TimeOffResponse>> {
+    // SPEC-7.400: a non-admin caller creating a time-off request has user_id forced to their own id.
     if !u.role.is_admin() && req.user_id != u.id {
         req.user_id = u.id;
     }
@@ -270,6 +273,7 @@ async fn get_time_off(
     Ok(Json(s.service.get_time_off(u.tenant(), id).await?))
 }
 
+// SPEC-7.401: approving/rejecting time off requires RequireManager.
 async fn approve_time_off(
     State(s): State<CalendarRouterState>,
     RequireCalendar { user: u, .. }: RequireCalendar,
@@ -310,6 +314,7 @@ async fn list_on_call(
     )))
 }
 
+// SPEC-7.405: create_on_call requires RequireManager in addition to RequireCalendar.
 async fn create_on_call(
     State(s): State<CalendarRouterState>,
     RequireCalendar { user: u, .. }: RequireCalendar,
@@ -325,6 +330,7 @@ async fn create_on_call(
     ))
 }
 
+// SPEC-7.405: update_on_call requires RequireManager in addition to RequireCalendar.
 async fn update_on_call(
     State(s): State<CalendarRouterState>,
     RequireCalendar { user: u, .. }: RequireCalendar,
@@ -340,6 +346,7 @@ async fn update_on_call(
     ))
 }
 
+// SPEC-7.405: delete_on_call requires RequireManager in addition to RequireCalendar.
 async fn delete_on_call(
     State(s): State<CalendarRouterState>,
     RequireCalendar { user: u, .. }: RequireCalendar,

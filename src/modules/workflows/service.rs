@@ -87,6 +87,8 @@ const RULE_SELECT: &str = "
 /// WorkflowExecutor, which reads `workflow_rules` and writes `workflow_rule_runs`
 /// inside the ticket service's own `begin_with_tenant` transaction, so it is
 /// GUC-safe too.
+// SPEC-7.162: every CRUD/list query runs inside begin_with_tenant(tenant_id),
+// so tenant_isolation RLS (migration 095) enforces scoping alongside the WHERE predicates.
 #[derive(Clone)]
 pub struct WorkflowsService {
     db: Database,
@@ -97,6 +99,7 @@ impl WorkflowsService {
         Self { db }
     }
 
+    // SPEC-7.155: returns every rule for tenant_id, ordered priority ASC, created_at ASC.
     pub async fn list(&self, tenant_id: Uuid) -> AppResult<Vec<WorkflowRuleResponse>> {
         let sql = format!(
             "SELECT {RULE_SELECT} \
@@ -115,10 +118,14 @@ impl WorkflowsService {
             .filter(|r| r.created_by_name.is_none())
             .map(|r| r.created_by_id)
             .collect();
+        // SPEC-7.163: unresolved created_by_name logs with context "workflows.list" but
+        // still returns the row with created_by_name: None.
         crate::utils::unresolved_person::log_unresolved_person_names("workflows.list", &unresolved);
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    // SPEC-7.156: scopes the lookup to tenant_id AND id, returning 404
+    // "Workflow rule" when no row matches.
     pub async fn get(&self, tenant_id: Uuid, id: Uuid) -> AppResult<WorkflowRuleResponse> {
         let sql = format!(
             "SELECT {RULE_SELECT} \
@@ -133,6 +140,7 @@ impl WorkflowsService {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound("Workflow rule".into()))?;
+        // SPEC-7.163: same unresolved-creator logging as list, tagged "workflows.get".
         if row.created_by_name.is_none() {
             crate::utils::unresolved_person::log_unresolved_person_names(
                 "workflows.get",
@@ -142,6 +150,8 @@ impl WorkflowsService {
         Ok(row.into())
     }
 
+    // SPEC-7.157: inserts the row bound to the caller's tenant_id and
+    // created_by_id = user_id.
     pub async fn create(
         &self,
         tenant_id: Uuid,
@@ -152,6 +162,8 @@ impl WorkflowsService {
         // silently create a rule that never fires. The Phase 2
         // allow-list covers `ticket.created`, `ticket.status_changed`,
         // and `ticket.priority_changed`.
+        // SPEC-7.153: rejects an unrecognised trigger_event with 400; the joined list
+        // preserves RECOGNISED_TRIGGERS' declared order, not alphabetical.
         if !RECOGNISED_TRIGGERS.contains(&req.trigger_event.as_str()) {
             return Err(AppError::BadRequest(format!(
                 "Unsupported trigger_event='{}'. Recognised: {}",
@@ -182,6 +194,8 @@ impl WorkflowsService {
         self.get(tenant_id, id).await
     }
 
+    // SPEC-7.158: applies COALESCE per-field updates (only non-null fields in
+    // the request body overwrite existing columns); updated_at is always set to NOW().
     pub async fn update(
         &self,
         tenant_id: Uuid,
@@ -189,6 +203,8 @@ impl WorkflowsService {
         req: UpdateWorkflowRuleRequest,
     ) -> AppResult<WorkflowRuleResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.159: returns 404 "Workflow rule" when no row with this
+        // tenant_id/id exists, checked via a separate SELECT id before the UPDATE.
         let existing: Option<(Uuid,)> =
             sqlx::query_as("SELECT id FROM workflow_rules WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)
@@ -223,6 +239,8 @@ impl WorkflowsService {
         self.get(tenant_id, id).await
     }
 
+    // SPEC-7.160: deletes the row scoped to tenant_id AND id, and returns 404
+    // "Workflow rule" when rows_affected() == 0.
     pub async fn delete(&self, tenant_id: Uuid, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query("DELETE FROM workflow_rules WHERE tenant_id = $1 AND id = $2")
@@ -241,6 +259,8 @@ impl WorkflowsService {
     /// List the runs for a given entity (typically a ticket id),
     /// most-recent first. Lets the SPA render "what auto-routed this
     /// ticket" on the ticket detail page.
+    // SPEC-7.161: returns every workflow_rule_runs row for entity_type/entity_id
+    // scoped to the caller's tenant, ordered ran_at DESC.
     pub async fn list_runs_for_entity(
         &self,
         tenant_id: Uuid,

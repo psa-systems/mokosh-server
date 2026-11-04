@@ -58,6 +58,12 @@ type HmacSha256 = Hmac<Sha256>;
 const SIGNING_KEY: &str = "fixture-webhook-key";
 const XERO_INVOICE_ID: &str = "9f1d1c62-0f3a-4a1e-9c6f-7b2c9d4e5a60";
 const QBO_INVOICE_ID: &str = "1042";
+/// PMS-1543: a BILL on each provider. Xero puts bills on the same endpoint
+/// and the same webhook category as invoices, so the stub serves both from
+/// one handler and the id is what tells them apart, exactly as production
+/// does.
+const XERO_BILL_ID: &str = "0b9b3e1a-5c7d-4a2f-8e6b-1d3f5a7c9e11";
+const QBO_BILL_ID: &str = "981";
 
 /// What the stub provider reports when asked for an invoice.
 #[derive(Clone, Default)]
@@ -65,18 +71,68 @@ struct Script {
     xero_status: Arc<Mutex<String>>,
     qbo_balance: Arc<Mutex<f64>>,
     fetches: Arc<Mutex<usize>>,
+    /// PMS-1543: what the provider says it has paid against the bill, and
+    /// what the bill is for. The receiver reconciles against these rather
+    /// than against the delivery, so a test moves them and re-delivers.
+    bill_paid: Arc<Mutex<f64>>,
+    bill_total: Arc<Mutex<f64>>,
+    bill_status: Arc<Mutex<String>>,
 }
 
-async fn xero_invoice(State(script): State<Script>) -> impl IntoResponse {
+async fn xero_invoice(
+    State(script): State<Script>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
     *script.fetches.lock().unwrap() += 1;
+    // PMS-1543: one endpoint, two document types, which is Xero's own
+    // shape. `Type` is what the receiver reads to tell them apart.
+    if id == XERO_BILL_ID {
+        let paid = *script.bill_paid.lock().unwrap();
+        let total = *script.bill_total.lock().unwrap();
+        let status = script.bill_status.lock().unwrap().clone();
+        return Json(json!({
+            "Invoices": [{
+                "InvoiceID": XERO_BILL_ID,
+                "Type": "ACCPAY",
+                "Status": status,
+                "AmountPaid": paid,
+                "Total": total,
+            }]
+        }));
+    }
     let status = script.xero_status.lock().unwrap().clone();
     Json(json!({
         "Invoices": [{
             "InvoiceID": XERO_INVOICE_ID,
             "InvoiceNumber": "INV-0042",
+            "Type": "ACCREC",
             "Status": status,
         }]
     }))
+}
+
+async fn qbo_bill(
+    State(script): State<Script>,
+    axum::extract::Path((_realm, id)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    *script.fetches.lock().unwrap() += 1;
+    if id != QBO_BILL_ID {
+        // An id this company file does not hold as a bill, which is what
+        // the receiver has to treat as "not mine" rather than an error.
+        return (StatusCode::NOT_FOUND, Json(json!({ "Fault": {} })));
+    }
+    let paid = *script.bill_paid.lock().unwrap();
+    let total = *script.bill_total.lock().unwrap();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "Bill": {
+                "Id": QBO_BILL_ID,
+                "TotalAmt": total,
+                "Balance": total - paid,
+            }
+        })),
+    )
 }
 
 async fn qbo_invoice(State(script): State<Script>) -> impl IntoResponse {
@@ -97,6 +153,9 @@ async fn start_stub() -> (Script, String) {
     let script = Script::default();
     *script.xero_status.lock().unwrap() = "AUTHORISED".to_string();
     *script.qbo_balance.lock().unwrap() = 300.0;
+    *script.bill_total.lock().unwrap() = 70.0;
+    *script.bill_paid.lock().unwrap() = 0.0;
+    *script.bill_status.lock().unwrap() = "AUTHORISED".to_string();
     let app = axum::Router::new()
         .route(
             "/api.xro/2.0/Invoices/{id}",
@@ -105,6 +164,10 @@ async fn start_stub() -> (Script, String) {
         .route(
             "/v3/company/{realm}/invoice/{id}",
             axum::routing::get(qbo_invoice),
+        )
+        .route(
+            "/v3/company/{realm}/bill/{id}",
+            axum::routing::get(qbo_bill),
         )
         .with_state(script.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -154,6 +217,9 @@ async fn receiver_with_apps(
     ));
     let state = Arc::new(InvoiceIssuerWebhookState {
         billing: Arc::new(BillingService::new(db.clone())),
+        expenses: Arc::new(mokosh_server::modules::expenses::ExpensesService::new(
+            db.clone(),
+        )),
         dispatcher,
         provider,
     });
@@ -287,6 +353,55 @@ async fn seed_delegated_invoice(pool: &PgPool, provider: &str, external_id: &str
     id
 }
 
+/// A delegated bill for 70.00, approved and unpaid here (PMS-1543).
+///
+/// Written with SQL rather than through `ExpensesService`: what is under
+/// test is the receiver, and a bill with no lines is enough for
+/// reconciliation, which reads only the three money columns.
+async fn seed_delegated_bill(pool: &PgPool, provider: &str, external_id: &str) -> Uuid {
+    let vendor_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO vendors (id, tenant_id, name, default_currency) \
+         VALUES ($1, $2, 'Rack Co', 'USD')",
+    )
+    .bind(vendor_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .execute(pool)
+    .await
+    .expect("seed a vendor");
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO bills (id, tenant_id, vendor_id, bill_number, issue_date, currency, \
+             subtotal_minor, tax_minor, total_minor, paid_minor, status, \
+             external_provider, external_bill_id) \
+         VALUES ($1, $2, $3, 'VEN-7781', $4, 'USD', 7000, 0, 7000, 0, 'approved', $5, $6)",
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(vendor_id)
+    .bind(NaiveDate::from_ymd_opt(2026, 10, 23).unwrap())
+    .bind(provider)
+    .bind(external_id)
+    .execute(pool)
+    .await
+    .expect("seed a delegated bill");
+    id
+}
+
+/// The bill as it stands here: status, paid total, and how many payment
+/// rows it has.
+async fn bill_state(pool: &PgPool, id: Uuid) -> (String, i64, i64) {
+    sqlx::query_as(
+        "SELECT b.status, b.paid_minor, \
+                (SELECT COUNT(*) FROM bill_payments p WHERE p.bill_id = b.id) \
+         FROM bills b WHERE b.id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read the bill")
+}
+
 fn xero_delivery(resource_id: &str) -> Value {
     json!({
         "events": [{
@@ -307,6 +422,26 @@ fn qbo_delivery(id: &str) -> Value {
             "dataChangeEvent": {
                 "entities": [{
                     "name": "Invoice",
+                    "id": id,
+                    "operation": "Update",
+                    "lastUpdated": "2026-10-23T12:00:00-0700",
+                }]
+            }
+        }]
+    })
+}
+
+/// A QuickBooks delivery naming a BILL rather than an invoice
+/// (PMS-1543). Xero needs no second builder: a bill is an invoice there
+/// and arrives under the same category, which is the whole reason those
+/// events were already reaching the receiver and being dropped.
+fn qbo_bill_delivery(id: &str) -> Value {
+    json!({
+        "eventNotifications": [{
+            "realmId": "4620816365",
+            "dataChangeEvent": {
+                "entities": [{
+                    "name": "Bill",
                     "id": id,
                     "operation": "Update",
                     "lastUpdated": "2026-10-23T12:00:00-0700",
@@ -720,4 +855,253 @@ async fn an_open_invoice_is_left_as_it_is(pool: PgPool) {
         ("sent".to_string(), Decimal::from(300))
     );
     assert_eq!(payment_count(&pool, invoice_id).await, 0);
+}
+
+// ── Bills (PMS-1543) ─────────────────────────────────────────────────────
+
+/// A bill the accountant paid in Xero is recorded here, and a redelivery
+/// does not record it twice.
+///
+/// Idempotent by arithmetic rather than by a dedupe column: the receiver
+/// reads the provider's running total and writes the difference, so the
+/// second delivery has nothing to write.
+#[mokosh_test]
+async fn a_bill_paid_in_the_provider_is_recorded_here(pool: PgPool) {
+    let (script, base) = start_stub().await;
+    common::seed_admin(&pool).await;
+    let bill_id = seed_delegated_bill(&pool, "xero", XERO_BILL_ID).await;
+    let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
+    *script.bill_paid.lock().unwrap() = 70.0;
+
+    let status = deliver(
+        &router,
+        InvoiceProviderKind::Xero,
+        &xero_delivery(XERO_BILL_ID),
+        SIGNING_KEY,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        bill_state(&pool, bill_id).await,
+        ("paid".to_string(), 7000, 1),
+        "the bill is paid, the total came from the provider, and there is one payment row"
+    );
+
+    let status = deliver(
+        &router,
+        InvoiceProviderKind::Xero,
+        &xero_delivery(XERO_BILL_ID),
+        SIGNING_KEY,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        bill_state(&pool, bill_id).await,
+        ("paid".to_string(), 7000, 1),
+        "a redelivery writes nothing: the difference against the provider is zero"
+    );
+}
+
+/// A part payment leaves the bill approved, and the rest of it lands on
+/// the next event rather than being written twice.
+#[mokosh_test]
+async fn a_part_payment_is_recorded_and_then_completed(pool: PgPool) {
+    let (script, base) = start_stub().await;
+    common::seed_admin(&pool).await;
+    let bill_id = seed_delegated_bill(&pool, "xero", XERO_BILL_ID).await;
+    let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
+
+    *script.bill_paid.lock().unwrap() = 30.0;
+    deliver(
+        &router,
+        InvoiceProviderKind::Xero,
+        &xero_delivery(XERO_BILL_ID),
+        SIGNING_KEY,
+    )
+    .await;
+    assert_eq!(
+        bill_state(&pool, bill_id).await,
+        ("approved".to_string(), 3000, 1),
+        "part paid is not paid"
+    );
+
+    // The vendor is paid the rest. The provider's total moves; Mokosh
+    // records only the difference.
+    *script.bill_paid.lock().unwrap() = 70.0;
+    deliver(
+        &router,
+        InvoiceProviderKind::Xero,
+        &xero_delivery(XERO_BILL_ID),
+        SIGNING_KEY,
+    )
+    .await;
+    assert_eq!(
+        bill_state(&pool, bill_id).await,
+        ("paid".to_string(), 7000, 2),
+        "two payments, 30 then 40, not 30 then 70"
+    );
+}
+
+/// QuickBooks, same contract through its own wire shape: a `Bill` entity
+/// event and a resource with `TotalAmt` and `Balance` rather than a paid
+/// figure.
+#[mokosh_test]
+async fn quickbooks_reports_a_bill_payment_the_same_way(pool: PgPool) {
+    let (script, base) = start_stub().await;
+    common::seed_admin(&pool).await;
+    let bill_id = seed_delegated_bill(&pool, "quickbooks", QBO_BILL_ID).await;
+    let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Quickbooks).await;
+    seed_blob(&secrets, InvoiceProviderKind::Quickbooks).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "quickbooks", "4620816365").await;
+    *script.bill_paid.lock().unwrap() = 70.0;
+
+    let status = deliver(
+        &router,
+        InvoiceProviderKind::Quickbooks,
+        &qbo_bill_delivery(QBO_BILL_ID),
+        SIGNING_KEY,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        bill_state(&pool, bill_id).await,
+        ("paid".to_string(), 7000, 1)
+    );
+}
+
+/// An invoice event is still an invoice event: the bill path does not
+/// swallow it, and a receivable is never read as a payable.
+///
+/// This is the case Xero makes possible by putting both documents on one
+/// category, and getting it wrong would record a CUSTOMER's payment as the
+/// MSP paying a vendor.
+#[mokosh_test]
+async fn a_receivable_is_never_read_as_a_payable(pool: PgPool) {
+    let (script, base) = start_stub().await;
+    common::seed_admin(&pool).await;
+    let bill_id = seed_delegated_bill(&pool, "xero", XERO_BILL_ID).await;
+    let invoice_id = seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
+    let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
+    *script.xero_status.lock().unwrap() = "PAID".to_string();
+    *script.bill_paid.lock().unwrap() = 70.0;
+
+    deliver(
+        &router,
+        InvoiceProviderKind::Xero,
+        &xero_delivery(XERO_INVOICE_ID),
+        SIGNING_KEY,
+    )
+    .await;
+
+    assert_eq!(
+        invoice_state(&pool, invoice_id).await,
+        ("paid".to_string(), Decimal::ZERO),
+        "the invoice was collected"
+    );
+    assert_eq!(
+        bill_state(&pool, bill_id).await,
+        ("approved".to_string(), 0, 0),
+        "and the bill is untouched, though the provider says it is paid"
+    );
+}
+
+/// An id neither an invoice nor a bill this tenant holds is ignored, with
+/// a 2xx: the provider's ledger is wider than one Mokosh tenant, and an
+/// error here would have them retry forever.
+#[mokosh_test]
+async fn an_unknown_document_is_ignored(pool: PgPool) {
+    let (_script, base) = start_stub().await;
+    common::seed_admin(&pool).await;
+    let bill_id = seed_delegated_bill(&pool, "xero", XERO_BILL_ID).await;
+    let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
+
+    let status = deliver(
+        &router,
+        InvoiceProviderKind::Xero,
+        &xero_delivery("a0000000-0000-4000-8000-000000000000"),
+        SIGNING_KEY,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        bill_state(&pool, bill_id).await,
+        ("approved".to_string(), 0, 0)
+    );
+    assert_eq!(
+        deliveries(&pool).await.last().map(|d| d.1.clone()),
+        Some("ignored".to_string())
+    );
+}
+
+/// A provider reporting more paid than the bill is for records the balance
+/// and no more.
+///
+/// The local refusal `record_bill_payment` gives a human is the right
+/// answer when somebody is typing; here the provider has already committed
+/// the payment, and refusing it would leave the two ledgers disagreeing,
+/// which is what this path exists to stop.
+#[mokosh_test]
+async fn a_provider_overpayment_records_the_balance_only(pool: PgPool) {
+    let (script, base) = start_stub().await;
+    common::seed_admin(&pool).await;
+    let bill_id = seed_delegated_bill(&pool, "xero", XERO_BILL_ID).await;
+    let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
+    // Paid twice over there, which is the duplicate-payment case.
+    *script.bill_paid.lock().unwrap() = 140.0;
+
+    deliver(
+        &router,
+        InvoiceProviderKind::Xero,
+        &xero_delivery(XERO_BILL_ID),
+        SIGNING_KEY,
+    )
+    .await;
+    assert_eq!(
+        bill_state(&pool, bill_id).await,
+        ("paid".to_string(), 7000, 1),
+        "the bill is paid for what it is worth, and `paid_minor` never exceeds the total"
+    );
+}
+
+/// A bill the provider voided is left for an operator rather than voided
+/// here: voiding would discard the MSP's own record of what it was billed,
+/// and that is their decision.
+#[mokosh_test]
+async fn a_voided_bill_is_left_for_an_operator(pool: PgPool) {
+    let (script, base) = start_stub().await;
+    common::seed_admin(&pool).await;
+    let bill_id = seed_delegated_bill(&pool, "xero", XERO_BILL_ID).await;
+    let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
+    *script.bill_status.lock().unwrap() = "VOIDED".to_string();
+
+    let status = deliver(
+        &router,
+        InvoiceProviderKind::Xero,
+        &xero_delivery(XERO_BILL_ID),
+        SIGNING_KEY,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        bill_state(&pool, bill_id).await,
+        ("approved".to_string(), 0, 0),
+        "nothing local changed"
+    );
+    assert_eq!(
+        deliveries(&pool).await.last().map(|d| d.1.clone()),
+        Some("unreconciled".to_string()),
+        "and the delivery says so, which is what a human reads off the row"
+    );
 }

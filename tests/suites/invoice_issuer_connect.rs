@@ -32,6 +32,12 @@ use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
+/// PMS-1580: the settings page a callback lands on exists only in
+/// mokosh-apps, never on the apex `CLIENT_ORIGIN` serves. Deliberately not
+/// `https://api.msp.example`, the fixture's `public_api_base`, so a
+/// destination built from the wrong origin cannot pass by coincidence.
+const SPA_BASE: &str = "https://app.msp.example";
+
 /// How many organisations the stub's `GET /connections` reports.
 #[derive(Clone, Default)]
 struct Script {
@@ -155,7 +161,7 @@ async fn service_with_toggle(
                 .with_identity_base(base),
         ),
         Some("https://api.msp.example".to_string()),
-        "https://app.msp.example".to_string(),
+        SPA_BASE.to_string(),
     );
     (service, secrets, db)
 }
@@ -216,7 +222,11 @@ async fn connecting_xero_writes_the_credential_and_names_the_organisation(pool: 
         .await
         .expect("complete");
     assert!(
-        destination.contains("/settings/integrations"),
+        destination.starts_with(SPA_BASE),
+        "a connect callback must land on the SPA, not the apex CLIENT_ORIGIN serves: {destination}"
+    );
+    assert!(
+        destination.ends_with("/settings/integrations"),
         "{destination}"
     );
 
@@ -336,6 +346,50 @@ async fn quickbooks_without_a_realm_is_refused(pool: PgPool) {
         .expect_err("no company was named");
     assert!(err.to_string().contains("named no company"), "{err}");
     assert!(integration_row(&pool, "quickbooks").await.is_none());
+}
+
+/// PMS-1580: a failed callback redirects to the SPA too, not the apex
+/// `CLIENT_ORIGIN` serves. Exercised through the actual HTTP handler
+/// (`invoice_issuer_public_routes`), since `app_base` is only read there and
+/// in `InvoiceIssuerConnectService::complete`'s success path, already
+/// covered above.
+#[mokosh_test]
+async fn a_failed_callback_redirects_to_the_spa(pool: PgPool) {
+    use mokosh_server::modules::billing::invoice_issuer_connect::invoice_issuer_public_routes;
+    use tower::ServiceExt;
+
+    let (_script, base) = start_stub().await;
+    let (svc, _secrets, _db) = service(&pool, &base, apps()).await;
+    let router = invoice_issuer_public_routes(Arc::new(svc));
+
+    for query in ["?error=access_denied", "?state=not-even-known", ""] {
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/invoice-issuer/xero/callback{query}"))
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the callback answers");
+        assert!(
+            response.status().is_redirection(),
+            "{query} should redirect, got {}",
+            response.status()
+        );
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            location.starts_with(SPA_BASE),
+            "a failed connect callback must land on the SPA, not the apex CLIENT_ORIGIN serves: {query} -> {location}"
+        );
+        assert!(location.contains("connect=failed"), "{query} -> {location}");
+    }
 }
 
 /// A state is spent once.
@@ -561,6 +615,7 @@ async fn disconnecting_forgets_the_credential_and_stops_delegating(pool: PgPool)
         .get(
             tenant,
             mokosh_types::integrations::IntegrationProvider::Xero,
+            mokosh_types::integrations::Capability::Invoicing,
         )
         .await
         .expect("read the row");
@@ -738,6 +793,79 @@ async fn bills_cannot_be_delegated_to_a_disconnected_provider(pool: PgPool) {
     );
 }
 
+/// PMS-1541: the reimburse-from account is set through the service and
+/// read back on the overview.
+///
+/// Read back as well as written, because a settings field that cannot show
+/// its current value is a write-only form. Blank clears it, which is how an
+/// admin stops reimbursing through a provider without disconnecting it.
+#[mokosh_test]
+async fn the_reimburse_from_account_round_trips(pool: PgPool) {
+    let (_script, base) = start_stub().await;
+    let (admin, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (svc, _secrets, _db) = service(&pool, &base, apps()).await;
+
+    // Before connecting there is nothing to reimburse from.
+    let err = svc
+        .set_payment_account(tenant, InvoiceProviderKind::Xero, Some("acct-1"))
+        .await
+        .expect_err("there is no connection yet");
+    assert!(
+        matches!(&err, AppError::Conflict(m) if m.contains("Connect xero")),
+        "{err:?}"
+    );
+
+    let url = svc
+        .begin(tenant, admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin");
+    svc.complete(InvoiceProviderKind::Xero, &state_from(&url), "code", None)
+        .await
+        .expect("complete");
+    assert_eq!(
+        svc.overview(tenant, InvoiceProviderKind::Xero)
+            .await
+            .expect("overview")
+            .payment_account_id,
+        None,
+        "connecting sets no account: it is the admin's to choose"
+    );
+
+    svc.set_payment_account(
+        tenant,
+        InvoiceProviderKind::Xero,
+        Some("  13918178-849a-247f-8ed7-c7b1f5e7e71c  "),
+    )
+    .await
+    .expect("set the account");
+    assert_eq!(
+        svc.overview(tenant, InvoiceProviderKind::Xero)
+            .await
+            .expect("overview")
+            .payment_account_id
+            .as_deref(),
+        Some("13918178-849a-247f-8ed7-c7b1f5e7e71c"),
+        "trimmed, and readable by the page that set it"
+    );
+
+    // Blank clears, and so does whitespace: a cleared field is not an
+    // account named by spaces.
+    for blank in ["", "   "] {
+        svc.set_payment_account(tenant, InvoiceProviderKind::Xero, Some(blank))
+            .await
+            .expect("clear the account");
+        assert_eq!(
+            svc.overview(tenant, InvoiceProviderKind::Xero)
+                .await
+                .expect("overview")
+                .payment_account_id,
+            None,
+            "{blank:?}"
+        );
+    }
+}
+
 /// One tenant's connection is invisible to another.
 #[mokosh_test]
 async fn an_overview_does_not_leak_another_tenants_connection(pool: PgPool) {
@@ -797,5 +925,67 @@ async fn a_deployment_without_an_application_cannot_connect(pool: PgPool) {
     assert_eq!(
         states, 0,
         "and no state is minted for a flow that cannot run"
+    );
+}
+
+/// PMS-1533: two tenants connecting to the same Xero organisation is a
+/// collision, not a race. Without `idx_integrations_provider_external_org`
+/// both rows would carry `external_organisation_id = 'xero-org-1'` and
+/// `tenant_for_external_organisation` would have no way to tell them apart.
+#[mokosh_test]
+async fn a_second_tenant_cannot_claim_an_organisation_the_first_already_connected(pool: PgPool) {
+    let (_script, base) = start_stub().await;
+    let (admin, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (svc, _secrets, _db) = service(&pool, &base, apps()).await;
+
+    let url = svc
+        .begin(tenant, admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin");
+    svc.complete(InvoiceProviderKind::Xero, &state_from(&url), "code", None)
+        .await
+        .expect("the first tenant connects cleanly");
+
+    let (other_tenant_id, other_admin, _other_email, _other_password) =
+        common::seed_tenant_with_admin(&pool, "other-msp").await;
+    let other_tenant = TenantId::from_trusted(other_tenant_id);
+
+    let other_url = svc
+        .begin(other_tenant, other_admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin");
+    let err = svc
+        .complete(
+            InvoiceProviderKind::Xero,
+            &state_from(&other_url),
+            "code",
+            None,
+        )
+        .await
+        .expect_err("the organisation is already claimed by the first tenant");
+    assert!(
+        matches!(&err, AppError::Conflict(m) if m.contains("Another tenant")),
+        "{err:?}"
+    );
+
+    let row = integration_row(&pool, "xero").await.expect("a row");
+    assert_eq!(
+        row.2.as_deref(),
+        Some("xero-org-1"),
+        "the first tenant's row is unchanged"
+    );
+    let other_row: Option<(String, Vec<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status, enabled_capabilities, external_organisation_id \
+         FROM integrations WHERE tenant_id = $1 AND provider = $2",
+    )
+    .bind(other_tenant_id)
+    .bind("xero")
+    .fetch_optional(&pool)
+    .await
+    .expect("read the integrations row");
+    assert!(
+        other_row.is_none(),
+        "the rejected tenant gets no row at all, not a half-written one: {other_row:?}"
     );
 }

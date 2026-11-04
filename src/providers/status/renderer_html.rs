@@ -15,6 +15,11 @@ use super::{KindEnumerationStatus, ProviderStatusReport};
 /// Render the report as a whole HTML page. The tests in
 /// `super::tests::html_*` pin the shape (a title, one `<section>` per kind,
 /// escaped dynamic values).
+// SPEC-3.70: the HTML page declares <meta name="robots"
+// content="noindex"> and renders one <section id="<kind>"> per kind;
+// every dynamically inserted value passes through HTML escaping, so
+// no raw markup from a provider name or reason string ever reaches
+// the page unescaped.
 pub fn render_html(report: &ProviderStatusReport) -> String {
     let mut out = String::with_capacity(4096);
     out.push_str("<!doctype html>\n<html lang=\"en\"><head>\n");

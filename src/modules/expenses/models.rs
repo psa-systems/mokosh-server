@@ -13,6 +13,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
+use validator::Validate;
 
 /// A vendor the MSP buys from. Tenant-scoped; separate from `companies`
 /// (which is the MSP's customers) on purpose.
@@ -117,6 +118,49 @@ pub struct BillLine {
     pub tax_minor: i64,
     pub total_minor: i64,
     pub position: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+/// What narrows `GET /bills` (PMS-1539).
+///
+/// The shape `InvoiceFilter` set for receivables, with the two fields a
+/// bills list needs and none it does not: `status` is one of the four the
+/// CHECK allows, and a value outside it answers an empty page rather than
+/// a 400, which is what `InvoiceFilter` does with an unknown status.
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
+pub struct BillFilter {
+    #[validate(length(max = 20))]
+    pub status: Option<String>,
+    #[validate(length(max = 200))]
+    pub q: Option<String>,
+}
+
+/// What narrows `GET /expenses` (PMS-1539). The claims half of
+/// [`BillFilter`]; `status` is one of the five an expense moves through.
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
+pub struct ExpenseFilter {
+    #[validate(length(max = 20))]
+    pub status: Option<String>,
+    #[validate(length(max = 200))]
+    pub q: Option<String>,
+}
+
+/// One payment the MSP made against a bill (PMS-1536).
+///
+/// Money leaving, in minor units like everything else in this subsystem.
+/// The rows are the record of WHAT was paid and WHEN, which a vendor
+/// statement has to be reconciled against; `bills.paid_minor` is the
+/// running total derived from them and has exactly one writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
+pub struct BillPayment {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub bill_id: Uuid,
+    pub paid_on: NaiveDate,
+    pub amount_minor: i64,
+    pub payment_method: String,
+    pub reference: Option<String>,
+    pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

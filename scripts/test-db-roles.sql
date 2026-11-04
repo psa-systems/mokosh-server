@@ -22,6 +22,8 @@
 -- LOGIN, password and privilege set `provision_roles` installs are deliberately
 -- NOT copied: a second definition of a role that src/db/provision.rs owns is
 -- exactly the kind of thing that drifts silently.
+-- SPEC-9.226: idempotently create the bare `mokosh_app` role name so
+-- migration 207's GRANT does not fail with "role does not exist" (42704).
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'mokosh_app') THEN
