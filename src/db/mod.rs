@@ -11,8 +11,10 @@ pub use pool::{Database, TenantTransaction};
 #[cfg(feature = "server")]
 pub mod provision;
 
-// MAPPS-475 (MAPPS-474 phase 1): read helpers over `identities` and
-// `tenant_memberships`. Not wired into any handler yet; phase 2 consumes them.
+// Read helpers over `identities` and `tenant_memberships`. Called live
+// from the auth middleware/service and the tenant routes
+// (`modules/auth/middleware.rs`, `modules/auth/service.rs`,
+// `modules/tenants/routes.rs`).
 #[cfg(feature = "server")]
 pub mod identity;
 
