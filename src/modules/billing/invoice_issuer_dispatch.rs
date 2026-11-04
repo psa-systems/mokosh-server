@@ -502,7 +502,7 @@ impl IssuerDispatcher {
                 })?;
                 let contact_id = Uuid::parse_str(&mapping.external_contact_id).map_err(|_| {
                     AppError::internal(format!(
-                        "person {} is mapped to {:?} but Xero expects a UUID ContactID",
+                        "person {} is mapped to {} but Xero expects a UUID ContactID",
                         request.user_id, mapping.external_contact_id
                     ))
                 })?;
@@ -1276,7 +1276,7 @@ impl IssuerDispatcher {
             })?;
         Uuid::parse_str(&mapping.external_customer_id).map_err(|_| {
             AppError::internal(format!(
-                "company {} is mapped to {:?} but Xero expects a UUID ContactID",
+                "company {} is mapped to {} but Xero expects a UUID ContactID",
                 company_id, mapping.external_customer_id
             ))
         })
