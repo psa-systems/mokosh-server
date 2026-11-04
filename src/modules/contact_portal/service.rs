@@ -301,8 +301,10 @@ impl ContactAuthService {
         )
         .await;
 
-        // Success: reset counters + stamp last-login. Best-effort.
-        let _ = sqlx::query(
+        // Success: reset counters + stamp last-login. Best-effort: the
+        // login response does not depend on the stamp landing, but a
+        // failure here must not be silent (PMS-1575).
+        if let Err(e) = sqlx::query(
             "UPDATE contacts \
              SET portal_failed_login_count = 0, portal_locked_until = NULL, \
                  portal_last_login_at = NOW(), updated_at = NOW() \
@@ -311,7 +313,14 @@ impl ContactAuthService {
         .bind(contact_id)
         .bind(tenant_id)
         .execute(self.db.migrator_pool())
-        .await;
+        .await
+        {
+            tracing::warn!(
+                contact_id = %contact_id,
+                error = %e,
+                "best-effort portal_last_login_at stamp on password login failed; counters not reset"
+            );
+        }
 
         let caps = self.load_capabilities(tenant_id, contact_id).await?;
         let session_id = Uuid::new_v4();
@@ -1596,8 +1605,9 @@ impl ContactAuthService {
             .await?;
         // Stamp last-login and, as the password login does, clear the
         // PMS-501 failure count a second factor may have ticked
-        // (PMS-1077). Best-effort.
-        let _ = sqlx::query(
+        // (PMS-1077). Best-effort: a failure here must not abort the
+        // session mint but also must not stay silent (PMS-1575).
+        if let Err(e) = sqlx::query(
             "UPDATE contacts \
              SET portal_last_login_at = NOW(), portal_failed_login_count = 0, \
                  portal_locked_until = NULL, updated_at = NOW() \
@@ -1606,7 +1616,14 @@ impl ContactAuthService {
         .bind(contact_id)
         .bind(tenant_id)
         .execute(self.db.migrator_pool())
-        .await;
+        .await
+        {
+            tracing::warn!(
+                contact_id = %contact_id,
+                error = %e,
+                "best-effort portal_last_login_at stamp on mint_session_for_contact failed; counters not reset"
+            );
+        }
         self.audit(
             tenant_id,
             Some(contact_id),
