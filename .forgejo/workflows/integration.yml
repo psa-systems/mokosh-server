@@ -43,9 +43,27 @@ name: Integration
 
 # SPEC-10.12: pull_request into main only, never push; three jobs (build, test, summary)
 on:
+  # PMS-1634: integration tests read no Markdown and no `docs/` file, so a
+  # pull request touching only those paths cannot regress what this suite
+  # proves. `paths-ignore` skips the run when EVERY changed path matches;
+  # one non-doc edit still triggers the full suite. `check.yml` is NOT
+  # treated the same way because several of its guards exist to run on
+  # doc changes.
   pull_request:
     branches:
       - main
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+      - ".editorconfig"
+      - "renovate.json"
+
+# PMS-1633: supersede obsolete PR runs. See check.yml for the ref-shape note.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -112,6 +130,16 @@ jobs:
           shared-key: integration
           cache-on-failure: true
 
+      - name: Cache cargo-nextest tarball
+        # PMS-1641: see check.yml's cargo-machete cache step for the full
+        # rationale. The key literal MUST match the matching cache step
+        # in cache-warm.yml and integration-unsupported.yml, or the
+        # three jobs restore from different caches on a version bump.
+        uses: https://github.com/actions/cache@v4
+        with:
+          path: /tmp/nextest.tar.gz
+          key: cargo-nextest-tarball-0.9.145-linux
+
       - name: Install cargo-nextest
         # PMS-1177: nextest schedules test CASES from every archived binary
         # concurrently rather than one suite to completion before the next,
@@ -131,8 +159,10 @@ jobs:
           NEXTEST_SHA256: "32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867"
         run: |
           set -euo pipefail
-          curl --silent --fail --location --output /tmp/nextest.tar.gz \
-            "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          if [ ! -s /tmp/nextest.tar.gz ]; then
+            curl --silent --fail --location --output /tmp/nextest.tar.gz \
+              "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          fi
           echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum --check --strict
           cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
           mkdir -p "${cargo_bin}"
@@ -258,6 +288,14 @@ jobs:
           name: nextest-archive
           path: .
 
+      - name: Cache cargo-nextest tarball
+        # PMS-1641: same version-keyed cache the build job above uses.
+        # Key MUST stay in step with the other cargo-nextest sites.
+        uses: https://github.com/actions/cache@v4
+        with:
+          path: /tmp/nextest.tar.gz
+          key: cargo-nextest-tarball-0.9.145-linux
+
       - name: Install cargo-nextest
         # The archive contents are version-pinned; the harness that runs
         # them is pinned to the matching nextest release the `build` job
@@ -267,8 +305,10 @@ jobs:
           NEXTEST_SHA256: "32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867"
         run: |
           set -euo pipefail
-          curl --silent --fail --location --output /tmp/nextest.tar.gz \
-            "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          if [ ! -s /tmp/nextest.tar.gz ]; then
+            curl --silent --fail --location --output /tmp/nextest.tar.gz \
+              "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          fi
           echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum --check --strict
           cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
           mkdir -p "${cargo_bin}"

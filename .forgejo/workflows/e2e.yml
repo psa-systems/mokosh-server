@@ -34,7 +34,6 @@
 # (10 consecutive green post-merge runs) before flipping that switch.
 name: E2E
 
-# SPEC-10.28
 on:
   push:
     branches:
@@ -59,7 +58,6 @@ on:
 # complete and every PR commit gets exercised once it makes it through the
 # queue. Slow throughput is the trade-off; throughput beats correctness is
 # never the right answer for an auth-rate-limited gate.
-# SPEC-10.29
 concurrency:
   group: e2e-staging
   cancel-in-progress: false
@@ -70,17 +68,14 @@ jobs:
     # Dev label, deliberate (PMS-423): the dev image pre-bakes bun, nodejs24 and
     # the Playwright browser binaries plus their system libraries. Nothing here
     # compiles, but base carries none of that toolchain.
-    # SPEC-10.30
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # Backstop, not a target (PMS-829): 42 green runs over the same window took
     # 1.2-4.2 minutes, median 2.0. The bound is generous against that because
     # what it catches is a browser or a staging request that never returns, not
     # a slow suite; Playwright's own per-test timeouts handle the slow case.
-    # SPEC-10.30
     timeout-minutes: 20
 
-    # SPEC-10.30
     defaults:
       run:
         working-directory: e2e
@@ -104,8 +99,6 @@ jobs:
     # The rest are test-only (no deployment equivalent) and keep the E2E_* name.
     # Forgejo must hold both env values at once, so per-env secrets carry a
     # _STAGING/_PRODUCTION suffix on the deployment base name.
-    # SPEC-10.31: every E2E_* secret resolves to its _PRODUCTION secret only on
-    # an explicit production dispatch, else _STAGING; E2E_OIDC_CLIENT_ID is shared.
     env:
       E2E_BASE_URL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_BASE_URL || secrets.E2E_STAGING_BASE_URL }}
       E2E_EMAIL: ${{ inputs.environment == 'production' && secrets.E2E_PRODUCTION_EMAIL || secrets.E2E_STAGING_EMAIL }}
@@ -121,18 +114,22 @@ jobs:
       # guard (tests/external-guard.spec.ts) can assert it never runs against
       # production. push / pull_request always resolve to staging (empty
       # `inputs` context); a manual dispatch selects.
-      # SPEC-10.31
       E2E_ENVIRONMENT: ${{ inputs.environment == 'production' && 'production' || 'staging' }}
 
     steps:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
         with:
-          # SPEC-10.32
-          # wait-for-deploy.mjs walks `git log` from GITHUB_SHA back to the
-          # most recent commit that touched a build-trigger path. A shallow
-          # clone would stop at depth 1 and the walk would miss or fail.
-          fetch-depth: 0
+          # PMS-1636: full history only on the paths that actually need it.
+          # `wait-for-deploy.mjs` (push + staging dispatch) walks `git log`
+          # from GITHUB_SHA back to the most recent commit touching a
+          # build-trigger path; a shallow clone would stop at depth 1 and
+          # the walk would miss or fail. The pull_request and production
+          # dispatch paths run `health-check.mjs` instead, which hits
+          # `/api/v1/health` and does not touch git log. Keep this
+          # expression in step with the `if:` on the Wait-for-deploy step
+          # below.
+          fetch-depth: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')) && 0 || 1 }}
 
       # No Node setup step: the opensuse-dev runner image (PMS-423) ships
       # nodejs24 and bun, so the runtime is already on disk. Using the
@@ -142,7 +139,6 @@ jobs:
       # invocation; Node scripts run on the concrete `node24` binary.
 
       - name: Install dependencies
-        # SPEC-10.33: no separate Node setup step, the runner image pre-bakes bun/nodejs24
         run: bun install --frozen-lockfile
 
       - name: Install Playwright browsers
@@ -156,8 +152,6 @@ jobs:
         run: bun x playwright install chromium firefox webkit
 
       - name: Report the runner's shared memory and fonts
-        # SPEC-10.34: warnings only, never fails the job - E2E / * is intended
-        # as a required status check on main.
         # PMS-1408: the two runner facts the chromium quarantine turned on, in
         # the log, because neither is knowable from any repository. The image and
         # the container options come from `vars.RUNS_ON_OPENSUSE_BASE_HEAVY` and
@@ -201,12 +195,10 @@ jobs:
       # staging dispatch; reachability runs on pull_request and on a production
       # dispatch.
       - name: Wait for deploy to serve this commit (push / staging dispatch)
-        # SPEC-10.35
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')
         run: node24 scripts/wait-for-deploy.mjs
 
       - name: Verify deployment is reachable (pull_request / production dispatch)
-        # SPEC-10.35
         if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'production')
         run: node24 scripts/health-check.mjs
 
@@ -224,18 +216,15 @@ jobs:
       # is skipped with a notice (the job stays green) instead of a misleading
       # login failure. Any other outcome (endpoint absent on prod, error) runs it.
       - name: Check staging is E2E-seeded
-        # SPEC-10.36
         id: seeded
         if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')
         run: node24 scripts/check-e2e-bootstrapped.mjs
 
       - name: Run E2E suite
-        # SPEC-10.36, SPEC-10.37
         if: steps.seeded.outputs.skip != 'true'
         run: bun x playwright test ${{ inputs.environment == 'production' && '--grep-invert @external' || '' }}
 
       - name: Upload Playwright report and traces
-        # SPEC-10.38
         if: failure()
         uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:

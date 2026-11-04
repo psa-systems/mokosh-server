@@ -40,6 +40,12 @@ on:
     branches:
       - main
 
+# PMS-1633: back-to-back merges only need the newest warm; drop in-flight runs
+# against the same ref so the shared cache reflects the latest main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   warm-check:
     name: warm check.yml cache
@@ -73,16 +79,19 @@ jobs:
         # SPEC-10.47
 
         # Build the profile fingerprints check.yml's job builds (clippy's
-        # lint-flagged dev, plain check, lib test-no-run) plus actually run
-        # the doc tests. The lib tests stay compile-only; the doc tests
-        # cannot — Cargo rejects `--no-run` for doc tests outright
-        # (`error: can't skip running doc tests with --no-run`), because
-        # rustdoc builds and runs them in one step. The run itself still
-        # primes the fingerprint check.yml's doc-test step reuses on a PR,
-        # which is the point of this workflow.
+        # lint-flagged dev, lib test-no-run) plus actually run the doc tests.
+        # The lib tests stay compile-only; the doc tests cannot, Cargo rejects
+        # `--no-run` for doc tests outright (`error: can't skip running doc
+        # tests with --no-run`), because rustdoc builds and runs them in one
+        # step. The run itself still primes the fingerprint check.yml's
+        # doc-test step reuses on a PR, which is the point of this workflow.
+        #
+        # PMS-1635: clippy flags MUST match check.yml exactly, or the warm
+        # fills a smaller fingerprint set than the PR run restores (the
+        # mokosh-types workspace crate's test target in particular). No
+        # separate `cargo check` because clippy drives the same compile path.
         run: |
-          cargo clippy --all-targets -- -D warnings
-          cargo check --all-targets
+          cargo clippy --workspace --all-targets -- -D warnings
           cargo test --no-run --workspace --lib
           cargo test --workspace --doc
 
@@ -117,6 +126,16 @@ jobs:
           shared-key: integration
           cache-on-failure: true
 
+      - name: Cache cargo-nextest tarball
+        # PMS-1641: see check.yml's matching step for the rationale.
+        # Key literal MUST match the three cargo-nextest sites across
+        # integration.yml, integration-unsupported.yml and this file,
+        # or they restore different caches on a bump.
+        uses: https://github.com/actions/cache@v4
+        with:
+          path: /tmp/nextest.tar.gz
+          key: cargo-nextest-tarball-0.9.145-linux
+
       - name: Install cargo-nextest
         # Mirrors integration.yml's pinned install so the archive step
         # below links the same binary the pull-request job will. The
@@ -129,8 +148,10 @@ jobs:
           NEXTEST_SHA256: "32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867"
         run: |
           set -euo pipefail
-          curl --silent --fail --location --output /tmp/nextest.tar.gz \
-            "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          if [ ! -s /tmp/nextest.tar.gz ]; then
+            curl --silent --fail --location --output /tmp/nextest.tar.gz \
+              "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          fi
           echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum --check --strict
           cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
           mkdir -p "${cargo_bin}"

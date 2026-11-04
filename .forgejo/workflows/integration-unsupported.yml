@@ -80,9 +80,27 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v5
 
       - name: Cache Rust build
+        # PMS-1639: share the key with integration.yml's PR job and
+        # cache-warm.yml's warm-integration job. Workspace fingerprints
+        # are identical between the supported and unsupported profiles
+        # (`.config/nextest.toml` partitions which cases RUN, not what
+        # COMPILES), so the weekly run restores what the merge gate
+        # already compiled on main instead of starting cold.
         uses: https://github.com/Swatinem/rust-cache@v2
         with:
+          shared-key: integration
           cache-on-failure: true
+
+      - name: Cache cargo-nextest tarball
+        # PMS-1641: same version-keyed tarball cache as integration.yml.
+        # The weekly cron runs infrequently enough that a fresh download
+        # on key miss is not a hot path, but a key hit (same version
+        # restored from the warm or PR runs on the same runner) still
+        # saves the ~5s this step would otherwise spend on curl.
+        uses: https://github.com/actions/cache@v4
+        with:
+          path: /tmp/nextest.tar.gz
+          key: cargo-nextest-tarball-0.9.145-linux
 
       - name: Install cargo-nextest
         # SPEC-10.24: pinned nextest 0.9.145 / SHA-256 32aa...867, same pin as integration.yml
@@ -112,8 +130,10 @@ jobs:
           NEXTEST_SHA256: "32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867"
         run: |
           set -euo pipefail
-          curl --silent --fail --location --output /tmp/nextest.tar.gz \
-            "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          if [ ! -s /tmp/nextest.tar.gz ]; then
+            curl --silent --fail --location --output /tmp/nextest.tar.gz \
+              "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          fi
           echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum --check --strict
           cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
           mkdir -p "${cargo_bin}"
