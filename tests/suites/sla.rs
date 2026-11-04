@@ -504,6 +504,223 @@ async fn ticket_create_and_status_change_evaluate_sla(pool: PgPool) {
     );
 }
 
+/// PMS-1644: `SlaService::evaluate_for_ticket` must persist the policy id it
+/// actually resolved, not just the due dates computed from it. Two
+/// assertions:
+///
+///   1. Create: a ticket created with no explicit `sla_id` falls back to the
+///      tenant's default policy; `evaluate_for_ticket` (wired in via
+///      `create_ticket`) must write that default policy's id back onto
+///      `tickets.sla_id` rather than leaving it NULL.
+///   2. Status change: with the tenant's default policy swapped to a
+///      different policy than the one resolved at creation, a status-change
+///      `update_ticket` call must re-resolve and persist the new default's
+///      id, proving the policy id stays current across re-evaluation the
+///      same way the due dates do.
+#[mokosh_test]
+async fn evaluate_for_ticket_persists_resolved_sla_id(pool: PgPool) {
+    let tenant_id = common::DEFAULT_TENANT_ID;
+    let tenant = TenantId::from_trusted(tenant_id);
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+
+    let in_progress_status_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND name = 'In Progress'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seeded In Progress status");
+    let queue_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_queues WHERE tenant_id = $1 LIMIT 1")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+            .expect("seeded queue");
+    let priority_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM ticket_priorities WHERE tenant_id = $1 AND name = 'Medium'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seeded Medium priority");
+
+    let company_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'PMS-1644 Co')")
+        .bind(company_id)
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .expect("seed company");
+
+    // The tenant's seeded default SLA policy (migration 023's "Standard
+    // SLA"), which `evaluate_for_ticket` falls back to when a ticket has no
+    // explicit sla_id.
+    let original_default_policy_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM sla_policies WHERE tenant_id = $1 AND is_default = TRUE",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seeded default sla policy");
+
+    let db = Database::from_pool(pool.clone());
+    let sla_service = SlaService::new(db.clone());
+    let ticket_service = TicketService::new(db.clone()).with_sla(Arc::new(sla_service.clone()));
+
+    // 1. Create with no explicit sla_id: must resolve and persist the
+    // tenant's default policy id, not leave it NULL.
+    let request = CreateTicketRequest {
+        title: "PMS-1644 default sla probe".to_string(),
+        description: None,
+        priority_id: None,
+        type_id: None,
+        category_id: None,
+        queue_id: Some(queue_id),
+        source: TicketSource::Api,
+        company_id,
+        contact_id: None,
+        site_id: None,
+        assigned_to_id: None,
+        team_id: None,
+        parent_ticket_id: None,
+        contract_id: None,
+        sla_id: None,
+        scheduled_start: None,
+        scheduled_end: None,
+        estimated_hours: None,
+        is_billable: true,
+        asset_id: None,
+        custom_fields: serde_json::json!({}),
+        tags: vec![],
+        source_kb_article_id: None,
+        procedure_kb_article_id: None,
+        email_message_id: None,
+        email_thread_id: None,
+    };
+    let created = ticket_service
+        .create_ticket(tenant, admin_id, &request, &AuditCtx::system(tenant_id))
+        .await
+        .expect("create ticket");
+    let ticket_id = created.id;
+
+    let sla_id_after_create: Option<Uuid> =
+        sqlx::query_scalar("SELECT sla_id FROM tickets WHERE id = $1")
+            .bind(ticket_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read back sla_id after create");
+    assert_eq!(
+        sla_id_after_create,
+        Some(original_default_policy_id),
+        "create with no explicit sla_id must persist the resolved default policy id"
+    );
+
+    // 2. Swap the tenant's default policy to a brand-new one, then trigger
+    // a status-change re-evaluation. The persisted sla_id must track the
+    // new default, not stay pinned to the one resolved at creation.
+    let bh_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO business_hours (id, tenant_id, name, timezone, schedule, is_default)
+           VALUES ($1, $2, 'PMS-1644 New Default Hours', 'America/New_York',
+                   '{
+                       "0": null,
+                       "1": {"start": "09:00", "end": "17:00"},
+                       "2": {"start": "09:00", "end": "17:00"},
+                       "3": {"start": "09:00", "end": "17:00"},
+                       "4": {"start": "09:00", "end": "17:00"},
+                       "5": {"start": "09:00", "end": "17:00"},
+                       "6": null
+                   }'::jsonb, FALSE)"#,
+    )
+    .bind(bh_id)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("seed new business hours");
+
+    let new_default_policy_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO sla_policies (id, tenant_id, name, business_hours_id, is_default)
+           VALUES ($1, $2, 'PMS-1644 New Default SLA', $3, FALSE)"#,
+    )
+    .bind(new_default_policy_id)
+    .bind(tenant_id)
+    .bind(bh_id)
+    .execute(&pool)
+    .await
+    .expect("seed new sla policy");
+
+    sqlx::query(
+        r#"INSERT INTO sla_targets
+           (sla_policy_id, priority_id, first_response_hours, resolution_hours, operational_hours)
+           VALUES ($1, $2, 4, 8, 'business_hours')"#,
+    )
+    .bind(new_default_policy_id)
+    .bind(priority_id)
+    .execute(&pool)
+    .await
+    .expect("seed new sla target");
+
+    sqlx::query("UPDATE sla_policies SET is_default = FALSE WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant_id)
+        .bind(original_default_policy_id)
+        .execute(&pool)
+        .await
+        .expect("unset old default policy");
+    sqlx::query("UPDATE sla_policies SET is_default = TRUE WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant_id)
+        .bind(new_default_policy_id)
+        .execute(&pool)
+        .await
+        .expect("set new default policy");
+
+    let update = UpdateTicketRequest {
+        title: None,
+        description: None,
+        status_id: Some(in_progress_status_id),
+        priority_id: None,
+        type_id: None,
+        category_id: None,
+        queue_id: None,
+        contact_id: None,
+        site_id: None,
+        assigned_to_id: None,
+        team_id: None,
+        contract_id: None,
+        sla_id: None,
+        scheduled_start: None,
+        scheduled_end: None,
+        estimated_hours: None,
+        is_billable: None,
+        billing_status: None,
+        asset_id: None,
+        custom_fields: None,
+        tags: None,
+    };
+    ticket_service
+        .update_ticket(
+            tenant,
+            ticket_id,
+            admin_id,
+            &update,
+            &AuditCtx::system(tenant_id),
+        )
+        .await
+        .expect("update ticket status");
+
+    let sla_id_after_status_change: Option<Uuid> =
+        sqlx::query_scalar("SELECT sla_id FROM tickets WHERE id = $1")
+            .bind(ticket_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read back sla_id after status change");
+    assert_eq!(
+        sla_id_after_status_change,
+        Some(new_default_policy_id),
+        "status change must re-resolve and persist the tenant's new default policy id"
+    );
+}
+
 /// PMS-1564: `TicketService::reopen_portal_ticket` flips a closed ticket's
 /// `status_id` back to the tenant's default status, which is a real status
 /// change and must re-evaluate SLA exactly like `update_ticket`'s own

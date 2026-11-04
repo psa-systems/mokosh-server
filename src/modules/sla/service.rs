@@ -750,13 +750,14 @@ impl SlaService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"UPDATE tickets SET first_response_due = $3, resolution_due = $4,
-                   sla_due_date = $4, updated_at = NOW()
+                   sla_due_date = $4, sla_id = $5, updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
         .bind(tenant_id)
         .bind(ticket_id)
         .bind(fr_due)
         .bind(res_due)
+        .bind(policy_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
