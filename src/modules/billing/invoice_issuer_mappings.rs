@@ -10,12 +10,11 @@
 //! `invoice_issuer_product_mappings`, migration 282); the external
 //! organisation / realm sits on `integrations.external_organisation_id`.
 //!
-//! This module is the read-side surface over all three. Phase 2c (the
-//! follow-up) adds the admin SPA that writes these rows and the
-//! dispatch that reads them from `create_invoice`. Nothing calls the
-//! methods here yet; shipping the service alongside the schema keeps
-//! the next step a small, reviewable PR instead of one that moves
-//! schema and callers at the same time.
+//! This module is the read-side surface over all three. Both halves
+//! that used to be deferred are live: `invoice_issuer_dispatch.rs`
+//! reads these mappings on the `create_invoice` dispatch path, and
+//! `invoice_issuer_mapping_routes.rs` writes them through the admin
+//! HTTP surface (mounted from `src/api/router.rs`).
 
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
