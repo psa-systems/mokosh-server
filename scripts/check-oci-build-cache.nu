@@ -19,9 +19,16 @@
 
 # SPEC-10.177: verifies .forgejo/workflows/*.yml against this required/forbidden
 # pattern set, comments stripped first.
+#
+# Each row names the invariant and the substring(s) that satisfy it. A row with
+# one pattern (as a string) matches that substring; a row with a list satisfies
+# when ANY substring is present, so a workflow may inline `--driver docker-container`
+# OR delegate to the shared `setup-buildx` composite (PMS-1638), which creates
+# the builder with that driver internally. The guard still fails any workflow
+# that does neither.
 const REQUIRED = [
-    [what pattern];
-    ["docker-container buildx driver" "--driver docker-container"]
+    [what patterns];
+    ["docker-container buildx driver" ["--driver docker-container" "psa-systems/common/.forgejo/actions/setup-buildx"]]
     ["Actions runtime-env export step" "crazy-max/ghaction-github-runtime@v3"]
     ["gha cache_from" 'cache_from = "type=gha"']
     ["gha cache_to with mode=max,ignore-error" 'cache_to = "type=gha,mode=max,ignore-error=true"']
@@ -60,8 +67,11 @@ def main [] {
         let body = ($code | each {|row| $row.item } | str join "\n")
 
         for req in $REQUIRED {
-            if not ($body | str contains $req.pattern) {
-                $errors = ($errors | append $"($file): missing ($req.what) \(expected `($req.pattern)`\)")
+            let patterns = (if ($req.patterns | describe) =~ '^list' { $req.patterns } else { [$req.patterns] })
+            let hit = ($patterns | any {|p| $body | str contains $p })
+            if not $hit {
+                let expected = ($patterns | each {|p| $"`($p)`" } | str join " OR ")
+                $errors = ($errors | append $"($file): missing ($req.what) \(expected ($expected)\)")
             }
         }
 
