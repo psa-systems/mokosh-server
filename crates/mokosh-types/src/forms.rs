@@ -260,6 +260,8 @@ fn default_true() -> bool {
 /// A field name is the key its answer occupies in the submission payload, so
 /// it is held to the same shape as a slug but with underscores instead of
 /// hyphens (payload keys read as identifiers, not URL segments).
+// SPEC-4.84: lowercase letters, digits and single underscores, starting with
+// a letter, no trailing or doubled underscore.
 fn validate_field_name(name: &str) -> Result<(), validator::ValidationError> {
     let ok = !name.is_empty()
         && name.starts_with(|c: char| c.is_ascii_lowercase())
@@ -281,6 +283,7 @@ fn validate_field_name(name: &str) -> Result<(), validator::ValidationError> {
 /// Deserialize a present-but-nullable field into `Some(None)` for an explicit
 /// JSON `null` and `Some(Some(v))` for a value, while an absent key stays
 /// `None`. Lets PATCH tell "clear this" apart from "don't touch this".
+// SPEC-4.83: absent means leave alone, null means clear, a value means set.
 fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,

@@ -19,6 +19,7 @@ const MAX_IDS_LOGGED: usize = 10;
 /// Logs once, at INFO, that `surface` returned `ids.len()` person ids it could
 /// not resolve to a name. No-op when `ids` is empty, so every call site can
 /// call this unconditionally after filtering rows down to the unresolved ones.
+// SPEC-4.3, SPEC-4.4: no-op on empty, else one INFO line, ids only, never names.
 pub fn log_unresolved_person_names(surface: &str, ids: &[Uuid]) {
     if ids.is_empty() {
         return;

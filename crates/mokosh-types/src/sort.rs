@@ -20,6 +20,8 @@
 //! Not here on purpose: the sort DIRECTION, which is its own parameter with its
 //! own contract, and each endpoint's DEFAULT ordering, which is a server
 //! implementation choice a client has no reason to know.
+//!
+// SPEC-4.51: the shared allow-list `order_by`/`order_by_mapped` enforce per endpoint.
 
 /// `GET /api/v1/auth/users`.
 pub const USERS: &[&str] = &[

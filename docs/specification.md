@@ -1034,661 +1034,365 @@ A tenant-tier secret belongs to one MSP tenant: a payment-gateway credential, a 
   tolerates a fresh database with no `tenants` table yet; an unknown subcommand prints an error naming the
   unrecognised token, then the help text, then exits with `ExitCode::FAILURE` (src/bin/mokosh-bootstrap.rs).
 
-## 4. Interfaces
+## 4. Utilities, PDF and wire types
 
-### 4.1 HTTP API
+Normative requirements for `src/utils/`, `src/pdf/` and `crates/mokosh-types/`. Each requirement below is cited at its
+implementing or enforcing site with a `// SPEC-4.<n>` comment. Requirement numbers are assigned in file-reading order
+and are not reused.
 
-All paths are relative to the server root. Bodies and responses are JSON unless stated (attachments, logos and PDFs are
-binary; uploads are `multipart/form-data`). List endpoints take `PaginationParams` query parameters and return a
-paginated envelope. Errors use the envelope in section 2.4.
+### 4.1 Money and date formatting
 
-Credentials: staff and platform routes take `Authorization: Bearer <token>`. Contact portal routes take a bearer token
-or the `mokosh:contact_token` cookie. Webhook and machine endpoints authenticate themselves as described after the
-route tables. Routes below are listed as registered; the guard on each is the extractor in its handler:
+- **SPEC-4.1**: `utils::money::money` must format a decimal amount as `"{amount:.2} {currency_code}"` (exactly two
+  decimal places, a literal space, then the code); when no currency is given it must default to `"USD"`, and it must
+  never special-case any single currency with a bare symbol (for example `$`).
+- **SPEC-4.2**: `utils::datetime::add_business_days` must add `n` business days (Monday-Friday) to `start`, skipping
+  Saturday and Sunday, and return a date that is always a weekday; `n == 0` must return `start` unchanged. Holidays are
+  not considered.
 
-| Area | Guard observed in handlers |
-|---|---|
-| Auth, tickets, contacts and companies, notifications, SLA, teams, search, dashboards, saved reports | `RequireAuth`; configuration writes add `RequireAdmin`; some add `RequireManager` |
-| Billing, quotes, expenses, invoice-issuer mappings | module gate `billing`; many routes also `RequireFinance` |
-| Contracts | module gate `contracts`; many routes also `RequireFinance` |
-| Projects | module gate `projects`; some `RequireAdmin` |
-| Calendar, dispatch | module gate `calendar`; some `RequireManager` |
-| Assets, asset catalog, company documentation | module gate `assets`; some `RequireAdmin` |
-| Knowledge base | module gate `knowledge_base`; some `RequireManager` |
-| RMM connections, mappings, alert rules | module gate `rmm_integration`; `RequireAdmin` on writes |
-| Reports | module gate `reports`; billing and clients reports also `RequireFinance` |
-| Time entries, timers, workday, mileage, work types | module gate `time_tracking`; timesheet and approval routes use the `timesheets` gate |
-| Workflow rules, ticket templates, email intake tokens, form definitions | `RequireAdminUser` (admin or super admin) |
-| Audit log list and export, data export, import and demo seed, IP enrichment | `RequireAdmin` |
-| Tenant list, create, suspend, activate | platform admin bearer |
-| Per-tenant get, update, usage, module config | platform admin bearer or a member of that tenant (`TenantOrPlatformCaller`) |
-| SMTP settings, product name, Google contacts client, feature switches | `DeploymentOperator`: a platform admin bearer or an admin of the system tenant |
-| Provider status (JSON and HTML) | admin session, or the identity provider's machine credential as HTTP Basic; refresh needs an admin session |
+### 4.2 Unresolved-person logging
 
-A module gate answers `404` when the module is disabled for the tenant.
+- **SPEC-4.3**: `utils::unresolved_person::log_unresolved_person_names` must be a no-op when `ids` is empty, so every
+  call site can call it unconditionally after filtering to unresolved rows.
+- **SPEC-4.4**: When `ids` is non-empty it must log exactly one `INFO`-level line per call, naming the caller-supplied
+  `surface`, the total `ids.len()`, and at most the first 10 ids (`MAX_IDS_LOGGED`); it must never log a resolved name
+  or email address, because an id alone identifies nothing but a name or email does.
 
-#### Service and status (no authentication)
+### 4.3 Login-location geolocation and decision
 
-```text
-GET                    /api/v1/health
-GET                    /api/v1/ready
-GET                    /api/v1/version
-GET                    /api/v1/version/check
-GET                    /api/v1/providers
-```
+- **SPEC-4.5**: `utils::geoip::GeoIpService::new` must return an error (not silently disable the feature) when the
+  configured IP2Location database path is set but the file cannot be opened as an IP2Location database.
+- **SPEC-4.6**: `GeoIpService::country_code` must return `None` for an address with no location record, and must treat
+  the IP2Location placeholder value `"-"` and a blank string as "no country", never as a real ISO 3166-1 alpha-2 code.
+- **SPEC-4.7**: `utils::login_location::login_location_decision` must return `Record` when there is no previous
+  country (`None`), `Unchanged` when the previous country string equals the current one exactly, and `Alert` for any
+  other previous value; it performs no lookup of its own, only a comparison of two already-resolved country codes.
 
-#### Authentication, sessions, users
+### 4.4 Outbound URL SSRF guard and client IP
 
-```text
-POST                   /api/v1/auth/login
-POST                   /api/v1/auth/select-tenant
-POST                   /api/v1/auth/switch-tenant/{tenant_id}
-POST                   /api/v1/auth/logout
-POST                   /api/v1/auth/logout-all
-POST                   /api/v1/auth/refresh
-POST                   /api/v1/auth/forgot-password
-POST                   /api/v1/auth/reset-password
-GET                    /api/v1/auth/set-password/context/{token}
-GET                    /api/v1/auth/me
-PUT                    /api/v1/auth/me
-GET                    /api/v1/auth/memberships
-POST                   /api/v1/auth/me/complete-onboarding
-PUT                    /api/v1/auth/me/password
-GET                    /api/v1/auth/me/sessions
-DELETE                 /api/v1/auth/me/sessions/{session_id}
-POST                   /api/v1/auth/me/mfa/setup
-POST                   /api/v1/auth/me/mfa/enable
-POST                   /api/v1/auth/me/mfa/disable
-GET                    /api/v1/auth/me/api-keys
-POST                   /api/v1/auth/me/api-keys
-DELETE                 /api/v1/auth/me/api-keys/{key_id}
-GET                    /api/v1/auth/directory
-GET                    /api/v1/auth/users
-POST                   /api/v1/auth/users
-GET                    /api/v1/auth/users/{user_id}
-PUT                    /api/v1/auth/users/{user_id}
-```
+- **SPEC-4.8**: `utils::net::is_non_public_ip` must classify as non-public: IPv4 loopback, RFC1918 private, link-local,
+  unspecified and broadcast addresses, the ranges `100.64.0.0/10`, `192.0.0.0/24` and `198.18.0.0/15`, IPv6 loopback,
+  unspecified, unique-local (`fc00::/7`) and link-local addresses, and any `::ffff:a.b.c.d` IPv4-mapped address whose
+  embedded IPv4 address is itself non-public. It must be the crate's only definition of this predicate.
+- **SPEC-4.9**: `utils::net::guard_outbound_url` must refuse a URL whose scheme is not `http` or `https`
+  (`UrlGuardError::Scheme`), a URL with no host (`UrlGuardError::NoHost`), and, when the caller passes
+  `allowed_ports`, a URL whose port is outside that set (`UrlGuardError::Port`), before performing any DNS resolution.
+- **SPEC-4.10**: Unless the host is named in the `PrivateTargetAllowlist`, `guard_outbound_url` must resolve the host
+  and refuse the URL with `UrlGuardError::Blocked` if any resolved address is non-public per SPEC-4.8 and not covered
+  by an allowlisted network; a resolution failure or a resolution to zero addresses must be reported as
+  `UrlGuardError::Dns`, and a resolved address found non-public on a later redirect hop must be screened the same way.
+- **SPEC-4.11**: `PrivateTargetAllowlist::parse` must treat an entry that parses as an IP address or CIDR as a network
+  exemption and any other non-blank entry as an exact (case-insensitive) hostname exemption; an empty or all-blank
+  input must produce an allowlist that exempts nothing (fail closed). A host named by `allows_host` must be exempted
+  from resolution and screening entirely.
+- **SPEC-4.12**: `utils::net::loggable_url_authority` must reduce a URL-shaped string to its authority (`host[:port]`),
+  stripping any scheme, userinfo, path, query and fragment, even when the input does not parse as a URL at all, so the
+  result is always safe to write to a log line.
+- **SPEC-4.13**: `utils::client_ip::trusted_proxies` must parse `TRUSTED_PROXY_CIDR` as a comma-separated CIDR list,
+  skipping (with a warning, not a boot failure) any entry that fails to parse, and must fall back to the built-in
+  default list (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `::1/128`, `fc00::/7`, `fe80::/10`)
+  when the variable is unset or blank.
+- **SPEC-4.14**: `utils::client_ip::extract_client_ip` must return the socket peer address unchanged, ignoring
+  `X-Forwarded-For` entirely, when the peer is not inside a trusted-proxy network.
+- **SPEC-4.15**: When the peer is a trusted proxy, `extract_client_ip` must read every `X-Forwarded-For` header
+  instance and element from right to left (treating repeated headers as one concatenated list) and return the first
+  address that is not itself inside a trusted-proxy network; when every address in the chain is trusted, or the header
+  is absent or unparseable, it must return the peer address, and it must never panic on malformed input.
+- **SPEC-4.16**: `utils::client_ip::parse_forwarded_ip` must accept a bare IPv4 or IPv6 address, a bracketed IPv6
+  literal with an optional `:port` suffix, and an IPv4 `host:port` form, and must return `None` for anything else.
 
-#### Platform plane (platform admins)
+### 4.5 Download headers, HTML escaping, inline images
 
-```text
-POST                   /api/v1/platform/login
-PUT                    /api/v1/platform/me/password
-POST                   /api/v1/platform/me/mfa/setup
-POST                   /api/v1/platform/me/mfa/enable
-POST                   /api/v1/platform/me/mfa/disable
-```
+- **SPEC-4.17**: `utils::content_disposition::content_disposition` must strip `"`, `/`, `\`, NUL and any other control
+  character from the given filename, keep at most the first 255 remaining characters, trim surrounding whitespace, and
+  fall back to the literal name `file` when nothing is left; a non-ASCII character must pass through unchanged. The
+  result must always be returned as `attachment; filename="<name>"`.
+- **SPEC-4.18**: `utils::html::html_escape` must replace `&` with `&amp;` before replacing `<`, `>` and `"`, so an
+  already-escaped entity is never escaped a second time.
+- **SPEC-4.19**: `utils::html::urlencoded` must percent-encode every byte outside `A-Z`, `a-z`, `0-9`, `-`, `_`, `.`
+  and `~`.
+- **SPEC-4.20**: `utils::inline_image::check_inline_image_mime` must accept only `image/png`, `image/jpeg`,
+  `image/webp` and `image/gif` (matched case-insensitively and after cutting the value at the first `;`), returning
+  the canonical lowercase MIME string on success; it must reject every other type, including `image/svg+xml`, because
+  SVG is script-capable and the three public, unauthenticated image surfaces (tenant logo, KB article image, ticket
+  inline image) must never serve one.
 
-#### Grant invitations
+### 4.6 Recovery codes, app name, upload limits
 
-```text
-GET                    /api/v1/grants/invitations/by-token/{token}
-POST                   /api/v1/grants/invitations/by-token/{token}/accept
-POST                   /api/v1/grants/invitations/by-token/{token}/decline
-POST                   /api/v1/grants/invitations
-GET                    /api/v1/grants/invitations
-DELETE                 /api/v1/grants/invitations/{id}
-GET                    /api/v1/my-grants/invitations
-POST                   /api/v1/my-grants/invitations/{id}/accept
-POST                   /api/v1/my-grants/invitations/{id}/decline
-DELETE                 /api/v1/my-grants/{id}
-```
+- **SPEC-4.21**: `utils::recovery::generate_code` must produce 10 random bytes, base32-encode all 16 resulting
+  characters (no truncation, preserving the full 80 bits of entropy) and format them as `XXXXXXXX-XXXXXXXX`.
+  `canonicalize` must strip whitespace and hyphens and uppercase the remainder, so any of the hyphenated, unhyphenated,
+  lower-case or spaced forms of a code canonicalize identically; `hash_code` and `hash_code_hex` must hash the
+  canonical form with SHA-256.
+- **SPEC-4.22**: `utils::app_name::app_name` must return `DEFAULT_APP_NAME` ("Mokosh") when no name has been set, and
+  must otherwise return the cached name set by the most recent `set_app_name` call; `sanitize` must reject a blank (or
+  whitespace-only) name, a name longer than `MAX_APP_NAME_LEN` (64) characters (counted as Unicode characters, not
+  bytes), and a name containing any control character, since the value is later written into an email `Subject`
+  header.
+- **SPEC-4.23**: `utils::upload_limits::oversized_upload_error` must return an `AppError` that renders as HTTP 413
+  (Payload Too Large) with the message `"{what} exceeds the {cap_bytes} byte cap."`. Every route that accepts an
+  upload against its own size cap must build this refusal through this function rather than a hand-built error.
+- **SPEC-4.24**: `utils::upload_limits::body_limit_bytes` must return the route's logical byte cap plus a fixed 64
+  KiB margin (`MULTIPART_OVERHEAD_BYTES`), and every route with an upload cap must pass that value to
+  `axum::extract::DefaultBodyLimit::max`, because axum's own un-raised multipart body limit is 2 MiB and would refuse
+  an at-cap upload before `oversized_upload_error` ever runs.
 
-#### Tenants, teams, members, invitations
+### 4.7 Password policy, security response headers, sanitized JSON extraction
 
-```text
-GET                    /api/v1/tenants
-POST                   /api/v1/tenants
-POST                   /api/v1/tenants/self-serve
-POST                   /api/v1/tenants/additional
-GET                    /api/v1/tenants/current
-PUT                    /api/v1/tenants/current
-PUT                    /api/v1/tenants/current/organization
-PUT                    /api/v1/tenants/current/logo
-DELETE                 /api/v1/tenants/current/logo
-GET                    /api/v1/tenants/{tenant_id}
-PUT                    /api/v1/tenants/{tenant_id}
-POST                   /api/v1/tenants/{tenant_id}/suspend
-POST                   /api/v1/tenants/{tenant_id}/activate
-GET                    /api/v1/tenants/{tenant_id}/usage
-GET                    /api/v1/tenants/{tenant_id}/modules/{module}
-PUT                    /api/v1/tenants/{tenant_id}/modules/{module}
-GET, POST              /api/v1/teams
-GET, PUT, DELETE       /api/v1/teams/{team_id}
-GET, POST              /api/v1/teams/{team_id}/members
-PUT, DELETE            /api/v1/teams/{team_id}/members/{user_id}
-GET                    /api/v1/me/teams
-GET                    /api/v1/members
-GET, POST              /api/v1/invitations
-DELETE                 /api/v1/invitations/{id}
-```
+- **SPEC-4.25**: `utils::password_policy::validate` must reject a password shorter than `policy.min_length`
+  (default 12) or longer than `policy.max_length` (default 128) characters, counted as Unicode characters, before
+  running any other check.
+- **SPEC-4.26**: `validate` must reject a password whose lowercased form, or whose lowercased form with `@` mapped to
+  `a` and `$` mapped to `s`, exactly matches an entry in the embedded common-password list, independent of the length
+  and score checks.
+- **SPEC-4.27**: `validate` must reject a password whose `zxcvbn` score is below `policy.min_zxcvbn_score` (default
+  3), scored with the caller-supplied `context_hints` so a password built from the user's own identifying strings
+  scores lower.
+- **SPEC-4.28**: The `security_headers` middleware must add `strict-transport-security`, `x-content-type-options`,
+  `x-frame-options`, `referrer-policy`, `permissions-policy` and `content-security-policy` to every response, filling
+  in only the headers the handler left unset, so a value the handler set for itself is never overwritten.
+- **SPEC-4.29**: `utils::json::Json` as an extractor must deserialize from the `ParsedJsonBody` request extension
+  when `sanitize_json_body` already parsed the body, and must fall back to `axum::Json`'s own parse only when that
+  extension is absent, so a well-formed JSON request body is parsed by `serde_json` exactly once.
 
-#### Contacts, companies, sites
+### 4.8 TOTP and recovery/portal cryptography
 
-```text
-GET                    /api/v1/contacts/companies
-POST                   /api/v1/contacts/companies
-GET                    /api/v1/contacts/companies/website-probe
-GET                    /api/v1/contacts/companies/{company_id}
-PUT                    /api/v1/contacts/companies/{company_id}
-DELETE                 /api/v1/contacts/companies/{company_id}
-GET                    /api/v1/contacts/companies/{company_id}/deletion-preview
-GET                    /api/v1/contacts/companies/{company_id}/contacts
-GET                    /api/v1/contacts/companies/{company_id}/sites
-GET, POST              /api/v1/contacts/companies/{company_id}/portal-roles
-GET, PUT, DELETE       /api/v1/contacts/companies/{company_id}/portal-roles/{role_id}
-GET                    /api/v1/contacts/contacts
-POST                   /api/v1/contacts/contacts
-GET                    /api/v1/contacts/contacts/field-values
-GET                    /api/v1/contacts/contacts/{contact_id}
-PUT                    /api/v1/contacts/contacts/{contact_id}
-DELETE                 /api/v1/contacts/contacts/{contact_id}
-GET                    /api/v1/contacts/contacts/portal-roles
-POST                   /api/v1/contacts/contacts/{contact_id}/grant-portal-access
-POST                   /api/v1/contacts/contacts/{contact_id}/resend-portal-invite
-POST                   /api/v1/contacts/contacts/{contact_id}/revoke-portal-access
-GET, PUT               /api/v1/contacts/contacts/{contact_id}/portal-roles
-GET                    /api/v1/contacts/contacts/{contact_id}/access-requests
-POST                   /api/v1/contacts/contacts/access-requests/{request_id}/resolve
-GET, POST              /api/v1/contacts/company-industries
-PUT, DELETE            /api/v1/contacts/company-industries/{id}
-POST                   /api/v1/contacts/sites
-GET                    /api/v1/contacts/sites/{site_id}
-PUT                    /api/v1/contacts/sites/{site_id}
-DELETE                 /api/v1/contacts/sites/{site_id}
-GET                    /api/v1/contacts/{contact_id}/notes
-GET                    /api/v1/portal-roles
-POST                   /api/v1/portal-roles
-GET                    /api/v1/portal-roles/capabilities
-GET                    /api/v1/portal-roles/{id}
-PUT                    /api/v1/portal-roles/{id}
-DELETE                 /api/v1/portal-roles/{id}
-GET                    /api/v1/companies/{company_id}/documentation
-PUT, DELETE            /api/v1/companies/{company_id}/{asset}
-PUT, DELETE            /api/v1/tenants/current/branding/{asset}
-```
+- **SPEC-4.30**: `utils::totp::base32_encode` must produce RFC 4648 base32 (uppercase alphabet) with no padding;
+  `base32_decode` must ignore whitespace and `=` padding and accept either case.
+- **SPEC-4.31**: `utils::totp::step` must compute the RFC 4226/6238 HMAC-SHA1 dynamic-truncation value for step
+  number `t`, and `verify` must accept `code` only when it is exactly `TOTP_DIGITS` ASCII digits, trying every step
+  from `t - window` to `t + window` inclusive with a constant-time comparison, returning the first matched step.
+- **SPEC-4.32**: `utils::crypto::encrypt` must AES-256-GCM-encrypt with a random 12-byte nonce, store
+  `nonce || ciphertext` and base64-encode the result; `decrypt` must reverse that exactly, rejecting an input shorter
+  than the 12-byte nonce.
+- **SPEC-4.33**: `utils::crypto::parse_encryption_key` must hex-decode a 64-character input to 32 bytes, must treat
+  a 32-character input as raw bytes only when it is not entirely hex digits (rejecting an all-hex 32-character input
+  as ambiguous), and must reject any other length.
+- **SPEC-4.34**: `utils::crypto::generate_portal_slug` must produce a 16-character string drawn only from Crockford
+  base32 characters with `I`, `L`, `O` and `U` excluded; `generate_portal_id` must return an integer in
+  `[100_000_000, 1_000_000_000)` so it always renders as exactly 9 digits.
+- **SPEC-4.35**: `utils::crypto::sha256_hex` must return the lowercase hex SHA-256 digest of its input.
+  `verify_password_or_dummy` must run exactly one Argon2 verification whether `row_hash` is `Some` or `None`
+  (verifying against a fixed dummy hash in the `None` case) and must return `Ok(false)` whenever `row_hash` is
+  `None`, so a lookup that matched no row costs the same time as one that did.
 
-#### Tickets
+### 4.9 Request-body text sanitization
 
-```text
-GET                    /api/v1/tickets
-POST                   /api/v1/tickets
-GET                    /api/v1/tickets/{ticket_id}
-GET                    /api/v1/tickets/{ticket_id}/sla
-PUT                    /api/v1/tickets/{ticket_id}
-PATCH                  /api/v1/tickets/{ticket_id}
-DELETE                 /api/v1/tickets/{ticket_id}
-POST                   /api/v1/tickets/{ticket_id}/assign
-POST                   /api/v1/tickets/{ticket_id}/approvals/request
-POST                   /api/v1/tickets/{ticket_id}/reopen
-POST                   /api/v1/tickets/{ticket_id}/attachments
-GET                    /api/v1/tickets/{ticket_id}/notes
-POST                   /api/v1/tickets/{ticket_id}/notes
-PUT                    /api/v1/tickets/{ticket_id}/notes/{note_id}
-GET, POST              /api/v1/tickets/statuses
-PUT, DELETE            /api/v1/tickets/statuses/{id}
-GET, POST              /api/v1/tickets/priorities
-PUT, DELETE            /api/v1/tickets/priorities/{id}
-GET, POST              /api/v1/tickets/queues
-PUT, DELETE            /api/v1/tickets/queues/{id}
-GET, POST              /api/v1/tickets/types
-PUT, DELETE            /api/v1/tickets/types/{id}
-GET, POST              /api/v1/tickets/categories
-PUT, DELETE            /api/v1/tickets/categories/{id}
-GET, POST              /api/v1/tickets/saved-views
-PUT, DELETE            /api/v1/tickets/saved-views/{id}
-POST                   /api/v1/tickets/{ticket_id}/attachments/inline
-GET, POST              /api/v1/tickets/{ticket_id}/notes/{note_id}/attachments
-GET, DELETE            /api/v1/tickets/{ticket_id}/notes/{note_id}/attachments/{attachment_id}
-GET, POST              /api/v1/ticket-templates
-GET, PATCH, DELETE     /api/v1/ticket-templates/{id}
-GET, POST              /api/v1/workflow-rules
-GET, PATCH, DELETE     /api/v1/workflow-rules/{id}
-GET                    /api/v1/tickets/{id}/workflow-runs
-GET, POST              /api/v1/tickets/{ticket_id}/approvals
-GET, POST              /api/v1/time-entries/{entity_id}/approvals
-GET, POST              /api/v1/change-requests/{entity_id}/approvals
-GET, POST              /api/v1/quotes/{entity_id}/approvals
-GET                    /api/v1/approvals/pending
-GET                    /api/v1/approvals/pending/count
-POST                   /api/v1/approvals/{id}/decision
-DELETE                 /api/v1/approvals/{id}
-```
+- **SPEC-4.36**: `utils::text::is_secret_field` must match a key against `SECRET_FIELD_NAMES` case-insensitively and
+  exactly (no substring match); `sanitize_json_tree` must skip sanitizing the entire subtree under a key that
+  matches, while still sanitizing the key string itself.
+- **SPEC-4.37**: `sanitize_json_tree` must apply `sanitize_invisible` to every string value and every object key at
+  any depth (except a skipped secret subtree's values), recursing into arrays and objects, and must return `true` if
+  and only if at least one byte changed.
+- **SPEC-4.38**: `utils::text::sanitize_json_body` must forward the request body untouched when the path matches a
+  `RAW_BODY_PATHS` prefix, when the `Content-Type` is not JSON, or when a declared `Content-Length` exceeds
+  `MAX_SANITIZED_JSON_BYTES` (25 MB); on a body that parses as JSON it must store the parsed (and possibly
+  sanitized) tree as a `ParsedJsonBody` request extension, replace the body with an empty one and remove
+  `Content-Length`; on an empty or unparseable body it must forward the original bytes untouched.
 
-#### Time tracking, mileage
+### 4.10 Field-level validators
 
-```text
-GET, POST              /api/v1/work-types
-PUT, DELETE            /api/v1/work-types/{id}
-GET, POST              /api/v1/time-entries
-GET                    /api/v1/time-entries/summary
-GET, PUT, DELETE       /api/v1/time-entries/{id}
-GET                    /api/v1/timesheets
-POST                   /api/v1/timesheets/{user_id}/{week_start}/submit
-POST                   /api/v1/timesheets/{user_id}/{week_start}/withdraw
-POST                   /api/v1/timesheets/{user_id}/{week_start}/approve
-POST                   /api/v1/timesheets/{user_id}/{week_start}/reject
-GET                    /api/v1/timers/active
-POST                   /api/v1/timers/start
-POST                   /api/v1/timers/{id}/stop
-GET                    /api/v1/workday
-POST                   /api/v1/workday/clock-in
-POST                   /api/v1/workday/clock-out
-POST                   /api/v1/workday/break/start
-POST                   /api/v1/workday/break/end
-PUT, DELETE            /api/v1/workday/segments/{id}
-GET, POST              /api/v1/time-rounding-rules
-PUT, DELETE            /api/v1/time-rounding-rules/{id}
-GET, POST              /api/v1/mileage-entries
-GET, PUT, DELETE       /api/v1/mileage-entries/{id}
-```
+- **SPEC-4.39**: `utils::validation::validate_email` must accept only a string matching
+  `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`.
+- **SPEC-4.40**: `validate_phone` must first strip invisible characters via `sanitize_invisible`, then accept an
+  empty result or one matching the E.164 pattern `^\+?[1-9]\d{1,14}$`.
+- **SPEC-4.41**: `validate_slug` must delegate to `mokosh_types::validation::validate_slug` rather than defining its
+  own grammar, so the server and the wire-type crate cannot diverge on what a slug is.
+- **SPEC-4.42**: `validate_password_strength` must require between 8 and 128 characters and at least one lowercase
+  letter, one uppercase letter, one ASCII digit and one non-alphanumeric character, listing every missing category
+  in the error message.
+- **SPEC-4.43**: `validate_cron` must accept only an expression `cron::Schedule::try_from` parses successfully.
+- **SPEC-4.44**: `validate_scheduling_template_kind`, `validate_contract_type`, `validate_contract_status` and
+  `validate_billing_cycle` must each accept only a value present in its fixed set (`SCHEDULING_TEMPLATE_KINDS`,
+  `CONTRACT_TYPES`, `CONTRACT_STATUSES`, `BILLING_CYCLES` respectively), matching the corresponding database CHECK
+  constraint exactly, so an out-of-set value is rejected with a 422 rather than a database error.
+- **SPEC-4.45**: `validate_money_amount` must reject a magnitude of 10,000,000,000 or more; `validate_payment_amount`
+  must additionally reject a value that is not strictly positive or has more than 2 decimal places;
+  `validate_budget_amount` and `validate_budget_hours` must reject a negative value, more than 2 decimal places, or
+  a magnitude at or above their respective `DECIMAL` column limits; `validate_sla_target_hours` must reject a value
+  that is not strictly positive, has more than 2 decimal places, or reaches 100,000,000; `validate_tax_rate` must
+  reject a negative value, a value over 100, or more than 4 decimal places.
+- **SPEC-4.46**: `validate_ip_address` must accept an empty string or one `std::net::IpAddr` parses; validate a MAC
+  address must accept an empty string or one matching a colon- or hyphen-separated six-octet hex pattern.
+- **SPEC-4.47**: `slugify` must lowercase the input, replace every non-alphanumeric character with `-`, and collapse
+  consecutive separators; `truncate` must cut at a UTF-8 character boundary at or before `max_len - 3` bytes and
+  append `"..."` rather than panicking on a byte offset inside a multi-byte character.
+- **SPEC-4.48**: `cross_field_error` must build a `ValidationError` carrying a `field` param equal to its `field`
+  argument, so a schema-level validation error can be re-keyed onto a named form field instead of a generic bucket.
 
-#### Projects
+### 4.11 Pagination parameters and response metadata
 
-```text
-GET, POST              /api/v1/projects
-GET                    /api/v1/projects/summary
-GET, PUT, DELETE       /api/v1/projects/{id}
-GET, POST              /api/v1/projects/{id}/phases
-PUT, DELETE            /api/v1/phases/{phase_id}
-GET, POST              /api/v1/task-statuses
-PUT, DELETE            /api/v1/task-statuses/{id}
-GET, POST              /api/v1/project-types
-PUT, DELETE            /api/v1/project-types/{id}
-GET, POST              /api/v1/projects/{id}/tasks
-GET, PUT, DELETE       /api/v1/tasks/{id}
-POST, DELETE           /api/v1/tasks/{id}/depends-on/{other}
-```
+- **SPEC-4.49**: `utils::pagination::PaginationParams` must reject a deserialized `per_page` greater than
+  `MAX_PER_PAGE` (100) at parse time with a deserialization error; `PaginationParams::per_page` must clamp the
+  stored value to the inclusive range `[1, MAX_PER_PAGE]`.
+- **SPEC-4.50**: `PaginationParams::direction` (used by `order_by`, `order_by_mapped` and
+  `reject_unsupported_sort`) must map `"asc"` (case-insensitive) to `"ASC"`, an empty string or `"desc"` to
+  `"DESC"`, and reject any other value with a 422 naming the `sort_dir` field.
+- **SPEC-4.51**: `order_by` and `order_by_mapped` must reject a `sort` value absent from their allow-list with a
+  422 naming the `sort` field, the requested value and the accepted values, and must leave a `None` sort unchanged
+  by substituting the default field or SQL expression; `order_by_mapped` must resolve an allow-listed public key to
+  its mapped SQL expression rather than ever splicing the client-supplied string into the generated SQL;
+  `reject_unsupported_sort` must reject any non-`None` `sort` with a 422 stating the endpoint does not support
+  sorting.
+- **SPEC-4.52**: `PaginatedResponse::new` must compute `total_pages` as `ceil(total / per_page)` with `per_page`
+  floored to 1 to avoid division by zero, and must set `has_next` to `page < total_pages` and `has_prev` to
+  `page > 1`.
 
-#### Calendar and dispatch
+### 4.12 The AppError envelope
 
-```text
-GET, POST              /api/v1/appointments
-GET                    /api/v1/calendar/appointments
-GET, PUT, DELETE       /api/v1/appointments/{id}
-GET, PUT               /api/v1/users/{user_id}/availability
-GET, POST              /api/v1/time-off
-GET, DELETE            /api/v1/time-off/{id}
-POST                   /api/v1/time-off/{id}/approval
-GET, POST              /api/v1/on-call-schedules
-PUT, DELETE            /api/v1/on-call-schedules/{id}
-GET                    /api/v1/on-call/now
-GET, POST              /api/v1/scheduling-templates
-GET, PUT, DELETE       /api/v1/scheduling-templates/{id}
-GET                    /api/v1/dispatch
-```
+- **SPEC-4.53**: `utils::error::AppError::status_code` and `error_code` must each return one fixed value per
+  variant, including `AccountDeleted` as 410 `ACCOUNT_DELETED`, `TokenExpired` as 401 `TOKEN_EXPIRED`, and
+  `RateLimited` as 429 `RATE_LIMITED`, so a client can switch on `code` without string-matching `message`.
+- **SPEC-4.54**: `ErrorResponse::from(AppError)` must render the `Database` variant's wire message as the fixed
+  string `"Database operation failed"` regardless of the wrapped cause, must render every other variant's wire
+  message as its `Display` string, and must populate `errors` only for the `Validation` and `QueryError` variants.
+- **SPEC-4.55**: `AppError`'s `IntoResponse` must render every `RateLimited` value, however constructed, through
+  `rate_limited_response` (a `Retry-After` header and `Cache-Control: no-store`), defaulting the wait to
+  `DEFAULT_RATE_LIMIT_RETRY_AFTER_SECONDS` (60) when `retry_after_seconds` is `None`.
+- **SPEC-4.56**: `normalize_error_envelope` must leave a response unchanged unless its status is a client error
+  (4xx) and its `Content-Type` is not `application/json`; such a response must be replaced with
+  `envelope_for_rejection`'s canonical `{error:{code,message}}` body, discarding the original.
+- **SPEC-4.57**: `From<sqlx::Error> for AppError` must map `RowNotFound` to `NotFound`, a Postgres `23505` unique
+  violation to `Conflict`, and any other database error to `Database` with the raw cause logged at `error` level
+  (a `23505` logs at `debug`).
+- **SPEC-4.58**: `From<validator::ValidationErrors> for AppError` must flatten nested `Struct` and `List` errors
+  into dotted (and `[index]`-suffixed) field paths, must re-key a schema-level error onto the field
+  `validation::cross_field_error` recorded via `cross_field_target`, and must build each message from the field
+  error's explicit `message` when present or otherwise synthesize one from its constraint code and bound
+  parameters (`humanize_field_error`).
 
-#### Contracts, SLA
+### 4.13 Deployment mode and provider selection
 
-```text
-GET, POST              /api/v1/contracts
-GET, PUT, DELETE       /api/v1/contracts/{id}
-GET, POST              /api/v1/contracts/{id}/items
-PUT, DELETE            /api/v1/contract-items/{id}
-GET                    /api/v1/contracts/{id}/hour-balance
-GET, POST              /api/v1/rate-cards
-GET, PUT, DELETE       /api/v1/rate-cards/{id}
-GET, POST              /api/v1/rate-cards/{id}/items
-DELETE                 /api/v1/rate-card-items/{id}
-GET, POST              /api/v1/sla/policies
-GET, PUT, DELETE       /api/v1/sla/policies/{id}
-GET, POST              /api/v1/sla/policies/{id}/targets
-DELETE                 /api/v1/sla/targets/{id}
-GET, POST              /api/v1/sla/business-hours
-PUT, DELETE            /api/v1/sla/business-hours/{id}
-GET, POST              /api/v1/sla/holiday-calendars
-PUT, DELETE            /api/v1/sla/holiday-calendars/{id}
-POST                   /api/v1/sla/tickets/{id}/evaluate
-```
+- **SPEC-4.59**: the deployment-mode reader used for mail dispatch must fall back to self-hosted and log a warning
+  on an unrecognized `MOKOSH_DEPLOYMENT_MODE` value, never fail the read.
+- **SPEC-4.60**: the deployment-mode reader used for provider selection must instead return an error naming the
+  accepted values on an unrecognized `MOKOSH_DEPLOYMENT_MODE` value.
+- **SPEC-4.61**: both readers must recognize the mode value case-insensitively and with surrounding whitespace
+  trimmed, and must treat an empty value the same as an absent one (self-hosted).
+- **SPEC-4.62**: resolving a deployment's provider table must select an operator's explicit per-capability choice
+  over the hosting profile's default for that capability only, and must record for each capability whether its
+  choice came from the profile or from an explicit override.
+- **SPEC-4.63**: the self-hosted hosting profile's default provider table must name no provider that requires
+  reaching an external service.
 
-#### Billing
+### 4.14 Outbound mail
 
-```text
-GET, POST              /api/v1/invoices
-GET                    /api/v1/invoices/summary
-POST                   /api/v1/invoices/from-time-entries
-GET, PUT               /api/v1/invoices/{invoice_id}
-POST                   /api/v1/invoices/{invoice_id}/write-off
-POST                   /api/v1/invoices/{invoice_id}/void
-POST                   /api/v1/invoices/{invoice_id}/amend
-GET                    /api/v1/invoices/{invoice_id}/pdf
-GET                    /api/v1/invoices/{invoice_id}/delivery-options
-POST                   /api/v1/invoices/{invoice_id}/pay
-GET                    /api/v1/invoices/{invoice_id}/payments
-GET                    /api/v1/invoices/{invoice_id}/payment-readiness
-GET, POST              /api/v1/products
-GET, PUT, DELETE       /api/v1/products/{product_id}
-GET                    /api/v1/statements
-GET                    /api/v1/statements/pdf
-GET, POST              /api/v1/credit-notes
-GET                    /api/v1/credit-notes/{credit_note_id}
-GET                    /api/v1/credit-notes/{credit_note_id}/pdf
-POST                   /api/v1/credit-notes/{credit_note_id}/void
-GET, POST              /api/v1/payments
-DELETE                 /api/v1/payments/{payment_id}
-GET, PUT               /api/v1/payment-gateways
-GET                    /api/v1/payment-gateways/webhook-endpoints
-GET                    /api/v1/payment-gateways/webhook-deliveries
-DELETE                 /api/v1/payment-gateways/{provider}
-POST                   /api/v1/payment-gateways/{provider}/check
-GET, POST              /api/v1/tax-rates
-PUT, DELETE            /api/v1/tax-rates/{id}
-GET                    /api/v1/tax-rates/lookup
-GET, POST              /api/v1/payment-terms
-PUT, DELETE            /api/v1/payment-terms/{id}
-GET                    /api/v1/invoice-issuer-mappings/companies
-PUT                    /api/v1/invoice-issuer-mappings/companies/{provider}/{company_id}
-GET                    /api/v1/invoice-issuer-mappings/products
-PUT                    /api/v1/invoice-issuer-mappings/products/{provider}/{product_id}
-GET                    /api/v1/invoice-issuer-mappings/vendors
-PUT                    /api/v1/invoice-issuer-mappings/vendors/{provider}/{vendor_id}
-GET                    /api/v1/invoice-issuer-mappings/expense-accounts
-PUT                    /api/v1/invoice-issuer-mappings/expense-accounts/{provider}/{category_id}
-GET                    /api/v1/invoice-issuer-mappings/people
-PUT                    /api/v1/invoice-issuer-mappings/people/{provider}/{user_id}
-GET                    /api/v1/integrations/invoice-issuer/{provider}
-POST                   /api/v1/integrations/invoice-issuer/{provider}/authorize
-POST                   /api/v1/integrations/invoice-issuer/{provider}/disconnect
-PUT                    /api/v1/integrations/invoice-issuer/{provider}/bills
-PUT                    /api/v1/integrations/invoice-issuer/{provider}/payment-account
-GET, POST              /api/v1/quotes
-GET, PUT, DELETE       /api/v1/quotes/{quote_id}
-POST                   /api/v1/quotes/{quote_id}/send
-GET                    /api/v1/quotes/{quote_id}/delivery-options
-POST                   /api/v1/quotes/{quote_id}/convert
-POST                   /api/v1/quotes/{quote_id}/accept
-POST                   /api/v1/quotes/{quote_id}/decline
-GET                    /api/v1/quotes/{quote_id}/pdf
-POST                   /api/v1/quotes/{quote_id}/lines
-PUT, DELETE            /api/v1/quotes/{quote_id}/lines/{line_id}
-GET, POST              /api/v1/vendors
-GET, PUT, DELETE       /api/v1/vendors/{id}
-GET, POST              /api/v1/expense-categories
-PUT                    /api/v1/expense-categories/{id}
-GET, POST              /api/v1/bills
-GET                    /api/v1/bills/{id}
-POST                   /api/v1/bills/{id}/approve
-POST                   /api/v1/bills/{id}/void
-GET, POST              /api/v1/bills/{id}/payments
-GET, POST              /api/v1/expenses
-GET                    /api/v1/expenses/{id}
-POST                   /api/v1/expenses/{id}/submit
-POST                   /api/v1/expenses/{id}/approve
-POST                   /api/v1/expenses/{id}/reject
-POST                   /api/v1/expenses/{id}/reimburse
-```
+- **SPEC-4.64**: a `Mailer` implementation that does not override `send_with_attachments` must send the text alone
+  and log a warning when given one or more attachments, never silently drop them without logging.
+- **SPEC-4.65**: sending to a recipient address in the reserved `.invalid` top-level domain must fail locally with
+  a client error rather than being handed to a transport.
+- **SPEC-4.66**: `SmtpTls::parse` must map `implicit`/`tls`/`smtps` to implicit TLS, `starttls` or an empty value to
+  STARTTLS, and `none`/`plain`/`off` to no TLS, rejecting any other value; `SmtpMailer::verify` must report success
+  only when the relay's `NOOP` returns true, and must report a distinct error for an unreachable host versus a
+  reachable host that refuses the `NOOP`.
+- **SPEC-4.67**: `MailerConfig::build` must select `LogMailer` when `SMTP_HOST` is unset or empty and `SmtpMailer`
+  otherwise, and `MailerConfig::from_env` must reject a configuration that sets `SMTP_USERNAME` without a
+  non-empty `SMTP_PASSWORD`.
+- **SPEC-4.68**: resolving the mail provider must honor an explicit `MAIL_PROVIDER` value over everything else,
+  must infer `smtp` as an explicit choice when `MAIL_PROVIDER` is unset but `SMTP_HOST` is set, and must otherwise
+  fall back to the hosting profile's default provider.
+- **SPEC-4.69**: building the `smtp` provider with no `SMTP_HOST` configured must fail with a named configuration
+  error rather than falling back to another provider, and building the `log` provider while `SMTP_HOST` is set
+  must still succeed but log a warning that the relay configuration is ignored.
+- **SPEC-4.70**: `SharedMailer::swap` must replace the active mailer such that every subsequent send through the
+  shared handle uses the new mailer, without any consumer needing to re-fetch a reference.
 
-#### Assets, documentation
+### 4.15 PDF document rendering
 
-```text
-GET, POST              /api/v1/asset-types
-PUT, DELETE            /api/v1/asset-types/{id}
-GET, POST              /api/v1/assets
-POST                   /api/v1/assets/search
-POST                   /api/v1/assets/search/facets
-POST                   /api/v1/assets/bulk-create
-POST                   /api/v1/assets/exists
-GET, PUT, PATCH, DELETE /api/v1/assets/{id}
-GET, POST              /api/v1/assets/{id}/relationships
-DELETE                 /api/v1/asset-relationships/{id}
-GET                    /api/v1/assets/{id}/impact
-POST                   /api/v1/assets/{id}/report-issue
-GET, POST              /api/v1/assets/{id}/configuration-items
-GET, DELETE            /api/v1/configuration-items/{id}
-GET, POST              /api/v1/assets/{id}/credentials
-GET, DELETE            /api/v1/credentials/{id}
-GET                    /api/v1/assets/{id}/audit-log
-GET, POST              /api/v1/asset-models
-GET                    /api/v1/asset-models/signature-detector
-GET, PUT, DELETE       /api/v1/asset-models/{id}
-GET, POST              /api/v1/asset-templates
-GET, PUT, DELETE       /api/v1/asset-templates/{id}
-```
+- **SPEC-4.71**: resolving a template's theme must fall back to the module's default accent color when the
+  tenant's accent is absent or does not parse as `#rrggbb`, logging a warning only in the unparseable case; the
+  band's text color must be chosen between a near-black and white ink by the accent's WCAG relative luminance so
+  the band's own title stays legible against it.
+- **SPEC-4.72**: parsing an accent color must accept only a leading `#` followed by exactly six ASCII hex digits,
+  rejecting every other string.
+- **SPEC-4.73**: rendering a document must embed, per font weight, only the glyphs that document's text actually
+  draws, selected by a deterministic (sorted) glyph id list, falling back to embedding the whole face without
+  failing the render when subsetting itself fails.
+- **SPEC-4.74**: folding text into the embedded face's character set must replace a C0/C1 control character and
+  any character the face has no glyph for with a single placeholder character, and must collect the distinct
+  missing characters so the caller can report them once per document rather than once per occurrence.
+- **SPEC-4.75**: rendering the same `Document` and the same `generated_on` date must produce byte-identical PDF
+  output on every call, with no part of the output read from the system clock.
+- **SPEC-4.76**: the saved PDF's trailer file identifier must be rewritten from a digest of the file with the
+  original identifier bytes blanked first, replacing both identifier slots with the same value of the same byte
+  length as what it replaces, and must leave the file untouched if the expected identifier markers are not found.
+- **SPEC-4.77**: placing a logo must scale it to fit inside its configured box while preserving its aspect ratio,
+  and a logo image that fails to decode must not fail the render, instead being omitted with a logged warning.
+- **SPEC-4.78**: distributing a table's column widths must never narrow a column below the configured minimum,
+  and a column whose content already fits within the narrow-column threshold must keep its full width before any
+  wider column gives up space; a cell that still does not fit its column must be truncated with a trailing
+  ellipsis rather than overflowing.
 
-#### Knowledge base
+### 4.16 Shared wire-type validators and helpers
 
-```text
-GET, POST              /api/v1/kb/categories
-PUT, DELETE            /api/v1/kb/categories/{id}
-GET, POST              /api/v1/kb/articles
-GET, PUT, DELETE       /api/v1/kb/articles/{id}
-GET, PUT, DELETE       /api/v1/kb/articles/{id}/draft
-GET                    /api/v1/kb/articles/{id}/versions
-POST                   /api/v1/kb/articles/{id}/versions/{version_number}/restore
-POST                   /api/v1/kb/articles/{id}/render
-POST                   /api/v1/kb/articles/{id}/helpful
-POST                   /api/v1/kb/articles/{id}/not_helpful
-GET                    /api/v1/kb/articles/{id}/vote
-GET                    /api/v1/kb/top-ticket-driving-articles
-GET                    /api/v1/kb/articles/{id}/measured-duration
-GET                    /api/v1/kb/articles/{id}/tickets
-GET, POST              /api/v1/kb/articles/{id}/comments
-PUT, DELETE            /api/v1/kb/comments/{id}
-POST                   /api/v1/kb/comments/{id}/resolve
-POST                   /api/v1/kb/comments/{id}/unresolve
-GET, POST              /api/v1/kb/articles/{id}/attachments
-DELETE                 /api/v1/kb/articles/{id}/attachments/{attachment_id}
-GET                    /api/v1/kb/attachments/{attachment_id}
-```
+- **SPEC-4.79**: a slug must match `^[a-z0-9]+(-[a-z0-9]+)*$`: lowercase letters and digits only, with a single
+  hyphen between groups and no leading, trailing or doubled hyphen.
+- **SPEC-4.80**: a stored rate or hours value must fit `NUMERIC(10,2)` and may be zero; a per-mile rate must fit
+  `NUMERIC(8,4)`; a mileage distance must fit `NUMERIC(8,2)` and must be strictly positive, rejecting zero where
+  the other three accept it.
+- **SPEC-4.81**: sanitizing a string must remove every Unicode format character and U+00AD, fold any non-ASCII
+  whitespace character to a plain space, and trim the result, while a zero-width joiner or non-joiner in the
+  interior of the string must be preserved and only removed when it is leading or trailing.
+- **SPEC-4.82**: resolving a person's local date or "today" must bucket the instant by their configured IANA time
+  zone, falling back to UTC when the zone string is empty or does not parse.
+- **SPEC-4.83**: a PATCH field deserialized through the double-option convention must read an absent key as
+  "leave alone", an explicit JSON `null` as "clear the field", and a present value as "set the field", regardless
+  of which module's copy of the deserializer is applied to that field.
+- **SPEC-4.84**: a form field name must match the same grouping grammar as a slug but with underscores in place of
+  hyphens: lowercase letters and digits only, starting with a letter, with no trailing or doubled underscore.
+- **SPEC-4.85**: a submitted TOTP code must contain only ASCII digits and must not be empty, independently of the
+  6-8 character length check applied to it.
+- **SPEC-4.86**: a user's theme base mode must be one of `light`, `dark` or `system`, rejecting every other value
+  before it can reach the database CHECK constraint on that column.
 
-#### Notifications, forms, email intake
+### 4.17 Ticket notes and SLA status
 
-```text
-GET, POST              /api/v1/notification-channels
-PUT, DELETE            /api/v1/notification-channels/{id}
-GET, POST              /api/v1/notification-templates
-PUT, DELETE            /api/v1/notification-templates/{id}
-GET, PUT               /api/v1/me/notification-preferences
-GET                    /api/v1/notifications
-POST                   /api/v1/notifications/{id}/read
-GET, POST              /api/v1/notification-rules
-PUT, DELETE            /api/v1/notification-rules/{id}
-POST                   /api/v1/notifications/dispatch
-POST                   /api/v1/notifications/preview
-GET, POST              /api/v1/forms
-GET, PUT               /api/v1/forms/drafts
-DELETE                 /api/v1/forms/drafts/{id}
-GET, PATCH             /api/v1/forms/{id}
-GET                    /api/v1/forms/{id}/submissions
-GET, POST              /api/v1/form-request-links
-POST                   /api/v1/email-intake
-GET, POST              /api/v1/intake-tokens
-DELETE                 /api/v1/intake-tokens/{id}
-GET                    /api/v1/email-intake-log/{id}
-```
+- **SPEC-4.87**: a ticket note is editable only when the caller's role permits it, the note was not created by a
+  contact, and, for a `Public` note, the note has not already been emailed; an `Internal` or `Resolution` note
+  stays editable regardless of send state, and a `TimeEntry` note is never editable through this path.
+- **SPEC-4.88**: the SLA at-risk lead is 20 percent of the window between a ticket's creation and its due date,
+  clamped between a 5-minute floor and a 24-hour ceiling, with a non-positive window falling back to the floor;
+  a ticket's SLA status must read `NotApplicable` once it is closed, resolved, or its status is flagged closed,
+  `Breached` once `now` passes the due date, `Warning` once `now` enters the at-risk lead before the due date, and
+  `OnTrack` otherwise.
+- **SPEC-4.89**: a saved ticket view name must fail validation when it is empty or contains only whitespace, not
+  merely when its untrimmed length is zero.
 
-#### Integrations, RMM, status monitoring, contact sync
+### 4.18 Contact and company request validation
 
-```text
-GET                    /api/v1/integrations
-GET, POST              /api/v1/rmm/connections
-GET, PUT, DELETE       /api/v1/rmm/connections/{id}
-POST                   /api/v1/rmm/connections/{id}/test
-GET, POST              /api/v1/rmm/device-mappings
-PUT, DELETE            /api/v1/rmm/device-mappings/{id}
-GET, POST              /api/v1/rmm/alert-rules
-PUT, DELETE            /api/v1/rmm/alert-rules/{id}
-POST                   /api/v1/rmm/alerts
-POST                   /api/v1/rmm/status
-GET                    /api/v1/status/systems/{id}/current
-GET                    /api/v1/status/companies/{company_id}/backup
-GET                    /api/v1/reports/status/backup-success-rate
-GET                    /api/v1/reports/status/uptime
-GET                    /api/v1/integrations/contact-sync
-POST                   /api/v1/integrations/contact-sync/google/authorize
-POST                   /api/v1/integrations/contact-sync/google/disconnect
-POST                   /api/v1/integrations/contact-sync/icloud/connect
-POST                   /api/v1/integrations/contact-sync/icloud/disconnect
-POST                   /api/v1/integrations/contact-sync/microsoft/authorize
-POST                   /api/v1/integrations/contact-sync/microsoft/disconnect
-PUT                    /api/v1/integrations/contact-sync/selection
-PUT                    /api/v1/integrations/contact-sync/schedule
-POST                   /api/v1/integrations/contact-sync/preview
-GET, POST              /api/v1/integrations/contact-sync/runs
-GET                    /api/v1/integrations/contact-sync/runs/{run_id}
-POST                   /api/v1/integrations/contact-sync/runs/{run_id}/cancel
-GET                    /api/v1/integrations/contact-sync/review-queue
-POST                   /api/v1/integrations/contact-sync/review-queue/resolve
-GET, POST              /api/v1/integrations/contact-sync/vcard/uploads
-POST                   /api/v1/integrations/contact-sync/vcard/uploads/{file_id}/preview
-POST                   /api/v1/integrations/contact-sync/vcard/uploads/{file_id}/import
-GET                    /api/v1/contacts/contacts/{contact_id}/sync
-DELETE                 /api/v1/contacts/contacts/{contact_id}/sync/locks/{field}
-POST                   /api/v1/contacts/contacts/{contact_id}/sync/unlink
-POST                   /api/v1/contacts/contacts/{contact_id}/sync/remove-imported-data
-```
+- **SPEC-4.90**: a request field holding a NUL byte, singly or in any element of a string list, must be rejected
+  before it reaches the database.
+- **SPEC-4.91**: a required company name must fail validation when it is whitespace-only or contains a control
+  character; the same rule applies to an optional company name field except that an empty string there is
+  accepted and means "clear the stored name".
+- **SPEC-4.92**: a contact request must reject supplying both a `company_id` and a non-empty freeform
+  `company_name` at once, and the same exclusion applies between a non-empty `companies` list and a non-empty
+  freeform `company_name`.
+- **SPEC-4.93**: a child list of phones, or of company links, must reject more than one entry flagged primary; a
+  list with none flagged primary is accepted.
+- **SPEC-4.94**: a `companies` list must reject an entry that names the same `company_id` as another entry in
+  the same list.
+- **SPEC-4.95**: creating a contact must fail when its email is absent or blank; updating a contact must not
+  apply that requirement, since an absent email there means leave the existing value alone.
+- **SPEC-4.96**: a website value must be empty or use an `http`/`https` scheme with a non-empty host, rejecting
+  every other scheme; normalizing a website for storage must add an `https://` prefix and lowercase only the
+  authority when the input has no scheme and is shaped like a bare host, and must otherwise pass the input
+  through unchanged so a value already carrying a scheme still reaches validation as typed.
+- **SPEC-4.97**: normalizing a phone number for storage must first remove invisible characters, then strip only
+  common formatting characters (spaces, tabs, a no-break space, hyphens, parentheses, dots) and nothing else;
+  validating the normalized result against E.164 must accept an empty value, otherwise require an optional
+  leading `+` followed by 2 to 15 digits whose first digit is 1-9.
+- **SPEC-4.98**: a time zone field must be empty or parse as a valid IANA time zone name.
+- **SPEC-4.99**: a country field must be empty or be one of the 249 ISO 3166-1 alpha-2 codes, case-insensitively.
+- **SPEC-4.100**: a postal code field must be empty or be 2 to 12 characters of ASCII letters, digits, spaces or
+  hyphens.
+- **SPEC-4.101**: the free-text contact field named in a field-values suggestion query must map only to one of a
+  fixed, closed set of column names, so that name is safe to interpolate into the query rather than being bound.
 
-#### CRM pipeline, search, reports, dashboards
+### 4.19 Invoice status edit-freeze rule
 
-```text
-GET, POST              /api/v1/crm/opportunities
-GET, PUT, DELETE       /api/v1/crm/opportunities/{id}
-POST                   /api/v1/crm/opportunities/{id}/close
-GET                    /api/v1/search
-GET                    /api/v1/reports
-GET                    /api/v1/reports/dashboard
-GET                    /api/v1/reports/tickets
-GET                    /api/v1/reports/time
-GET                    /api/v1/reports/request-types
-GET                    /api/v1/reports/billing
-GET                    /api/v1/reports/projects
-GET                    /api/v1/reports/clients
-GET                    /api/v1/reports/custom/schema
-POST                   /api/v1/reports/custom
-GET                    /api/v1/reports/{report}/export
-GET, POST              /api/v1/reports/saved
-GET, PATCH, DELETE     /api/v1/reports/saved/{id}
-POST                   /api/v1/reports/saved/{id}/execute
-GET, POST              /api/v1/reports/saved/{id}/schedules
-GET, PATCH, DELETE     /api/v1/reports/schedules/{schedule_id}
-GET, POST              /api/v1/dashboards
-GET                    /api/v1/dashboards/default
-GET, PATCH, DELETE     /api/v1/dashboards/{id}
-GET, POST              /api/v1/dashboards/{id}/schedules
-GET, PATCH, DELETE     /api/v1/dashboards/schedules/{schedule_id}
-```
-
-#### Settings, features, audit, data transfer, operator
-
-```text
-GET, PUT               /api/v1/settings
-GET                    /api/v1/settings/modules
-GET, PUT               /api/v1/settings/modules/{module}
-GET, PUT               /api/v1/settings/email
-POST                   /api/v1/settings/email/test-send
-POST                   /api/v1/settings/email/verify
-GET, PUT               /api/v1/settings/google-contacts-client
-GET, PUT               /api/v1/settings/app-name
-GET                    /api/v1/settings/{category}
-GET, PUT, DELETE       /api/v1/settings/{category}/{key}
-GET                    /api/v1/settings/feature-toggles
-PUT                    /api/v1/settings/feature-toggles/{key}
-GET                    /api/v1/audit-log
-GET                    /api/v1/audit-log/export.csv
-GET                    /api/v1/audit-log/entity/{entity_type}/{entity_id}
-GET                    /api/v1/data/export
-POST                   /api/v1/data/import
-POST                   /api/v1/data/seed-demo
-GET                    /api/v1/ip-enrichment
-GET                    /api/v1/admin/providers/status
-GET                    /api/v1/admin/providers/status.html
-POST                   /api/v1/admin/providers/status/refresh
-```
-
-#### Contact portal (prefix /api/v1/contact)
-
-```text
-POST                   /api/v1/contact/auth/login
-POST                   /api/v1/contact/auth/refresh
-POST                   /api/v1/contact/auth/logout
-POST                   /api/v1/contact/auth/set-password
-POST                   /api/v1/contact/auth/login-link
-POST                   /api/v1/contact/auth/login-link/redeem
-GET, PUT               /api/v1/contact/auth/me
-PUT                    /api/v1/contact/auth/me/password
-POST                   /api/v1/contact/auth/me/mfa/setup
-POST                   /api/v1/contact/auth/me/mfa/enable
-POST                   /api/v1/contact/auth/me/mfa/disable
-GET                    /api/v1/contact/auth/me/sessions
-DELETE                 /api/v1/contact/auth/me/sessions/{session_id}
-GET, PATCH             /api/v1/contact/companies/self/branding
-POST                   /api/v1/contact/access-requests
-GET                    /api/v1/contact/dashboard/summary
-GET                    /api/v1/contact/portal/{handle}/host
-GET                    /api/v1/contact/portal/{slug}/resolve-to-portal-id
-GET, POST              /api/v1/contact/payment-methods
-DELETE                 /api/v1/contact/payment-methods/{id}
-PUT                    /api/v1/contact/payment-methods/{id}/default
-PUT, DELETE            /api/v1/contact/companies/self/{asset}
-```
-
-#### Public, unauthenticated (prefix /api/v1/public, 60 requests per minute per client IP)
-
-```text
-GET                    /api/v1/public/config
-GET                    /api/v1/public/tenants/{tenant_id}/logo
-GET                    /api/v1/public/companies/{company_id}/{asset}
-GET                    /api/v1/public/tenants/{tenant_id}/{asset}
-GET                    /api/v1/public/kb/attachments/{attachment_id}
-GET                    /api/v1/public/tickets/attachments/{attachment_id}
-GET, POST              /api/v1/public/request-forms/{token}
-GET                    /api/v1/public/contact-sync/google/callback
-GET                    /api/v1/public/contact-sync/microsoft/callback
-GET                    /api/v1/public/invoice-issuer/{provider}/callback
-```
-
-#### Inbound webhooks and machine endpoints (self-authenticated)
-
-```text
-POST                   /api/v1/bunyip/webhooks/account-deleted
-POST                   /api/v1/bunyip/webhooks/mokosh-grant-changed
-POST                   /api/v1/bunyip/oauth2/backchannel-logout
-POST                   /api/v1/stripe/webhooks/{tenant_id}
-POST                   /api/v1/paypal/webhooks/{tenant_id}
-POST                   /api/v1/webhooks/xero
-POST                   /api/v1/webhooks/quickbooks
-```
-
-
-Self-authenticating routes:
-
-- `POST /api/v1/rmm/alerts` and `POST /api/v1/rmm/status`: HMAC-SHA256 of the raw body in the `X-Signature` header, compared
-  in constant time against the stored connection secret; no bearer.
-- `POST /api/v1/email-intake` and the intake log: tenant intake bearer token from `tenant_intake_tokens`.
-- `POST /api/v1/bunyip/webhooks/*`: `X-Webhook-Signature`, hex HMAC-SHA256 of the body with `BUNYIP_WEBHOOK_SECRET`.
-  Replays are idempotent.
-- `POST /api/v1/bunyip/oauth2/backchannel-logout`: mounted only when the identity-provider verifier is configured;
-  verifies the logout token and records the ended session; rate limited.
-- `POST /api/v1/stripe/webhooks/{tenant_id}` and `/api/v1/paypal/webhooks/{tenant_id}`: the tenant's active provider
-  verifies the delivery over the raw body (`Stripe-Signature` HMAC, or PayPal verification of the transmission headers)
-  before parsing; a delivery from a provider that is not the tenant's active one is refused.
-- `POST /api/v1/webhooks/xero` (`x-xero-signature`) and `/quickbooks` (`intuit-signature`): base64 HMAC-SHA256 over the raw
-  body.
-
-CORS: allowed methods GET, POST, PUT, DELETE, PATCH, OPTIONS; allowed request headers `Authorization`, `Content-Type`,
-`Accept`, `X-Forwarded-Host`; credentials allowed; preflight cache 600 s. Allowed origins come from `CORS_ORIGIN`
-(exact origins, or a scheme-locked `https://*.example.com` wildcard on the leftmost label); a malformed entry fails
-startup.
-
-### 4.2 Command line
-
-`mokosh-server` with no argument serves. With a first argument from this list it runs the task and exits non-zero on
-error:
-
-| Subcommand | Arguments | Purpose |
-|---|---|---|
-| `bootstrap-infisical` | env `INFISICAL_ADMIN_EMAIL`, `INFISICAL_ADMIN_PASSWORD` (required); `INFISICAL_ADMIN_FIRST_NAME`, `INFISICAL_ADMIN_LAST_NAME`, `INFISICAL_URL`, `INFISICAL_PROJECT_NAME`, `INFISICAL_IDENTITY_NAME`, `INFISICAL_ENVIRONMENT`, `MOKOSH_ENV_FILE` | First-run setup of a secret-manager instance; writes the resulting credentials into an env file. |
-| `qa-seed`, `qa-teardown` | `--tenant <uuid>` or env `MOKOSH_QA_TENANT_ID`; env `DATABASE_URL` | Load or remove the QA walkthrough dataset; refuses any tenant not marked QA. |
-| `showcase-seed`, `showcase-refresh`, `showcase-teardown` | `--tenant <uuid>` or env `MOKOSH_SHOWCASE_TENANT_ID`; env `DATABASE_URL` | Create, reset or remove the showcase dataset; refuses any tenant not marked showcase. |
-| `provider-status` | `--json`, `--text` | Presence matrix: every declared key per provider and which provider serves it; values are never printed. |
-| `provider-set` | `--secret <NAME>`, `--from-env <VAR>`, `--json`, `--text` | Write one application-tier secret, read from the named environment variable, into the provider the deployment declares, then read it back and compare; takes effect after a restart. |
-| `provider-migrate` | `--from <provider>`, `--to <provider>`, `--json`, `--text` | Copy every key the source provider holds into the target with read-back comparison; never clears the source. |
-| `provider-purge` | `--provider <name>`, `--confirm`, `--json`, `--text` | Delete every key a disabled provider holds, only where the key is verified live in the serving provider; a dry run unless `--confirm`. |
-| `verify-providers` | `--json`, `--text` | Boot each provider seam and report whether it serves; sends an SMTP NOOP for the email row; exits non-zero on any failure. |
-
-`mokosh-bootstrap` (`src/bin/mokosh-bootstrap.rs`) is a second binary shipped in the image with subcommands
-`bootstrap-infisical`, `qa-seed`, `qa-teardown`, `dev-seed-portal` (portal fixture tenants and contacts for development),
-`normalize-company-industries` (map free-text industries onto the canonical set across tenants) and `--version`.
+- **SPEC-4.102**: an invoice whose status is `sent`, `paid`, `partially_paid`, `void` or `written_off` must be
+  treated as frozen, disallowing header or line edits; only `draft` and `pending` remain editable, and correcting
+  a frozen invoice's totals must go through a credit note rather than an in-place edit.
 
 ## 5. Data model
 
@@ -2888,3 +2592,663 @@ Every migration under `migrations/` is embedded at compile time via `sqlx::migra
   downloads stream from storage instead of buffering; recurring appointments are expanded per requested range.
 - Observability endpoints: `/api/v1/health`, `/api/v1/ready`, `/api/v1/version`, `/api/v1/providers` (public
   provider summary), `/api/v1/admin/providers/status` (full report, JSON or HTML) and its refresh.
+
+## 12. Interfaces
+
+### 12.1 HTTP API
+
+All paths are relative to the server root. Bodies and responses are JSON unless stated (attachments, logos and PDFs are
+binary; uploads are `multipart/form-data`). List endpoints take `PaginationParams` query parameters and return a
+paginated envelope. Errors use the envelope in section 2.4.
+
+Credentials: staff and platform routes take `Authorization: Bearer <token>`. Contact portal routes take a bearer token
+or the `mokosh:contact_token` cookie. Webhook and machine endpoints authenticate themselves as described after the
+route tables. Routes below are listed as registered; the guard on each is the extractor in its handler:
+
+| Area | Guard observed in handlers |
+|---|---|
+| Auth, tickets, contacts and companies, notifications, SLA, teams, search, dashboards, saved reports | `RequireAuth`; configuration writes add `RequireAdmin`; some add `RequireManager` |
+| Billing, quotes, expenses, invoice-issuer mappings | module gate `billing`; many routes also `RequireFinance` |
+| Contracts | module gate `contracts`; many routes also `RequireFinance` |
+| Projects | module gate `projects`; some `RequireAdmin` |
+| Calendar, dispatch | module gate `calendar`; some `RequireManager` |
+| Assets, asset catalog, company documentation | module gate `assets`; some `RequireAdmin` |
+| Knowledge base | module gate `knowledge_base`; some `RequireManager` |
+| RMM connections, mappings, alert rules | module gate `rmm_integration`; `RequireAdmin` on writes |
+| Reports | module gate `reports`; billing and clients reports also `RequireFinance` |
+| Time entries, timers, workday, mileage, work types | module gate `time_tracking`; timesheet and approval routes use the `timesheets` gate |
+| Workflow rules, ticket templates, email intake tokens, form definitions | `RequireAdminUser` (admin or super admin) |
+| Audit log list and export, data export, import and demo seed, IP enrichment | `RequireAdmin` |
+| Tenant list, create, suspend, activate | platform admin bearer |
+| Per-tenant get, update, usage, module config | platform admin bearer or a member of that tenant (`TenantOrPlatformCaller`) |
+| SMTP settings, product name, Google contacts client, feature switches | `DeploymentOperator`: a platform admin bearer or an admin of the system tenant |
+| Provider status (JSON and HTML) | admin session, or the identity provider's machine credential as HTTP Basic; refresh needs an admin session |
+
+A module gate answers `404` when the module is disabled for the tenant.
+
+#### Service and status (no authentication)
+
+```text
+GET                    /api/v1/health
+GET                    /api/v1/ready
+GET                    /api/v1/version
+GET                    /api/v1/version/check
+GET                    /api/v1/providers
+```
+
+#### Authentication, sessions, users
+
+```text
+POST                   /api/v1/auth/login
+POST                   /api/v1/auth/select-tenant
+POST                   /api/v1/auth/switch-tenant/{tenant_id}
+POST                   /api/v1/auth/logout
+POST                   /api/v1/auth/logout-all
+POST                   /api/v1/auth/refresh
+POST                   /api/v1/auth/forgot-password
+POST                   /api/v1/auth/reset-password
+GET                    /api/v1/auth/set-password/context/{token}
+GET                    /api/v1/auth/me
+PUT                    /api/v1/auth/me
+GET                    /api/v1/auth/memberships
+POST                   /api/v1/auth/me/complete-onboarding
+PUT                    /api/v1/auth/me/password
+GET                    /api/v1/auth/me/sessions
+DELETE                 /api/v1/auth/me/sessions/{session_id}
+POST                   /api/v1/auth/me/mfa/setup
+POST                   /api/v1/auth/me/mfa/enable
+POST                   /api/v1/auth/me/mfa/disable
+GET                    /api/v1/auth/me/api-keys
+POST                   /api/v1/auth/me/api-keys
+DELETE                 /api/v1/auth/me/api-keys/{key_id}
+GET                    /api/v1/auth/directory
+GET                    /api/v1/auth/users
+POST                   /api/v1/auth/users
+GET                    /api/v1/auth/users/{user_id}
+PUT                    /api/v1/auth/users/{user_id}
+```
+
+#### Platform plane (platform admins)
+
+```text
+POST                   /api/v1/platform/login
+PUT                    /api/v1/platform/me/password
+POST                   /api/v1/platform/me/mfa/setup
+POST                   /api/v1/platform/me/mfa/enable
+POST                   /api/v1/platform/me/mfa/disable
+```
+
+#### Grant invitations
+
+```text
+GET                    /api/v1/grants/invitations/by-token/{token}
+POST                   /api/v1/grants/invitations/by-token/{token}/accept
+POST                   /api/v1/grants/invitations/by-token/{token}/decline
+POST                   /api/v1/grants/invitations
+GET                    /api/v1/grants/invitations
+DELETE                 /api/v1/grants/invitations/{id}
+GET                    /api/v1/my-grants/invitations
+POST                   /api/v1/my-grants/invitations/{id}/accept
+POST                   /api/v1/my-grants/invitations/{id}/decline
+DELETE                 /api/v1/my-grants/{id}
+```
+
+#### Tenants, teams, members, invitations
+
+```text
+GET                    /api/v1/tenants
+POST                   /api/v1/tenants
+POST                   /api/v1/tenants/self-serve
+POST                   /api/v1/tenants/additional
+GET                    /api/v1/tenants/current
+PUT                    /api/v1/tenants/current
+PUT                    /api/v1/tenants/current/organization
+PUT                    /api/v1/tenants/current/logo
+DELETE                 /api/v1/tenants/current/logo
+GET                    /api/v1/tenants/{tenant_id}
+PUT                    /api/v1/tenants/{tenant_id}
+POST                   /api/v1/tenants/{tenant_id}/suspend
+POST                   /api/v1/tenants/{tenant_id}/activate
+GET                    /api/v1/tenants/{tenant_id}/usage
+GET                    /api/v1/tenants/{tenant_id}/modules/{module}
+PUT                    /api/v1/tenants/{tenant_id}/modules/{module}
+GET, POST              /api/v1/teams
+GET, PUT, DELETE       /api/v1/teams/{team_id}
+GET, POST              /api/v1/teams/{team_id}/members
+PUT, DELETE            /api/v1/teams/{team_id}/members/{user_id}
+GET                    /api/v1/me/teams
+GET                    /api/v1/members
+GET, POST              /api/v1/invitations
+DELETE                 /api/v1/invitations/{id}
+```
+
+#### Contacts, companies, sites
+
+```text
+GET                    /api/v1/contacts/companies
+POST                   /api/v1/contacts/companies
+GET                    /api/v1/contacts/companies/website-probe
+GET                    /api/v1/contacts/companies/{company_id}
+PUT                    /api/v1/contacts/companies/{company_id}
+DELETE                 /api/v1/contacts/companies/{company_id}
+GET                    /api/v1/contacts/companies/{company_id}/deletion-preview
+GET                    /api/v1/contacts/companies/{company_id}/contacts
+GET                    /api/v1/contacts/companies/{company_id}/sites
+GET, POST              /api/v1/contacts/companies/{company_id}/portal-roles
+GET, PUT, DELETE       /api/v1/contacts/companies/{company_id}/portal-roles/{role_id}
+GET                    /api/v1/contacts/contacts
+POST                   /api/v1/contacts/contacts
+GET                    /api/v1/contacts/contacts/field-values
+GET                    /api/v1/contacts/contacts/{contact_id}
+PUT                    /api/v1/contacts/contacts/{contact_id}
+DELETE                 /api/v1/contacts/contacts/{contact_id}
+GET                    /api/v1/contacts/contacts/portal-roles
+POST                   /api/v1/contacts/contacts/{contact_id}/grant-portal-access
+POST                   /api/v1/contacts/contacts/{contact_id}/resend-portal-invite
+POST                   /api/v1/contacts/contacts/{contact_id}/revoke-portal-access
+GET, PUT               /api/v1/contacts/contacts/{contact_id}/portal-roles
+GET                    /api/v1/contacts/contacts/{contact_id}/access-requests
+POST                   /api/v1/contacts/contacts/access-requests/{request_id}/resolve
+GET, POST              /api/v1/contacts/company-industries
+PUT, DELETE            /api/v1/contacts/company-industries/{id}
+POST                   /api/v1/contacts/sites
+GET                    /api/v1/contacts/sites/{site_id}
+PUT                    /api/v1/contacts/sites/{site_id}
+DELETE                 /api/v1/contacts/sites/{site_id}
+GET                    /api/v1/contacts/{contact_id}/notes
+GET                    /api/v1/portal-roles
+POST                   /api/v1/portal-roles
+GET                    /api/v1/portal-roles/capabilities
+GET                    /api/v1/portal-roles/{id}
+PUT                    /api/v1/portal-roles/{id}
+DELETE                 /api/v1/portal-roles/{id}
+GET                    /api/v1/companies/{company_id}/documentation
+PUT, DELETE            /api/v1/companies/{company_id}/{asset}
+PUT, DELETE            /api/v1/tenants/current/branding/{asset}
+```
+
+#### Tickets
+
+```text
+GET                    /api/v1/tickets
+POST                   /api/v1/tickets
+GET                    /api/v1/tickets/{ticket_id}
+GET                    /api/v1/tickets/{ticket_id}/sla
+PUT                    /api/v1/tickets/{ticket_id}
+PATCH                  /api/v1/tickets/{ticket_id}
+DELETE                 /api/v1/tickets/{ticket_id}
+POST                   /api/v1/tickets/{ticket_id}/assign
+POST                   /api/v1/tickets/{ticket_id}/approvals/request
+POST                   /api/v1/tickets/{ticket_id}/reopen
+POST                   /api/v1/tickets/{ticket_id}/attachments
+GET                    /api/v1/tickets/{ticket_id}/notes
+POST                   /api/v1/tickets/{ticket_id}/notes
+PUT                    /api/v1/tickets/{ticket_id}/notes/{note_id}
+GET, POST              /api/v1/tickets/statuses
+PUT, DELETE            /api/v1/tickets/statuses/{id}
+GET, POST              /api/v1/tickets/priorities
+PUT, DELETE            /api/v1/tickets/priorities/{id}
+GET, POST              /api/v1/tickets/queues
+PUT, DELETE            /api/v1/tickets/queues/{id}
+GET, POST              /api/v1/tickets/types
+PUT, DELETE            /api/v1/tickets/types/{id}
+GET, POST              /api/v1/tickets/categories
+PUT, DELETE            /api/v1/tickets/categories/{id}
+GET, POST              /api/v1/tickets/saved-views
+PUT, DELETE            /api/v1/tickets/saved-views/{id}
+POST                   /api/v1/tickets/{ticket_id}/attachments/inline
+GET, POST              /api/v1/tickets/{ticket_id}/notes/{note_id}/attachments
+GET, DELETE            /api/v1/tickets/{ticket_id}/notes/{note_id}/attachments/{attachment_id}
+GET, POST              /api/v1/ticket-templates
+GET, PATCH, DELETE     /api/v1/ticket-templates/{id}
+GET, POST              /api/v1/workflow-rules
+GET, PATCH, DELETE     /api/v1/workflow-rules/{id}
+GET                    /api/v1/tickets/{id}/workflow-runs
+GET, POST              /api/v1/tickets/{ticket_id}/approvals
+GET, POST              /api/v1/time-entries/{entity_id}/approvals
+GET, POST              /api/v1/change-requests/{entity_id}/approvals
+GET, POST              /api/v1/quotes/{entity_id}/approvals
+GET                    /api/v1/approvals/pending
+GET                    /api/v1/approvals/pending/count
+POST                   /api/v1/approvals/{id}/decision
+DELETE                 /api/v1/approvals/{id}
+```
+
+#### Time tracking, mileage
+
+```text
+GET, POST              /api/v1/work-types
+PUT, DELETE            /api/v1/work-types/{id}
+GET, POST              /api/v1/time-entries
+GET                    /api/v1/time-entries/summary
+GET, PUT, DELETE       /api/v1/time-entries/{id}
+GET                    /api/v1/timesheets
+POST                   /api/v1/timesheets/{user_id}/{week_start}/submit
+POST                   /api/v1/timesheets/{user_id}/{week_start}/withdraw
+POST                   /api/v1/timesheets/{user_id}/{week_start}/approve
+POST                   /api/v1/timesheets/{user_id}/{week_start}/reject
+GET                    /api/v1/timers/active
+POST                   /api/v1/timers/start
+POST                   /api/v1/timers/{id}/stop
+GET                    /api/v1/workday
+POST                   /api/v1/workday/clock-in
+POST                   /api/v1/workday/clock-out
+POST                   /api/v1/workday/break/start
+POST                   /api/v1/workday/break/end
+PUT, DELETE            /api/v1/workday/segments/{id}
+GET, POST              /api/v1/time-rounding-rules
+PUT, DELETE            /api/v1/time-rounding-rules/{id}
+GET, POST              /api/v1/mileage-entries
+GET, PUT, DELETE       /api/v1/mileage-entries/{id}
+```
+
+#### Projects
+
+```text
+GET, POST              /api/v1/projects
+GET                    /api/v1/projects/summary
+GET, PUT, DELETE       /api/v1/projects/{id}
+GET, POST              /api/v1/projects/{id}/phases
+PUT, DELETE            /api/v1/phases/{phase_id}
+GET, POST              /api/v1/task-statuses
+PUT, DELETE            /api/v1/task-statuses/{id}
+GET, POST              /api/v1/project-types
+PUT, DELETE            /api/v1/project-types/{id}
+GET, POST              /api/v1/projects/{id}/tasks
+GET, PUT, DELETE       /api/v1/tasks/{id}
+POST, DELETE           /api/v1/tasks/{id}/depends-on/{other}
+```
+
+#### Calendar and dispatch
+
+```text
+GET, POST              /api/v1/appointments
+GET                    /api/v1/calendar/appointments
+GET, PUT, DELETE       /api/v1/appointments/{id}
+GET, PUT               /api/v1/users/{user_id}/availability
+GET, POST              /api/v1/time-off
+GET, DELETE            /api/v1/time-off/{id}
+POST                   /api/v1/time-off/{id}/approval
+GET, POST              /api/v1/on-call-schedules
+PUT, DELETE            /api/v1/on-call-schedules/{id}
+GET                    /api/v1/on-call/now
+GET, POST              /api/v1/scheduling-templates
+GET, PUT, DELETE       /api/v1/scheduling-templates/{id}
+GET                    /api/v1/dispatch
+```
+
+#### Contracts, SLA
+
+```text
+GET, POST              /api/v1/contracts
+GET, PUT, DELETE       /api/v1/contracts/{id}
+GET, POST              /api/v1/contracts/{id}/items
+PUT, DELETE            /api/v1/contract-items/{id}
+GET                    /api/v1/contracts/{id}/hour-balance
+GET, POST              /api/v1/rate-cards
+GET, PUT, DELETE       /api/v1/rate-cards/{id}
+GET, POST              /api/v1/rate-cards/{id}/items
+DELETE                 /api/v1/rate-card-items/{id}
+GET, POST              /api/v1/sla/policies
+GET, PUT, DELETE       /api/v1/sla/policies/{id}
+GET, POST              /api/v1/sla/policies/{id}/targets
+DELETE                 /api/v1/sla/targets/{id}
+GET, POST              /api/v1/sla/business-hours
+PUT, DELETE            /api/v1/sla/business-hours/{id}
+GET, POST              /api/v1/sla/holiday-calendars
+PUT, DELETE            /api/v1/sla/holiday-calendars/{id}
+POST                   /api/v1/sla/tickets/{id}/evaluate
+```
+
+#### Billing
+
+```text
+GET, POST              /api/v1/invoices
+GET                    /api/v1/invoices/summary
+POST                   /api/v1/invoices/from-time-entries
+GET, PUT               /api/v1/invoices/{invoice_id}
+POST                   /api/v1/invoices/{invoice_id}/write-off
+POST                   /api/v1/invoices/{invoice_id}/void
+POST                   /api/v1/invoices/{invoice_id}/amend
+GET                    /api/v1/invoices/{invoice_id}/pdf
+GET                    /api/v1/invoices/{invoice_id}/delivery-options
+POST                   /api/v1/invoices/{invoice_id}/pay
+GET                    /api/v1/invoices/{invoice_id}/payments
+GET                    /api/v1/invoices/{invoice_id}/payment-readiness
+GET, POST              /api/v1/products
+GET, PUT, DELETE       /api/v1/products/{product_id}
+GET                    /api/v1/statements
+GET                    /api/v1/statements/pdf
+GET, POST              /api/v1/credit-notes
+GET                    /api/v1/credit-notes/{credit_note_id}
+GET                    /api/v1/credit-notes/{credit_note_id}/pdf
+POST                   /api/v1/credit-notes/{credit_note_id}/void
+GET, POST              /api/v1/payments
+DELETE                 /api/v1/payments/{payment_id}
+GET, PUT               /api/v1/payment-gateways
+GET                    /api/v1/payment-gateways/webhook-endpoints
+GET                    /api/v1/payment-gateways/webhook-deliveries
+DELETE                 /api/v1/payment-gateways/{provider}
+POST                   /api/v1/payment-gateways/{provider}/check
+GET, POST              /api/v1/tax-rates
+PUT, DELETE            /api/v1/tax-rates/{id}
+GET                    /api/v1/tax-rates/lookup
+GET, POST              /api/v1/payment-terms
+PUT, DELETE            /api/v1/payment-terms/{id}
+GET                    /api/v1/invoice-issuer-mappings/companies
+PUT                    /api/v1/invoice-issuer-mappings/companies/{provider}/{company_id}
+GET                    /api/v1/invoice-issuer-mappings/products
+PUT                    /api/v1/invoice-issuer-mappings/products/{provider}/{product_id}
+GET                    /api/v1/invoice-issuer-mappings/vendors
+PUT                    /api/v1/invoice-issuer-mappings/vendors/{provider}/{vendor_id}
+GET                    /api/v1/invoice-issuer-mappings/expense-accounts
+PUT                    /api/v1/invoice-issuer-mappings/expense-accounts/{provider}/{category_id}
+GET                    /api/v1/invoice-issuer-mappings/people
+PUT                    /api/v1/invoice-issuer-mappings/people/{provider}/{user_id}
+GET                    /api/v1/integrations/invoice-issuer/{provider}
+POST                   /api/v1/integrations/invoice-issuer/{provider}/authorize
+POST                   /api/v1/integrations/invoice-issuer/{provider}/disconnect
+PUT                    /api/v1/integrations/invoice-issuer/{provider}/bills
+PUT                    /api/v1/integrations/invoice-issuer/{provider}/payment-account
+GET, POST              /api/v1/quotes
+GET, PUT, DELETE       /api/v1/quotes/{quote_id}
+POST                   /api/v1/quotes/{quote_id}/send
+GET                    /api/v1/quotes/{quote_id}/delivery-options
+POST                   /api/v1/quotes/{quote_id}/convert
+POST                   /api/v1/quotes/{quote_id}/accept
+POST                   /api/v1/quotes/{quote_id}/decline
+GET                    /api/v1/quotes/{quote_id}/pdf
+POST                   /api/v1/quotes/{quote_id}/lines
+PUT, DELETE            /api/v1/quotes/{quote_id}/lines/{line_id}
+GET, POST              /api/v1/vendors
+GET, PUT, DELETE       /api/v1/vendors/{id}
+GET, POST              /api/v1/expense-categories
+PUT                    /api/v1/expense-categories/{id}
+GET, POST              /api/v1/bills
+GET                    /api/v1/bills/{id}
+POST                   /api/v1/bills/{id}/approve
+POST                   /api/v1/bills/{id}/void
+GET, POST              /api/v1/bills/{id}/payments
+GET, POST              /api/v1/expenses
+GET                    /api/v1/expenses/{id}
+POST                   /api/v1/expenses/{id}/submit
+POST                   /api/v1/expenses/{id}/approve
+POST                   /api/v1/expenses/{id}/reject
+POST                   /api/v1/expenses/{id}/reimburse
+```
+
+#### Assets, documentation
+
+```text
+GET, POST              /api/v1/asset-types
+PUT, DELETE            /api/v1/asset-types/{id}
+GET, POST              /api/v1/assets
+POST                   /api/v1/assets/search
+POST                   /api/v1/assets/search/facets
+POST                   /api/v1/assets/bulk-create
+POST                   /api/v1/assets/exists
+GET, PUT, PATCH, DELETE /api/v1/assets/{id}
+GET, POST              /api/v1/assets/{id}/relationships
+DELETE                 /api/v1/asset-relationships/{id}
+GET                    /api/v1/assets/{id}/impact
+POST                   /api/v1/assets/{id}/report-issue
+GET, POST              /api/v1/assets/{id}/configuration-items
+GET, DELETE            /api/v1/configuration-items/{id}
+GET, POST              /api/v1/assets/{id}/credentials
+GET, DELETE            /api/v1/credentials/{id}
+GET                    /api/v1/assets/{id}/audit-log
+GET, POST              /api/v1/asset-models
+GET                    /api/v1/asset-models/signature-detector
+GET, PUT, DELETE       /api/v1/asset-models/{id}
+GET, POST              /api/v1/asset-templates
+GET, PUT, DELETE       /api/v1/asset-templates/{id}
+```
+
+#### Knowledge base
+
+```text
+GET, POST              /api/v1/kb/categories
+PUT, DELETE            /api/v1/kb/categories/{id}
+GET, POST              /api/v1/kb/articles
+GET, PUT, DELETE       /api/v1/kb/articles/{id}
+GET, PUT, DELETE       /api/v1/kb/articles/{id}/draft
+GET                    /api/v1/kb/articles/{id}/versions
+POST                   /api/v1/kb/articles/{id}/versions/{version_number}/restore
+POST                   /api/v1/kb/articles/{id}/render
+POST                   /api/v1/kb/articles/{id}/helpful
+POST                   /api/v1/kb/articles/{id}/not_helpful
+GET                    /api/v1/kb/articles/{id}/vote
+GET                    /api/v1/kb/top-ticket-driving-articles
+GET                    /api/v1/kb/articles/{id}/measured-duration
+GET                    /api/v1/kb/articles/{id}/tickets
+GET, POST              /api/v1/kb/articles/{id}/comments
+PUT, DELETE            /api/v1/kb/comments/{id}
+POST                   /api/v1/kb/comments/{id}/resolve
+POST                   /api/v1/kb/comments/{id}/unresolve
+GET, POST              /api/v1/kb/articles/{id}/attachments
+DELETE                 /api/v1/kb/articles/{id}/attachments/{attachment_id}
+GET                    /api/v1/kb/attachments/{attachment_id}
+```
+
+#### Notifications, forms, email intake
+
+```text
+GET, POST              /api/v1/notification-channels
+PUT, DELETE            /api/v1/notification-channels/{id}
+GET, POST              /api/v1/notification-templates
+PUT, DELETE            /api/v1/notification-templates/{id}
+GET, PUT               /api/v1/me/notification-preferences
+GET                    /api/v1/notifications
+POST                   /api/v1/notifications/{id}/read
+GET, POST              /api/v1/notification-rules
+PUT, DELETE            /api/v1/notification-rules/{id}
+POST                   /api/v1/notifications/dispatch
+POST                   /api/v1/notifications/preview
+GET, POST              /api/v1/forms
+GET, PUT               /api/v1/forms/drafts
+DELETE                 /api/v1/forms/drafts/{id}
+GET, PATCH             /api/v1/forms/{id}
+GET                    /api/v1/forms/{id}/submissions
+GET, POST              /api/v1/form-request-links
+POST                   /api/v1/email-intake
+GET, POST              /api/v1/intake-tokens
+DELETE                 /api/v1/intake-tokens/{id}
+GET                    /api/v1/email-intake-log/{id}
+```
+
+#### Integrations, RMM, status monitoring, contact sync
+
+```text
+GET                    /api/v1/integrations
+GET                    /api/v1/integrations/{provider}
+PUT                    /api/v1/integrations/{provider}
+POST                   /api/v1/integrations/{provider}/connect
+POST                   /api/v1/integrations/{provider}/disconnect
+GET, POST              /api/v1/rmm/connections
+GET, PUT, DELETE       /api/v1/rmm/connections/{id}
+POST                   /api/v1/rmm/connections/{id}/test
+GET, POST              /api/v1/rmm/device-mappings
+PUT, DELETE            /api/v1/rmm/device-mappings/{id}
+GET, POST              /api/v1/rmm/alert-rules
+PUT, DELETE            /api/v1/rmm/alert-rules/{id}
+POST                   /api/v1/rmm/alerts
+POST                   /api/v1/rmm/status
+GET                    /api/v1/status/systems/{id}/current
+GET                    /api/v1/status/companies/{company_id}/backup
+GET                    /api/v1/reports/status/backup-success-rate
+GET                    /api/v1/reports/status/uptime
+GET                    /api/v1/integrations/contact-sync
+POST                   /api/v1/integrations/contact-sync/google/authorize
+POST                   /api/v1/integrations/contact-sync/google/disconnect
+POST                   /api/v1/integrations/contact-sync/icloud/connect
+POST                   /api/v1/integrations/contact-sync/icloud/disconnect
+POST                   /api/v1/integrations/contact-sync/microsoft/authorize
+POST                   /api/v1/integrations/contact-sync/microsoft/disconnect
+PUT                    /api/v1/integrations/contact-sync/selection
+PUT                    /api/v1/integrations/contact-sync/schedule
+POST                   /api/v1/integrations/contact-sync/preview
+GET, POST              /api/v1/integrations/contact-sync/runs
+GET                    /api/v1/integrations/contact-sync/runs/{run_id}
+POST                   /api/v1/integrations/contact-sync/runs/{run_id}/cancel
+GET                    /api/v1/integrations/contact-sync/review-queue
+POST                   /api/v1/integrations/contact-sync/review-queue/resolve
+GET, POST              /api/v1/integrations/contact-sync/vcard/uploads
+POST                   /api/v1/integrations/contact-sync/vcard/uploads/{file_id}/preview
+POST                   /api/v1/integrations/contact-sync/vcard/uploads/{file_id}/import
+GET                    /api/v1/contacts/contacts/{contact_id}/sync
+DELETE                 /api/v1/contacts/contacts/{contact_id}/sync/locks/{field}
+POST                   /api/v1/contacts/contacts/{contact_id}/sync/unlink
+POST                   /api/v1/contacts/contacts/{contact_id}/sync/remove-imported-data
+```
+
+#### CRM pipeline, search, reports, dashboards
+
+```text
+GET, POST              /api/v1/crm/opportunities
+GET, PUT, DELETE       /api/v1/crm/opportunities/{id}
+POST                   /api/v1/crm/opportunities/{id}/close
+GET                    /api/v1/search
+GET                    /api/v1/reports
+GET                    /api/v1/reports/dashboard
+GET                    /api/v1/reports/tickets
+GET                    /api/v1/reports/time
+GET                    /api/v1/reports/request-types
+GET                    /api/v1/reports/billing
+GET                    /api/v1/reports/projects
+GET                    /api/v1/reports/clients
+GET                    /api/v1/reports/custom/schema
+POST                   /api/v1/reports/custom
+GET                    /api/v1/reports/{report}/export
+GET, POST              /api/v1/reports/saved
+GET, PATCH, DELETE     /api/v1/reports/saved/{id}
+POST                   /api/v1/reports/saved/{id}/execute
+GET, POST              /api/v1/reports/saved/{id}/schedules
+GET, PATCH, DELETE     /api/v1/reports/schedules/{schedule_id}
+GET, POST              /api/v1/dashboards
+GET                    /api/v1/dashboards/default
+GET, PATCH, DELETE     /api/v1/dashboards/{id}
+GET, POST              /api/v1/dashboards/{id}/schedules
+GET, PATCH, DELETE     /api/v1/dashboards/schedules/{schedule_id}
+```
+
+#### Settings, features, audit, data transfer, operator
+
+```text
+GET, PUT               /api/v1/settings
+GET                    /api/v1/settings/modules
+GET, PUT               /api/v1/settings/modules/{module}
+GET, PUT               /api/v1/settings/email
+POST                   /api/v1/settings/email/test-send
+POST                   /api/v1/settings/email/verify
+GET, PUT               /api/v1/settings/google-contacts-client
+GET, PUT               /api/v1/settings/app-name
+GET                    /api/v1/settings/{category}
+GET, PUT, DELETE       /api/v1/settings/{category}/{key}
+GET                    /api/v1/settings/feature-toggles
+PUT                    /api/v1/settings/feature-toggles/{key}
+GET                    /api/v1/audit-log
+GET                    /api/v1/audit-log/export.csv
+GET                    /api/v1/audit-log/entity/{entity_type}/{entity_id}
+GET                    /api/v1/data/export
+POST                   /api/v1/data/import
+POST                   /api/v1/data/seed-demo
+GET                    /api/v1/ip-enrichment
+GET                    /api/v1/admin/providers/status
+GET                    /api/v1/admin/providers/status.html
+POST                   /api/v1/admin/providers/status/refresh
+```
+
+#### Contact portal (prefix /api/v1/contact)
+
+```text
+POST                   /api/v1/contact/auth/login
+POST                   /api/v1/contact/auth/refresh
+POST                   /api/v1/contact/auth/logout
+POST                   /api/v1/contact/auth/set-password
+POST                   /api/v1/contact/auth/login-link
+POST                   /api/v1/contact/auth/login-link/redeem
+GET, PUT               /api/v1/contact/auth/me
+PUT                    /api/v1/contact/auth/me/password
+POST                   /api/v1/contact/auth/me/mfa/setup
+POST                   /api/v1/contact/auth/me/mfa/enable
+POST                   /api/v1/contact/auth/me/mfa/disable
+GET                    /api/v1/contact/auth/me/sessions
+DELETE                 /api/v1/contact/auth/me/sessions/{session_id}
+GET, PATCH             /api/v1/contact/companies/self/branding
+POST                   /api/v1/contact/access-requests
+GET                    /api/v1/contact/dashboard/summary
+GET                    /api/v1/contact/portal/{handle}/host
+GET                    /api/v1/contact/portal/{slug}/resolve-to-portal-id
+GET, POST              /api/v1/contact/payment-methods
+DELETE                 /api/v1/contact/payment-methods/{id}
+PUT                    /api/v1/contact/payment-methods/{id}/default
+PUT, DELETE            /api/v1/contact/companies/self/{asset}
+```
+
+#### Public, unauthenticated (prefix /api/v1/public, 60 requests per minute per client IP)
+
+```text
+GET                    /api/v1/public/config
+GET                    /api/v1/public/tenants/{tenant_id}/logo
+GET                    /api/v1/public/companies/{company_id}/{asset}
+GET                    /api/v1/public/tenants/{tenant_id}/{asset}
+GET                    /api/v1/public/kb/attachments/{attachment_id}
+GET                    /api/v1/public/tickets/attachments/{attachment_id}
+GET, POST              /api/v1/public/request-forms/{token}
+GET                    /api/v1/public/contact-sync/google/callback
+GET                    /api/v1/public/contact-sync/microsoft/callback
+GET                    /api/v1/public/invoice-issuer/{provider}/callback
+```
+
+#### Inbound webhooks and machine endpoints (self-authenticated)
+
+```text
+POST                   /api/v1/bunyip/webhooks/account-deleted
+POST                   /api/v1/bunyip/webhooks/mokosh-grant-changed
+POST                   /api/v1/bunyip/oauth2/backchannel-logout
+POST                   /api/v1/stripe/webhooks/{tenant_id}
+POST                   /api/v1/paypal/webhooks/{tenant_id}
+POST                   /api/v1/webhooks/xero
+POST                   /api/v1/webhooks/quickbooks
+```
+
+
+Self-authenticating routes:
+
+- `POST /api/v1/rmm/alerts` and `POST /api/v1/rmm/status`: HMAC-SHA256 of the raw body in the `X-Signature` header, compared
+  in constant time against the stored connection secret; no bearer.
+- `POST /api/v1/email-intake` and the intake log: tenant intake bearer token from `tenant_intake_tokens`.
+- `POST /api/v1/bunyip/webhooks/*`: `X-Webhook-Signature`, hex HMAC-SHA256 of the body with `BUNYIP_WEBHOOK_SECRET`.
+  Replays are idempotent.
+- `POST /api/v1/bunyip/oauth2/backchannel-logout`: mounted only when the identity-provider verifier is configured;
+  verifies the logout token and records the ended session; rate limited.
+- `POST /api/v1/stripe/webhooks/{tenant_id}` and `/api/v1/paypal/webhooks/{tenant_id}`: the tenant's active provider
+  verifies the delivery over the raw body (`Stripe-Signature` HMAC, or PayPal verification of the transmission headers)
+  before parsing; a delivery from a provider that is not the tenant's active one is refused.
+- `POST /api/v1/webhooks/xero` (`x-xero-signature`) and `/quickbooks` (`intuit-signature`): base64 HMAC-SHA256 over the raw
+  body.
+
+CORS: allowed methods GET, POST, PUT, DELETE, PATCH, OPTIONS; allowed request headers `Authorization`, `Content-Type`,
+`Accept`, `X-Forwarded-Host`; credentials allowed; preflight cache 600 s. Allowed origins come from `CORS_ORIGIN`
+(exact origins, or a scheme-locked `https://*.example.com` wildcard on the leftmost label); a malformed entry fails
+startup.
+
+### 12.2 Command line
+
+`mokosh-server` with no argument serves. With a first argument from this list it runs the task and exits non-zero on
+error:
+
+| Subcommand | Arguments | Purpose |
+|---|---|---|
+| `bootstrap-infisical` | env `INFISICAL_ADMIN_EMAIL`, `INFISICAL_ADMIN_PASSWORD` (required); `INFISICAL_ADMIN_FIRST_NAME`, `INFISICAL_ADMIN_LAST_NAME`, `INFISICAL_URL`, `INFISICAL_PROJECT_NAME`, `INFISICAL_IDENTITY_NAME`, `INFISICAL_ENVIRONMENT`, `MOKOSH_ENV_FILE` | First-run setup of a secret-manager instance; writes the resulting credentials into an env file. |
+| `qa-seed`, `qa-teardown` | `--tenant <uuid>` or env `MOKOSH_QA_TENANT_ID`; env `DATABASE_URL` | Load or remove the QA walkthrough dataset; refuses any tenant not marked QA. |
+| `showcase-seed`, `showcase-refresh`, `showcase-teardown` | `--tenant <uuid>` or env `MOKOSH_SHOWCASE_TENANT_ID`; env `DATABASE_URL` | Create, reset or remove the showcase dataset; refuses any tenant not marked showcase. |
+| `provider-status` | `--json`, `--text` | Presence matrix: every declared key per provider and which provider serves it; values are never printed. |
+| `provider-set` | `--secret <NAME>`, `--from-env <VAR>`, `--json`, `--text` | Write one application-tier secret, read from the named environment variable, into the provider the deployment declares, then read it back and compare; takes effect after a restart. |
+| `provider-migrate` | `--from <provider>`, `--to <provider>`, `--json`, `--text` | Copy every key the source provider holds into the target with read-back comparison; never clears the source. |
+| `provider-purge` | `--provider <name>`, `--confirm`, `--json`, `--text` | Delete every key a disabled provider holds, only where the key is verified live in the serving provider; a dry run unless `--confirm`. |
+| `verify-providers` | `--json`, `--text` | Boot each provider seam and report whether it serves; sends an SMTP NOOP for the email row; exits non-zero on any failure. |
+
+`mokosh-bootstrap` (`src/bin/mokosh-bootstrap.rs`) is a second binary shipped in the image with subcommands
+`bootstrap-infisical`, `qa-seed`, `qa-teardown`, `dev-seed-portal` (portal fixture tenants and contacts for development),
+`normalize-company-industries` (map free-text industries onto the canonical set across tenants) and `--version`.

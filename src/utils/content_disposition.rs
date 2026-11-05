@@ -16,6 +16,7 @@
 /// nothing is left. A non-ASCII character is passed through as-is: it is not
 /// this helper's job to transliterate a customer's own filename, only to make
 /// every call site agree on what happens to it.
+// SPEC-4.17: strip quote/slash/control chars, cap at 255 chars, fall back to "file".
 pub fn content_disposition(filename: &str) -> String {
     let sanitized: String = filename
         .chars()

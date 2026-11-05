@@ -22,6 +22,7 @@ impl GeoIpService {
     /// Open the IP2Location `.BIN` database at `db_path`. Fails loudly if the
     /// path is set but unreadable, so a misconfiguration surfaces at startup
     /// rather than silently disabling alerts.
+    // SPEC-4.5: an unreadable configured DB path fails loudly, never disables silently.
     pub fn new(db_path: &str) -> AppResult<Self> {
         let db = DB::from_file(db_path)
             .map_err(|e| AppError::internal(format!("IP2Location DB load failed: {e}")))?;
@@ -43,6 +44,7 @@ impl GeoIpService {
 /// or `None`. IP2Location stores `"-"` (and occasionally a blank) for unknown /
 /// reserved ranges; those are not real countries and must never be treated as a
 /// login-location change (PMS-657).
+// SPEC-4.6: IP2Location's "-" placeholder and blank are "no country", not a code.
 fn normalize_country_code(raw: &str) -> Option<String> {
     let code = raw.trim();
     if code.is_empty() || code == "-" {
