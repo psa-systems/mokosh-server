@@ -1,10 +1,10 @@
 # PMS-1286: paths whose scanner findings are provably false positives.
 # One sentence per entry naming WHY the exclusion is safe. A real secret
 # in any of these paths is the same incident class a scan on a clean path
-# would catch; files are listed individually rather than widening a parent
+# would catch (SPEC-10.165); files are listed individually rather than widening a parent
 # glob so a future contributor cannot land a real secret under cover of a
 # module-wide exemption. Comments do NOT quote the fixture strings
-# themselves, or the ignore file re-triggers the scanner on itself.
+# themselves, or the ignore file re-triggers the scanner on itself. (SPEC-10.164)
 
 # This file. The scanner has no way to tell its own ignore list apart from
 # a committed secret-shaped string in another plain-text file.

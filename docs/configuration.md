@@ -32,7 +32,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 <a id="release-v0-17-0"></a>
 
-### v0.17.0
+### Unreleased (v0.17.0)
 
 #### Added
 
@@ -47,7 +47,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 <a id="release-v0-16-0"></a>
 
-### v0.16.0
+### Unreleased (v0.16.0)
 
 #### Added
 
@@ -68,7 +68,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 <a id="release-v0-15-0"></a>
 
-### v0.15.0
+### Unreleased (v0.15.0)
 
 #### Added
 
@@ -95,7 +95,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 <a id="release-v0-14-0"></a>
 
-### v0.14.0
+### Unreleased (v0.14.0)
 
 #### Added
 
@@ -146,11 +146,132 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 - [`GOOGLE_OAUTH_REDIRECT_URI`](#var-google-oauth-redirect-uri) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose variables; the Google sign-in routes it served are gone. (PMS-837)
 - [`OAUTH_SUPER_ADMIN_EMAILS`](#var-oauth-super-admin-emails) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose variables; only the removed Google sign-in path read it. (PMS-837)
 
-<a id="release-v0-13-0"></a>
+<a id="release-v0-12-0"></a>
 
-### v0.13.0
+### Unreleased (v0.12.0)
 
-No configuration changes.
+#### Added
+
+- [`ABUSE_CONTACT_EMAIL`](#var-abuse-contact-email) (Required: no) - Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces. (PMS-748)
+- [`INFISICAL_ADDRESS`](#var-infisical-address) (Required: no) - Optional. Blank reports Infisical as skipped in the readiness probe. (GOV-50)
+- [`PUBLIC_API_BASE_URL`](#var-public-api-base-url) (Required: no) - Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces. (PMS-748)
+- [`SPA_BASE_URL`](#var-spa-base-url) (Required: no) - Optional at the time (required since v0.14.0). Set it to the mokosh-apps origin so SPA-only email links land there. (MAPPS-425)
+- [`TENANT_LOGO_MAX_BYTES`](#var-tenant-logo-max-bytes) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-11-0"></a>
+
+### Unreleased (v0.11.0)
+
+#### Added
+
+- [`IP2PROXY_DB_PATH`](#var-ip2proxy-db-path) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-10-0"></a>
+
+### Unreleased (v0.10.0)
+
+#### Added
+
+- [`STRIPE_API_BASE`](#var-stripe-api-base) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-8-0"></a>
+
+### Unreleased (v0.8.0)
+
+#### Added
+
+- [`LOGIN_APPROVAL_ENABLED`](#var-login-approval-enabled) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-7-0"></a>
+
+### Unreleased (v0.7.0)
+
+#### Added
+
+- [`IP2LOCATION_DB_PATH`](#var-ip2location-db-path) (Required: no) - Optional. Leave it unset to keep the default.
+- [`TRUSTED_PROXY_CIDR`](#var-trusted-proxy-cidr) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-6-0"></a>
+
+### Unreleased (v0.6.0)
+
+#### Added
+
+- **Breaking: won't start:** [`BUNYIP_WEBHOOK_SECRET`](#var-bunyip-webhook-secret) (Required: yes) - Set it to bunyip-api's `BUNYIP_WEBHOOK_SIGNING_SECRET` before restarting; boot refuses without it outside dev/test. (PMS-591)
+
+<a id="release-v0-4-0"></a>
+
+### Unreleased (v0.4.0)
+
+#### Added
+
+- [`ATTACHMENT_DIR`](#var-attachment-dir) (Required: no) - Optional. Leave it unset to keep the default.
+- [`ATTACHMENT_MAX_BYTES`](#var-attachment-max-bytes) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_ADMIN_DATABASE_URL`](#var-mokosh-admin-database-url) (Required: no) - Optional. Leave it unset to keep the default.
+
+#### Changed
+
+- **Breaking: won't start:** [`ENCRYPTION_KEY`](#var-encryption-key) (Required: yes) - Now required outside dev/test: boot refuses an unset value or the built-in dev value. Set a real secret before restarting. (PMS-499)
+- **Breaking: won't start:** [`JWT_SECRET`](#var-jwt-secret) (Required: yes) - Now required outside dev/test: boot refuses an unset value or the built-in dev value. Set a real secret before restarting. (PMS-499)
+
+<a id="release-v0-3-0"></a>
+
+### Unreleased (v0.3.0)
+
+#### Added
+
+- [`MOKOSH_APP_DATABASE_URL`](#var-mokosh-app-database-url) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_APP_PASSWORD`](#var-mokosh-app-password) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_DEMO_SEED`](#var-mokosh-demo-seed) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_MIGRATOR_PASSWORD`](#var-mokosh-migrator-password) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_SEED_TENANT_ID`](#var-mokosh-seed-tenant-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_UPDATE_CHECK_URL`](#var-mokosh-update-check-url) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OAUTH_SUPER_ADMIN_EMAILS`](#var-oauth-super-admin-emails) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_AUDIENCE`](#var-oidc-audience) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_DEFAULT_TENANT_ID`](#var-oidc-default-tenant-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_ISSUER`](#var-oidc-issuer) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_JWKS_CACHE_TTL_SECS`](#var-oidc-jwks-cache-ttl-secs) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_LEEWAY_SECONDS`](#var-oidc-leeway-seconds) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-2-0"></a>
+
+### Unreleased (v0.2.0)
+
+#### Added
+
+- [`CLIENT_ORIGIN`](#var-client-origin) (Required: no) - Optional. Leave it unset to keep the default.
+- [`CORS_ORIGIN`](#var-cors-origin) (Required: no) - Optional. Leave it unset to keep the default.
+- [`GOOGLE_OAUTH_CLIENT_ID`](#var-google-oauth-client-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`GOOGLE_OAUTH_CLIENT_SECRET`](#var-google-oauth-client-secret) (Required: no) - Optional. Leave it unset to keep the default.
+- [`GOOGLE_OAUTH_REDIRECT_URI`](#var-google-oauth-redirect-uri) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_FROM`](#var-smtp-from) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_HOST`](#var-smtp-host) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_PASSWORD`](#var-smtp-password) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_PORT`](#var-smtp-port) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_TLS`](#var-smtp-tls) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_USERNAME`](#var-smtp-username) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-1-0"></a>
+
+### Unreleased (v0.1.0)
+
+#### Added
+
+- [`DATABASE_URL`](#var-database-url) (Required: yes) - Required: set it before the server starts.
+- [`ADMIN_EMAIL`](#var-admin-email) (Required: no) - Optional. Leave it unset to keep the default.
+- [`ADMIN_PASSWORD`](#var-admin-password) (Required: no) - Optional. Leave it unset to keep the default.
+- [`BASE_URL`](#var-base-url) (Required: no) - Optional. Leave it unset to keep the default.
+- [`ENCRYPTION_KEY`](#var-encryption-key) (Required: no) - Optional. Leave it unset to keep the default.
+- [`ENVIRONMENT`](#var-environment) (Required: no) - Optional. Leave it unset to keep the default.
+- [`HOST`](#var-host) (Required: no) - Optional. Leave it unset to keep the default.
+- [`INFISICAL_CLIENT_ID`](#var-infisical-client-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`INFISICAL_CLIENT_SECRET`](#var-infisical-client-secret) (Required: no) - Optional. Leave it unset to keep the default.
+- [`INFISICAL_ENVIRONMENT`](#var-infisical-environment) (Required: no) - Optional. Leave it unset to keep the default.
+- [`INFISICAL_PROJECT_ID`](#var-infisical-project-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`JWT_SECRET`](#var-jwt-secret) (Required: no) - Optional. Leave it unset to keep the default.
+- [`PORT`](#var-port) (Required: no) - Optional. Leave it unset to keep the default.
+- [`RUN_MIGRATIONS`](#var-run-migrations) (Required: no) - Optional. Leave it unset to keep the default.
+- [`RUST_LOG`](#var-rust-log) (Required: no) - Optional. Leave it unset to keep the default.
 
 <!-- END GENERATED: recently-added -->
 

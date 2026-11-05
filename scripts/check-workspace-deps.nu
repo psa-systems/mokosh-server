@@ -14,6 +14,8 @@
 #   - re-declares a crate with its own version/features when the workspace
 #     table already pins it.
 
+# SPEC-10.179: fails an uninherited workspace.dependencies entry, or a member
+# pin that shadows one already in the workspace table.
 const ROOT_MANIFEST = 'Cargo.toml'
 const DEP_TABLES = ['dependencies' 'dev-dependencies' 'build-dependencies']
 

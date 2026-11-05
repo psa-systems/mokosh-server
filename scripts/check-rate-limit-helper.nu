@@ -16,6 +16,7 @@
 #     `AppError::rate_limited(retry_after_seconds)`, the one constructor, is the
 #     only bypass-proof way to build one.
 
+# SPEC-10.174: let _ = retry_after is banned even inside this helper file.
 const HELPER_FILE = 'src/utils/error.rs'
 
 def main [] {

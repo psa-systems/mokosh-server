@@ -203,6 +203,8 @@ def build-entries [catalog: list, meta: record] {
     let all = ($auto | append $explicit | each {|e|
         if ($e.action | is-empty) { $e | update action (default-action $e) } else { $e }
     })
+    # SPEC-10.188: a required-at-add entry (other than v0.1.0) needs a [[change]]
+    # naming an issue and action; feature-off needs a non-empty feature.
     for e in $all {
         if ($e.level | is-not-empty) and (($e.action | is-empty) or not ($e.issue =~ '^[A-Z]+-\d+$')) {
             $errors = ($errors | append $"($LEVELS | get $e.level) ($e.group) ($e.var) in ($e.release) needs a [[change]] record in ($VARIABLES_FILE) with the operator action and the issue that introduced it")
@@ -518,6 +520,9 @@ def main [] {
     print "usage: nu scripts/config-docs.nu <generate|check|since <version>|release-notes <version>|self-test>"
 }
 
+# SPEC-10.186: rewrites only the Recently-added block and the All-variables
+# table rows; a second run is idempotent.
+
 def "main generate" [] {
     let repo = (load-repo)
     fail-on $repo.errors "the configuration facts are inconsistent"
@@ -527,6 +532,9 @@ def "main generate" [] {
     $next | save --force $DOC_FILE
     print $"rewrote the generated parts of ($DOC_FILE)"
 }
+
+# SPEC-10.185: fails on a catalog defect (duplicate name, malformed field, or a
+# code-read var missing from the registry) or a docs/configuration.md mismatch.
 
 def "main check" [] {
     let repo = (load-repo)
@@ -540,6 +548,9 @@ def "main check" [] {
     fail-on $errors "docs/configuration.md disagrees with the configuration facts (PMS-1442)"
     print $"config docs OK: ($repo.catalog | length) variables, ($repo.entries | length) changelog entries"
 }
+
+# SPEC-10.187: one row per catalog change after `version`, sorted by release,
+# breaking-level, required-first, name.
 
 def "main since" [
     version: string   # the release you run now, e.g. v0.13.0

@@ -46,6 +46,7 @@ const MAX_PAGES = 8
 
 # `timeout-minutes` per job, keyed `<workflow file>::<job>`.
 #
+# SPEC-10.194: reads timeout-minutes from the workflow files, never a value hardcoded here.
 # Read from the workflow files rather than listed here, so the thresholds stay
 # the ones PMS-829 justified in their own comments. A second copy in this script
 # would be one more thing to keep in step, and the drift would be silent.
@@ -198,6 +199,7 @@ def main [
         return
     }
 
+    # SPEC-10.194
     let token = ($env | get --optional FORGEJO_TOKEN | default '')
     if ($token | str trim | is-empty) {
         print --stderr 'ERROR: FORGEJO_TOKEN is not set, so this check cannot run.'

@@ -3,6 +3,7 @@
 # As non-root (compose `user:` pin): no remap, hooks or chown; fail unless every $DATA_DIRS entry is writable.
 set -eu
 
+# SPEC-10.124
 : "${APP_USER:?entrypoint: APP_USER must be set by the image}"
 : "${DATA_DIRS?entrypoint: DATA_DIRS must be set by the image (empty when it writes nothing)}"
 
@@ -14,6 +15,7 @@ fi
 CURRENT_UID=$(id -u)
 CURRENT_GID=$(id -g)
 
+# SPEC-10.125
 if [ "$CURRENT_UID" != "0" ]; then
     echo "entrypoint: started as ${CURRENT_UID}:${CURRENT_GID} (not root), skipping the PUID/PGID remap, hooks and chown" >&2
     if [ -n "${PUID:-}" ] && [ "$PUID" != "$CURRENT_UID" ]; then
@@ -34,6 +36,7 @@ if [ "$CURRENT_UID" != "0" ]; then
     exec "$@"
 fi
 
+# SPEC-10.126
 # PUID/PGID must be numeric and non-zero: the workload never runs as root.
 check_id() {
     case "$2" in
@@ -68,6 +71,7 @@ else
 fi
 echo "entrypoint: resolved ${APP_USER} to ${RESOLVED_UID}:${RESOLVED_GID} (uid from ${UID_SOURCE}, gid from ${GID_SOURCE})" >&2
 
+# SPEC-10.127
 # -o allows an id already present in the image.
 groupmod -o -g "$RESOLVED_GID" "$APP_USER"
 usermod -o -u "$RESOLVED_UID" -g "$RESOLVED_GID" "$APP_USER"
@@ -80,6 +84,7 @@ for hook in /etc/entrypoint.d/*.sh; do
     sh "$hook" || { rc=$?; echo "entrypoint: root hook ${hook} failed with exit ${rc}, refusing to start" >&2; exit "$rc"; }
 done
 
+# SPEC-10.128
 # Chown only what is wrong, so a volume that already matches is untouched.
 for dir in $DATA_DIRS; do
     find "$dir" \( ! -user "$RESOLVED_UID" -o ! -group "$RESOLVED_GID" \) -exec chown "$RESOLVED_UID:$RESOLVED_GID" {} +

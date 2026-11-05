@@ -1,4 +1,5 @@
 # Mokosh Server - production OCI image
+# SPEC-10.114
 FROM ghcr.io/niceguyit/rust-builder-musl:v1.1.0-rust1.98.1-alpine AS builder
 
 WORKDIR /build
@@ -7,6 +8,7 @@ RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static lld
 
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 
+# SPEC-10.115
 # PMS-781: dependency layer. Only the manifests land here, so the expensive
 # third-party compile below is an image layer that no change under `src/` or
 # `crates/*/src/` can invalidate - and, unlike a `target/` cache mount, a layer
@@ -57,6 +59,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # change invalidates every layer under it. Above the dependency build they
 # would recompile the whole dependency graph once per build and the layer
 # would never be reused.
+# SPEC-10.116
 ARG MOKOSH_GIT_HASH=""
 ARG MOKOSH_GIT_DESCRIBE=""
 ARG MOKOSH_BUILD_DATE=""
@@ -71,6 +74,7 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 # members to resolve the workspace, and build.rs bakes the version metadata
 # env vars into the binaries. (PMS-1007's vendored fonts are inside src/, which
 # is why they live there rather than in a top-level assets/.)
+# SPEC-10.117
 COPY migrations ./migrations
 COPY build.rs ./
 COPY crates ./crates
@@ -84,6 +88,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # first `DATA_DIRS` entry) and drops to it with `gosu`. `gosu` lives in
 # Alpine 3.23's community repo, so the runtime stage pins 3.23 and no later
 # `USER` line resets to a baked uid.
+# SPEC-10.118
 FROM alpine:3.23
 
 WORKDIR /app
@@ -93,6 +98,7 @@ RUN apk add --no-cache ca-certificates tzdata gosu shadow
 RUN addgroup -g 1001 appuser \
     && adduser -D -H -u 1001 -G appuser appuser
 
+# SPEC-10.119
 COPY --from=builder --chown=appuser:appuser /build/target/release/mokosh-server /app/mokosh-server
 COPY --from=builder --chown=appuser:appuser /build/target/release/mokosh-bootstrap /app/mokosh-bootstrap
 COPY --from=builder --chown=appuser:appuser /build/migrations /app/migrations
@@ -111,6 +117,7 @@ COPY --from=builder --chown=appuser:appuser /build/src/pdf/fonts/OFL.txt /app/li
 # root-owned, and this container runs as uid 1001, so every upload would fail
 # the day persistence was added. `ATTACHMENT_DIR` defaults to `./attachments`
 # against WORKDIR /app, so this path is also what a bare `docker run` uses.
+# SPEC-10.120
 RUN mkdir -p /app/attachments \
     && chown --recursive appuser:appuser /app
 
@@ -120,11 +127,13 @@ COPY --chmod=0755 oci-build/gosu-entrypoint.sh /usr/local/bin/gosu-entrypoint.sh
 # `DATA_DIRS` lists every runtime-writable directory, primary persistent
 # volume first (its owner is the uid the entrypoint adopts when PUID/PGID
 # are unset).
+# SPEC-10.121
 ENV APP_USER=appuser \
     DATA_DIRS="/app/attachments"
 
 ARG MOKOSH_GIT_HASH=""
 ARG MOKOSH_GIT_DESCRIBE=""
+# SPEC-10.122
 LABEL org.opencontainers.image.description="Mokosh Server"
 LABEL org.opencontainers.image.revision="${MOKOSH_GIT_HASH}"
 LABEL org.opencontainers.image.version="${MOKOSH_GIT_DESCRIBE}"
@@ -137,4 +146,5 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 # PMS-1513 / GOV-82: the container starts as root, `gosu-entrypoint.sh`
 # drops to `appuser` after remapping it to PUID/PGID (or the volume owner),
 # and a compose `user:` pin disables the remap and chown.
+# SPEC-10.123
 ENTRYPOINT ["/usr/local/bin/gosu-entrypoint.sh", "/app/mokosh-server"]

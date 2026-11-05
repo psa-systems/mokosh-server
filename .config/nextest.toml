@@ -44,6 +44,7 @@
 # parentheses even when the list is one entry long, and add a new suite to the
 # `unsupported` list only, never here.
 default-filter = 'not (test(/^suites::s3_storage::/) or test(/^suites::google_client_from_infisical::/))'
+# SPEC-10.155, SPEC-10.156: must negate the unsupported profile's filter character-for-character.
 
 # nextest schedules test CASES across every archived binary at once instead
 # of running one binary to completion before starting the next (what
@@ -58,6 +59,7 @@ default-filter = 'not (test(/^suites::s3_storage::/) or test(/^suites::google_cl
 # limit rather than at it. Lower it if `PoolTimedOut` appears in a run.
 test-threads = 12
 fail-fast = false
+# SPEC-10.157
 
 # Replaces the shell `timeout --signal=QUIT` wrapper and the grep for "has
 # been running for over" in integration.yml: nextest names the slow or
@@ -65,6 +67,7 @@ fail-fast = false
 # running past 60s is reported as slow; one still running after three more
 # periods (180s total) is sent SIGTERM and the run continues rather than the
 # whole job stalling on it.
+# SPEC-10.158
 [profile.ci.slow-timeout]
 period = "60s"
 terminate-after = 3
@@ -105,6 +108,7 @@ terminate-after = 3
 # PMS-1283's thread reservation stays on the p99 case. It was the right idea
 # and it is not sufficient: it governs nextest's own concurrency and says
 # nothing about the other workflows on the runner.
+# SPEC-10.159: the one test in [profile.ci] with a retry.
 [[profile.ci.overrides]]
 filter = 'test(health_p99_does_not_regress_under_concurrent_argon2_burst)'
 threads-required = "num-test-threads"
@@ -118,6 +122,7 @@ retries = 2
 # It inherits `ci`'s settings by naming it as its base, so the slow-timeout,
 # the failure policy and the thread budget cannot drift from the suite this one
 # was split out of. Only the filter differs.
+# SPEC-10.160
 [profile.unsupported]
 inherits = "ci"
 default-filter = '(test(/^suites::s3_storage::/) or test(/^suites::google_client_from_infisical::/))'

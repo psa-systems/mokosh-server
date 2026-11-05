@@ -2551,7 +2551,339 @@ Every migration under `migrations/` is embedded at compile time via `sqlx::migra
 - **SPEC-9.249**: migrations/155_teams_name_uniqueness.sql adds a case-insensitive unique index on `teams(tenant_id, LOWER(name)) WHERE is_active`, so two active teams cannot share a name within a tenant while an archived team's name is free to be reused.
 - **SPEC-9.250**: migrations/156_team_members_updated_at.sql adds `team_members.updated_at` with a `BEFORE UPDATE` trigger reusing the shared `update_updated_at_column()` function (migration 024), so a role change on a team membership is audit-trackable without a delete-and-reinsert.
 
-## 10. Deployment and operations
+## 10. Build, CI and deployment
+
+This section covers `.forgejo/workflows/`, `oci-build/`, `Dockerfile`, `compose.dev.yml`, `justfile`, `.env.example`,
+`Cargo.toml`, `rust-toolchain.toml`, `.cargo/`, `.config/`, `.devcontainer/`, `renovate.json`, `.gitignore`,
+`.gitmodules`, `.noseyparker-ignore.txt`, `scripts/*.nu`, and the non-test configuration and helpers under `e2e/`.
+Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enforcing site with a 1-2 line comment.
+
+### 10.1 Compile and lint gate (`.forgejo/workflows/check.yml`)
+
+- **SPEC-10.1** On every `pull_request` targeting `main`, the `check` job must run on `${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}`; the workflow must fail if the job exceeds its 30-minute timeout.
+- **SPEC-10.2** `check.yml` must not declare a `push` trigger for `main`: re-running compile and lint after a merge gates nothing, since the pull request already covered the merge commit.
+- **SPEC-10.3** The checkout step must set `fetch-depth: 0` (so migration-immutability can diff against `origin/main`) and `submodules: true` (so `common/common.just` resolves and `just --list` parses).
+- **SPEC-10.4** The job must also shallow-clone `psa-systems/mokosh-apps` to path `mokosh-apps` using `secrets.FORGEJO_PAT`, for the route-consumers check.
+- **SPEC-10.5** `CARGO_BUILD_JOBS` must be set to `nproc/2`, capping build parallelism at half the host's cores.
+- **SPEC-10.6** The Rust build cache (`Swatinem/rust-cache@v2`) must use `shared-key: check` with `cache-on-failure: true`, matching `cache-warm.yml`'s `warm-check` job's key exactly; a mismatch means a pull request restores nothing.
+- **SPEC-10.7** The job must run, in order, and fail the workflow if any exits non-zero: `just check-migration-versions`, `just check-migration-immutability`, `just check-migration-versions-against-base`, then `nu scripts/check-guarded-content-migrations.nu`, `check-no-duplicate-mail-copy.nu`, `check-pool-safety.nu`, `check-create-update-validate-parity.nu`, `check-rate-limit-helper.nu`, `check-runner-labels.nu`, `check-oci-build-cache.nu`, `check-oci-publish-tags.nu`, `check-workspace-deps.nu`, `check-env-example.nu`, `check-build-target-storage.nu`, `check-doc-recipes.nu`, `check-config-doc-paths.nu`, `config-docs.nu self-test` then `config-docs.nu check`, `check-doc-links.nu`, `check-claude-md.nu --self-test` then `check-claude-md.nu`, `cargo machete` (after installing pinned cargo-machete 0.9.2), then `check-route-consumers.nu` with env `MOKOSH_APPS_DIR=mokosh-apps`.
+- **SPEC-10.8** `cargo-machete` must be installed by downloading `cargo-machete-v0.9.2-x86_64-unknown-linux-musl.tar.gz` from its GitHub release, verifying it against SHA-256 `48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9` with `sha256sum --check --strict`, and installing to `${CARGO_HOME:-$HOME/.cargo}/bin/cargo-machete`; a checksum mismatch must fail the step.
+- **SPEC-10.9** The job must run, in order, and fail on non-zero exit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo check --workspace --all-targets`, `cargo test --workspace --lib`, `cargo test --workspace --doc`.
+- **SPEC-10.10** The `secrets` job must run on `${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}` with a 15-minute timeout, rename an existing `~/.gitconfig` to `~/.gitconfig-disabled` before checkout, check out with `fetch-depth: 0` and `persist-credentials: false`, then invoke the `check-secrets` composite action from `psa-systems/common` with a fixed `kingfisher_excludes` path list, a `kingfisher_skip_regex`, and `noseyparker_ignore_file: .noseyparker-ignore.txt`.
+
+### 10.2 Migration guard on merge (`.forgejo/workflows/post-merge-guards.yml`)
+
+- **SPEC-10.11** On every `push` to `main`, the `guards` job must run on `${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}` with a 5-minute timeout, check out with `fetch-depth: 0` and `submodules: true`, then run `just check-migration-versions` and `just check-migration-immutability` against the merge result, failing the workflow if either exits non-zero.
+
+### 10.3 Integration test gate (`.forgejo/workflows/integration.yml`)
+
+- **SPEC-10.12** On every `pull_request` into `main` (never `push`), the workflow must run three jobs: `build` (compiles once), `test` (a matrix of 3 shards, `fail-fast: false`), and `summary` (`needs: test`, `if: always()`).
+- **SPEC-10.13** The `build` job must run on `${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}` with a 25-minute timeout and env `SQLX_OFFLINE=true`, `RUST_BACKTRACE=1`.
+- **SPEC-10.14** Before building, the job must fail with exit 1 and an `::error::` annotation if free disk space on the workspace filesystem is under 25 GB.
+- **SPEC-10.15** The Rust build cache must use `shared-key: integration`, matching `cache-warm.yml`'s `warm-integration` job.
+- **SPEC-10.16** `cargo-nextest` must be installed by downloading `https://get.nexte.st/0.9.145/linux`, verifying SHA-256 `32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867` via `sha256sum --check --strict`, then extracting to `${CARGO_HOME:-$HOME/.cargo}/bin`.
+- **SPEC-10.17** The build step must run `cargo nextest archive --archive-file nextest-archive.tar.zst`, sampling free disk space every 5 seconds to `/tmp/disk-samples-build.txt` for the duration, and must propagate the archive command's own exit status, never the sampler's.
+- **SPEC-10.18** The archive must be uploaded as artifact `nextest-archive` with `retention-days: 1` and `if-no-files-found: error`.
+- **SPEC-10.19** The `test` job must run a 3-way matrix (`shard: [1, 2, 3]`) on `${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}` with `fail-fast: false` and a 20-minute per-shard timeout, each with its own `postgres:18.2-alpine3.23` service (`POSTGRES_PASSWORD=postgres`, `POSTGRES_USER=postgres`, `POSTGRES_DB=postgres`, health-checked every 5 seconds up to 20 retries).
+- **SPEC-10.20** Each shard must download the `nextest-archive` artifact, install the same pinned nextest (0.9.145, SHA-256 `32aa...867`), disable Postgres durability (`fsync`, `synchronous_commit`, `full_page_writes` all off via `ALTER SYSTEM SET` plus `pg_reload_conf()`), create the DB roles the migrations grant to by running `scripts/test-db-roles.sql` with `ON_ERROR_STOP=1`, set `TMPDIR=$HOME/.nextest-tmp`, build the template database by running `cargo nextest run --archive-file nextest-archive.tar.zst --profile ci --no-capture -E 'test(/^suites::template_database::/)'`, then run `cargo nextest run --archive-file nextest-archive.tar.zst --profile ci --partition hash:${shard}/3`.
+- **SPEC-10.21** The `summary` job must run on `${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}` with a 5-minute timeout, and must fail (`exit 1` with an `::error::` annotation) unless `needs.test.result == 'success'`.
+
+### 10.4 Unsupported/scheduled integration suite (`.forgejo/workflows/integration-unsupported.yml`)
+
+- **SPEC-10.22** The workflow must trigger only on `schedule: "0 6 * * 1"` (Monday 06:00 UTC) and `workflow_dispatch`, never on `push` or `pull_request`.
+- **SPEC-10.23** The job must run on `${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}` with a 30-minute timeout, with its own `postgres:18.2-alpine3.23` service identical to `integration.yml`'s.
+- **SPEC-10.24** The job must install the same pinned nextest (0.9.145 / SHA-256 `32aa...867`), then start MinIO for the S3 suite by pulling image digest `docker.io/bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c`, extracting `/opt/bitnami/minio/bin/minio` via `docker create` plus `docker cp`, verifying it against SHA-256 `0586fed6e33767430230d2f5bafd0d2f4ea2b844ce17025593dd7ab07f5f33c2`, and running it with `MINIO_ROOT_USER=mokosh MINIO_ROOT_PASSWORD=mokosh-ci-password` bound to `127.0.0.1:9000`, polling `/minio/health/live` for up to 30 seconds before failing loud.
+- **SPEC-10.25** The step must fail immediately with an `::error::` if `uname -m` is not `x86_64` (the MinIO pin is amd64-only).
+- **SPEC-10.26** The job must export `STORAGE_S3_ENDPOINT=http://127.0.0.1:9000`, `STORAGE_S3_BUCKET=mokosh-ci`, `STORAGE_S3_REGION=us-east-1`, `STORAGE_S3_PATH_STYLE=true`, `STORAGE_S3_ACCESS_KEY_ID=mokosh`, `STORAGE_S3_SECRET_ACCESS_KEY=mokosh-ci-password` to `GITHUB_ENV`.
+- **SPEC-10.27** The job must disable Postgres durability and create DB roles identically to `integration.yml`, then run `cargo nextest run --profile unsupported` with no archive step.
+
+### 10.5 End-to-end gate (`.forgejo/workflows/e2e.yml`)
+
+- **SPEC-10.28** The workflow must trigger on `push: main`, `pull_request: main`, and `workflow_dispatch` with a required `environment` choice input (`staging` default, or `production`).
+- **SPEC-10.29** All triggers must serialize under `concurrency: group: e2e-staging, cancel-in-progress: false`, so no run is ever cancelled mid-flight.
+- **SPEC-10.30** The job must run on `${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}` with a 20-minute timeout and `defaults.run.working-directory: e2e`.
+- **SPEC-10.31** Every `E2E_*` secret-backed env var must resolve to its `_PRODUCTION` secret only when `inputs.environment == 'production'`, else its `_STAGING` secret (except `E2E_OIDC_CLIENT_ID`, shared across environments with no suffix); `E2E_ENVIRONMENT` must be `production` only on an explicit production dispatch, else `staging`.
+- **SPEC-10.32** Checkout must use `fetch-depth: 0`, required by `wait-for-deploy.mjs`'s `git log` walk.
+- **SPEC-10.33** The job must install dependencies with `bun install --frozen-lockfile` and browsers with `bun x playwright install chromium firefox webkit`, with no separate Node setup step (the runner image ships `nodejs24`/`bun` pre-baked).
+- **SPEC-10.34** The job must report `/dev/shm` free space and `fc-list` font count as warnings only, never failing the job, because `E2E / *` is intended as a required status check on `main`.
+- **SPEC-10.35** On `push` or a `workflow_dispatch` with `environment=staging`, the job must run `node24 scripts/wait-for-deploy.mjs` (SHA-polling deploy-sync gate); on `pull_request` or a production dispatch, it must instead run `node24 scripts/health-check.mjs` (reachability check only); the two conditions must be mutually exclusive by event/environment.
+- **SPEC-10.36** On `push`, `pull_request`, or a staging dispatch, the job must run `node24 scripts/check-e2e-bootstrapped.mjs` to set a `skip` output; the suite step must be skipped, not failed, when `steps.seeded.outputs.skip == 'true'`.
+- **SPEC-10.37** The suite must run as `bun x playwright test`, adding `--grep-invert @external` only for a production dispatch.
+- **SPEC-10.38** On failure, the job must upload `e2e/playwright-report/` and `e2e/test-results/` as artifact `playwright-report` with `retention-days: 14` and `if-no-files-found: ignore`.
+
+### 10.6 Release and image publishing (`.forgejo/workflows/build-oci-image.yml`, `create-release.yml`)
+
+- **SPEC-10.39** `build-oci-image.yml` must trigger on `push` to `main` or tag `v*` with a path filter limited to `src/**`, `crates/**`, `migrations/**`, `.cargo/**`, `Cargo.toml`, `Cargo.lock`, `oci-build/**`, `.forgejo/workflows/build-oci-image.yml`, plus `workflow_dispatch` with `dry_run` (boolean, default `true`) and `simulate_tag` (string) inputs.
+- **SPEC-10.40** The `build-and-push` job must run only `if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')`, on `${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}`, with a 45-minute timeout and `permissions: contents: read, packages: write`.
+- **SPEC-10.41** The publish mode must be derived from the trigger only, never `git describe`: `workflow_dispatch` resolves `dry-run`; a tag ref resolves `release`; `ref_name == main` resolves `latest`; any other ref resolves `branch` (rejected downstream unless allow-listed in `oci-build/get-tags.nu`). `dry_run` must be true unless the event is `workflow_dispatch` and `inputs.dry_run == "false"`; push events always publish for real.
+- **SPEC-10.42** Resolved tags and mode must come from `nu oci-build/get-tags.nu --mode $mode --ref-name $ref_name --simulate-tag $simulate_tag --json`, writing `mode`, `train`, `tag`, `describe`, `dry_run` to `GITHUB_OUTPUT`.
+- **SPEC-10.43** Build metadata env vars `MOKOSH_GIT_HASH` (`git rev-parse --short=12 HEAD`), `MOKOSH_GIT_DESCRIBE` (`git describe --tags --always --dirty`), `MOKOSH_BUILD_DATE` (ISO-8601 UTC), `SOURCE_DATE_EPOCH` (`git log -1 --pretty=%ct HEAD`) must be exported and passed as `--build-arg` to the Docker build.
+- **SPEC-10.44** The buildx builder must use the `docker-container` driver, required for cache export.
+- **SPEC-10.45** The image build must use `--cache-from type=gha` and, when not a dry run, `--cache-to type=gha,mode=max,ignore-error=true`; a dry run must use `--load` and skip `--push`/`--cache-to` entirely, so a simulated run never mutates the shared cache.
+- **SPEC-10.46** `create-release.yml` must trigger on `pull_request_target: closed` into `main`, and its `create-release` job must run only `if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/v')`, calling the reusable workflow `https://dev.a8n.run/psa-systems/common/.forgejo/workflows/create-release.yml@main` with `runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}` and `secrets: inherit`.
+
+### 10.7 Cache warmup (`.forgejo/workflows/cache-warm.yml`)
+
+- **SPEC-10.47** The workflow must trigger only on `push: main`, running `warm-check` (`shared-key: check`; `cargo clippy --all-targets -- -D warnings`, `cargo check --all-targets`, `cargo test --no-run --workspace --lib`, `cargo test --workspace --doc`) and `warm-integration` (`shared-key: integration`; `SQLX_OFFLINE=true`; archiving via `cargo nextest archive --archive-file /tmp/nextest-archive.tar.zst --workspace --tests`), so neither job runs any assertion-bearing test.
+- **SPEC-10.48** `warm-check`'s `shared-key` must equal `check.yml`'s and `warm-integration`'s must equal `integration.yml`'s, or a pull-request run restores nothing from cache.
+
+### 10.8 Dependency updates (`.forgejo/workflows/renovate.yml`, `renovate.json`)
+
+- **SPEC-10.49** `renovate.yml` must trigger on `schedule: "0 2 * * 6"` (Saturday 02:00 UTC) and `workflow_dispatch`, calling the pinned reusable workflow at commit `f466fa87127d4c5d78e9b8d5a730bfc59ef45450` (aliased `main`) with `target_repository: ${{ github.repository }}` and secrets `RENOVATE_CI_TOKEN`, `PUBLIC_GITHUB_REPO_TOKEN`, `PSA_SYSTEMS_PRIVATE_PACKAGE_PAT`, `A8N_TOOLS_PRIVATE_PACKAGE_PAT`, `FORGEJO_PAT`.
+- **SPEC-10.50** `renovate.json` must extend `local>psa-systems/common:renovate-default`, set `gitAuthor` to `renovate-bot <renovate-bot@users.noreply.dev.a8n.run>`, enable `osvVulnerabilityAlerts`, and restrict `enabledManagers` to exactly `cargo`, `docker-compose`, `dockerfile`, `github-actions`; Renovate must not open a PR for any other manager (for example npm in `e2e/`) from this config.
+- **SPEC-10.51** The `packageRules` entry matching package names `rust`/`rustc` must group them under `groupName: "rust toolchain"`, separate from any other dependency grouping, so a toolchain bump never folds into a general dependency-update PR.
+
+### 10.9 `justfile`: recipe wiring and precedence
+
+- **SPEC-10.52** `justfile` must import `common/common.just` (a submodule vendored at `./common`) with `import 'common/common.just'` after `default` is defined, since `just` picks the default recipe by source order, never from an import; a clone that has not run `git submodule update --init` must fail to resolve the import before any recipe runs.
+- **SPEC-10.53** `justfile` must set `allow-duplicate-recipes := true` so that the locally redefined recipes `default`, `dev-clean`, `ensure-env`, `check-docker`, `build-docker` and `test` (which also exist in `common/common.just`) are legal redefinitions, and the last definition in file order (this repo's own body, defined after the import) wins.
+- **SPEC-10.54** `default` must run `just --list` and nothing else; invoking `just` with no recipe name must print the recipe list, never execute a recipe body.
+
+### 10.10 `justfile`: check recipes
+
+- **SPEC-10.55** `just check` must run exactly this recipe list, in order, as prerequisites: `check-compile check-clippy check-fmt check-migrations check-migration-immutability check-migration-versions-against-base check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-config-docs check-doc-links check-claude-md`, and must not include `check-docker` or `test-integration`; any prerequisite's non-zero exit fails the whole recipe at that point.
+- **SPEC-10.56** `check-compile` must run `cargo check --workspace --all-targets`.
+- **SPEC-10.57** `check-clippy` must run `cargo clippy --workspace --all-targets -- -D warnings`, matching `check.yml` exactly so a lint failing CI also fails this local recipe.
+- **SPEC-10.58** `check-fmt` must run `cargo fmt --all --check` and must not modify any file.
+- **SPEC-10.59** `check-config-docs` must run `nu scripts/config-docs.nu self-test` then `nu scripts/config-docs.nu check`, in that order; either non-zero exit fails the recipe.
+- **SPEC-10.60** `check-doc-links` must run `nu scripts/check-doc-links.nu`.
+- **SPEC-10.61** `check-claude-md` must run `nu scripts/check-claude-md.nu --self-test` then `nu scripts/check-claude-md.nu`, in that order.
+- **SPEC-10.62** `check-build-target-storage` must run `nu scripts/check-build-target-storage.nu`.
+- **SPEC-10.63** `check-doc-recipes` must run `nu scripts/check-doc-recipes.nu`.
+- **SPEC-10.64** `check-config-doc-paths` must run `nu scripts/check-config-doc-paths.nu`.
+- **SPEC-10.65** `check-env-example` must run `nu scripts/check-env-example.nu`.
+- **SPEC-10.66** `check-migrations` must run `check-migration-versions` and `check-migration-versions-against-base` as prerequisites (the former is `common/common.just`'s own recipe, invoking its own `scripts/check-migration-versions.nu` against `migrations_dir`).
+- **SPEC-10.67** `check-migration-versions-against-base base_ref="origin/main"` must run `nu scripts/check-migration-versions-against-base.nu migrations {{base_ref}}`.
+- **SPEC-10.68** `check-guarded-content-migrations` must run `nu scripts/check-guarded-content-migrations.nu`.
+- **SPEC-10.69** `check-pool-safety` must run `nu scripts/check-pool-safety.nu`.
+- **SPEC-10.70** `check-validate-parity` must run `nu scripts/check-create-update-validate-parity.nu`.
+- **SPEC-10.71** `check-route-consumers` must run `nu scripts/check-route-consumers.nu`.
+- **SPEC-10.72** `check-mail-copy` must run `nu scripts/check-no-duplicate-mail-copy.nu`.
+- **SPEC-10.73** `check-rate-limit-helper` must run `nu scripts/check-rate-limit-helper.nu`.
+- **SPEC-10.74** `check-runner-labels` must run `nu scripts/check-runner-labels.nu`.
+- **SPEC-10.75** `check-oci-cache` must run `nu scripts/check-oci-build-cache.nu`.
+- **SPEC-10.76** `check-oci-publish-tags` must run `nu scripts/check-oci-publish-tags.nu`.
+- **SPEC-10.77** `check-workspace-deps` must run `nu scripts/check-workspace-deps.nu`.
+- **SPEC-10.78** `check-unused-deps` must exit 1 with stderr `cargo-machete not installed: cargo install --locked cargo-machete` when `cargo-machete` is not on `PATH`, and otherwise run `cargo machete`.
+- **SPEC-10.79** `check-docker` must build only the `builder` target stage (`--target builder`) of `oci-build/Dockerfile`, tagged `mokosh-server:check`, with build args `MOKOSH_GIT_HASH`, `MOKOSH_GIT_DESCRIBE`, `MOKOSH_BUILD_DATE` computed the same way as the CI build (10.43); `check-docker` must not be a prerequisite of `just check` because it needs a Docker builder and network access that no `check.yml` step requires either.
+
+### 10.11 `justfile`: dev stack recipes
+
+- **SPEC-10.80** `ensure-env` must be a no-op if `.env` already exists and must never overwrite it. On first run it must generate, via `openssl rand -hex 24` (pg/migrator/app passwords, Infisical Postgres password, MinIO root password), `openssl rand -hex 32` (`JWT_SECRET`, `ENCRYPTION_KEY`), `openssl rand -hex 16` (`INFISICAL_ENCRYPTION_KEY`) and `openssl rand -base64 32` (`INFISICAL_AUTH_SECRET`), substitute these into the named keys and the three rebuilt `postgres://` URL lines (`DATABASE_URL`, `MOKOSH_ADMIN_DATABASE_URL`, `MOKOSH_APP_DATABASE_URL`, `INFISICAL_DB_CONNECTION_URI`) while leaving `${MOKOSH_PG_HOST_PORT}` as literal unexpanded text in those URLs, write the result to `.env`, and print `ensure-env: created .env with freshly generated self-owned secrets`; third-party credential placeholders from `.env.example` must stay blank.
+- **SPEC-10.81** `dev *args` must depend on `ensure-env`, rewrite `.env` so exactly one `USER=<value>` line exists (from `whoami`, trimmed, replacing any prior `USER=` line), print `Starting the dev stack as <user>, routed at https://<user>-mokosh-api.a8n.run`, then run `docker compose --file compose.dev.yml up {{args}}`, passing trailing args through unmodified.
+- **SPEC-10.82** `dev-infisical *args` must depend on `ensure-env`, set `MOKOSH_SERVER_INFISICAL_ADDRESS=http://infisical:8080` in `.env` (replacing any prior line with that key), then run `docker compose --file compose.dev.yml --profile infisical up {{args}} infisical infisical-postgres`.
+- **SPEC-10.83** `dev-s3 *args` must depend on `ensure-env` and must error with `MINIO_ROOT_USER / MINIO_ROOT_PASSWORD are missing or blank in .env; copy both keys from .env.example and give the password a value (a .env generated before PMS-958 has neither)` if either key is empty or absent; otherwise it must fill, only when currently blank, exactly `STORAGE_S3_ENDPOINT=http://minio:9000`, `STORAGE_S3_BUCKET=mokosh`, `STORAGE_S3_REGION=us-east-1`, `STORAGE_S3_PATH_STYLE=true`, `STORAGE_S3_ACCESS_KEY_ID=<MINIO_ROOT_USER>`, `STORAGE_S3_SECRET_ACCESS_KEY=<MINIO_ROOT_PASSWORD>` (never `STORAGE_BACKEND`), then run `docker compose --file compose.dev.yml --profile s3 up {{args}} minio`.
+- **SPEC-10.84** `down` must depend on `ensure-env` and run `docker compose --file compose.dev.yml down --remove-orphans`, preserving named volumes.
+- **SPEC-10.85** `infisical-bootstrap` must depend on `ensure-env`; if `.env.infisical` exists it must parse it as `name=value` lines (skipping comments and blank lines) and inject them as environment, then run `cargo run --quiet --bin mokosh-server -- bootstrap-infisical` with that environment.
+- **SPEC-10.86** `dev-seed-portal` must depend on `ensure-env` and run, inside the `server` compose service with `--no-deps`, `DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo run --quiet --bin mokosh-bootstrap -- dev-seed-portal`, idempotently.
+- **SPEC-10.87** `dev-clean` must depend on `ensure-env`, run `docker compose --file compose.dev.yml down --remove-orphans`, remove exactly the named volumes `dev-mokosh-postgres-data-${USER}`, `dev-mokosh-infisical-postgres-data-${USER}`, `dev-mokosh-server-target-${USER}`, `dev-mokosh-attachments-${USER}` if present, recursively remove the local `target` directory if it exists (printing `removed target`), remove `.env` if it exists (printing `removed .env`), and finish by printing `dev-clean: done`.
+- **SPEC-10.88** `dev-clean-all` must depend on and run after `dev-clean`, then remove the Docker images `mokosh-server:check` and `mokosh-server:local` if present, run `docker buildx prune --force`, and print `dev-clean-all: done`.
+
+### 10.12 `justfile`: test recipes
+
+- **SPEC-10.89** `test` (overriding `common`'s `test`) must run `cargo test --workspace --lib --bins`, deliberately scoped to `--lib --bins` and never the workspace's `tests/*` integration binaries, because at least 19 of those suites depend on one-process-per-file semantics a merged `tests/suites/*.rs` module would break.
+- **SPEC-10.90** `ensure-test-db-roles` must depend on `ensure-env`, run `docker compose --file compose.dev.yml up --detach --wait postgres`, then exec, inside the `postgres` service, `psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --set=ON_ERROR_STOP=1` feeding it `scripts/test-db-roles.sql` from stdin, so a `psql` error fails the recipe.
+- **SPEC-10.91** `test-integration` must depend on `ensure-env` and `ensure-test-db-roles`, then run, inside the `server` compose service via `docker compose run --rm` with `SQLX_OFFLINE=true`: `cargo install --locked --version 0.9.145 cargo-nextest`, then (with `DATABASE_URL` overridden to `$MOKOSH_ADMIN_DATABASE_URL`) `cargo nextest run --profile ci --no-capture -E 'test(/^suites::template_database::/)'` before `cargo nextest run --profile ci`, in that order.
+- **SPEC-10.92** `test-integration-unsupported` must depend on `ensure-env` and `ensure-test-db-roles`, run `cargo install --locked --version 0.9.145 cargo-nextest` then `DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile unsupported`; the pinned nextest version must match `test-integration`'s.
+- **SPEC-10.93** `verify-providers *args` must exec, inside the already-running `server` compose service, `/app/target/debug/mokosh-server verify-providers {{args}}`, passing trailing args through so `--json` selects a JSON envelope and the default (`--text`) prints an operator table.
+- **SPEC-10.94** `verify-demo` must depend on `ensure-env` and `ensure-test-db-roles`, and run, inside `server` with `SQLX_OFFLINE=true` and `DATABASE_URL` overridden to `$MOKOSH_ADMIN_DATABASE_URL`, `cargo test --test seed_demo --test data_transfer -- --test-threads=4`.
+- **SPEC-10.95** `test-e2e *args` must, from the `e2e/` directory, run `bun install --frozen-lockfile`, then `bun x playwright install chromium firefox webkit` (all three browsers), then `bun x playwright test {{args}}` with trailing args passed through.
+
+### 10.13 `justfile`: build, image and release recipes
+
+- **SPEC-10.96** `ci-stalls days="3"` must run `nu scripts/check-ci-stalls.nu {{days}}` and must not be a prerequisite of `just check`, since it needs network access and `FORGEJO_TOKEN`.
+- **SPEC-10.97** `ci-log *args` must run `nu scripts/ci-job-log.nu {{args}}`, passing `--workflow`, `--sha`, `--run`, `--list` through.
+- **SPEC-10.98** `ci-stalls-self-test` must run `nu scripts/check-ci-stalls.nu --self-test` and must need no network token.
+- **SPEC-10.99** `config-docs` must run `nu scripts/config-docs.nu generate`.
+- **SPEC-10.100** `config-since version *args` must run `nu scripts/config-docs.nu since {{version}} {{args}}`.
+- **SPEC-10.101** `config-release-notes version *args` must run `nu scripts/config-docs.nu release-notes {{version}} {{args}}`.
+- **SPEC-10.102** `build` must run `cargo build --release --bins`.
+- **SPEC-10.103** `build-docker` must build the full (non-`--target`) `oci-build/Dockerfile` image, tagged `mokosh-server:local`, with the same three build args as `check-docker` (10.79), computed identically.
+- **SPEC-10.104** `migrate-run` must run `sqlx migrate run` against `$DATABASE_URL`.
+- **SPEC-10.105** `migrate-create name` must run `sqlx migrate add {{name}}`.
+
+### 10.14 `justfile`: variables
+
+- **SPEC-10.106** `app` must be the literal `"mokosh-server"`, used by `common`'s `release_crate` default for a release's `cargo update --package` step.
+- **SPEC-10.107** `compose_service` must be `"server"`, not `common`'s default `"app"` (no compose service in this repo is named `app`).
+- **SPEC-10.108** `clippy_args` must be exactly `"--workspace --all-targets -- -D warnings"`, deliberately never `--all-features`, since `check.yml` compiles only the default feature set.
+- **SPEC-10.109** `compile_step` must be `"check"` (not `"build"`), and `compile_args` must be `"--workspace --all-targets"`.
+- **SPEC-10.110** `test_args` must be exactly `"--workspace --lib"` for the common-driven hook path; the doc-test invocation runs only in CI, never via this variable.
+- **SPEC-10.111** `compose_file` must be the literal `"compose.dev.yml"`, used by every recipe invoking `docker compose --file {{compose_file}}`.
+
+### 10.15 Dev image (`Dockerfile`)
+
+- **SPEC-10.112** The dev image must build `FROM ghcr.io/niceguyit/rust-builder-glibc:v1.2.0-rust1.98.1-trixie` and install `pkg-config libssl-dev curl` via apt, removing `/var/lib/apt/lists/*` afterward.
+- **SPEC-10.113** The dev image must create `/app /data /config`, set `WORKDIR /app`, `EXPOSE 8080`, and run `CMD ["cargo", "run", "--bin", "mokosh-server"]`, so the compose-mounted source compiles on every container start rather than running a baked binary. The real listen port comes from `$PORT`, which `compose.dev.yml` sets from `MOKOSH_PORT`; the `EXPOSE 8080` is a documentation default only.
+
+### 10.16 Production OCI image (`oci-build/Dockerfile`)
+
+- **SPEC-10.114** The builder stage must build `FROM ghcr.io/niceguyit/rust-builder-musl:v1.1.0-rust1.98.1-alpine`, install `musl-dev pkgconfig openssl-dev openssl-libs-static lld`, and set `RUSTFLAGS="-C link-arg=-fuse-ld=lld"`.
+- **SPEC-10.115** The builder must populate a dependency-only layer by copying only `Cargo.toml`/`Cargo.lock` and each workspace crate's own `Cargo.toml`, stubbing every crate's `src/lib.rs`/`main.rs`/`build.rs` with `fn main() {}`, running `cargo build --release --bins` against the stubs, then `cargo clean --release` the five first-party packages (`mokosh-server`, `mokosh-types`, `build-metadata`, `mokosh-test-macros`, `mokosh-test`) while keeping third-party artifacts, so a change under `src/` or `crates/*/src/` cannot invalidate this layer and the stub binary is never shipped.
+- **SPEC-10.116** Build args `MOKOSH_GIT_HASH`, `MOKOSH_GIT_DESCRIBE`, `MOKOSH_BUILD_DATE`, `SOURCE_DATE_EPOCH` must each default to `""` and be promoted to `ENV` of the same name below the dependency layer (not above it), so `build.rs` observes them without invalidating the dependency cache on every build; unset, `build.rs` falls back to `"unknown"` plus the package version.
+- **SPEC-10.117** The real-source copy must land `migrations`, `build.rs`, `crates`, `src` (in that order) before the final `cargo build --release --bins`, because `sqlx::migrate!` reads `migrations/` at compile time and `build.rs` needs its own crate present.
+- **SPEC-10.118** The runtime stage must be `FROM alpine:3.23` (pinned because `gosu` is only in Alpine 3.23's community repo), install `ca-certificates tzdata gosu shadow`, and create group+user `appuser` at fixed `uid:gid` 1001:1001 via `addgroup -g 1001 appuser && adduser -D -H -u 1001 -G appuser appuser`.
+- **SPEC-10.119** The runtime stage must copy `mokosh-server`, `mokosh-bootstrap`, and `migrations` from the builder with `--chown=appuser:appuser`, and copy `src/pdf/fonts/OFL.txt` to `/app/licenses/NotoSans-OFL.txt`, a licence-obligation artifact nothing reads at runtime.
+- **SPEC-10.120** The image must create `/app/attachments` and `chown -R appuser:appuser /app` before `ENV DATA_DIRS` is declared, so a freshly created named volume mounted over `/app/attachments` inherits `appuser` ownership instead of root's.
+- **SPEC-10.121** The image must set `ENV APP_USER=appuser` and `ENV DATA_DIRS="/app/attachments"`, read by `gosu-entrypoint.sh`.
+- **SPEC-10.122** The image must set OCI labels `org.opencontainers.image.description=Mokosh Server`, `...revision=${MOKOSH_GIT_HASH}`, `...version=${MOKOSH_GIT_DESCRIBE}`, `EXPOSE 8080`, and a `HEALTHCHECK` with `--interval=30s --timeout=3s --start-period=5s --retries=3` running `wget --no-verbose --tries=1 --spider http://localhost:8080/api/v1/health`, failing on any non-success.
+- **SPEC-10.123** `ENTRYPOINT` must be `["/usr/local/bin/gosu-entrypoint.sh", "/app/mokosh-server"]`; a runtime `user:` pin that is non-root disables the remap and chown steps in the entrypoint (10.125).
+
+### 10.17 Shared container entrypoint (`oci-build/gosu-entrypoint.sh`)
+
+- **SPEC-10.124** On start, the script must fail if `APP_USER` is unset, printing `entrypoint: APP_USER must be set by the image`; `DATA_DIRS` may be empty but must be set. It must exit 1 with `entrypoint: no command to run...` if invoked with zero arguments.
+- **SPEC-10.125** When started as non-root: the script must skip the PUID/PGID remap, root hooks and chown; if `PUID`/`PGID` are set but do not match the running uid/gid it must exit 1 naming the mismatch; for each `DATA_DIRS` entry it must exit 1 if the directory is missing or not writable by the current user, else `exec` the given command as-is.
+- **SPEC-10.126** When started as root: `PUID`/`PGID`, if set, must be numeric and non-zero (rejecting non-numeric or `0` with exit 1, "refusing to run the workload as root"); if unset, the resolved uid/gid must be the owner of the first `DATA_DIRS` entry when that owner is non-root, else default to `1001:1001`.
+- **SPEC-10.127** The script must remap `$APP_USER` to the resolved uid/gid via `groupmod -o -g ... && usermod -o -u ... -g ...`, log the resolution source (`PUID`/`PGID`/owner-of-dir/default) to stderr, then run every executable in `/etc/entrypoint.d/*.sh` as root (skipping if the glob matches nothing), aborting with that hook's exit code if any hook fails.
+- **SPEC-10.128** For each `DATA_DIRS` entry the script must `chown` only entries whose uid or gid differs from the resolved pair, then must `exec gosu "$APP_USER" "$@"` (user form, not `uid:gid`, so supplementary groups resolve from `/etc/group`).
+
+### 10.18 Image tagging (`oci-build/get-tags.nu`)
+
+- **SPEC-10.129** `main` must accept only `release|latest|branch|dry-run` for `--mode`; any other value must error `[get-tags] Unknown mode: '<mode>'. Expected release|latest|branch|dry-run.`.
+- **SPEC-10.130** Mode `release` must resolve `{train: "release", version: ref_name}` and error `[get-tags] release train requires a non-empty version...` if `ref_name` is empty. Mode `latest` must resolve `{train: "latest", version: ""}`. Mode `branch` must resolve `{train: "branch", version: ref_name}`. Mode `dry-run` must resolve to `release` when `--simulate-tag` is non-empty, to `branch` when `--ref-name` is non-empty and not `"main"`, else to `latest`.
+- **SPEC-10.131** `BRANCH_ALLOW_LIST` must be the single source of truth for which branches may publish; a `branch`-train version not on the list must error `[get-tags] Branch '<name>' is not on the publish allow-list ...`. It is currently empty (no feature branch publishes); `scripts/check-oci-publish-tags.nu` keeps `build-oci-image.yml`'s own branch filter in sync with it.
+- **SPEC-10.132** The final `tag` must be the version string for `release`, `branch-tag(version)` (every `/` replaced with `-`) for `branch`, and the literal `latest` for `latest`; `describe` (`git describe --tags --always`) is diagnostic only and never changes the train. With `--json`, the record `{mode, train, tag, describe}` must serialize via `to json --raw`.
+
+### 10.19 Dev stack compose (`compose.dev.yml`)
+
+- **SPEC-10.133** The compose project name must be `dev-mokosh-${USER}` and every `container_name`/volume/network name must carry the `dev-mokosh-` prefix plus `-${USER}` suffix, so two developers on one host never collide; `USER` has no default (`${USER:?USER missing - run via just dev}`).
+- **SPEC-10.134** `infisical`, `infisical-postgres`, and `valkey` must start only under compose profile `infisical`; `minio` must start only under profile `s3`; no other service is profile-gated.
+- **SPEC-10.135** `postgres`, `infisical-postgres`, and `mailpit` host-published ports must bind to `127.0.0.1` only, as must `minio`'s two published ports; the `server` service must publish no host port at all, reaching ingress solely through the external `network-traefik-public` Traefik network via its `labels`.
+- **SPEC-10.136** `postgres`'s `PGDATA` must be pinned to `/var/lib/postgresql/data/pgdata`, a subdirectory of the named volume mount, to avoid both the Postgres-18 default-path change and the entrypoint's refusal to `initdb` into a non-empty directory.
+- **SPEC-10.137** The `server` service must build from `Dockerfile` with `context: .`, depend on `postgres` with `condition: service_healthy` and on `mailpit` with `condition: service_started`, and must not declare a `depends_on` for `infisical`, since a hard dependency on a profiled-out service makes compose reject the whole project.
+- **SPEC-10.138** `CARGO_BUILD_JOBS` must default to `1` inside the `server` container, serializing rustc to avoid earlyoom SIGTERM around roughly 1.5 GB free; an operator may override it in `.env`.
+- **SPEC-10.139** The `server` service's volumes must mount `./src`, `./crates`, `./Cargo.toml`, `./Cargo.lock`, `./build.rs`, `./migrations`, `./tests`, `./e2e:ro`, and `./.config` individually, plus named volumes `server-target:/app/target` and `attachments:/data/attachments`; a new top-level directory this list omits is invisible inside the dev container.
+- **SPEC-10.140** `STORAGE_ROOT` must default to `/data/attachments` in the `server` environment, matching the `attachments:/data/attachments` mount point.
+- **SPEC-10.141** The `server`'s `extra_hosts` must pin `${USER}-bunyip-api.a8n.run` to `${BUNYIP_OP_TRAEFIK_IP:-172.30.0.11}` so the in-container OIDC discovery fetch reaches the local Traefik with a valid certificate rather than the host's public edge.
+- **SPEC-10.142** Traefik routing labels for `server` must use YAML list syntax, not map syntax, since Compose does not interpolate `${USER}` inside map keys, only inside string values.
+- **SPEC-10.143** `minio`'s image must be pinned by digest `docker.io/bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c`, with its data volume mounted at `/bitnami/minio/data`, not `/data`, because the Bitnami non-root image cannot `chown` a freshly created volume mounted at `/data`.
+
+### 10.20 Devcontainer (`.devcontainer/`)
+
+- **SPEC-10.144** `devcontainer.json` must use image `ghcr.io/niceguyit/opensuse-dev:v0.7.0-leap-16.0`, and must run `config-devcontainer.sh dev` via `sudo su --login --command` on `postCreateCommand`, `updateContentCommand`, and `postStartCommand` alike, a JetBrains-only workaround since JetBrains does not run those hooks as the configured user.
+- **SPEC-10.145** `config-devcontainer.sh` must add the `dev` user to a `docker-host` group matching the host docker socket's gid (creating the group if absent) whenever that gid is non-zero and not already present in `/etc/group`, so `dev` can reach `/var/run/docker.sock`.
+- **SPEC-10.146** Under JetBrains (`/.jbdevcontainer/` present), the script must move each of `chezmoi`, `nushell`, and `bun`'s config directories under `/.jbdevcontainer/config/` on first run and replace the original path with a symlink owned by `dev:dev`, so JetBrains' use of `XDG_CONFIG_HOME`/`XDG_DATA_HOME` still persists configuration across container rebuilds.
+- **SPEC-10.147** When `bun` is on `PATH`, the script must globally install `prettier`, `cspell`, `corepack`, `@anthropic-ai/claude-code`, `@tailwindcss/cli`, then run `bun update --global --latest` against every global package.
+
+### 10.21 Rust toolchain and workspace (`Cargo.toml`, `rust-toolchain.toml`, `.cargo/config.toml`)
+
+- **SPEC-10.148** The workspace must resolve with `resolver = "2"` and contain exactly four members: the root `mokosh-server` package, `crates/mokosh-types`, `crates/build-metadata`, `crates/mokosh-test-macros`, `crates/mokosh-test`; a member outside this list, or a missing one, breaks `cargo check --workspace` with an unresolved-path error.
+- **SPEC-10.149** `rust-toolchain.toml` must pin `channel = "1.98.1"` with `components = ["clippy", "rustfmt"]`; every `cargo`/`rustfmt`/`clippy` invocation in this repo, dev container and CI alike, must use exactly this patch, so formatting and lint output are identical everywhere.
+- **SPEC-10.150** A bump of the `rust-builder-glibc` or `rust-builder-musl` image tags (10.112, 10.114) must be accompanied, in the same change, by the matching `channel` bump in `rust-toolchain.toml`; drift between the pin and the image's actual rustc produces the same class of silent formatting/lint divergence the pin exists to prevent.
+- **SPEC-10.151** `[workspace.dependencies]` must list only crate entries that at least one member inherits via `{ workspace = true }` (enforced by `check-workspace-deps.nu`, 10.179): `serde 1.0.229` (derive), `serde_json 1.0.154`, `uuid 1.11` (v4, v7, serde), `chrono 0.4.45` (serde), `async-trait 0.1.92`, `secrecy 0.10.3` (serde), `ipnetwork 0.20`, `lettre 0.11.23` (default features off; tokio1-native-tls, builder, smtp-transport, pool).
+- **SPEC-10.152** `[profile.release]` must build with `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`; a release binary must abort rather than unwind on panic, and ship with symbols stripped.
+- **SPEC-10.153** `[profile.dev]` must build with `debug = 0` and `codegen-units = 256` (not rustc's default `debug = 2`), to keep rustc's peak RSS under the OOM threshold of memory-constrained dev containers, leaving `overflow-checks` and `debug-assertions` at their profile defaults (on); `[profile.dev.package."*"]` must set `opt-level = 3` for every dependency crate, so only the root crate itself builds unoptimized.
+- **SPEC-10.154** `.cargo/config.toml` must set `[net] git-fetch-with-cli = true`, so a `git`-dependency fetch (the `dunite-*` crates, pinned by `rev`) uses the system git CLI and its configured credential helper against the private `https://dev.a8n.run/psa-systems/dunite` repo, instead of libgit2, which can fail to authenticate against a private Forgejo remote.
+
+### 10.22 Test runner configuration (`.config/nextest.toml`)
+
+- **SPEC-10.155** `[profile.ci].default-filter` must read exactly `'not (test(/^suites::s3_storage::/) or test(/^suites::google_client_from_infisical::/))'`, character-for-character the negation of `[profile.unsupported]`'s filter `'(test(/^suites::s3_storage::/) or test(/^suites::google_client_from_infisical::/))'`.
+- **SPEC-10.156** `cargo nextest run --profile ci` must still compile `tests/suites/s3_storage.rs` and `tests/suites/google_client_from_infisical.rs` into the one test binary on every pull request (a compile break in either fails the PR job) while never executing their cases; those suites run only via `[profile.unsupported]`, invoked weekly by `integration-unsupported.yml` (10.22-10.27) and locally by `just test-integration-unsupported` (10.92).
+- **SPEC-10.157** `[profile.ci]` must run with `test-threads = 12` and `fail-fast = false`.
+- **SPEC-10.158** `[profile.ci.slow-timeout]` must mark a case slow after `period = "60s"` and send it SIGTERM after `terminate-after = 3` consecutive periods (180s total), continuing the rest of the run rather than stalling the whole job.
+- **SPEC-10.159** The override `[[profile.ci.overrides]]` for `filter = 'test(health_p99_does_not_regress_under_concurrent_argon2_burst)'` must set `threads-required = "num-test-threads"` and `retries = 2`; no other test in `[profile.ci]` is retried.
+- **SPEC-10.160** `[profile.unsupported]` must `inherit = "ci"` (same slow-timeout, fail-fast, thread budget) and override only `default-filter`, plus set `failure-output = "immediate-final"` so a failing case in the weekly run prints its output without a local re-run.
+
+### 10.23 Repo hygiene (`.gitignore`, `.gitmodules`)
+
+- **SPEC-10.161** `.gitmodules` must declare submodule `common` at path `common`, url `https://dev.a8n.run/psa-systems/common.git`; a fresh clone must run `git submodule update --init` before `pre-commit`, `pre-push`, `install-hooks` or `create-release` resolve, since those recipes are implemented in the `common` submodule.
+- **SPEC-10.162** `.gitignore` must exclude every `.env*` file except `.env.example` (`.env*` then `!.env.example`), so a generated `.env` with live secrets is never committed while the template always is.
+- **SPEC-10.163** `.gitignore` must exclude `/secrets/` (generated OIDC signing keys), `/gen/` (build output), `/assets/styles.css` (Tailwind-generated CSS), `data/` (the dev Postgres bind-mount directory), `.claude/` (agent scratch/config), `For AI/` (local-only AI scratch context), and `/attachments/` (the default local-storage root for a bare `cargo run` or a test).
+
+### 10.24 Secret-scan exemptions (`.noseyparker-ignore.txt`)
+
+- **SPEC-10.164** `.noseyparker-ignore.txt` must list only individual file/directory paths, never a widened parent glob, each with a comment stating why its matches are not real secrets, and the comments must not quote the matched fixture strings themselves, since quoting would re-trigger the scanner on the ignore file itself.
+- **SPEC-10.165** A real secret committed under any exempted path must be treated as the same incident class the scanner exists to catch on a clean path; the exemption is scoped to known-safe fixtures, never a blanket allowance for the listed paths.
+
+### 10.25 Environment variable registry file (`.env.example`)
+
+- **SPEC-10.166** `.env.example` must hold, as a comment-only key with an empty or documented-default value, every environment variable the config registry reads, checked by `check-env-example.nu` (10.189-10.193). Operators must not copy it to `.env` by hand; `ensure-env` (10.80) generates `.env` from it once per clone and fills every self-owned secret with a strong random value via `openssl rand`, so no placeholder password ever reaches a running `.env`.
+- **SPEC-10.167** `MOKOSH_PG_HOST_PORT` (default `5433`) must be the single place the host-published Postgres port is written; `DATABASE_URL`, `MOKOSH_ADMIN_DATABASE_URL`, and `MOKOSH_APP_DATABASE_URL`'s host forms must interpolate it rather than repeat the literal, so resolving a port collision between two checkouts on one host cannot leave a host-side tool migrating a different checkout's database.
+- **SPEC-10.168** `MOKOSH_APP_DATABASE_URL` must be the `mokosh_app` role's URL; if unset the server falls back to `DATABASE_URL` (`mokosh_migrator`, bypassing row-level security), which makes every `tenant_isolation` policy inert for request-serving connections. Outside `development`/`dev`/`test` `ENVIRONMENT` values, the server must refuse to boot if `MOKOSH_APP_DATABASE_URL` is unset.
+
+### 10.26 CI gate scripts: migrations, pool safety, validate parity, mail copy
+
+- **SPEC-10.169** `check-guarded-content-migrations.nu` must check only `migrations/*.sql` files whose numeric filename prefix is strictly greater than `209`; for such a file whose `UPDATE` matches `AND\s+<col>\s*(=|LIKE)\s*'` for any of `subject`, `body_text`, `body_html`, `name`, `description`, the file must also contain the literal `GET DIAGNOSTICS`, or the script exits 1 naming the file and the missing assertion; migrations numbered 209 or below are exempt unconditionally.
+- **SPEC-10.170** `check-migration-versions-against-base.nu migrations_dir base_ref` must union migration filenames from `base_ref` (default `origin/main`, via `git ls-tree -r --name-only`) and the current `migrations_dir` on disk, group them by leading numeric prefix, and exit 1 listing every prefix shared by two or more distinct filenames as a post-merge collision.
+- **SPEC-10.171** `check-pool-safety.nu` must scan every `src/**/*.rs` file except `src/db/pool.rs` for a non-comment line containing `.pool()` that is not a `migrator_pool` call; for each, it must look back up to 8 lines, and if none contain the substring `SAFETY (PMS-285`, record it as a violation and exit 1.
+- **SPEC-10.172** `check-create-update-validate-parity.nu` must pair every `Create*Request`/`Upsert*Request` struct with its `Update*Request`/`Patch*Request` counterpart by stripped struct name; for each same-named field present on both sides, the normalized `#[validate(...)]` attribute text must be identical unless the pair-and-field is listed in the script's `ALLOWED` constant (currently empty); any mismatch, or a stale `ALLOWED` entry whose two sides no longer differ, exits 1.
+- **SPEC-10.173** `check-no-duplicate-mail-copy.nu` must fail if any of the 8 seeded template phrases in its `PHRASES` constant (for example `"Welcome to {{app_name}}"`) appears as a substring anywhere under `src/`, and must separately fail unless the literal sentence `"has added an update to ticket"` appears verbatim in both `migrations/148_restore_ticket_note_org_identity.sql` and `src/modules/tickets/service.rs`.
+
+### 10.27 CI gate scripts: rate limiting, route consumers, runner labels
+
+- **SPEC-10.174** `check-rate-limit-helper.nu` must scan every `src/**/*.rs` file and fail if, outside `src/utils/error.rs`, a non-comment line contains `TOO_MANY_REQUESTS` or `AppError::RateLimited`, and must fail (even inside `src/utils/error.rs`) on any line containing the literal `let _ = retry_after`.
+- **SPEC-10.175** `check-route-consumers.nu` must scan `src/modules/*/*.rs` for `.route("<path>", ...)` literals (with any `#[cfg(test)]` module stripped first); a route is exempt if every static path segment appears, delimiter-bounded, in `$MOKOSH_APPS_DIR/src/**/*.rs` (default `../mokosh-apps`), or if its own file carries a `//`-comment containing both `parity record` and a `YYYY-MM-DD` date and a separate comment naming that exact route literal; under CI (`$CI` set) a missing client checkout is a hard failure, else the check is skipped.
+- **SPEC-10.176** For every job in every `.forgejo/workflows/*.yml` file, `check-runner-labels.nu` must fail a step that installs a toolchain package (`gcc`, `binutils`, `glibc-devel`, `libopenssl-devel`, `build-essential`) via a package manager at run time instead of requesting the dev image; must fail a job that runs `cargo ` natively without `RUNS_ON_OPENSUSE_BASE_HEAVY` in its `runs-on:`; and must fail any `runs-on:` line with no immediately preceding comment justifying its label.
+
+### 10.28 CI gate scripts: OCI cache and publish-tag parity, workspace dependencies
+
+- **SPEC-10.177** `check-oci-build-cache.nu` must select every `.forgejo/workflows/*.yml` file containing `docker buildx build`; after stripping `#`-comments, each must contain `--driver docker-container`, `crazy-max/ghaction-github-runtime@v3`, `cache_from = "type=gha"`, `cache_to = "type=gha,mode=max,ignore-error=true"`, `--cache-from`, `--cache-to`, and must contain none of `type=inline`, `type=registry`, `:buildcache`; any violation exits 1.
+- **SPEC-10.178** `check-oci-publish-tags.nu` must verify `build-oci-image.yml`'s `on.push.branches` equals `["main"]` plus `oci-build/get-tags.nu`'s `BRANCH_ALLOW_LIST`, the `build-and-push` job's `if:` guard starts with `github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')`, `check.yml`'s `on.pull_request.branches` includes `main` and its `on.push.branches` includes every allow-listed branch, and that `get-tags`'s own mode resolution and `branch-tag` (slash-to-hyphen) behave as specified in 10.129-10.132; a branch not on the allow-list must raise, never resolve a tag.
+- **SPEC-10.179** `check-workspace-deps.nu` must fail when a `[workspace.dependencies]` entry has no workspace member that inherits it via `workspace = true`, and must fail when a member declares a dependency already in `[workspace.dependencies]` without `workspace = true` (its own pin shadowing the shared one); an unresolvable `workspace.members` manifest path exits 1 immediately.
+
+### 10.29 CI gate scripts: documentation and configuration consistency
+
+- **SPEC-10.180** `check-doc-links.nu` must resolve every Markdown link, image, reference-definition, and HTML `href`/`src` target in every `git ls-files "*.md"` file (skipping anchors, protocol-relative and scheme URLs, fenced code, and HTML comments), root-relative for a leading `/` and else relative to the containing file; any target that does not resolve on disk exits 1 naming `<file>:<line>`.
+- **SPEC-10.181** `check-doc-recipes.nu` must check a fixed set of docs (`README.md`, `docs/README.md`, `docs/quickstart.md`, `docs/architecture.md`, `docs/binaries.md`, `docs/configuration.md`, `docs/recipes.md`, `docs/invariants/ci-release.md`, `docs/invariants/config-providers.md`) for every `just <recipe>` invocation and fail if the named recipe is absent from the union of `justfile`'s non-`[private]` recipes and `just --summary`'s resolved (imported) recipes; a missing submodule import failure must direct the operator to `git submodule update --init`.
+- **SPEC-10.182** `check-config-doc-paths.nu` must scan `.env.example`, `compose.dev.yml`, and `justfile` for bare `docs/...`-shaped path references and exit 1 listing any that do not resolve on disk.
+- **SPEC-10.183** `check-claude-md.nu` must exit 1 when `CLAUDE.md` exceeds `20000` UTF-8 bytes, when any non-fenced line exceeds `400` characters, or when a `](docs/...)` link's target or `#anchor` does not resolve; it must name `CLAUDE.md:<line>` for any violation.
+- **SPEC-10.184** `check-build-target-storage.nu` must resolve cargo's target directory in cargo's own precedence (`CARGO_TARGET_DIR`, then `CARGO_BUILD_TARGET_DIR`, then `.cargo/config.toml`'s `build.target-dir`, then `<repo>/target`), determine its filesystem type via `stat --file-system --format=%T`, and exit 1 when that type is `tmpfs` or `ramfs` unless `MOKOSH_ALLOW_TMPFS_TARGET` is `1`/`true`/`yes`.
+- **SPEC-10.185** `config-docs.nu check` must fail when the registry/`variables.toml` catalog has a duplicate variable name, a malformed `since`/`required_since`/`deprecated.release`/`removed.release` value, or a `required_since` without `required: true` at a release not after `since`; when any discovered env-var read in `src/**/*.rs` or `crates/**/*.rs` is absent from the registry, `variables.toml`, and the `NOT_SERVER_CONFIG` exemption list; when `docs/configuration.md`'s `## All variables` table disagrees with the catalog on `Required`/`Added in`, is malformed, or a variable has zero or more than one row; or when the generated `Recently added` block (between its fixed marker comments) is missing, out of order, or disagrees with the computed changelog for the covered release window.
+- **SPEC-10.186** `config-docs.nu generate` must rewrite only the text between the `Recently added` marker lines and the `## All variables` table rows, and running it twice in a row must be idempotent (byte-identical the second time).
+- **SPEC-10.187** `config-docs.nu since <version>` must print one row per catalog change released strictly after `<version>` (labelled `WON'T START`, `FEATURE OFF: <feature>`, or blank), sorted by release then breaking-level then required-first then name, or print exactly `No configuration changes after <version>.` when there are none.
+- **SPEC-10.188** A registry entry whose `required` flag becomes true in the same release it was added (other than the `v0.1.0` baseline) must have a matching `[[change]]` record naming an `issue` (`^[A-Z]+-\d+$`) and a non-empty `action`, or the catalog build fails; a `[[change]]` with `breaking: "feature-off"` must set a non-empty `feature`, or the catalog build fails.
+
+### 10.30 CI gate scripts: environment-variable parity
+
+- **SPEC-10.189** `check-env-example.nu` must union env-var names read by code (`declare_keys!` entries in `src/config/registry.rs`, plus every `env::var`/`env::var_os`/`require_env`/`required_env`/`parse_tenant_arg_env` call site and const-aliased name across `src/**/*.rs` and `crates/**/*.rs`) into one `CODE` set.
+- **SPEC-10.190** Every `CODE` name must have a key in `.env.example` (including a commented-out `# NAME=` line) unless listed in `CODE_NOT_IN_TEMPLATE`, and must appear in `compose.dev.yml`'s `services.server.environment` map unless listed in `CODE_NOT_IN_COMPOSE`; a missing entry exits 1 naming it.
+- **SPEC-10.191** Every `.env.example` key must be read by code or interpolated (`${NAME`) in `compose.dev.yml` unless listed in `TEMPLATE_UNREAD`; an unread key exits 1 naming it dead.
+- **SPEC-10.192** A stale `CODE_NOT_IN_TEMPLATE`, `CODE_NOT_IN_COMPOSE`, or `TEMPLATE_UNREAD` entry, one whose excused asymmetry no longer holds, must itself exit 1 naming the entry to delete.
+
+### 10.31 Operational and diagnostic scripts
+
+- **SPEC-10.193** `audit-portal-no-credential.nu` must error `DATABASE_URL is required (point it at the target deployment).` when `DATABASE_URL` is unset, otherwise query `contacts` for rows with `is_portal_user = TRUE AND portal_password_hash IS NULL`, print a per-row and per-tenant summary, and print a `WARNING:` line when any row's age exceeds 7 days. This script is a manual survey tool with no `just` wrapper and no CI invocation.
+- **SPEC-10.194** `check-ci-stalls.nu days="3"` must read each workflow job's `timeout-minutes` from `.forgejo/workflows/*.yml` (never a value hardcoded in the script), exit 1 if `FORGEJO_TOKEN` is unset, fetch Forgejo actions runs from the last `days` days and compare each run's wall-clock time against its workflow's bound, and exit 1 naming every run that outlived its bound; a workflow with no `timeout-minutes` on any job is excluded from judgement, never counted as passing.
+- **SPEC-10.195** `ci-job-log.nu` must resolve a target run from `--run <id>`, else the 50 most recent runs filtered by `--workflow`/`--sha`/failure status (newest match wins), then fetch and print that run's first failed job's log (or the first job overall if none failed) by calling the Forgejo actions API with a token read from `~/.local/share/forgejo-cli/keys.json`; `--list` must print the candidate run table without fetching a log.
+
+### 10.32 E2E: environment resolution and auth state
+
+- **SPEC-10.196** `e2e/lib/env.ts` must load `e2e/.env` via dotenv with `override: false` (a real environment variable always wins), and `required(name)` must throw `Missing required env var ${name}...` when the variable is unset or blank after trimming.
+- **SPEC-10.197** `E2E_BASE_URL` must be required with no hardcoded fallback; `apiBaseURL` must resolve to `E2E_API_BASE_URL` if set, else `api.` prepended to the base URL's hostname, else the base URL itself when that hostname already starts with `api.` or fails to parse; `opBaseURL` must resolve to `E2E_OP_BASE_URL` if set, else fall back to `apiBaseURL`.
+- **SPEC-10.198** `E2E_EMAIL`, `E2E_PASSWORD`, `E2E_TENANT_ID`, `E2E_OIDC_CLIENT_ID`, `E2E_OIDC_REDIRECT_URI`, `E2E_TOTP_SECRET` must each be required; `E2E_FOREIGN_COMPANY_ID` must be optional; `E2E_ENVIRONMENT` must default to `staging` when unset; `preflightRequiredEnv()` must collect every missing required variable into one thrown error rather than failing on the first.
+- **SPEC-10.199** The bearer token must be read from `e2e/.auth/token.txt`, OP session cookies from `e2e/.auth/op-state.json`, and the foreign-company canary id from `e2e/.auth/foreign-company.txt`; each reader must throw when its file is absent or its content is empty/malformed, and the last-used TOTP step must persist to `e2e/.auth/totp-last-step` so a cross-process run never resubmits a code for a step bunyip already saw.
+
+### 10.33 E2E: Playwright configuration
+
+- **SPEC-10.200** The suite must run with `fullyParallel: false` and `workers: 1` (serial), since tests share one tenant and bearer token; `forbidOnly` must be true, and `retries` must be 1, only when `process.env.CI` is set (else `false`/`0`).
+- **SPEC-10.201** The global test timeout must be 60000ms and `expect.timeout` 15000ms; `globalTeardown` must run `./global.teardown.ts` after every run regardless of outcome; reporters must be `list` plus an `html` reporter that never auto-opens.
+- **SPEC-10.202** On failure, `trace`, `screenshot`, and `video` must each be retained/captured only on failure (`retain-on-failure` / `only-on-failure`).
+- **SPEC-10.203** The `preflight` project must have no dependencies and run first; `setup` must run in Firefox, depend on `preflight`, and resolve `env.baseURL`; `chromium`/`firefox`/`webkit` projects must each run `(auth|form-validation).spec.ts`, depend on `preflight`, and use `env.baseURL` (`chromium` additionally passing `--disable-dev-shm-usage`); `ui-selectors` must run only in Firefox, depending on `setup`; `api` must depend on `setup` and use `env.apiBaseURL`, never `env.baseURL`; `guard` must depend on `preflight` only.
+
+### 10.34 E2E: login helper and request fixtures
+
+- **SPEC-10.204** `loginViaSpa` must retry at most 4 times total, only on a rate-limit rejection (parsed backoff, capped at 60000ms), a `no-form` outcome (backoff 3000ms), or an `unclear` outcome, and must fail fast with no retry on a definite credential rejection.
+- **SPEC-10.205** When post-credential navigation lands on `/login/(2fa|mfa)`, a TOTP step must be filled: the code must be generated only when at least 5 seconds remain in the current 30-second step, must wait for a step later than the last one this run used, and must retry with a fresh code at most twice before falling back to a manual submit click; on `/oauth2/consent`, the helper must click the allow/authorize/approve control to persist the grant.
+- **SPEC-10.206** `expectAuthenticated`/`expectAnonymous` must assert `GET <tickets>?per_page=1` returns 200 when authenticated and 401 or 403 when not; `expectAtLoginScreen` must poll the page URL for up to 30000ms until it matches `/^\/login(\/|$)/`.
+- **SPEC-10.207** The default `test` fixture must attach `Authorization: Bearer <token>` (from the token file) to every request context; the `oidcTest` fixture must replay the OP cookie storage state against `opBaseURL` and must never attach a bearer header.
+
+### 10.35 E2E: test data tagging, factories and teardown
+
+- **SPEC-10.208** Every created record's run suffix must have the shape `e2e-<epochMs>-<runId>-<n>`, where `runId` resolves from `GITEA_RUN_ID`, else `GITHUB_RUN_ID`, else `E2E_RUN_ID`, else the process start timestamp, sanitized and truncated to 24 characters; `isStale(name)` must consider a record stale only once its embedded epoch is more than 24 hours old.
+- **SPEC-10.209** `createCompany`/`createContact` must assert a 200 response with a truthy `id`; `enableModule` must `PUT` `{is_enabled: true}` to the module's settings route and assert success, so a 403 (missing admin privilege) surfaces as a test failure rather than being swallowed.
+- **SPEC-10.210** `global.teardown.ts` must throw when the bearer token file is absent (rather than silently skipping cleanup), page every list endpoint at the server's max page size (treating a 404 as an empty, disabled module), sweep a fixed, ordered list of 23 resource kinds (children before the parents that refuse deletion while referenced, companies last) deleting any record this run owns or that is more than 24 hours stale, and throw one aggregated error naming every collected failure after the full sweep completes.
+
+### 10.36 E2E: deploy-readiness scripts, package and TypeScript configuration
+
+- **SPEC-10.211** `check-e2e-bootstrapped.mjs` must probe the OP's `/e2e-bootstrapped` endpoint with a 15000ms timeout and set the `skip=true` output only when the JSON body is exactly `{bootstrapped: false}`; any non-2xx, network error, or parse failure must fall through to running the suite.
+- **SPEC-10.212** `health-check.mjs` must `GET <apiBaseURL>/api/v1/health` once with a 30000ms timeout, exiting 0 on an ok response and 1 otherwise.
+- **SPEC-10.213** `wait-for-deploy.mjs` must resolve the expected SHA by walking `git log` back to the most recent commit touching one of the fixed build-trigger paths (`src`, `crates`, `migrations`, `.cargo`, `Cargo.toml`, `Cargo.lock`, `oci-build`, `.forgejo/workflows/build-oci-image.yml`, kept in lock-step with `build-oci-image.yml`'s own path filter, 10.39), self-healing with `git fetch --unshallow` then `git fetch --refetch` if the walk finds nothing, then poll `GET <apiBaseURL>/api/v1/version` every 15000ms for up to 600000ms until `body.git_hash` prefix-matches; on total resolution failure it must warn and exit 0 rather than fail the job.
+- **SPEC-10.214** The suite must run under `bun` per the committed `bun.lock`, never `npm ci`; TypeScript compilation must target `ES2022`/`ESNext` modules with `strict: true` and `noEmit: true`; `node_modules/`, `.auth/`, `playwright-report/`, `blob-report/`, `test-results/`, `playwright/.cache/`, and `.env` must never be committed under `e2e/`.
+- **SPEC-10.215** `e2e/lib/api.ts`'s `MAX_PER_PAGE` constant must equal `src/utils/pagination.rs`'s `PaginationParams::MAX_PER_PAGE` (100); a Rust unit test under `pms1427_e2e_page_size` must fail the build if any `per_page` literal under `e2e/` exceeds that constant, so the two values cannot drift apart silently.
+- **SPEC-10.216** The `preflight` Playwright project (`e2e/tests/preflight.setup.ts`) must call `preflightRequiredEnv()` and run before every other project, so a missing required env var is reported once, naming every gap, rather than failing the first project that happens to read it.
+- **SPEC-10.217** The `setup` Playwright project (`e2e/tests/global.setup.ts`) must drive a real browser login against the SPA, capture the bearer token from the OIDC token-endpoint response as its primary signal and from the first `Authorization: Bearer`-carrying request as a backstop, and persist the token, the OP session cookie state, and the foreign-company id to the fixed `e2e/.auth/` files read by `e2e/lib/auth-state.ts` (10.199); it must prefer the response-body capture because it survives an SPA that never fires an authenticated request.
+
+### 10.37 Deployment and operations
 
 - Build: `oci-build/Dockerfile` builds both binaries in a musl Rust builder image with dependencies cached in a separate
   layer, then copies `mokosh-server`, `mokosh-bootstrap`, `migrations/` and the font license into an Alpine runtime

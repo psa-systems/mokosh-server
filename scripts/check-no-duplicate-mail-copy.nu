@@ -12,6 +12,7 @@
 # Exit 0 when no seeded body copy appears under src/, 1 (listing the hits)
 # when it does.
 
+# SPEC-10.173: fails if any of these 8 phrases appears anywhere under src/.
 # PMS-789 rewrote the product name in both bodies to `{{app_name}}` (migration
 # 116), so the current copy is listed alongside the pre-789 wording. Dropping
 # the old lines would stop catching a reintroduction of the literal, which is
@@ -36,6 +37,7 @@ const PHRASES = [
 # verbatim, or which document a client receives depends on how the service was
 # constructed - exactly the gap that let migrations 104/110/148 rewrite this
 # same row three times with nobody noticing the fallback had gone stale.
+# SPEC-10.173: this exact sentence must appear verbatim in both files below.
 const TICKET_NOTE_SENTENCE = "has added an update to ticket"
 const TICKET_NOTE_SEED_FILE = "migrations/148_restore_ticket_note_org_identity.sql"
 const TICKET_NOTE_RUST_FILE = "src/modules/tickets/service.rs"

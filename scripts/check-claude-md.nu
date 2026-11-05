@@ -11,6 +11,7 @@
 #   nu scripts/check-claude-md.nu               # check the repo's CLAUDE.md
 #   nu scripts/check-claude-md.nu --self-test   # prove each rule fires, on fixtures
 
+# SPEC-10.183
 const MAX_BYTES = 20000
 const MAX_LINE = 400
 

@@ -1,3 +1,4 @@
+# SPEC-10.148: exactly these four members, in a workspace resolving with "2".
 [workspace]
 resolver = "2"
 members = [
@@ -22,6 +23,7 @@ authors = ["Mokosh Server Team"]
 # Only crates a member actually inherits with `{ workspace = true }` belong here
 # (PMS-785): an entry nobody inherits pins a version and a feature set the build
 # never uses. `scripts/check-workspace-deps.nu` fails the build if that drifts.
+# SPEC-10.151: the entry list below, each required to be inherited by a member.
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -297,12 +299,15 @@ mokosh-test = { path = "crates/mokosh-test" }
 # Shared build-script logic (PMS-198). build.rs calls build_metadata::emit().
 build-metadata = { path = "crates/build-metadata" }
 
+# SPEC-10.152: release aborts on panic and ships stripped.
 [profile.release]
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
 
+# SPEC-10.153: debug=0/codegen-units=256 keeps rustc peak RSS under the
+# OOM ceiling of memory-constrained dev containers (see comment below).
 [profile.dev]
 opt-level = 0
 # Memory-constrained dev containers (e.g. 15 GiB box with earlyoom at
@@ -320,5 +325,6 @@ codegen-units = 256
 # in dev so a panic in a test prints the row. `overflow-checks` and
 # `debug-assertions` stay ON so a dev-time bug is loud.
 
+# SPEC-10.153: every dependency crate builds optimized even under [profile.dev].
 [profile.dev.package."*"]
 opt-level = 3

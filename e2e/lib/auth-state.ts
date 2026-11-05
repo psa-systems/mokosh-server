@@ -35,6 +35,7 @@ import { readFileSync, existsSync } from 'node:fs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
+// SPEC-10.199: bearer token and OP cookies persist to these fixed paths.
 export const TOKEN_FILE = resolve(here, '..', '.auth', 'token.txt');
 export const OP_STORAGE_STATE_FILE = resolve(here, '..', '.auth', 'op-state.json');
 // Cross-tenant company canary fixture. setup writes the company id the
@@ -46,8 +47,10 @@ export const FOREIGN_COMPANY_FILE = resolve(here, '..', '.auth', 'foreign-compan
 // through a file because the setup project and the browser projects are
 // separate module instances, and bunyip refuses a second code from a step the
 // account already used.
+// SPEC-10.199: persisted so a cross-process run never resubmits a seen step.
 export const TOTP_LAST_STEP_FILE = resolve(here, '..', '.auth', 'totp-last-step');
 
+// SPEC-10.199: throws when the file is absent or its content is empty.
 export function readToken(): string {
   if (!existsSync(TOKEN_FILE)) {
     throw new Error(
@@ -82,6 +85,7 @@ export interface OpStorageState {
   origins: never[];
 }
 
+// SPEC-10.199: throws when the file is absent or its content is empty.
 export function readForeignCompanyId(): string {
   if (!existsSync(FOREIGN_COMPANY_FILE)) {
     throw new Error(
@@ -99,6 +103,7 @@ export function readForeignCompanyId(): string {
   return id;
 }
 
+// SPEC-10.199: throws when the file is absent or malformed (no cookies).
 export function readOpStorageState(): OpStorageState {
   if (!existsSync(OP_STORAGE_STATE_FILE)) {
     throw new Error(

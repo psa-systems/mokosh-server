@@ -33,6 +33,7 @@ let counter = 0;
 // Unique suffix for a single record, e.g. `e2e-1717545600000-1234567890-3`.
 // Shape: <prefix>-<epochMs>-<runId>-<n>. The epoch is what the stale sweep
 // parses; the runId is what same-run teardown matches on.
+// SPEC-10.208: shape e2e-<epochMs>-<runId>-<n>, runId sanitized/truncated to 24 chars.
 export function runSuffix(): string {
   counter += 1;
   return `${E2E_PREFIX}-${RUN_STARTED_AT}-${RUN_ID}-${counter}`;
@@ -59,6 +60,7 @@ export function createdAtMs(name: string | null | undefined): number | null {
 }
 
 // True for e2e residue older than STALE_MS (swept regardless of which run made it).
+// SPEC-10.208: stale only once the embedded epoch is more than 24 hours old.
 export function isStale(name: string | null | undefined, now = Date.now()): boolean {
   const created = createdAtMs(name);
   return created !== null && now - created > STALE_MS;

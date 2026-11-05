@@ -45,6 +45,7 @@
 # not "any branch": a stray push must not fill the registry. This is the single
 # source of truth - scripts/check-oci-publish-tags.nu fails the build when the
 # workflow's push filter or its ref guard disagrees with it.
+# SPEC-10.131
 export const BRANCH_ALLOW_LIST = []
 
 # The registry tag a branch publishes: the branch name with `/` replaced by `-`,
@@ -63,6 +64,7 @@ export def main [
     let describe = (^git describe --tags --always | str trim)
     log info $"[get-tags] mode: ($mode) ref-name: ($ref_name) simulate-tag: ($simulate_tag) describe: ($describe)"
 
+    # SPEC-10.129, SPEC-10.130
     # Resolve the effective publish train and its version (if any). A dry-run
     # maps onto a real train so both publish paths can be exercised without a
     # registry mutation.
@@ -95,6 +97,7 @@ export def main [
         error make { msg: $"[get-tags] Branch '($effective.version)' is not on the publish allow-list ($BRANCH_ALLOW_LIST | str join ', '). Add it there before building an image from it." }
     }
 
+    # SPEC-10.132
     let tag = if $effective.train == "release" {
         $effective.version
     } else if $effective.train == "branch" {
