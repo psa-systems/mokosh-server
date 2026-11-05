@@ -175,13 +175,6 @@ impl BunyipProvider {
     /// Build against an explicit [`BunyipConfig`]. Public so a test can drive
     /// the network path against a stub base URL.
     pub async fn load(config: &BunyipConfig) -> AppResult<Self> {
-        Self::load_keys(config, SERVED_KEYS).await
-    }
-
-    /// The actual fetch loop, parametrised on the served-key list so a test
-    /// can exercise more than the one key [`SERVED_KEYS`] carries today
-    /// without changing what production asks bunyip for.
-    async fn load_keys(config: &BunyipConfig, served_keys: &[(&str, &str)]) -> AppResult<Self> {
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -190,20 +183,19 @@ impl BunyipProvider {
             })?;
 
         let mut values = BTreeMap::new();
-        for (local, remote) in served_keys {
+        for (local, remote) in SERVED_KEYS {
             match fetch_value(&http, config, remote).await {
                 Ok(Some(value)) => {
                     values.insert((*local).to_string(), value);
                 }
                 Ok(None) => {
-                    // A 404 (bunyip holds no value for this key) or a
-                    // transport failure (fetch_value already logged the
-                    // reason) leaves the key unheld here; the provider
-                    // itself is still working, so the next key is fetched.
+                    // 404: bunyip serves this key but holds no value for it,
+                    // which is a fact about bunyip's own configuration and
+                    // leaves the key unheld here.
                     tracing::info!(
                         key = *local,
                         bunyip_key = *remote,
-                        "bunyip has no value for {remote}; {local} stays unheld"
+                        "bunyip holds no value for {remote}; {local} stays unheld"
                     );
                 }
                 // A refused credential or a refused key is the provider
@@ -261,26 +253,21 @@ async fn fetch_value(
     key: &str,
 ) -> AppResult<Option<String>> {
     let url = format!("{}{HOST_CONFIG_PREFIX}{key}", config.base_url);
-    let resp = match http
+    let resp = http
         .get(&url)
         .basic_auth(&config.client_id, Some(&config.client_secret))
         .header("Accept", "application/json")
         .send()
         .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            // A transport failure says nothing about bunyip's own health, so
-            // it is treated the same as a 404: this key stays unheld and the
-            // next key may still resolve.
-            tracing::info!(
-                bunyip_key = key,
-                error = %e,
-                "could not reach bunyip at {url} for {key}: {e}; this key stays unheld"
-            );
-            return Ok(None);
-        }
-    };
+        .map_err(|e| {
+            AppError::external_service(
+                "bunyip-config",
+                format!(
+                    "could not reach bunyip at {url}: {e}. Check BUNYIP_CONFIG_URL and that \
+                     bunyip is reachable from this host."
+                ),
+            )
+        })?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
@@ -397,83 +384,5 @@ mod tests {
     fn env_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
-    /// Bind an ephemeral loopback port and answer `connections` requests in
-    /// turn: a request whose path ends in `/fail` is dropped with no
-    /// response at all, simulating a transport-level failure (the server is
-    /// unreachable mid-request) rather than any HTTP status; every other
-    /// request gets a bunyip-shaped 200 envelope whose value is the path's
-    /// last segment. Lets the transport-failure path be tested without a
-    /// mock-server dependency, the same approach `version_check`'s
-    /// `oneshot_http` uses for a single request.
-    async fn stub_bunyip(connections: usize) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            for _ in 0..connections {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut buf = [0u8; 1024];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]);
-                let path = request
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap_or("/")
-                    .to_string();
-                if path.ends_with("/fail") {
-                    // No response at all: the client sees the connection
-                    // close mid-request, a transport failure rather than
-                    // any status code.
-                    drop(sock);
-                    continue;
-                }
-                let value = path.rsplit('/').next().unwrap_or("value");
-                let body = format!(r#"{{"data":{{"key":"{path}","value":"{value}"}}}}"#);
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.flush().await;
-            }
-        });
-        format!("http://{addr}")
-    }
-
-    /// A transport failure on one served key leaves that key unheld and
-    /// does not abort fetching the rest: the acceptance criterion PMS-1645
-    /// adds, as a regression test against the loop in [`BunyipProvider::load_keys`]
-    /// that used to propagate any `Err` from `fetch_value`, including a
-    /// `.send()` failure, straight out of the whole load.
-    #[tokio::test]
-    async fn a_transport_failure_on_one_key_leaves_it_unheld_and_continues() {
-        let served_keys: &[(&str, &str)] = &[
-            ("FIRST", "remote/first"),
-            ("SECOND", "remote/fail"),
-            ("THIRD", "remote/third"),
-        ];
-        let base_url = stub_bunyip(served_keys.len()).await;
-        let config = BunyipConfig {
-            base_url,
-            client_id: "id".to_string(),
-            client_secret: "secret".to_string(),
-        };
-
-        let provider = BunyipProvider::load_keys(&config, served_keys)
-            .await
-            .expect("a transport failure on one key is not a fatal load error");
-
-        assert_eq!(provider.get("FIRST"), Some("first".to_string()));
-        assert_eq!(provider.get("THIRD"), Some("third".to_string()));
-        assert_eq!(
-            provider.get("SECOND"),
-            None,
-            "the key behind the dropped connection stays unheld"
-        );
     }
 }
