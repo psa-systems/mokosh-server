@@ -32,9 +32,16 @@ pub const PAGE_SHELL_VIEWPORT: &str =
 /// legitimately wider than the 404 page's two paragraphs (PMS-1201). A caller
 /// embeds this inside its own `<style>` tag and may append page-specific rules
 /// after it.
+///
+/// `color-scheme: light dark` tells the browser this page supports both
+/// schemes, which makes it paint its default canvas background near-black
+/// under a dark OS/browser; `color` and `background-color` are paired with
+/// `light-dark()` (PMS-1629) so the body text stays legible against that
+/// background in both resolutions, instead of the fixed light-only
+/// `#1a1a1a` text this helper used to set alone.
 pub fn page_shell_css(max_width: &str) -> String {
     format!(
-        "body{{font-family:system-ui,-apple-system,sans-serif;max-width:{max_width};margin:2rem auto;padding:0 1rem;color:#1a1a1a;color-scheme:light dark}}"
+        "body{{font-family:system-ui,-apple-system,sans-serif;max-width:{max_width};margin:2rem auto;padding:0 1rem;color:light-dark(#1a1a1a,#e8e8e8);background-color:light-dark(#fff,#121212);color-scheme:light dark}}"
     )
 }
 
@@ -91,5 +98,23 @@ mod tests {
         assert!(narrow.contains("max-width:36rem"));
         assert!(wide.contains("max-width:64rem"));
         assert!(narrow.contains("color-scheme:light dark"));
+    }
+
+    /// PMS-1629: `color-scheme: light dark` makes the browser paint a
+    /// near-black canvas under a dark OS/browser wherever no author
+    /// `background-color` overrides it, so every `color` this helper sets
+    /// must carry a paired `background-color`, not just a light-mode text
+    /// color on an unset background.
+    #[test]
+    fn page_shell_css_pairs_color_with_a_background_color() {
+        let css = page_shell_css("36rem");
+        assert!(
+            css.contains("background-color:light-dark(#fff,#121212)"),
+            "css should declare a scheme-aware background-color: {css}"
+        );
+        assert!(
+            css.contains("color:light-dark(#1a1a1a,#e8e8e8)"),
+            "css should pair the text color with the dark-mode value: {css}"
+        );
     }
 }
