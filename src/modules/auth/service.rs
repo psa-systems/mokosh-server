@@ -1542,9 +1542,16 @@ impl AuthService {
             Some((tenant_id, token_hash)) => (Some(*tenant_id), Some(token_hash.as_str())),
             None => (None, None),
         };
-        let verified = verify_password_or_dummy(secret, row_hash)
-            .await
-            .unwrap_or(false);
+        // PMS-1577: a verification error is not the same answer as a
+        // genuine wrong/missing token, so it is logged distinctly before
+        // falling through to the same `NotFound` refusal below.
+        let verified = match verify_password_or_dummy(secret, row_hash).await {
+            Ok(matches) => matches,
+            Err(e) => {
+                tracing::warn!(user_id = %user_id, error = %e, "password reset token verification failed; treating as invalid");
+                false
+            }
+        };
         let tenant_id = match (verified, candidate_tenant) {
             (true, Some(tenant_id)) => tenant_id,
             _ => return Err(AppError::NotFound("token".to_string())),
@@ -3986,7 +3993,20 @@ impl AuthService {
                             any_verified_user = Some(user);
                         }
                     }
-                    _ => continue,
+                    Ok(false) => continue,
+                    // PMS-1577: a verification error (corrupt stored hash)
+                    // is not the same answer as a genuine wrong password,
+                    // so it is logged distinctly before moving on to the
+                    // next membership.
+                    Err(e) => {
+                        tracing::warn!(
+                            user_id = %user.id,
+                            tenant_id = %m.tenant_id,
+                            error = %e,
+                            "password verification failed; treating as not matched",
+                        );
+                        continue;
+                    }
                 }
             }
             if matched_memberships.is_empty() {

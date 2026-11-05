@@ -480,7 +480,10 @@ pub fn create_api_router(
     let email_intake_service = EmailIntakeService::new(
         db.clone(),
         ticket_service.clone(),
-        AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
+        AttachmentService::new(
+            db.clone(),
+            AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
+        ),
     );
     // PMS-451: per-ticket approval requests.
     let approvals_service = ApprovalsService::new(db.clone());
@@ -709,7 +712,10 @@ pub fn create_api_router(
             "/tickets",
             ticket_routes(
                 ticket_service.clone(),
-                AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
+                AttachmentService::new(
+                    db.clone(),
+                    AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
+                ),
                 // PMS-937: the tickets router now also owns
                 // `POST /tickets/{id}/approvals/request`, which needs
                 // the shared ApprovalsService instance (used for both
@@ -722,7 +728,7 @@ pub fn create_api_router(
         // path nests cleanly under the existing ticket tree.
         .merge(agent_attachment_routes(AttachmentService::new(
             db.clone(),
-            AttachmentConfig::from_env(),
+            AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
         )))
         // PMS-468: agent "all comments from this contact" feed. The
         // route lives on the tickets module (TicketService owns the
@@ -820,7 +826,7 @@ pub fn create_api_router(
         // because an `<img>` cannot carry an Authorization header.
         .merge(kb_attachment_routes(KbAttachmentService::new(
             db.clone(),
-            KbAttachmentConfig::from_env(),
+            KbAttachmentConfig::from_env().expect("KB_ATTACHMENT_MAX_BYTES invalid"),
         )))
         // Org membership invitations (PMS-244): admin-only, tenant-scoped.
         .merge(invitations_routes(invitations_service))
@@ -1280,7 +1286,7 @@ pub fn create_api_router(
         // `internal` article. Same bargain as the logo above.
         .merge(public_kb_attachment_routes(KbAttachmentService::new(
             db.clone(),
-            KbAttachmentConfig::from_env(),
+            KbAttachmentConfig::from_env().expect("KB_ATTACHMENT_MAX_BYTES invalid"),
         )))
         // PMS-941: an image embedded in a ticket description or note, for the
         // same reason as the KB image above and with one extra guard: this
@@ -1289,7 +1295,7 @@ pub fn create_api_router(
         // `is_inline`. Anything else 404s here exactly as an unknown id does.
         .merge(public_ticket_attachment_routes(AttachmentService::new(
             db.clone(),
-            AttachmentConfig::from_env(),
+            AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
         )))
         .merge(public_form_routes(
             FormsService::with_request_links(

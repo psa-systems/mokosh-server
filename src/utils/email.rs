@@ -804,9 +804,10 @@ impl MailerConfig {
     /// upgrades without a fatal boot.
     pub fn from_env() -> AppResult<Self> {
         let host = config::get(&keys::SMTP_HOST).filter(|s| !s.is_empty());
-        let port = config::get(&keys::SMTP_PORT)
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(587);
+        let port =
+            crate::config::parse::parse_optional(&keys::SMTP_PORT, config::get(&keys::SMTP_PORT))
+                .map_err(AppError::Configuration)?
+                .unwrap_or(587);
         let username = config::get(&keys::SMTP_USERNAME).filter(|s| !s.is_empty());
         let password = config::get(&keys::SMTP_PASSWORD)
             .filter(|s| !s.is_empty())
