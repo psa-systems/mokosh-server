@@ -56,7 +56,78 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  classify:
+    name: classify changed files
+    # PMS-560: content-aware gate. A PR touching only `//` / `/* */` / `#`
+    # comment lines or whitespace in a code file skips the compile/test jobs
+    # (`cargo`, `guards`). The `secrets` job stays unconditional because its
+    # scanners read git history, which a comment-only PR still extends.
+    # MEDIUM: only diffs file paths and scans comment/whitespace lines, no
+    # compile.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    outputs:
+      run_gate: ${{ steps.classify.outputs.run_gate }}
+    steps:
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: classify
+        shell: nu {0}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          let event = $env.EVENT_NAME
+          let base_ref = $env.BASE_REF
+          let before = $env.BEFORE
+
+          # push events where `before` is empty or all-zeros have no previous
+          # commit to diff against (e.g. the branch's first push); treat that
+          # as a code change rather than guessing. This workflow only triggers
+          # on pull_request today, but the guard keeps the shape portable.
+          let no_previous_commit = (
+              $event == "push"
+              and (($before | is-empty) or ($before == "0000000000000000000000000000000000000000"))
+          )
+
+          let base_head = if $no_previous_commit {
+              null
+          } else if $event == "pull_request" {
+              let fetch = (^git fetch origin $base_ref | complete)
+              if $fetch.exit_code != 0 {
+                  print --stderr $fetch.stderr
+                  exit 1
+              }
+              {base: "FETCH_HEAD", head: "HEAD"}
+          } else {
+              {base: $before, head: "HEAD"}
+          }
+
+          let run_gate = if $no_previous_commit {
+              # No prior commit to classify against; be conservative.
+              true
+          } else {
+              let verdict = (nu scripts/classify-diff.nu $base_head.base $base_head.head | str trim)
+              print $"content classifier verdict: ($verdict)"
+              # "code" -> run; "comments-only" -> skip; "non-code" -> skip.
+              match $verdict {
+                  "code" => true,
+                  "comments-only" => false,
+                  "non-code" => false,
+                  _ => true,
+              }
+          }
+
+          print $"run_gate=($run_gate)"
+          $"run_gate=($run_gate)\n" | save --append $env.GITHUB_OUTPUT
+
   cargo:
+    needs: classify
+    if: needs.classify.outputs.run_gate == 'true'
     name: fmt + clippy + tests + machete
     # Dev label: this job compiles Rust natively on the runner, and only the
     # dev image carries `cc` / `gcc` / `ld` plus the OpenSSL headers openssl-sys
@@ -179,6 +250,8 @@ jobs:
           cargo machete
 
   guards:
+    needs: classify
+    if: needs.classify.outputs.run_gate == 'true'
     name: nu guards + migrations + routes
     # Base label: nothing in this job invokes `cargo`. Every step is a nu
     # script, a `just` recipe (just comes from the common submodule), or a
