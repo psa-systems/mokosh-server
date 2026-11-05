@@ -110,6 +110,19 @@ The closing row is left alone. Its `hours_included` and `hours_used` are the rec
 
 The two period functions have to cut the same windows, and `billing::service::pms1572_period_agreement_tests` is what makes that true rather than hoped: this run anchors periods with `current_billing_period` and the roll lands on the window `ContractsService::period_for` names. A day's disagreement would put the hours in a balance row nothing else uses, with no error and no log, leaving a customer short and a stray row that reads as a double allotment.
 
+## Quote approval (PMS-1624)
+
+A quote's internal status has two writers and one authority at a time. A staff user sets `submitted` / `approved` / `rejected` through `PUT /quotes/{id}`, filtered by `QuoteStatus::is_staff_settable`; a decision on a staff-addressed approval moves the same three through `quotes::approval_sync`, which is the only place that writes `quotes.status` on an approval's behalf and lives in the quotes module so the column keeps one owning module.
+
+The rule: a quote goes `approved` when every staff-addressed approval on it is decided and all approved, and any rejection moves it to `rejected` at once. The veto is checked before the completeness rule, so a chain that is complete AND contains a rejection is rejected; the quote has then left `submitted`, so a later approval of a second row finds nothing to move and the veto stands. Only out of `submitted`: a decision landing on a `draft`, `sent`, `cancelled` or already-decided quote is still recorded, because an approver must never be blocked by a status change they had no part in, and simply moves nothing.
+
+Only staff-addressed rows count and only they drive it (`approver_contact_id IS NULL`). A contact-addressed approval is the client asking for or giving sign-off, and `QuoteStatus` keeps the client's decision in `Accepted` / `Declined`, spelled differently from `Approved` / `Rejected` precisely so the two cannot be confused; letting a contact's decision write the internal status would collapse that distinction, and letting a contact's pending row block the chain would stall staff sign-off on a customer.
+
+The manual `approved` is refused while a staff decision is outstanding, which is what makes "two writers" safe rather than a race whose loser is silently ignored. A manual `rejected` is deliberately still allowed: it is the same answer a veto gives, so it creates no conflicting claim, and refusing it would strand a quote whose named approver has gone on leave. Cancelling the approval returns the quote to the manual path.
+
+Before PMS-1624 the approvals surface wrote only `ticket_approvals` for all four of its targets, which is still true of the other three and is that surface's stated position (`src/modules/approvals/routes.rs`). Quotes are the exception because they were the case where two independent records of one idea could disagree in both directions, and PMS-1573 is where that surfaced: as a defect report saying `approved` was unreachable, filed after reading a doc comment that claimed the approvals surface already drove it.
+
+
 ## Currency (PMS-1028)
 
 An invoice is issued in the tenant's currency (PMS-1028): `settings::read_default_currency` reads `billing_prefs/currency` on the caller's tenant-GUC connection, unset means `USD`, and every invoice writer (`create_invoice`, `create_invoice_from_time_entries`, the recurring generator) resolves the request's currency else the setting; a credit note inherits its invoice's. `invoices.currency` is the per-row home, so an invoice keeps the currency it was issued in when the setting changes. The two `"USD"` literals left in `billing::service` are read-side fallbacks for rows older than the column and say so.

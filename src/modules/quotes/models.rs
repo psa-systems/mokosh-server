@@ -28,19 +28,27 @@ use validator::Validate;
 /// deliberately spelled differently so a reader can always tell the two
 /// apart.
 ///
-/// PMS-1573: this used to say the internal three were "driven by the
-/// existing polymorphic approvals surface". They are not, and reading that
-/// and then finding no writer in `src/modules/approvals/` is what got a
-/// defect filed saying `approved` is unreachable. It is reachable: a staff
-/// user sets all three through `PUT /quotes/{id}`, which is what
-/// [`Self::is_staff_settable`] permits and what Settings-side "Submit for
-/// Approval" and "Mark approved" call.
+/// Two things write the internal three. A staff user sets them through
+/// `PUT /quotes/{id}`, which is what [`Self::is_staff_settable`] permits and
+/// what "Submit for Approval" and "Mark approved" call; and a decision on a
+/// staff-addressed approval moves them too (PMS-1624,
+/// [`super::approval_sync`]). The manual `approved` is refused while a
+/// decision is outstanding, so there is one authority at a time.
 ///
-/// The approvals surface is deliberately not the writer, for any of its
-/// four targets: `ApprovalsService::decide` writes only its own table, so
-/// a sign-off there is offered and never required (see the header of
-/// `src/modules/approvals/routes.rs`). Wiring it to move a quote's status
-/// would be a product decision, not a repair.
+/// A contact-addressed approval is the CLIENT's sign-off and moves nothing
+/// here: that decision belongs in `Accepted` / `Declined`, which is the whole
+/// reason the two pairs are spelled differently.
+///
+/// This paragraph has been wrong in both directions. It used to claim the
+/// internal three were "driven by the existing polymorphic approvals
+/// surface" while nothing in `src/modules/approvals/` wrote them, and
+/// somebody reading that and finding no writer filed PMS-1573 saying
+/// `approved` was unreachable. PMS-1573 corrected it to say the approvals
+/// surface was deliberately not the writer and that wiring it would be a
+/// product decision; PMS-1624 is that decision, taken. The other three
+/// approval targets are still gated by nothing, which remains that
+/// surface's stated position (see the header of
+/// `src/modules/approvals/routes.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuoteStatus {

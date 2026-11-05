@@ -194,6 +194,7 @@ pub mod portal_transactional_mail;
 pub mod product_catalog;
 pub mod projects;
 pub mod provision_probe_nologin;
+pub mod quote_approval_status;
 pub mod quote_client_visibility;
 pub mod quote_convert;
 pub mod quote_recipient;

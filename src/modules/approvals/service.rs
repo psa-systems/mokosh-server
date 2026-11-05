@@ -15,6 +15,23 @@ use super::models::{
     ApprovalResponse, ApprovalTarget, CreateApprovalRequest, DecideApprovalRequest,
 };
 use crate::db::Database;
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::modules::auth::TenantId;
+
+/// PMS-1624: what `decide` locks and reads off the approval row.
+///
+/// A struct rather than a five-field tuple because `target` and `entity_id`
+/// joined it for the quote sync, and a tuple that wide stops saying which
+/// field is which at the destructuring site.
+#[derive(FromRow)]
+struct DecideScopeRow {
+    status: String,
+    approver_user_id: Option<Uuid>,
+    approver_role: Option<String>,
+    target: String,
+    entity_id: Uuid,
+}
+
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Debug, FromRow)]
@@ -582,6 +599,10 @@ impl ApprovalsService {
         caller_id: Uuid,
         caller_role: &str,
         req: DecideApprovalRequest,
+        // PMS-1624: a decision that moves a quote's status writes an audit
+        // row for it, so the context comes in from the route rather than
+        // being invented as `AuditCtx::system`.
+        ctx: &AuditCtx,
     ) -> AppResult<ApprovalResponse> {
         // SPEC-7.526: only "approve"/"reject" are accepted;
         // anything else is a 400, otherwise approved/rejected status.
@@ -605,8 +626,10 @@ impl ApprovalsService {
         // with no lock on the read the second decision could still land
         // after the first, overwriting it. The lock serializes the second
         // caller behind the first's commit.
-        let scope: Option<(String, Option<Uuid>, Option<String>)> = sqlx::query_as(
-            "SELECT status, approver_user_id, approver_role \
+        // PMS-1624: `target` and `entity_id` come back too, so a decision on
+        // a quote can move the quote's own status in this transaction.
+        let scope: Option<DecideScopeRow> = sqlx::query_as(
+            "SELECT status, approver_user_id, approver_role, target, entity_id \
              FROM ticket_approvals \
              WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
         )
@@ -615,7 +638,13 @@ impl ApprovalsService {
         .fetch_optional(&mut *tx)
         .await?;
         // SPEC-7.528: 404 ("Approval") when no row matches.
-        let (status, by_user, by_role) = scope.ok_or(AppError::NotFound("Approval".into()))?;
+        let DecideScopeRow {
+            status,
+            approver_user_id: by_user,
+            approver_role: by_role,
+            target,
+            entity_id,
+        } = scope.ok_or(AppError::NotFound("Approval".into()))?;
         // SPEC-7.529: 400 "Approval is already {status}" when the
         // locked row is not pending.
         if status != "pending" {
@@ -651,6 +680,48 @@ impl ApprovalsService {
                 "Approval is already decided".to_string(),
             ));
         }
+
+        // PMS-1624: a quote's own status follows its staff approvals. After
+        // the UPDATE above, so the count inside sees this decision; in this
+        // transaction, so the approval and the status it implies commit
+        // together or not at all.
+        //
+        // The write lives in `quotes::approval_sync` rather than here, so
+        // `quotes.status` keeps one owning module. Only quotes: a ticket, a
+        // change request and a time entry are all gated by nothing, which is
+        // this surface's stated position for them (see the routes header).
+        if ApprovalTarget::from_str(&target) == Some(ApprovalTarget::Quote) {
+            if let Some(next) =
+                crate::modules::quotes::approval_sync::apply_decision(&mut tx, tenant_id, entity_id)
+                    .await?
+            {
+                audit_write(
+                    &mut *tx,
+                    TenantId::from_trusted(tenant_id),
+                    ctx,
+                    AuditAction::Update,
+                    "quotes",
+                    Some(entity_id),
+                    None,
+                    Some(serde_json::json!({
+                        "event": "quote.approval_decided",
+                        "decision": new_status,
+                        "status": next.as_str(),
+                        "approval_id": id,
+                    })),
+                )
+                .await?;
+                tracing::info!(
+                    %tenant_id,
+                    quote_id = %entity_id,
+                    approval_id = %id,
+                    decision = new_status,
+                    status = next.as_str(),
+                    "an approval decision moved a quote's status"
+                );
+            }
+        }
+
         tx.commit().await?;
         // SPEC-7.533: commits, then re-fetches via get() to build
         // the response rather than constructing it from the UPDATE's data.
