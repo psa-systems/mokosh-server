@@ -1044,7 +1044,7 @@ async fn a_slow_provider_call_does_not_block_a_concurrent_credit_note(pool: PgPo
     let (invoice_id, _product) =
         delegated_invoice(&billing, &pool, db, InvoiceProviderKind::Xero, XERO_CONTACT).await;
 
-    const DELAY_MS: u64 = 300;
+    const DELAY_MS: u64 = 600;
     stub.lock().unwrap().credit_delay_ms = DELAY_MS;
 
     let first = billing.clone();
