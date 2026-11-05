@@ -412,14 +412,14 @@ impl TicketService {
                 id, tenant_id, ticket_number, title, description,
                 status_id, priority_id, type_id, category_id, queue_id, source,
                 company_id, contact_id, site_id, assigned_to_id, team_id,
-                contract_id, sla_id, sla_id_explicit, scheduled_start, scheduled_end,
+                contract_id, sla_id, scheduled_start, scheduled_end,
                 estimated_hours, is_billable, asset_id, custom_fields, tags,
                 created_by_id, source_kb_article_id, procedure_kb_article_id,
                 email_message_id, email_thread_id, parent_ticket_id
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                 $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26,
-                $27, $28, $29, $30, $31, $32
+                $27, $28, $29, $30, $31
             )
             "#,
         )
@@ -441,7 +441,6 @@ impl TicketService {
         .bind(request.team_id)
         .bind(request.contract_id)
         .bind(request.sla_id)
-        .bind(request.sla_id.is_some())
         .bind(request.scheduled_start)
         .bind(request.scheduled_end)
         .bind(request.estimated_hours)
