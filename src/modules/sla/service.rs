@@ -650,11 +650,15 @@ impl SlaService {
 
     // PMS-112 / PMS-106 evaluator ---------------------------------------------
     /// Compute and persist `tickets.first_response_due`, `resolution_due`,
-    /// `sla_due_date` for the ticket based on its priority's targets in
-    /// its assigned SLA policy.
+    /// `sla_due_date` and `sla_id` for the ticket based on its priority's
+    /// targets in its applicable SLA policy.
     ///
-    /// The applicable policy is the ticket's `sla_id` when set, else the
-    /// tenant's default policy (`is_default = TRUE`). The policy's
+    /// The applicable policy is the ticket's `sla_id` when explicitly
+    /// assigned (`sla_id_explicit`, PMS-1644), else the tenant's default
+    /// policy (`is_default = TRUE`), re-resolved on every call so a changed
+    /// default tracks forward. Either way the resolved policy's id is
+    /// written back onto `tickets.sla_id` so the API never surfaces due
+    /// dates next to a `NULL` policy id. The policy's
     /// `business_hours` row supplies the timezone + weekly schedule, and
     /// the business-hours row's `holidays` (a `UUID[]` of
     /// `holiday_calendars`) supply the non-working dates. Each target is
@@ -665,8 +669,8 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn evaluate_for_ticket(&self, tenant_id: TenantId, ticket_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<(Option<Uuid>, Uuid, DateTime<Utc>)> = sqlx::query_as(
-            r#"SELECT sla_id, priority_id, created_at FROM tickets
+        let row: Option<(Option<Uuid>, bool, Uuid, DateTime<Utc>)> = sqlx::query_as(
+            r#"SELECT sla_id, sla_id_explicit, priority_id, created_at FROM tickets
                WHERE tenant_id = $1 AND id = $2"#,
         )
         .bind(tenant_id)
@@ -675,15 +679,22 @@ impl SlaService {
         .await?;
         // SPEC-7.120: silent no-op (Ok(()), no write) when the ticket
         // id does not exist for the tenant.
-        let Some((sla_id, priority_id, created_at)) = row else {
+        let Some((sla_id, sla_id_explicit, priority_id, created_at)) = row else {
             return Ok(());
         };
 
-        // SPEC-7.121: applicable policy is the ticket's own sla_id if set, else the
-        // tenant's is_default policy (LIMIT 1 if more than one default row exists).
+        // SPEC-7.121: applicable policy is the ticket's own sla_id if explicitly
+        // assigned, else the tenant's is_default policy (LIMIT 1 if more than
+        // one default row exists). `sla_id_explicit` (PMS-1644), not the mere
+        // presence of `sla_id`, is what gates this: this evaluator persists its
+        // own resolved policy id back onto `sla_id` below, so a previous
+        // default-fallback resolution must keep being treated as a fallback
+        // (re-resolved every call, tracking the tenant's current default)
+        // rather than becoming a pinned explicit assignment.
         // Resolve the applicable policy and its business-hours id in one
         // query so we do not round-trip twice.
-        let policy: Option<(Uuid, Option<Uuid>)> = match sla_id {
+        let explicit_sla_id = sla_id_explicit.then_some(sla_id).flatten();
+        let policy: Option<(Uuid, Option<Uuid>)> = match explicit_sla_id {
             Some(p) => sqlx::query_as(
                 "SELECT id, business_hours_id FROM sla_policies WHERE tenant_id = $1 AND id = $2",
             )
@@ -750,13 +761,14 @@ impl SlaService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"UPDATE tickets SET first_response_due = $3, resolution_due = $4,
-                   sla_due_date = $4, updated_at = NOW()
+                   sla_due_date = $4, sla_id = $5, updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
         .bind(tenant_id)
         .bind(ticket_id)
         .bind(fr_due)
         .bind(res_due)
+        .bind(policy_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
