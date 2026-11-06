@@ -260,7 +260,7 @@ protected by declaring an extractor in the handler signature (`RequireAuth`, `Re
 
 Tenant isolation: services open work with `Database::begin_with_tenant(tenant_id)`, which starts a transaction on the
 request-serving pool and sets `app.current_tenant` for that transaction. Row level security policies read that setting
-(section 5.2).
+(section 9, "Tenancy").
 
 Errors: every failure is an `AppError` rendered as a JSON envelope `{"error": {"code", "message", "errors"?}}`. The
 `normalize_error_envelope` layer rewrites plain-text extractor rejections into the same envelope. Rate-limit
@@ -1394,81 +1394,425 @@ and are not reused.
   treated as frozen, disallowing header or line edits; only `draft` and `pending` remain editable, and correcting
   a frozen invoice's totals must go through a credit note rather than an in-place edit.
 
-## 5. Data model
+## 5. Identity and tenancy
 
-### 5.1 Storage and migrations
+Normative requirements for `src/modules/auth/`, `src/modules/members/`, `src/modules/invitations/`,
+`src/modules/contact_portal/`, `src/modules/portal_roles/`, `src/modules/tenants/`, `src/modules/platform/`,
+`src/modules/teams/`, `src/modules/audit/`, `src/modules/credential_move.rs` and `src/modules/ip_enrich/`. Each
+requirement below is cited at its implementing or enforcing site with a `// SPEC-5.<n>` comment. Requirement numbers are
+assigned in file-reading order within each sub-section and are not reused. This section is split across sibling slices
+of PMS-1596: SPEC-5.1 to SPEC-5.99 cover auth session core (service.rs, routes.rs, mod.rs, models.rs, tenant.rs,
+caller_context.rs, bootstrap.rs); later slices add contiguous ranges for auth security controls, identity-provider
+integration and grants, tenants and platform, the contact portal plane, and members/invitations/teams/audit/ip_enrich.
 
-PostgreSQL. SQL migrations live in `migrations/` as `NNN_name.sql` files (starting at `002_tenants.sql`) and are embedded
-into the binary with `sqlx::migrate!` and copied into the image at `/app/migrations`. They are applied at boot on the
-privileged pool when `RUN_MIGRATIONS` is true. Applied migrations missing from the directory are ignored
-(`set_ignore_missing(true)`). Migrations create the extensions `uuid-ossp`, `pg_trgm`, `citext` and `pgcrypto`.
+Legacy pre-split content: the database-wide table inventory that used to live here was superseded by section 9 "Data
+model and migrations", which carries the authoritative SPEC-9.n requirements for every migration and schema shape.
 
-Two database roles are used: `mokosh_migrator` (login, `BYPASSRLS`, owns the schema, runs DDL, migrations, bootstrap,
-cross-tenant workers and the explicitly pre-authentication paths) and `mokosh_app` (login, `NOSUPERUSER NOBYPASSRLS`,
-serves requests, owns nothing). Both are created idempotently at first boot from `MOKOSH_ADMIN_DATABASE_URL` when the
-migrator role cannot yet log in. Each pool allows 20 connections (minimum 2), a 30 s acquire timeout, 600 s idle timeout
-and 1800 s maximum lifetime.
+### 5.1 Module wiring and typed tenant scope
 
-### 5.2 Tenant isolation
+- **SPEC-5.1**: `src/modules/auth/mod.rs` must not mount `/google` or `/google/callback` routes under `/api/v1/auth` and
+  must not re-export a `login_with_google` or any `google_oauth_flow` helper; the retirement is deliberate and the
+  `user_oauth_identities` table is retained for historical rows only.
+- **SPEC-5.2**: `src/modules/auth/models.rs` must be a re-export shim for `mokosh_types::auth::*`; it must introduce no
+  behavior or type of its own, so `super::models::*` paths in the module keep resolving.
+- **SPEC-5.3**: `TenantId` (in `src/modules/auth/tenant.rs`) must be constructible inside the crate only through
+  `TenantId::new`, and `TenantId::new` must have exactly one in-crate caller: `TenantScoped::tenant` on
+  `CurrentUser`; a bare `Uuid` passed where a `TenantId` is expected must fail to compile.
+- **SPEC-5.4**: `TenantId::from_trusted(uuid)` must be the sole public escape hatch, named verbosely so it is greppable
+  at review, and must not be called with unvalidated request input; its legitimate uses are validated super-admin
+  cross-tenant parameters, tests and bootstrap paths with no request context.
+- **SPEC-5.5**: `TenantId` must bind to SQL identically to `Uuid` (via `#[sqlx(transparent)]`) and must implement
+  `Display`, `Deref<Target=Uuid>` and `From<TenantId> for Uuid` so helpers such as `Database::begin_with_tenant` accept
+  either shape.
 
-Tenant-scoped tables carry `tenant_id`, enable and force row level security, and have a policy named `tenant_isolation`
-comparing `tenant_id` with `current_setting('app.current_tenant')`. The setting is applied per transaction by
-`begin_with_tenant`. Because `mokosh_app` does not bypass RLS, a query run without the setting sees no tenant rows.
-Cross-tenant and pre-authentication reads (login, webhooks, workers) use the migrator pool.
+### 5.2 First-run platform-admin bootstrap
 
-### 5.3 Tables by domain
+- **SPEC-5.6**: `maybe_bootstrap_admin` (in `src/modules/auth/bootstrap.rs`) must run only when both `ADMIN_EMAIL` and
+  `ADMIN_PASSWORD` environment variables are set AND non-empty after trim; any absence or blank must return `Ok(())`
+  without writing to the database.
+- **SPEC-5.7**: The bootstrap must write a `platform_admins` row, not a `users` row, on the migrator pool, with
+  `status='active'`, `email_verified_at=NOW()`, derived first and last name from `derive_name(email)`, and an
+  Argon2-hashed password; it must run `INSERT ... ON CONFLICT (id) DO NOTHING`.
+- **SPEC-5.8**: The bootstrap must short-circuit idempotently when `SELECT COUNT(*) FROM platform_admins > 0`,
+  logging at `info` with the message "ADMIN_EMAIL/ADMIN_PASSWORD set but a platform admin already exists" and
+  returning without any write.
+- **SPEC-5.9**: On a successful insert the bootstrap must log at `warn` level with the explicit text "DEV ONLY; do not
+  use in production" and the sign-in location `/platform/login`, including the `admin_id` and `email` tracing fields.
+- **SPEC-5.10**: `derive_name(email)` must extract the local-part, split on `.`, `_`, `-` or `+`, drop empties and
+  title-case each piece, returning `("Admin", "User")` for an empty local-part, `(segment, "Admin")` for a single
+  segment, and `(first, rest.join(" "))` for a multi-segment local-part.
 
-Tables created by the migrations (`CREATE TABLE`), grouped:
+### 5.3 Dual-plane caller context
 
-- Tenancy and identity: `tenants`, `tenant_settings`, `module_config`, `feature_toggles`, `users`, `user_sessions`,
-  `api_keys`, `password_reset_tokens`, `user_oauth_identities`, `identities`, `tenant_memberships`,
-  `tenant_membership_entitlements`, `platform_admins`, `teams`, `team_members`, `tenant_invitations`,
-  `mokosh_bunyip_grants`, `mokosh_grant_invitations`, `login_approvals`, `user_login_devices`.
-- Clients and portal: `companies`, `company_industries`, `contacts`, `contact_phones`, `contact_companies`, `sites`,
-  `portal_roles`, `contact_role_assignments`, `contact_sessions`, `portal_setup_tokens`, `portal_refresh_tokens`,
-  `portal_password_reset_tokens`, `portal_login_intents`, `portal_access_requests`, `portal_delegations`,
-  `portal_exports`, `contact_notification_preferences`, `contact_payment_methods`.
-- Contact import: `contact_sync_connections`, `contact_sync_links`, `contact_field_locks`, `contact_sync_candidates`,
-  `contact_sync_oauth_states`, `contact_sync_suppressions`, `contact_sync_runs`, `contact_import_files`.
-- Service desk: `tickets`, `ticket_sequences`, `ticket_queues`, `ticket_statuses`, `ticket_priorities`, `ticket_types`,
-  `ticket_categories`, `ticket_notes`, `ticket_attachments`, `ticket_automation_rules`, `ticket_templates`,
-  `ticket_saved_views`, `ticket_approvals`, `change_requests`, `workflow_rules`, `workflow_rule_runs`,
-  `email_mailboxes`, `email_parse_rules`, `email_intake_log`, `tenant_intake_tokens`.
-- SLA: `business_hours`, `holiday_calendars`, `sla_policies`, `sla_targets`, `sla_notifications`.
-- Time, projects, calendar: `work_types`, `time_entries`, `time_rounding_rules`, `active_timers`, `work_day_segments`,
-  `mileage_entries`, `projects`, `project_phases`, `project_types`, `task_statuses`, `tasks`, `task_dependencies`,
-  `appointments`, `appointment_reminders`, `user_availability`, `time_off`, `on_call_schedules`,
-  `scheduling_templates`.
-- Commercial: `contracts`, `contract_items`, `contract_hour_balances`, `contract_invoice_runs`, `rate_cards`,
-  `rate_card_items`, `invoices`, `invoice_lines`, `invoice_sequences`, `invoice_company_sequences`, `invoice_reminders`,
-  `payments`, `payment_refunds`, `payment_terms`, `payment_gateway_configs`, `payment_webhook_deliveries`, `tax_rates`,
-  `products`, `credit_notes`, `credit_note_lines`, `credit_note_sequences`, `quotes`, `quote_lines`, `quote_sequences`,
-  `opportunities`, `vendors`, `expense_categories`, `bills`, `bill_lines`, `bill_payments`, `expenses`, `expense_lines`,
-  `integrations`, `invoice_issuer_company_mappings`, `invoice_issuer_product_mappings`,
-  `invoice_issuer_vendor_mappings`, `invoice_issuer_expense_account_mappings`, `invoice_issuer_user_mappings`,
-  `invoice_issuer_oauth_states`.
-- Assets and knowledge: `asset_types`, `assets`, `asset_relationships`, `asset_models`, `asset_templates`,
-  `asset_tag_counters`, `configuration_items`, `credential_vault`, `asset_audit_log`, `kb_categories`, `kb_articles`,
-  `kb_article_versions`, `kb_article_drafts`, `kb_article_votes`, `kb_article_attachments`, `kb_article_comments`,
-  `kb_comment_mentions`.
-- Forms: `form_definitions`, `form_fields`, `form_definition_drafts`, `form_submissions`, `form_request_tokens`.
-- Notifications and reporting: `notification_channels`, `notification_templates`, `user_notification_preferences`,
-  `notifications`, `notification_rules`, `saved_reports`, `scheduled_reports`, `saved_dashboards`,
-  `scheduled_dashboards`, `audit_log`.
-- Integrations and operations: `rmm_connections`, `rmm_device_mappings`, `rmm_alert_rules`, `monitored_systems`,
-  `status_observations`, `secrets` (tenant secret provider rows), `app_secrets` and `app_config` (deployment-level
-  provider rows), `files` (storage ledger).
+- **SPEC-5.11**: `CallerContext` (in `src/modules/auth/caller_context.rs`) must carry exactly two variants, `Staff(AuthState)`
+  and `Contact(ContactSession)`; the extractor `RequireCallerContext` must resolve the staff plane first and only fall
+  back to the contact plane when no authenticated staff state is on the request.
+- **SPEC-5.12**: When an `AuthState` is present with `deleted == true` (MAPPS-348 tombstone-after-verify),
+  `RequireCallerContext` must return `AppError::AccountDeleted` (410 Gone) without touching the contact plane.
+- **SPEC-5.13**: When neither plane is authenticated, `RequireCallerContext` must return `AppError::Unauthorized` (401).
+- **SPEC-5.14**: `CallerContext::tenant()` must return the caller's `TenantId`; for a staff caller whose `AuthState`
+  has no `tenant_id` the fallback must be `Uuid::nil` wrapped via `TenantId::from_trusted` so downstream queries fail
+  closed (a nil tenant matches no real row), not fail open.
+- **SPEC-5.15**: `CallerContext::today(db)` must compute the caller's "today" in their timezone, using
+  `AuthState.user.timezone` (falling back to `"UTC"` when `user` is `None`) for a staff caller, or a cached
+  `ContactSession` timezone populated from a tenant-scoped SELECT on `contacts.timezone` for a contact caller; the
+  contact-side timezone lookup must run on an RLS-aware transaction opened with `begin_with_tenant` and must collapse
+  a NULL or missing row to `"UTC"`.
+- **SPEC-5.16**: `CallerContext::require_staff()` must return `Err(AppError::Forbidden("This endpoint is restricted
+  to staff users."))` for a contact caller and `Ok(())` for a staff caller; the error text is observable and must not
+  change.
+- **SPEC-5.17**: `CallerContext::require_capability(cap, db)` must be an unconditional `Ok(())` for a staff caller
+  (the staff plane does not consult `portal_roles`) and for a contact caller must load the DISTINCT union of
+  `portal_roles.capabilities` across every active `contact_role_assignments` row for
+  `(contact_id, tenant_id)`, cache the result via `ContactSession.role_cache: OnceCell` for the request's lifetime,
+  and return `Err(AppError::Forbidden(capability_refusal_message(cap)))` when the capability is not present.
+- **SPEC-5.18**: The capability loader `load_contact_capabilities` must run on the migrator pool (RLS-exempt) and
+  carry a belt-and-braces `WHERE tenant_id = $1` on the join of `contact_role_assignments` to `portal_roles`.
+- **SPEC-5.19**: `CallerContext::require_capability` must NOT consult the JWT `caps` claim; role revokes through
+  `PUT /api/v1/contacts/{id}/portal-roles` must take effect on the next request, not after the 15-minute access-token
+  TTL.
+- **SPEC-5.20**: `capability_refusal_message(cap)` must look `cap` up in `capability_labels::descriptors()`,
+  lowercase the first character of the label and format the string `"Missing required capability. You don't have
+  permission to {phrase}."`; the message must not include a `:` separator or the raw capability key, so error
+  strings do not enumerate capabilities.
+- **SPEC-5.21**: `has_capability(cap, db)` must mirror `require_capability` but return a `bool`, returning `true` for
+  every staff caller.
+- **SPEC-5.22**: The module must publish process-global `AtomicUsize` counters `CAPABILITY_LOADS` and
+  `TIMEZONE_LOADS`; each counter must increment once per actual database load (not once per `require_capability` or
+  `today` call), so a test can assert that the per-request cache held.
 
-### 5.4 Constraints worth knowing
+### 5.4 Router construction and rate limiter wiring
 
-- Check constraints pin enumerations in SQL as well as Rust, for example opportunity `stage` to six values with `outcome`
-  set exactly when the stage is `won` or `lost`, and RMM `provider` to `tactical_rmm`, `mesh_central`, `datto`,
-  `connectwise`, `ninja_rmm`. Of those only `tactical_rmm` has an adapter (section 8); the others answer with a stub that
-  records an error.
-- Numbering (tickets, invoices, quotes, credit notes, per-company invoices, asset tags) comes from sequence tables, not
-  from application counters.
-- A tombstoned user keeps its row (`deleted_at`), its email is rewritten to a `deleted-<uuid>` form so the unique
-  `(tenant_id, email)` constraint does not block a re-signup.
+- **SPEC-5.23**: `AuthRouterState` (in `src/modules/auth/routes.rs`) must carry three rate limiters:
+  `login_limiter` (20/min per IP and 5/min per email), `forgot_password_limiter` (10/min per IP and 3/min per email),
+  and `reauth_limiter` (10/min per IP and 5/min per user, failures only); all three limiters must live for the
+  router's lifetime so quotas survive individual requests.
+- **SPEC-5.24**: `POST /api/v1/auth/me/password` (`change_password`) and `POST /api/v1/auth/me/mfa/disable`
+  (`disable_mfa`) must share one `reauth_limiter` instance; a failed current-password check on either endpoint must
+  count against the other's budget so credential grinding by alternation is blocked.
+- **SPEC-5.25**: The complete authenticated route set mounted on `/api/v1/auth` must be: `GET /me`, `PUT /me`,
+  `GET /memberships`, `POST /me/complete-onboarding`, `PUT /me/password`, `GET /me/sessions`,
+  `DELETE /me/sessions/{session_id}`, `POST /me/mfa/setup`, `POST /me/mfa/enable`, `POST /me/mfa/disable`,
+  `GET /me/api-keys`, `POST /me/api-keys`, `DELETE /me/api-keys/{key_id}`, `GET /directory`, `GET /users`,
+  `POST /users`, `GET /users/{user_id}`, `PUT /users/{user_id}`.
+- **SPEC-5.26**: The complete public route set mounted on `/api/v1/auth` must be: `POST /login`,
+  `POST /select-tenant`, `POST /switch-tenant/{tenant_id}` (the handler uses `RequireAuthState` internally),
+  `POST /logout`, `POST /logout-all`, `POST /refresh`, `POST /forgot-password`, `POST /reset-password`,
+  `GET /set-password/context/{token}`.
+
+### 5.5 Rate-limited login paths and anti-enumeration
+
+- **SPEC-5.27**: `POST /login` must call `request.validate()` before consulting the login limiter; an invalid body
+  must return 400 without spending limiter budget.
+- **SPEC-5.28**: The login limiter must be keyed `(client_ip, request.email)`; over quota must return a
+  `rate_limited_response` with 429 status, the reset's `Retry-After` and the literal body
+  `"Too many login attempts, please try again later"`.
+- **SPEC-5.29**: Client IP for `POST /login` must be extracted via `extract_client_ip(peer, headers,
+  trusted_proxies())`, falling back to the peer address for a direct client and walking `X-Forwarded-For` right to
+  left only when the peer is itself a trusted proxy.
+- **SPEC-5.30**: `POST /login` must select between two authentication paths by whether the request carries a tenant
+  hint: a non-empty `tenant_id` or a trimmed non-empty `tenant_slug` dispatches to `AuthService::login` (tenant-hint
+  path), and absence of both dispatches to `AuthService::authenticate_identity_first` (identity-first path).
+- **SPEC-5.31**: When `AuthService::login` returns an `AppError` whose `known_retry_after()` is `Some`, the handler
+  must map it to `rate_limited_response(retry_after, "Too many failed verification codes, please try again later")`,
+  so the persistent MFA lockout is surfaced as 429 + `Retry-After` on the same contract as the per-request limiter.
+- **SPEC-5.32**: `AuthService::login` must refuse before any credential check with the same `Unauthorized` shape when
+  the local provider is disabled (`providers::is_enabled(AuthProviderKind::Local)` returns false), so provider
+  enumeration from error shapes is not possible.
+- **SPEC-5.33**: `AuthService::login` must resolve the caller's tenant in this order: a non-nil `request.tenant_id`
+  wins; otherwise a non-blank `tenant_slug` must be resolved via `resolve_tenant_slug` (which 401s on unknown);
+  neither provided must return `Unauthorized` (PMS-728 AC1 removed the old default-tenant fallback at this call
+  site).
+- **SPEC-5.34**: After tenant resolution, `AuthService::login` must call `find_user_by_email_for_tenant`, return
+  `Unauthorized` when no row matches, and return `Forbidden("Account is not active")` when the row's `status` is not
+  `Active`.
+- **SPEC-5.35**: When `local_password_auth_disabled()` returns `true` (`deployment_mode.is_saas() && sso_mounted`),
+  the login handler must refuse with `sso_only_rejection()` carrying the exact text `"This deployment signs in with
+  single sign-on. Use your organisation's sign-in page; a password set here would not sign you in."`; the check
+  must run after user lookup and status check but before any password verify.
+- **SPEC-5.36**: Before the password verify, `AuthService::login` must call `ensure_tenant_active(user.tenant_id)` so
+  a suspended tenant 403s with `"This organization is not active"` and an inactive tenant entitlement fails the same
+  way.
+- **SPEC-5.37**: A failed password must emit a best-effort audit row via `audit_write` on a tenant-scoped
+  transaction with `AuditAction::Login` and a JSON `after` snapshot of `{"outcome":"failed","reason":"bad_password"}`,
+  then return `Unauthorized`; a lost audit commit must be logged at `error` level but must not change the response.
+- **SPEC-5.38**: `AuthService::assess_login` must return `LoginAssessment { country, device_hash, suspicious }` where
+  `suspicious = country_new OR device_new`; `device_new` must require a non-blank device hash, a prior device
+  record for this user (`has_known_device == true`, so first devices never trigger the alert), AND
+  `is_known_device == false`.
+
+### 5.6 MFA enrollment, verification, and fan-out writes
+
+- **SPEC-5.39**: `start_mfa_enrollment(tenant_id, user_id)` must refuse with `Conflict("MFA is already enabled")` when
+  the user's row already has `mfa_enabled = true`; it must generate a fresh TOTP secret via `totp::generate_secret`,
+  base32-encode it, seal via `mfa_secret::seal`, and fan the sealed value out via `write_mfa_secret(email,
+  Some(sealed), None)` to both `users` and `identities`; it must NOT flip `mfa_enabled`.
+- **SPEC-5.40**: The provisioning URI returned by `start_mfa_enrollment` must set its issuer to
+  `app_name().replace(':', " ")` (otpauth labels break on literal colons) and its label to `"{app}:{email}"`.
+- **SPEC-5.41**: `enable_mfa(tenant_id, user_id, code)` must refuse with `BadRequest("MFA enrollment has not been
+  started")` when the stored `mfa_secret` is absent; it must open the sealed secret, base32-decode it (a corrupt
+  decode must return `Internal`), verify the TOTP code with a +/-1 step window, and on verify must generate 10
+  recovery codes, hash each with `recovery_code_hex_hash`, write `mfa_enabled = true` to both planes via
+  `write_mfa_enabled`, and persist the hashes on the per-tenant `users.mfa_recovery_codes_hashes` column; it must
+  return the 10 raw recovery codes exactly once.
+- **SPEC-5.42**: `disable_mfa(tenant_id, user_id, password)` must refuse with `BadRequest("This account has no
+  password")` when `password_hash` is absent and with `Unauthorized` when the password does not verify; the
+  order of its three writes must be `write_mfa_enabled(email, false)` first, then clear
+  `mfa_recovery_codes_hashes` for the per-tenant row, then `write_mfa_secret(email, None, None)` last. Any other
+  order would leave the flag enabled with no secret on a partial failure, locking the user out with no re-enrol
+  path.
+- **SPEC-5.43**: `write_mfa_secret(email, value, previous)` must run on the migrator pool and must update both
+  `users` and `identities` at `lower(email)` in one transaction, writing `mfa_secret` and `updated_at`; when
+  `previous` is `Some`, the UPDATE must include `AND mfa_secret = $previous` so a concurrent write cannot be lost.
+- **SPEC-5.44**: `write_mfa_enabled(email, enabled)` must update `users` first, then `identities`, in one
+  transaction on the migrator pool; the `identities` UPDATE must also reset `mfa_last_totp_step = 0`.
+- **SPEC-5.45**: `upgrade_legacy_mfa_secret(email, secret_b32)` must seal the plaintext via `mfa_secret::seal` and
+  call `write_mfa_secret(email, Some(sealed), Some(secret_b32))`, and must run only after a verified TOTP code
+  confirms the plaintext is the correct secret.
+- **SPEC-5.46**: `mfa_locked_until(tenant_id, user_id)` must return the stored `mfa_locked_until` under
+  `begin_with_tenant`; `register_failed_mfa(tenant_id, user_id)` must UPDATE `users` with
+  `mfa_failed_attempts = mfa_failed_attempts + 1` and `mfa_locked_until = COALESCE(NOW() + make_interval(secs =>
+  <mfa_lock_seconds_sql>), mfa_locked_until)`, so the new window is derived from the incremented value inside the
+  same UPDATE (never from a stale read).
+- **SPEC-5.47**: `record_mfa_success(tenant_id, user_id, used_step)` must run a CAS UPDATE
+  `WHERE mfa_last_used_step IS NULL OR mfa_last_used_step < $used_step`, clearing `mfa_failed_attempts = 0` and
+  `mfa_locked_until = NULL` on success; it must return `false` on 0 rows affected (a step replay) and the caller
+  must treat that as an MFA failure.
+- **SPEC-5.48**: `clear_mfa_lockout(tenant_id, user_id)` must zero `mfa_failed_attempts` and
+  `mfa_locked_until` without advancing `mfa_last_used_step`, because a recovery code is not a TOTP step.
+- **SPEC-5.49**: `mfa_lockout_until(failed_count, now)` must return `None` for `failed_count < 3`; for `failed_count
+  >= 3` it must return `now + 30 * 2^(failed_count - 3)` seconds, capped at 3600 seconds (1 hour); the exponent
+  must be clamped so an unbounded `failed_count` cannot overflow.
+- **SPEC-5.50**: `mfa_lock_seconds_sql(count_expr)` must produce the SQL twin of SPEC-5.49: `CASE WHEN (<expr>) >= 3
+  THEN LEAST(3600, 30 * 2^LEAST(20, (<expr>) - 3))::double precision END`; the `count_expr` argument must be a SQL
+  fragment (column or bind), never user input. A parity test must pin the two schedules to agree.
+
+### 5.7 Suspicious-login approval gate
+
+- **SPEC-5.51**: `LOGIN_APPROVAL_MAX_ATTEMPTS` must be exactly `5`: the wrong-code budget before the challenge is
+  destroyed and a fresh code must be requested.
+- **SPEC-5.52**: `issue_login_approval` must generate a 6-digit numeric code, SHA-256 hash it, DELETE any prior
+  unconsumed challenge for that user, INSERT a new `login_approvals` row with `expires_at = NOW() + 15 minutes`,
+  and detached-spawn-send the challenge email; it must not be gated on `sends_local_account_email()`, because
+  suppressing it would strand callers mid-login.
+- **SPEC-5.53**: `verify_login_approval` must consume the freshest unconsumed, unexpired challenge: on a code match
+  it must UPDATE `consumed_at = NOW()` and return `Ok`; on a code mismatch it must UPDATE `attempts = attempts + 1
+  RETURNING attempts` (never a stale read), and when the returned `attempts >= 5` it must DELETE the row.
+- **SPEC-5.54**: An absent, expired, or over-limit challenge in `verify_login_approval` must return
+  `Unauthorized`.
+- **SPEC-5.55**: The suspicious-login gate in `AuthService::login` must run AFTER password and MFA verification, so
+  a flagged sign-in is first authenticated; when `login_approval_enabled` is true and the assessment is
+  `suspicious`, a missing `approval_code` must cause `issue_login_approval` and return a `LoginResponse` with
+  `approval_required: true` and empty tokens, while a present `approval_code` must be checked via
+  `verify_login_approval`.
+
+### 5.8 Login-location alerts
+
+- **SPEC-5.56**: `check_login_location` must no-op when any of these holds: `geoip` is `None`, the IP is
+  unparseable, the IP is non-public per `utils::net::is_non_public_ip`, or geoip resolution fails; none of these
+  paths must raise a login-time error.
+- **SPEC-5.57**: `login_location_decision(previous, current)` must return `Record` when there is no previous
+  country, `Unchanged` when the previous and current strings are equal, and `Alert` for any other difference; the
+  first geolocatable login must record silently (no email).
+- **SPEC-5.58**: A `country_change` alert email must be sent on a detached `tokio::spawn`, via the direct
+  `mailer` (not the notifications dispatcher, because no template is seeded for this event), with no retry; a
+  slow or failing SMTP must never add latency to or fail the login.
+- **SPEC-5.59**: The alert email must only be sent when both `user.login_location_alerts` is true AND
+  `self.sends_local_account_email()` is true; the country must be persisted via `set_last_login_country` in the
+  same code path whether or not the email is suppressed.
+
+### 5.9 Per-request active principal gate and session lifecycle
+
+- **SPEC-5.60**: `ensure_user_and_tenant_active(tenant_id, user_id, token_iat, session_id)` must load the user via
+  `get_user_by_id` (missing or tombstoned returns `NotFound`), require `status == Active` (else
+  `Forbidden("Account is not active")`), call `ensure_tenant_active(user.tenant_id)`, verify
+  `session_is_live(tenant_id, session_id)` (else `Forbidden("Session has been signed out")`), and when
+  `user.password_changed_at.is_some() && token_iat < that.timestamp()` return `Unauthorized` (401, not 403, so the
+  SPA's refresh-and-retry kicks in on a post-password-change token).
+- **SPEC-5.61**: `session_is_live(tenant_id, session_id)` must run under `begin_with_tenant` because `user_sessions`
+  is RLS-covered and must return `EXISTS WHERE id=$1 AND tenant_id=$2 AND expires_at > NOW()`.
+- **SPEC-5.62**: `ensure_tenant_active(tenant_id)` must LEFT JOIN `tenants` with `tenant_membership_entitlements`
+  (both RLS-exempt) in a single statement on `.pool()`, and must return `Forbidden("This organization is not
+  active")` for any of these three cases: `tenants` row absent, `tenants.status != 'active'`, or the entitlement
+  row is `suspended` or has `expires_at < NOW()`; an `unknown` or NULL entitlement must pass. All three failure
+  branches must return identical copy so billing vs operator lifecycle are not distinguishable to the caller.
+- **SPEC-5.63**: `set_tenant_entitlement(tenant_id, status, expires_at, reason)` must UPSERT
+  `tenant_membership_entitlements` on the migrator pool (RLS-exempt), rejecting any `status` not in
+  `{"active","suspended","unknown"}`.
+- **SPEC-5.64**: `create_session(tenant_id, user_id, ip, ua, remember_me)` must mint a new UUID, set
+  `token_hash = sha256_hex(generate_token(32))` (defence in depth, not a credential), and set
+  `expires_at = NOW() + 30 days` when `remember_me == true`, else `+7 days`.
+- **SPEC-5.65**: `generate_tokens(user, session_id)` must set `iat = nbf = now`, access `exp = now + 1 hour`,
+  refresh `exp = now + 7 days`, must stamp `iss = MOKOSH_JWT_ISSUER` and `aud = MOKOSH_JWT_AUDIENCE` on both
+  tokens, must set `typ = "access"` and `typ = "refresh"` respectively, must thread `sid` from the session row,
+  and must resolve `mid` via `MembershipRepo::find_id_by_email_and_tenant` on the migrator pool (a `None`
+  resolution is tolerated so bootstrap paths keep working); encoding must be HS256.
+- **SPEC-5.66**: `decode_token(token)` must set `Algorithm::HS256` explicitly (never any other algorithm), set
+  `validate_exp = true`, set `validate_aud = false` (deferred strict validation per MAPPS-334), and allow a
+  30-second leeway.
+- **SPEC-5.67**: `refresh_token(refresh_token)` must require `claims.typ == "refresh"` (else `Unauthorized`), find a
+  live session row via `get_session(claims.tid, claims.sid)` (else `Unauthorized`), load the user and reject a
+  non-`Active` status with `Forbidden`, call `ensure_tenant_active`, and then mint new tokens with the SAME `sid`
+  as the refresh token carried (refresh reuses, does not rotate); it must update `last_activity_at` on the
+  session row.
+- **SPEC-5.68**: `logout(session_id)` must DELETE a single row from `user_sessions` by primary key on the
+  migrator pool (an unguessable session id makes the single-row blast radius acceptable);
+  `logout_all(tenant_id, user_id)` must DELETE every `user_sessions` row for the user under
+  `begin_with_tenant`.
+- **SPEC-5.69**: `POST /logout` must call `AuthService::logout(claims.sid)` only when the bearer decodes; a
+  missing or undecodable bearer must silently skip the DELETE but still run the audit row; both paths must
+  return 200.
+- **SPEC-5.70**: `POST /logout` and `POST /logout-all` must write their audit rows on their own tenant-scoped
+  transactions (PMS-256), so RLS is satisfied; an audit commit failure must be logged (`error` on logout, `warn`
+  on logout-all) but must not fail the response.
+- **SPEC-5.71**: `POST /switch-tenant/{tenant_id}` must require `RequireAuthState` and must verify the target tenant
+  is in the caller's `AuthState.memberships` (the enriched middleware pass populated it); a missing match must
+  return `NotFound("No active membership in the requested tenant")`; a missing `auth_state.user` must return
+  `Unauthorized`; a verified membership must mint a new scoped session via `mint_session_for_membership`.
+- **SPEC-5.72**: `GET /me/sessions` must call `pagination.reject_unsupported_sort()` first, best-effort decode the
+  bearer to obtain `current_session_id` (defaulting to `Uuid::nil()` when the bearer is absent or malformed), and
+  return a paginated `PaginatedResponse<SessionInfo>` where `is_current = (row.id == current_session_id)`.
+- **SPEC-5.73**: `DELETE /me/sessions/{session_id}` must delegate to `AuthService::delete_session(user.id,
+  session_id)` on the migrator pool and must return 200 even when the row was absent (there is no 404 surface).
+
+### 5.10 Password lifecycle
+
+- **SPEC-5.74**: `request_password_reset(tenant_hint, email)` must refuse with `sso_only_rejection()` before any
+  user lookup when the deployment is SSO-only, so a known and unknown address are not distinguishable in that
+  mode; in other modes it must silently return `Ok(())` when the email is unknown (anti-enumeration).
+- **SPEC-5.75**: `request_password_reset` must generate a 64-character secret, store both a dual hash set
+  (`token_hash = argon2(secret)` and `lookup_hash = sha256_hex(secret)` per PMS-1244, so only one Argon2 verify
+  runs per attempt), compose the token as `{user_id}.{secret}`, set `expires_at = NOW() + 24 hours`, INSERT into
+  `password_reset_tokens` under `begin_with_tenant(user.tenant_id)`, and dispatch the `"auth.password_reset"`
+  notification template via the notifications dispatcher; a missing dispatcher must log at `warn` without a
+  direct-send fallback (body copy lives in the template, per PMS-700).
+- **SPEC-5.76**: `GET /set-password/context/{token}` must return `{tenant_name, tenant_slug}` for a valid
+  unredeemed unexpired token and must return `NotFound("token")` for every failure mode (invalid shape, unknown
+  lookup, expired, redeemed, Argon2 mismatch) so token enumeration is not possible. The handler must not mark
+  the token as used.
+- **SPEC-5.77**: `reset_password(request)` must refuse with `sso_only_rejection()` first, reject a mismatch
+  between `new_password` and `confirm_password` with a validation error on `confirm_password`, parse the
+  user-bound token (bad shape returns `BadRequest("Invalid or expired reset token")`), SELECT
+  `(tenant_id, token_hash)` on the migrator pool filtered by `(user_id, lookup_hash, used_at IS NULL, expires_at >
+  NOW())`, verify via `verify_password_or_dummy` to preserve timing (the verification error must be logged at
+  `warn` and treated as invalid per PMS-1577), and on success UPDATE `users` with the new hash,
+  `status = 'active'`, `password_changed_at = NOW()`, mark every unused reset token for the user used, and
+  DELETE every `user_sessions` row for the user, all in ONE transaction under `begin_with_tenant` (PMS-681
+  fail-closed: a session-revoke failure must roll the password change back).
+- **SPEC-5.78**: `reset_password` and `change_password` must both set the session-local GUC
+  `app.skip_users_identity_mirror = on` inside their transaction, as a belt-and-braces guard against the
+  users-to-identities mirror trigger firing on these specific writes (MAPPS-548).
+- **SPEC-5.79**: `change_password(tenant_id, user_id, request, ctx)` must refuse with `Forbidden("This account
+  has no local password set")` when the loaded `password_hash` is NULL (a bunyip-only user; PMS-1236), return a
+  validation error on `current_password` ("current password is incorrect") when the current password does not
+  verify, and otherwise UPDATE the password hash, stamp `password_changed_at = NOW()`, and DELETE every
+  `user_sessions` row for the user in the same transaction.
+- **SPEC-5.80**: `PUT /me/password` must run the reauth limiter check by `(client_ip, user.id)` before the
+  service call, must return 429 + `"Too many failed password attempts, please try again later"` over quota, and
+  on a service error must record the failure against the reauth limiter only when the error is a validation
+  failure on field `current_password`; other error shapes (validation on the new password, DB failure) must not
+  spend limiter budget.
+
+### 5.11 User CRUD and directory
+
+- **SPEC-5.81**: `GET /me` must call `AuthService::get_user_by_id(user.tenant_id, user.id)` and project the row to
+  `UserResponse`. `PUT /me` must set both `request.role` and `request.status` to `None` before calling
+  `AuthService::update_user` so a caller cannot change their own role or status through `/me`.
+- **SPEC-5.82**: `GET /memberships` must be a pure projection over `AuthState.memberships` populated by the
+  middleware's enrich pass (MAPPS-491 phase 2); the handler must not make a database query.
+- **SPEC-5.83**: `POST /me/complete-onboarding` must accept an empty body (`Option<Json<_>>`) and delegate to
+  `AuthService::mark_profile_completed(tenant_id, user_id, first_name, last_name)`; the service UPDATE must be
+  gated on `profile_completed_at IS NULL` for the name writes (first completion wins the names, so a replay
+  cannot overwrite an IdP-authoritative value) and must stamp `profile_completed_at = COALESCE(profile_completed_at,
+  NOW())` so the timestamp is idempotent.
+- **SPEC-5.84**: `POST /users` must require `user.role.is_admin()` (else `Forbidden("You do not have permission to
+  do that")`) and `user.role.can_grant(request.role)` (else `Forbidden("Cannot create a user with a role above
+  your own")`, PMS-503 ceiling); it must then validate the body and call `AuthService::create_user`.
+- **SPEC-5.85**: `AuthService::create_user(tenant_id, request, ctx)` must run an EXISTS check on
+  `(tenant_id, email)` before insert and return `conflict("A user with this email already exists")` on a hit; it
+  must INSERT with `status = 'pending'`; it must capture the audit `after` snapshot with the password hash and
+  MFA secret stripped (`to_jsonb(t) - 'password_hash' - 'mfa_secret'`) and write an `AuditAction::Create` row via
+  `audit_write`; when `send_welcome_email && !sends_local_account_email()` it must suppress the welcome mail and
+  log at `info` (PMS-904); when `send_welcome_email && sends_local_account_email()` it must mint a user-bound
+  welcome token (7-day expiry), persist it in `password_reset_tokens`, and dispatch the `"auth.welcome"`
+  notification template (no dispatcher must log at `warn` and persist the token without mailing).
+- **SPEC-5.86**: `GET /users/{user_id}` must permit the request when the caller is admin OR
+  `caller.id == user_id`, else return `Forbidden("You do not have permission to do that")`; the service must bind
+  both `id` and `tenant_id` so a cross-tenant `user_id` returns `NotFound("User")`, not a leak.
+- **SPEC-5.87**: `PUT /users/{user_id}` must require `caller.role.is_admin()` (else `Forbidden("You do not have
+  permission to do that")`); when `request.role` is `Some`, `caller.role.can_grant(role)` must hold (else
+  `Forbidden("Cannot create a user with a role above your own")`, PMS-625 mirror of the create-side ceiling); the
+  role check must run before body validation.
+- **SPEC-5.88**: `update_user(tenant_id, user_id, request, ctx)` must build the UPDATE dynamically from the
+  Option fields; the settable set must be exactly `email`, `mobile`, `title`, `role`, `status`, `timezone`,
+  `date_format_string`, `theme_base_mode`, `theme_accent_id`, `login_location_alerts`. `first_name`, `last_name`
+  and `phone` must not be writable here (PMS-512: bunyip owns names, phone has no mokosh-side source yet). An
+  empty update must no-op and return the current user; the service must capture before and after snapshots with
+  secret columns stripped and write one `AuditAction::Update` audit row.
+- **SPEC-5.89**: `GET /directory` must be gated on `RequireAuth` (not `RequireManager`); any authenticated user of
+  the tenant may read it. `list_directory` must SELECT `id, COALESCE(NULLIF(TRIM(first_name||' '||last_name),''),
+  'Unnamed User') AS name, LOWER(split_part(email,'@',1)) AS handle FROM users WHERE tenant_id = $1 AND
+  status = 'active' ORDER BY name, id`; the email itself must never enter the response. The handler must call
+  `log_unresolved_person_names("auth.directory", &unresolved_ids)` for any row whose name resolved to
+  `"Unnamed User"`.
+- **SPEC-5.90**: `GET /users` must be gated on `RequireManager` and must call `list_users(tenant_id, filter,
+  pagination)`, which must exclude rows whose email matches `system+%@mokosh.local` (MAPPS-562 - hides the
+  auto-provisioned system attribution user) and must support optional `q` (ILIKE across email, first_name,
+  last_name), `role` and `status` filters; the response must be the broader `UserResponse` projection.
+
+### 5.12 Personal API keys
+
+- **SPEC-5.91**: `AuthService::create_api_key(tenant_id, user_id, request, ctx)` must mint a raw key of exactly 44
+  characters (`psa_` prefix plus 40 alphanumeric), store `key_prefix` as the first 10 characters and
+  `key_hash = argon2(raw)`, default `scopes` to `["*"]` when absent, INSERT into `api_keys` with
+  `is_active = TRUE`, write an `AuditAction::Create` audit row with the `key_hash` column stripped from the
+  snapshot, and return the raw key in the response exactly once.
+- **SPEC-5.92**: `list_api_keys(tenant_id, user_id, pagination)` must run under tenant GUC and must exclude the
+  `key_hash` column from its row type and response.
+- **SPEC-5.93**: `revoke_api_key(tenant_id, user_id, key_id)` must DELETE the row matched by
+  `(id = $key_id AND tenant_id = $tenant_id AND user_id = $user_id)` and must return `NotFound("API key")` when
+  zero rows were affected.
+
+### 5.13 Identity-first login path
+
+- **SPEC-5.94**: `authenticate_identity_first(request, ip, ua)` must resolve the identity via
+  `IdentityRepo::find_by_email` on the migrator pool, list every active membership for the identity via
+  `MembershipRepo::list_views_for_identity`, and verify the password either against `identities.password_hash`
+  (when the identity holds zero memberships, so no per-tenant users row exists yet) or against each matching
+  `users.password_hash` under each membership's tenant; a verification error must be logged at `warn` and
+  treated as a mismatch (PMS-1577), and an empty match set must return `Unauthorized`.
+- **SPEC-5.95**: When `identity.mfa_enabled` is true, `authenticate_identity_first` must require an `mfa_code` or
+  must return `LoginResponse { mfa_required: true, ... }` with empty tokens and no user; it must decrypt
+  `identities.mfa_secret` via `mfa_secret::open` (PMS-1055 - same ciphertext as the users plane), verify the
+  code with a +/-1 step window, and on verify call `IdentityRepo::record_identity_mfa_success(id, step)` whose
+  CAS semantics must refuse a replay with `Unauthorized`.
+- **SPEC-5.96**: `authenticate_identity_first` must branch on the resolved membership set: zero memberships must
+  mint an identity token and return `needs_setup: true`; exactly one matched membership must call
+  `ensure_principal_usable`, run `check_login_approval`, and delegate to `mint_session_for_user`; more than one
+  matched membership must mint an identity token and return `needs_selection: true` with
+  `memberships: Some(matched)` in the response.
+- **SPEC-5.97**: `mint_identity_token(identity_id, email)` must produce a 5-minute token with `typ = "identity"`,
+  `tid = Uuid::nil()`, `sid = Uuid::nil()`, `mid = None`, and a placeholder role; `decode_identity_token(token)`
+  must return `Unauthorized` on any decode error or on a `typ` other than `"identity"`.
+- **SPEC-5.98**: `select_tenant_for_identity(identity_token, tenant_id, ip, ua)` must decode the identity token,
+  look up the membership via `MembershipRepo::find(identity_id, tenant_id)` (missing returns `NotFound("Membership
+  in this tenant")`, not-active returns `NotFound("Membership is not active")`), and delegate to
+  `mint_session_for_membership`.
+
+### 5.14 Static-analysis guards in the test module
+
+- **SPEC-5.99**: `service.rs`'s test module must carry a source-scan test
+  (`local_password_auth_closes_only_when_a_working_alternative_exists`) pinning the four-cell truth table of
+  `(deployment_mode, sso_mounted)`: only `(Saas, true)` may close local password auth. A second source-scan test
+  (`attempt_counters_are_incremented_in_sql`) must fail if the pre-PMS-693 shapes `"SET mfa_failed_attempts = $"`,
+  `"SET portal_failed_login_count = $"`, or `"SET attempts = $"` re-enter `service.rs`, and must fail if the
+  historical `register_failed_mfa` / `register_failed_login` signatures reappear. A third test
+  (`routes_do_not_reach_global_login_helpers`) must assert that `routes.rs` does not call the migrator-pool
+  cross-tenant helpers `find_user_placement`, `find_bunyip_principal` or `find_bunyip_principal_in_tenant`; and a
+  fourth (`mirror_direction::no_writer_takes_the_identity_row_before_the_users_row`, PMS-1120) must source-scan
+  the whole `src/` tree for `UPDATE identities` statements that touch mirrored columns and either require them to
+  be inside `write_mfa_enabled` or `write_mfa_secret`, or require a preceding `UPDATE users` in the same
+  function.
 
 ## 6. Configuration
 
