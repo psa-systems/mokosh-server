@@ -63,6 +63,7 @@ pub(crate) fn default_true() -> bool {
 /// communicate "clear this FK". The first consumer is the asset_id
 /// field on UpdateTicketRequest; future PATCH-style nullable FKs should
 /// follow the same pattern.
+// SPEC-4.83: absent means leave alone, null means clear, a value means set.
 pub fn deserialize_double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
 where
     T: serde::de::Deserialize<'de>,

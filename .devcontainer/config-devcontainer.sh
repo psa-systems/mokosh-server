@@ -7,6 +7,7 @@
 # https://containers.dev/implementors/json_reference/
 # This is run as root.
 
+# SPEC-10.145
 # Add the user to the host's docker group
 sudoIf() { if [ "$(id -u)" -ne 0 ]; then sudo "$@"; else "$@"; fi }
 NONROOT_USER=dev
@@ -28,6 +29,7 @@ fi
 #   XDG_CACHE_HOME
 #   XDG_CONFIG_HOME
 #   XDG_DATA_HOME
+# SPEC-10.146
 if [[ -d /.jbdevcontainer/ ]]
 then
 
@@ -100,6 +102,7 @@ then
 
 fi
 
+# SPEC-10.147
 if which bun 2>/dev/null
 then
 

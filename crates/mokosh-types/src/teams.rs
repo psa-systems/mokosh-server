@@ -96,6 +96,7 @@ pub struct UpdateTeamRequest {
     pub is_active: Option<bool>,
 }
 
+// SPEC-4.83: absent means leave alone, null means clear, a value means set.
 fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,

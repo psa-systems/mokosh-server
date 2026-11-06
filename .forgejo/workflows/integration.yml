@@ -41,6 +41,7 @@
 
 name: Integration
 
+# SPEC-10.12: pull_request into main only, never push; three jobs (build, test, summary)
 on:
   # PMS-1634: integration tests read no Markdown and no `docs/` file, so a
   # pull request touching only those paths cannot regress what this suite
@@ -70,6 +71,7 @@ jobs:
     # Dev label: `cargo nextest archive` compiles natively on the runner, and
     # only the dev image ships the C toolchain + OpenSSL headers that needs
     # (PMS-705).
+    # SPEC-10.13
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
 
     # Placeholder (PMS-1253): the first three green sharded runs after this
@@ -77,10 +79,16 @@ jobs:
     # the summary; replace each `timeout-minutes` with 1.5x the longest
     # observed value rounded up to 5 minutes, and record the measurements in
     # the per-job comment. The historical unsharded build step took 111-731s
-    # (`7959c0e1`'s own data), so this bound covers the cold case with
-    # headroom until the measured value lands.
-    timeout-minutes: 25
+    # (`7959c0e1`'s own data). PR 1276's run 11780 lost 18 min to a failed
+    # cache-restore tar (exit 2) before compilation even started, hit the
+    # 25m ceiling before mokosh-server finished, and died on dind context
+    # deadline exceeded during cleanup. 45 absorbs a cold rebuild on top of
+    # a failed cache restore when the HEAVY runner is loaded; the common
+    # cache-hit path still finishes in 5-10 min.
+    # SPEC-10.13
+    timeout-minutes: 45
 
+    # SPEC-10.13
     env:
       SQLX_OFFLINE: "true"
       RUST_BACKTRACE: 1
@@ -90,6 +98,7 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v5
 
       - name: Require disk headroom for the link step
+        # SPEC-10.14: exit 1 with ::error:: when free space is under 25G
         # PMS-740: the archive step used to link one debug binary per
         # `tests/*.rs` suite. When the runner filesystem fills mid-write,
         # `rust-lld` writes its output through an mmap and takes SIGBUS
@@ -115,6 +124,7 @@ jobs:
           fi
 
       - name: Cache Rust build
+        # SPEC-10.15
         # PMS-1252: `shared-key` MUST match `cache-warm.yml`'s
         # warm-integration job so a pull-request run restores what the
         # post-merge warm saved. The key lands in rust-cache's key
@@ -147,6 +157,7 @@ jobs:
         # here matches `cache-warm.yml`'s install step; bump both together
         # when upgrading nextest, otherwise the warm cache the pull-request
         # job restores was built against a different binary.
+        # SPEC-10.16
         env:
           NEXTEST_VERSION: "0.9.145"
           NEXTEST_SHA256: "32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867"
@@ -165,6 +176,7 @@ jobs:
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
       - name: Build the integration test archive
+        # SPEC-10.17: disk sampler must never change the step's propagated exit status
         # PMS-1177: `cargo nextest archive` compiles every `tests/*.rs`
         # binary plus the lib unit tests BEFORE the timed step, the same
         # reason PMS-1100 split the compile out of the timed step in the
@@ -199,6 +211,7 @@ jobs:
           exit "${status}"
 
       - name: Upload the nextest archive
+        # SPEC-10.18
         # Each shard downloads this with `forgejo/download-artifact@v4` and
         # runs it with `--archive-file`, so no shard recompiles the test
         # binaries. `retention-days: 1` is enough: the artifact is useful
@@ -225,9 +238,16 @@ jobs:
     # one; the 8-CPU runner timed out at 30m before the archive step split
     # (`#6274`). At N=3 each shard runs ~1/3 of the cases on an independent
     # Postgres, so this bound is a cautious cold-start cover until the first
-    # three sharded runs supply the real number.
-    timeout-minutes: 20
+    # three sharded runs supply the real number. 30 rather than 20 absorbs
+    # the DB-heavy shard (shard 2's bill_payments / billing suites run at
+    # ~40-50s per test when the HEAVY runner is loaded and nextest's threads
+    # are capped at 8 for the Postgres connection budget): 1074 tests / 8
+    # parallel * 2s average fits well inside 30m, with headroom for a slow
+    # shard composition.
+    # SPEC-10.19
+    timeout-minutes: 30
 
+    # SPEC-10.19
     strategy:
       # Every shard still runs after one fails, so a slow case does not hide
       # a different one in a different shard. The summary job folds the
@@ -242,6 +262,7 @@ jobs:
         # service. The template every case clones (PMS-1254) is built once
         # per shard inside the suite's own advisory lock, idempotent across
         # the three shards and across runs.
+        # SPEC-10.19
         image: postgres:18.2-alpine3.23
         env:
           POSTGRES_PASSWORD: postgres
@@ -269,6 +290,8 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v5
 
       - name: Download the nextest archive
+        # SPEC-10.20: each shard downloads the archive before installing
+        # nextest, creating DB roles and running its own partition.
         uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           name: nextest-archive
@@ -405,11 +428,13 @@ jobs:
     # label stays uniform across this file for the file-wide
     # `check-runner-labels` guard that reads any `cargo ` line anywhere
     # as a requirement for every job's label (PMS-705).
+    # SPEC-10.21
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
     timeout-minutes: 5
 
     steps:
       - name: Fail if any shard failed
+        # SPEC-10.21
         # Reads the matrix job's aggregate result; `success` is the only
         # value that lets the summary pass. A cancelled or skipped shard
         # fails the workflow, same as the single-job gate did.

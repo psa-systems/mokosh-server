@@ -14,6 +14,7 @@ pub const RECOVERY_CODE_BYTES: usize = 10;
 /// full 16 chars preserves the 80 bits of entropy (PMS-188: the previous
 /// code kept only the first 10 chars, delivering just 50 bits despite the
 /// 80-bit comment).
+// SPEC-4.21: 16 base32 chars kept (80 bits), formatted XXXXXXXX-XXXXXXXX.
 pub fn generate_code() -> String {
     let mut bytes = [0u8; RECOVERY_CODE_BYTES];
     rand::rng().fill_bytes(&mut bytes);
@@ -28,6 +29,7 @@ pub fn generate_set() -> Vec<String> {
 /// Strip whitespace and hyphens, uppercase. Used by both generation and
 /// verification so `"abcde-fghij"`, `"ABCDE-FGHIJ"`, `"abcdefghij"`, and
 /// `"abc de-fg hij"` all canonicalize to the same byte string.
+// SPEC-4.21: strip whitespace/hyphens and uppercase so equivalent spellings match.
 pub fn canonicalize(code: &str) -> String {
     code.chars()
         .filter(|c| !c.is_ascii_whitespace() && *c != '-')

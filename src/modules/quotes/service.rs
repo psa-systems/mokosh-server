@@ -574,6 +574,28 @@ impl QuotesService {
                     next.as_str()
                 )));
             }
+            // PMS-1624: one authority at a time. A quote under a staff
+            // approval chain is approved by that chain, so "Mark approved"
+            // is refused while a decision is outstanding; otherwise the two
+            // race and whichever landed second would be silently ignored.
+            //
+            // Only `approved`. A manual `rejected` is the same answer a veto
+            // gives, so it creates no conflicting claim, and refusing it
+            // would strand a quote whose named approver has gone on leave.
+            if next == QuoteStatus::Approved
+                && super::approval_sync::has_pending_staff_approval(
+                    &mut tx,
+                    tenant_id.get(),
+                    quote_id,
+                )
+                .await?
+            {
+                return Err(AppError::Conflict(
+                    "This quote is waiting on an approval; approve it from the approvals queue, \
+                     or cancel the approval to decide it here"
+                        .to_string(),
+                ));
+            }
         }
 
         // PMS-1000: the same rule the create path applies. Validating against
@@ -1892,7 +1914,15 @@ mod tests {
         QuoteStatus::Cancelled,
     ];
 
-    /// PMS-1573: who writes each status, exhaustively.
+    /// PMS-1573: which route accepts each status, exhaustively.
+    ///
+    /// PMS-1624 added a second writer for the internal three that is not a
+    /// route: a decision on a staff-addressed approval moves `submitted` /
+    /// `approved` / `rejected` through `quotes::approval_sync`. This table
+    /// stays about what `PUT /quotes/{id}` accepts, which is what
+    /// `is_staff_settable` answers and what the agreement test below pins,
+    /// so `StaffUpdate` means "this route takes it" and not "only this
+    /// route writes it".
     ///
     /// The ticket behind this reported that a quote can never reach
     /// `approved`, on the evidence that no statement in `src/` writes the

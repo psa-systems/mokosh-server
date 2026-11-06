@@ -24,6 +24,7 @@ export const API_V1 = '/api/v1';
 // once, named after the server constant it has to match; a unit test in
 // `src/utils/pagination.rs` fails the build if any `per_page` literal under
 // `e2e/` exceeds it, so the two cannot drift apart again in silence.
+// SPEC-10.215: must match PaginationParams::MAX_PER_PAGE in src/utils/pagination.rs.
 export const MAX_PER_PAGE = 100;
 
 export const routes = {

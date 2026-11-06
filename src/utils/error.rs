@@ -288,6 +288,7 @@ impl AppError {
     }
 
     /// Get the HTTP status code for this error
+    // SPEC-4.53: one fixed HTTP status per variant.
     pub fn status_code(&self) -> u16 {
         match self {
             Self::Unauthorized => 401,
@@ -315,6 +316,7 @@ impl AppError {
     }
 
     /// Get the error code for API responses
+    // SPEC-4.53: one fixed machine code per variant.
     pub fn error_code(&self) -> &'static str {
         match self {
             Self::Unauthorized => "UNAUTHORIZED",
@@ -358,6 +360,7 @@ pub struct ErrorDetail {
     pub errors: Option<Vec<FieldError>>,
 }
 
+// SPEC-4.54: Database always renders the fixed generic message; errors[] only on Validation/QueryError.
 impl From<AppError> for ErrorResponse {
     fn from(error: AppError) -> Self {
         let errors = match &error {
@@ -427,6 +430,7 @@ mod server_impl {
     /// genuinely does not know when the window lifts.
     const DEFAULT_RATE_LIMIT_RETRY_AFTER_SECONDS: u64 = 60;
 
+    // SPEC-4.55: every RateLimited value renders through rate_limited_response.
     impl IntoResponse for AppError {
         fn into_response(self) -> Response {
             // PMS-1203: every `RateLimited` error renders through
@@ -500,6 +504,7 @@ mod server_impl {
     /// returned to a client (PMS-298). Responses that are already JSON (every
     /// `AppError`, including structured validation errors) pass through
     /// untouched.
+    // SPEC-4.56: rewrite a non-JSON 4xx into the canonical envelope; leave all else unchanged.
     pub async fn normalize_error_envelope(
         request: axum::extract::Request,
         next: axum::middleware::Next,
@@ -523,6 +528,7 @@ mod server_impl {
         (status, Json(envelope_for_rejection(status))).into_response()
     }
 
+    // SPEC-4.57: RowNotFound -> NotFound; 23505 -> Conflict; else Database, logged at error.
     impl From<sqlx::Error> for AppError {
         fn from(err: sqlx::Error) -> Self {
             match err {
@@ -680,6 +686,7 @@ fn cross_field_target(error: &validator::ValidationError) -> Option<String> {
         .map(str::to_string)
 }
 
+// SPEC-4.58: flatten nested errors to dotted paths, re-key cross-field targets, humanize messages.
 impl From<validator::ValidationErrors> for AppError {
     fn from(errors: validator::ValidationErrors) -> Self {
         let mut field_errors = Vec::new();

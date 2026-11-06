@@ -34,6 +34,7 @@
 
 name: Cache warm
 
+# SPEC-10.47: push: main only, no assertion-bearing test runs in either job
 on:
   push:
     branches:
@@ -64,6 +65,7 @@ jobs:
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
       - name: Cache Rust build
+        # SPEC-10.48: this shared-key MUST equal check.yml's
         # `shared-key` MUST match check.yml's pull-request job. Both
         # land in the key as the `-check-` segment; the restore key
         # printed by a pull-request run must equal the key this run
@@ -74,6 +76,8 @@ jobs:
           cache-on-failure: true
 
       - name: Compile what check.yml compiles
+        # SPEC-10.47
+
         # Build the profile fingerprints check.yml's job builds (clippy's
         # lint-flagged dev, lib test-no-run) plus actually run the doc tests.
         # The lib tests stay compile-only; the doc tests cannot, Cargo rejects
@@ -115,6 +119,7 @@ jobs:
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
       - name: Cache Rust build
+        # SPEC-10.48: this shared-key MUST equal integration.yml's
         # `shared-key` MUST match integration.yml's pull-request job.
         uses: https://github.com/Swatinem/rust-cache@v2
         with:
@@ -153,6 +158,7 @@ jobs:
           tar --extract --gzip --file /tmp/nextest.tar.gz --directory "${cargo_bin}"
 
       - name: Archive what integration.yml archives
+        # SPEC-10.47
         # Same command the pull-request job uses, writing to a scratch
         # path. The archive itself is discarded; this step exists to
         # fill the build cache with the test-binary fingerprints the

@@ -125,7 +125,7 @@ If `/api/v1/ready` answers `503` with `checks.db` carrying an error string, the 
 
 ## 6. Create a dev admin (optional)
 
-`.env` ships `ADMIN_EMAIL` / `ADMIN_PASSWORD` empty, so a fresh stack has no user accounts and nothing to log in as. Set both and restart; the server creates one `super_admin` under the default tenant on the next boot, and only while the `users` table is still empty.
+`.env` ships `ADMIN_EMAIL` / `ADMIN_PASSWORD` empty, so a fresh stack has no platform admin account and nothing to log in as. Set both and restart; the server creates one `platform_admins` row on the next boot, and only while that table is still empty.
 
 ```nu
 "ADMIN_EMAIL=you@example.com\nADMIN_PASSWORD=at-least-12-characters\n" | save --append .env
@@ -137,15 +137,14 @@ Then log in against your own values:
 
 ```nu
 let api = $"https://(^whoami | str trim)-mokosh-api.a8n.run"
-http post --content-type application/json $"($api)/api/v1/auth/login" {
+http post --content-type application/json $"($api)/platform/login" {
   email: "you@example.com",
   password: "at-least-12-characters"
 }
-# expect: access_token, refresh_token, expires_at, mfa_required: false,
-# and user.role = "super_admin"
+# expect: access_token, expires_at, admin
 ```
 
-DEV ONLY. Once any user exists these two variables are ignored, so it is safe to leave them in `.env`.
+DEV ONLY. Once any platform admin exists these two variables are ignored, so it is safe to leave them in `.env`.
 
 ## 7. Bootstrap Infisical (optional, one-time)
 

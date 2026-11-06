@@ -853,6 +853,21 @@ mod tests {
         assert!(html.contains("max-width:64rem"));
     }
 
+    /// PMS-1629: the body's `color-scheme: light dark` makes a dark browser
+    /// paint a near-black canvas, so the embedded `style.css` rules that set
+    /// a `color` or `background` must pair a dark-mode value with
+    /// `light-dark()`, not a fixed light-mode one, or they go unreadable
+    /// once the body itself goes dark.
+    #[test]
+    fn html_pairs_style_css_colors_for_dark_mode() {
+        let html = renderer_html::render_html(&collect());
+        assert!(html.contains("background-color:light-dark(#fff,#121212)"));
+        assert!(html.contains(".muted { color: light-dark(#777, #aaa)"));
+        assert!(html.contains(".state-unchanged { color: light-dark(#2a662a, #6fcf6f)"));
+        assert!(html.contains(".state-diverged { color: light-dark(#a33, #ff6b6b)"));
+        assert!(html.contains("th { background: light-dark(#f5f5f5, #1e1e1e)"));
+    }
+
     /// HTML: values that look like they could be interpreted as markup are
     /// escaped. A provider name of `<script>alert(1)</script>` should not
     /// reach the page as a raw tag.

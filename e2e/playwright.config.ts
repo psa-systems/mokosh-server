@@ -6,24 +6,30 @@ import { env } from './lib/env';
 export default defineConfig({
   testDir: './tests',
   // Teardown deletes this run's records and sweeps stale residue.
+  // SPEC-10.201: globalTeardown runs after every run regardless of outcome.
   globalTeardown: './global.teardown.ts',
   // Serial: tests share one E2E tenant + bearer token; parallel mutation
   // invites cross-test interference during this stabilisation phase.
+  // SPEC-10.200: fullyParallel false, workers 1, forbidOnly/retries CI-only.
   fullyParallel: false,
   workers: 1,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
+  // SPEC-10.201: 60000ms global timeout, 15000ms expect timeout.
   timeout: 60_000,
   expect: { timeout: 15_000 },
+  // SPEC-10.201: list plus html (never auto-opened).
   reporter: [['list'], ['html', { open: 'never' }]],
   // No top-level baseURL: SPA vs API have different hosts on the canonical
   // deployment (msp.a8n.systems vs api.msp.a8n.systems). Each project picks
   // the right one in its own `use:` block.
+  // SPEC-10.202: trace/screenshot/video each retained or captured on failure only.
   use: {
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
   },
+  // SPEC-10.203: project dependency graph and per-project baseURL/apiBaseURL split.
   projects: [
     // 0. Aggregate-all-missing env-var check. Runs before everything else so
     //    a misconfigured CI names every gap in one round trip instead of

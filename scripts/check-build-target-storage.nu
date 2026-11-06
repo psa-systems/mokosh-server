@@ -31,7 +31,7 @@ const MEMORY_BACKED = ["tmpfs" "ramfs"]
 # guards. It warns rather than failing so the reason stays visible in the log.
 const ALLOW_VAR = "MOKOSH_ALLOW_TMPFS_TARGET"
 
-# Resolve the target directory the way cargo does, highest precedence first:
+# SPEC-10.184: resolves the target directory in cargo's own precedence order.
 # `CARGO_TARGET_DIR`, then `CARGO_BUILD_TARGET_DIR` (the environment form of
 # `build.target-dir`), then `build.target-dir` from the nearest config file, then
 # the default `<workspace root>/target`. Returns the path and how it was chosen,
@@ -102,6 +102,7 @@ def main [] {
     print $"  chosen by:      ($resolved.source)"
     print $"  filesystem:     ($fs.fstype) \(probed at ($fs.probed))"
 
+    # SPEC-10.184: exit 1 on tmpfs/ramfs unless MOKOSH_ALLOW_TMPFS_TARGET is set.
     if ($fs.fstype not-in $MEMORY_BACKED) {
         print $"Build target storage OK: ($fs.fstype) is disk-backed, so build artifacts do not spend memory"
         return

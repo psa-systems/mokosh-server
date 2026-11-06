@@ -23,6 +23,7 @@ use chrono_tz::Tz;
 /// predictable default. The preference is validated on write
 /// (`mokosh_types::contacts` / the auth profile update), so a bad value here
 /// is a defensive backstop, not the expected path.
+// SPEC-4.82: falls back to UTC when the zone string is empty or does not parse.
 pub fn resolve_tz(user_tz: &str) -> Tz {
     user_tz.parse::<Tz>().unwrap_or(chrono_tz::UTC)
 }
@@ -43,6 +44,7 @@ pub fn canonical_tz_name(user_tz: &str) -> &'static str {
 /// This is the one helper every in-memory date-bucket call site uses. A
 /// 2026-06-15 23:30 `America/Los_Angeles` instant (2026-06-16 06:30 UTC)
 /// buckets to 2026-06-15, not 2026-06-16.
+// SPEC-4.82: buckets the instant by the user's resolved zone, not UTC.
 pub fn user_local_date(dt: DateTime<Utc>, user_tz: &str) -> NaiveDate {
     dt.with_timezone(&resolve_tz(user_tz)).date_naive()
 }

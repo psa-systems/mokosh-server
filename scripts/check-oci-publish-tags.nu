@@ -20,6 +20,8 @@
 # the tests. `main` is the opposite case and must NOT be there (DEV-612): every
 # main commit arrives through a pull request, which check.yml already gates.
 
+# SPEC-10.178: cross-checks build-oci-image.yml, check.yml, and get-tags.nu's
+# BRANCH_ALLOW_LIST against each other; the resolver's const is authoritative.
 use ../oci-build/get-tags.nu
 use ../oci-build/get-tags.nu BRANCH_ALLOW_LIST
 

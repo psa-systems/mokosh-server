@@ -33,6 +33,7 @@ pub const ALLOWED_INLINE_IMAGE_MIME: &[&str] =
 /// the header is. The returned value is the canonical `&'static str` from the
 /// list, so what gets stored is what this module named rather than whatever
 /// casing the upload arrived in.
+// SPEC-4.20: only PNG/JPEG/WebP/GIF accepted; SVG and all else refused.
 pub fn check_inline_image_mime(raw: &str) -> AppResult<&'static str> {
     let base = raw
         .split(';')

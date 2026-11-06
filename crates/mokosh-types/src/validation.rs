@@ -70,6 +70,8 @@ fn validate_nonneg(
 /// engine is a large thing to ship for one grammar this simple. The server's
 /// `utils::validation::validate_slug` now delegates here, so there is one
 /// definition rather than two that can disagree.
+// SPEC-4.79: lowercase letters and digits only, single hyphens between
+// groups, no leading, trailing or doubled hyphen.
 pub fn validate_slug(slug: &str) -> Result<(), ValidationError> {
     let ok = !slug.is_empty()
         && !slug.starts_with('-')
@@ -85,6 +87,7 @@ pub fn validate_slug(slug: &str) -> Result<(), ValidationError> {
     }
 }
 
+// SPEC-4.80: DECIMAL(10,2), zero allowed.
 pub fn validate_rate(value: &Decimal) -> Result<(), ValidationError> {
     validate_nonneg(
         value,
@@ -109,6 +112,7 @@ pub fn validate_hours(value: &Decimal) -> Result<(), ValidationError> {
 
 /// Validate the mileage `rate_per_mile` `NUMERIC(8, 4)` column: non-negative,
 /// at most 4 decimal places, magnitude `< 10_000`.
+// SPEC-4.80: NUMERIC(8,4), zero allowed.
 pub fn validate_rate_per_mile(value: &Decimal) -> Result<(), ValidationError> {
     validate_nonneg(
         value,
@@ -123,6 +127,7 @@ pub fn validate_rate_per_mile(value: &Decimal) -> Result<(), ValidationError> {
 /// rate/hours fields the distance must be strictly positive (a zero-mile trip
 /// is not a trip; the column carries a `distance_miles > 0` CHECK), so it is
 /// validated separately rather than via [`validate_rate`].
+// SPEC-4.80: NUMERIC(8,2), strictly positive, zero rejected.
 pub fn validate_distance_miles(value: &Decimal) -> Result<(), ValidationError> {
     if !value.is_sign_positive() || value.is_zero() {
         let mut error = ValidationError::new("distance_not_positive");

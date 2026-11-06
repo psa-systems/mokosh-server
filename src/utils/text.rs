@@ -82,6 +82,7 @@ pub const SECRET_FIELD_NAMES: &[&str] = &[
 /// True when `key` names a credential whose bytes must reach the handler
 /// untouched. Matching is exact on the ASCII-lowercased key: a substring rule
 /// would also swallow fields like `password_policy_description`.
+// SPEC-4.36: exact, case-insensitive match against SECRET_FIELD_NAMES.
 pub fn is_secret_field(key: &str) -> bool {
     SECRET_FIELD_NAMES
         .binary_search(&key.to_ascii_lowercase().as_str())
@@ -101,6 +102,7 @@ pub fn is_secret_field(key: &str) -> bool {
 ///
 /// Recursion is bounded by `serde_json`'s own 128-level nesting limit, which
 /// rejects a deeper document at parse time before this ever runs.
+// SPEC-4.36, SPEC-4.37: skip secret-field value subtrees; sanitize keys and all else.
 pub fn sanitize_json_tree(value: &mut serde_json::Value) -> bool {
     use serde_json::Value;
     let mut changed = false;
@@ -254,6 +256,7 @@ mod server_impl {
     /// the extension rather than re-buffering and re-parsing the bytes,
     /// which removes the second `serde_json` parse every JSON request used
     /// to pay for.
+    // SPEC-4.38: skip raw-body/non-JSON/oversized paths; else stash parsed tree, empty the body.
     pub async fn sanitize_json_body(request: Request, next: Next) -> Response {
         let path = request.uri().path();
         if RAW_BODY_PATHS.iter().any(|p| path.starts_with(p)) {
