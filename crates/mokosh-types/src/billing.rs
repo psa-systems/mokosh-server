@@ -67,6 +67,7 @@ impl InvoiceStatus {
     /// This comment deferred that for long enough that `void` and
     /// `written_off` became statuses the model knew and no code path could
     /// reach; see `BillingService::create_credit_note`.
+    // SPEC-4.102: the edit-freeze rule.
     pub fn is_frozen(&self) -> bool {
         matches!(
             self,

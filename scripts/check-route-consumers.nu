@@ -22,6 +22,8 @@
 #   nu scripts/check-route-consumers.nu             # check
 #   nu scripts/check-route-consumers.nu --self-test # fixtures, no client needed
 
+# SPEC-10.175: delimiter-bounded static-segment match; a dated parity-record
+# comment naming the route literal is the escape hatch.
 def static_segments [path: string] {
     $path | split row '/' | where {|s| ($s | is-not-empty) and (not ($s | str contains '{')) }
 }

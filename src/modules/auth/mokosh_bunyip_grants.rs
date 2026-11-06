@@ -39,7 +39,7 @@ use mokosh_types::auth::UserRole;
 ///
 /// MAPPS-877 (2026-09-18): `read_only` now projects onto the
 /// first-class [`UserRole::ReadOnly`] variant that landed alongside
-/// migration 295. Before this it deliberately mapped to
+/// migration 297. Before this it deliberately mapped to
 /// [`UserRole::Technician`] because mokosh had no read-only tier;
 /// that gave every `read_only` grantee technician-level WRITE access
 /// on the granted workspace, so a viewer could create companies,

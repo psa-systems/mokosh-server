@@ -1,3 +1,4 @@
+# SPEC-10.161: fresh clone must `git submodule update --init` before pre-commit/pre-push/install-hooks/create-release resolve.
 [submodule "common"]
 	path = common
 	url = https://dev.a8n.run/psa-systems/common.git

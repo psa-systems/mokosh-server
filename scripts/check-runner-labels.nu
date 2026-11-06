@@ -17,6 +17,8 @@
 # non-compiling job (e.g. a secrets scanner that only invokes a composite
 # action) can live beside a cargo job without inheriting its label.
 
+# SPEC-10.176: run-time toolchain install, a cargo job without the dev label,
+# or an unjustified runs-on: line each fail the gate.
 const TOOLCHAIN_PKGS = [
     "gcc"
     "binutils"

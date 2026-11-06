@@ -451,7 +451,7 @@ async fn find_bunyip_principal_in_tenant_returns_the_row_for_that_tenant(pool: P
 /// the whole PMS-1162 role set onto Mokosh's [`UserRole`]. Every
 /// mapping is now a bijection - `read_only` promotes to the
 /// first-class [`UserRole::ReadOnly`] variant that landed alongside
-/// migration 295, and `RequireWriteAccess` (and the request-path
+/// migration 297, and `RequireWriteAccess` (and the request-path
 /// `require_write_for_mutations` middleware) refuse mutations from
 /// that role.
 #[test]

@@ -22,8 +22,21 @@ import { attachPageDiagnostics, trackApiErrors } from '../lib/page-diagnostics';
 // from the setup project's bearer token rather than lib/fixtures.ts's
 // `request` fixture, because that fixture resolves its baseURL from the
 // Playwright project (the SPA host here), not the API host.
+//
+// MAPPS-1177: quarantined (`test.fixme`) - blocked on a SPA-side cache
+// invalidation defect, not a mokosh-server regression. The test creates a
+// task-status via `POST /api/v1/task-statuses` with a fresh timestamp name,
+// opens the project-task Add dialog, and expects the new option in the
+// Status select. The SPA's `use_shared_list_provider` task-statuses cache
+// is populated once per session and never refetches unless the tenant
+// generation bumps, so a row created out-of-band (API, admin page, sibling
+// tab) never surfaces in the dialog until the next hard reload. The fix is
+// in mokosh-apps PR fix/MAPPS-1177-ui-selectors-refresh (restart the
+// cache on Add Task); un-fixme once that PR deploys to staging. The
+// failure is unrelated to any mokosh-server PR's own code and must stop
+// gating unrelated merges, same convention as auth.spec.ts and oidc.spec.ts.
 test.describe('UI reference-list selectors (PMS-1461)', () => {
-  test('work type, technician and task status selectors are populated', async ({ page }) => {
+  test.fixme('work type, technician and task status selectors are populated', async ({ page }) => {
     test.setTimeout(120_000);
 
     const api: APIRequestContext = await requestFactory.newContext({

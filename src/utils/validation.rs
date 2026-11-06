@@ -12,6 +12,7 @@ static EMAIL_REGEX: LazyLock<Regex> =
 static PHONE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\+?[1-9]\d{1,14}$").unwrap());
 
 /// Validate an email address
+// SPEC-4.39: accept only the standard local@domain.tld shape.
 pub fn validate_email(email: &str) -> Result<(), ValidationError> {
     if EMAIL_REGEX.is_match(email) {
         Ok(())
@@ -28,6 +29,7 @@ pub fn validate_email(email: &str) -> Result<(), ValidationError> {
 /// middleware already strips one from a request body; doing it here too means a
 /// value reaching this validator from a path the middleware does not cover
 /// (a worker, a seeder, an import helper) behaves the same way.
+// SPEC-4.40: strip invisibles first; empty or E.164-shaped is accepted.
 pub fn validate_phone(phone: &str) -> Result<(), ValidationError> {
     let phone = crate::utils::text::sanitize_invisible(phone);
     if phone.is_empty() || PHONE_REGEX.is_match(&phone) {
@@ -43,11 +45,13 @@ pub fn validate_phone(phone: &str) -> Result<(), ValidationError> {
 /// now that the forms DTOs validate a slug on the wire. Kept as a wrapper so
 /// the server's existing call sites and `#[validate(custom(...))]` paths do not
 /// all have to move at once.
+// SPEC-4.41: delegates to mokosh_types::validation::validate_slug, no local grammar.
 pub fn validate_slug(slug: &str) -> Result<(), ValidationError> {
     mokosh_types::validation::validate_slug(slug)
 }
 
 /// Validate password strength
+// SPEC-4.42: 8-128 chars plus lower/upper/digit/non-alphanumeric, all named if missing.
 pub fn validate_password_strength(password: &str) -> Result<(), ValidationError> {
     let mut errors = Vec::new();
 
@@ -80,6 +84,7 @@ pub fn validate_password_strength(password: &str) -> Result<(), ValidationError>
 }
 
 /// Validate a CRON expression
+// SPEC-4.43: accept only what cron::Schedule::try_from parses.
 pub fn validate_cron(expr: &str) -> Result<(), ValidationError> {
     match cron::Schedule::try_from(expr) {
         Ok(_) => Ok(()),
@@ -100,6 +105,7 @@ pub const SCHEDULING_TEMPLATE_KINDS: [&str; 2] = ["dispatch", "calendar"];
 /// allows. The `kind` field deserializes as a free `String`, so an unknown
 /// value passes deserialization but violates the DB constraint; rejecting it
 /// here turns an unhandled 500 into a clear 422 (PMS-403).
+// SPEC-4.44: accept only a value in SCHEDULING_TEMPLATE_KINDS, matching the DB CHECK.
 pub fn validate_scheduling_template_kind(value: &str) -> Result<(), ValidationError> {
     if SCHEDULING_TEMPLATE_KINDS.contains(&value) {
         Ok(())
@@ -134,6 +140,7 @@ pub const CONTRACT_TYPES: [&str; 5] = [
 /// values such as `recurring` or `retainer` pass deserialization but
 /// violate the DB constraint; rejecting them here turns an unhandled 500
 /// into a clear 422 (PMS-299).
+// SPEC-4.44: accept only a value in CONTRACT_TYPES, matching the DB CHECK.
 pub fn validate_contract_type(value: &str) -> Result<(), ValidationError> {
     if CONTRACT_TYPES.contains(&value) {
         Ok(())
@@ -161,6 +168,7 @@ pub const CONTRACT_STATUSES: [&str; 5] = ["draft", "active", "expired", "cancell
 /// The `status` field deserializes as a free `String`, so an unknown value
 /// passes deserialization but violates the DB constraint; rejecting it here
 /// turns an unhandled 500 into a clear 422 (PMS-337).
+// SPEC-4.44: accept only a value in CONTRACT_STATUSES, matching the DB CHECK.
 pub fn validate_contract_status(value: &str) -> Result<(), ValidationError> {
     if CONTRACT_STATUSES.contains(&value) {
         Ok(())
@@ -190,6 +198,7 @@ pub const BILLING_CYCLES: [&str; 6] = [
 /// The `billing_cycle` field deserializes as a free `String`, so an unknown
 /// value passes deserialization but violates the DB constraint; rejecting it
 /// here turns an unhandled 500 into a clear 422 (PMS-337).
+// SPEC-4.44: accept only a value in BILLING_CYCLES, matching the DB CHECK.
 pub fn validate_billing_cycle(value: &str) -> Result<(), ValidationError> {
     if BILLING_CYCLES.contains(&value) {
         Ok(())
@@ -219,6 +228,7 @@ const MONEY_AMOUNT_MAX_EXCLUSIVE: i64 = 10_000_000_000;
 /// class as PMS-297). The check is on the absolute value so signed amounts
 /// (refunds, credits) are bounded symmetrically; the sign itself is allowed
 /// (see the field-level docs on `CreatePaymentRequest::amount`).
+// SPEC-4.45: reject a magnitude of 10,000,000,000 or more.
 pub fn validate_money_amount(value: &Decimal) -> Result<(), ValidationError> {
     if value.abs() < Decimal::from(MONEY_AMOUNT_MAX_EXCLUSIVE) {
         Ok(())
@@ -244,6 +254,7 @@ pub fn validate_money_amount(value: &Decimal) -> Result<(), ValidationError> {
 /// decimal places would be silently rounded by the column, and an oversized
 /// magnitude would overflow it and surface as a 500 (same class as PMS-306).
 /// A `payments_amount_positive` CHECK constraint backstops this at the DB.
+// SPEC-4.45: strictly positive, at most 2 decimal places, under the column limit.
 pub fn validate_payment_amount(value: &Decimal) -> Result<(), ValidationError> {
     if !value.is_sign_positive() || value.is_zero() {
         let mut error = ValidationError::new("payment_amount_not_positive");
@@ -283,6 +294,7 @@ const BUDGET_HOURS_MAX_EXCLUSIVE: i64 = 100_000_000;
 /// a 500 numeric-overflow rather than a clear 422 (same class as PMS-306);
 /// without the scale check a value like `1.234` is silently rounded to `1.23`
 /// by the column. `column` names the backing type in the message only.
+// SPEC-4.45: non-negative, at most 2 decimal places, under the column limit.
 fn validate_budget(
     value: &Decimal,
     max_exclusive: i64,
@@ -333,6 +345,7 @@ const SLA_HOURS_MAX_EXCLUSIVE: i64 = 100_000_000;
 /// overflow it and surface as a 500 instead of a clear 422 (same class as
 /// PMS-324). Applied per field via `#[validate(custom(...))]`; on an
 /// `Option<Decimal>` the validator runs on the inner value and skips `None`.
+// SPEC-4.45: strictly positive, at most 2 decimal places, under 100,000,000.
 pub fn validate_sla_target_hours(value: &Decimal) -> Result<(), ValidationError> {
     if !value.is_sign_positive() || value.is_zero() {
         let mut error = ValidationError::new("sla_hours_not_positive");
@@ -375,6 +388,7 @@ const TAX_RATE_MAX_INCLUSIVE: i64 = 100;
 /// and at most 4 decimal places, matching the column scale; more than 4 dp
 /// would be silently rounded by the column. This turns the DB 500 into a clean
 /// 422 with a field-level message (same class as PMS-306 / PMS-324).
+// SPEC-4.45: non-negative, at most 100, at most 4 decimal places.
 pub fn validate_tax_rate(value: &Decimal) -> Result<(), ValidationError> {
     if value.is_sign_negative() {
         let mut error = ValidationError::new("tax_rate_negative");
@@ -405,6 +419,7 @@ static MAC_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// malformed value becomes a 422 field envelope instead of surfacing as a
 /// generic `Database operation failed` from `invalid input syntax for type
 /// inet`.
+// SPEC-4.46: empty or a string std::net::IpAddr parses.
 pub fn validate_ip_address(value: &str) -> Result<(), ValidationError> {
     if value.is_empty() {
         return Ok(());
@@ -420,6 +435,7 @@ pub fn validate_ip_address(value: &str) -> Result<(), ValidationError> {
 
 /// Parse a MAC address (colon or hyphen separated) ahead of the Postgres
 /// `::macaddr` cast; same rationale as `validate_ip_address` (PMS-1488).
+// SPEC-4.46: empty or a colon/hyphen-separated six-octet hex address.
 pub fn validate_mac_address(value: &str) -> Result<(), ValidationError> {
     if value.is_empty() {
         return Ok(());
@@ -434,6 +450,7 @@ pub fn validate_mac_address(value: &str) -> Result<(), ValidationError> {
 }
 
 /// Generate a slug from a string
+// SPEC-4.47: lowercase, non-alphanumeric to "-", collapse consecutive separators.
 pub fn slugify(s: &str) -> String {
     s.to_lowercase()
         .chars()
@@ -450,6 +467,7 @@ pub fn slugify(s: &str) -> String {
 /// `max_len` is a byte budget. Slicing at an arbitrary byte index panics when
 /// it lands inside a multi-byte UTF-8 sequence, so the cut point is snapped
 /// back to the nearest char boundary via `char_indices` before slicing.
+// SPEC-4.47: cut at a char boundary at or before max_len - 3 bytes, append "...".
 pub fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         return s.to_string();
@@ -481,6 +499,7 @@ pub const CROSS_FIELD_TARGET_PARAM: &str = "field";
 /// (PMS-364). Recording the target field as a param lets the
 /// `From<ValidationErrors> for AppError` conversion re-key the error onto that
 /// field so the form renders it inline, the same as a single-field error.
+// SPEC-4.48: carries a "field" param so a schema-level error re-keys onto a named field.
 pub fn cross_field_error(
     code: &'static str,
     field: &'static str,

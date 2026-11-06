@@ -27,6 +27,7 @@ pub enum LoginLocationDecision {
     Alert,
 }
 
+// SPEC-4.7: Record on no previous country, Unchanged on exact match, else Alert.
 pub fn login_location_decision(previous: Option<&str>, current: &str) -> LoginLocationDecision {
     match previous {
         None => LoginLocationDecision::Record,

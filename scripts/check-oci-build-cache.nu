@@ -17,6 +17,9 @@
 # Comment lines are excluded on purpose: the workflow's own comments name the
 # retired backends when explaining why they were dropped.
 
+# SPEC-10.177: verifies .forgejo/workflows/*.yml against this required/forbidden
+# pattern set, comments stripped first.
+#
 # Each row names the invariant and the substring(s) that satisfy it. A row with
 # one pattern (as a string) matches that substring; a row with a list satisfies
 # when ANY substring is present, so a workflow may inline `--driver docker-container`

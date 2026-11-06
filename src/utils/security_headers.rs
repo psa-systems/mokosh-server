@@ -59,6 +59,7 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
 /// Axum middleware that adds the [`SECURITY_HEADERS`] set to every response.
 /// Mounted as a global layer on the outermost router so it covers the API, the
 /// portal API, and the `not_a_frontend` fallback uniformly.
+// SPEC-4.28: fills only headers the handler left unset; never overwrites one it set.
 pub async fn security_headers(
     request: axum::extract::Request,
     next: axum::middleware::Next,

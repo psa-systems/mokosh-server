@@ -69,11 +69,15 @@ in the 2026-06-12 draft had all moved by the time anyone followed them.
 - **Coverage of the invariant is tested, and the allowlist is where an exemption is decided.**
   `tests/suites/rls_coverage.rs` (PMS-683) introspects the fully-migrated schema and lists every
   `public` table that has a `tenant_id` column but is missing RLS enabled, RLS forced, or a
-  `tenant_isolation` policy. Its `ALLOWED_WITHOUT_RLS` allowlist holds one entry,
-  `tenant_membership_entitlements`, whose read is pre-auth and cross-tenant and so cannot
+  `tenant_isolation` policy. Its `ALLOWED_WITHOUT_RLS` allowlist holds two entries.
+  `tenant_membership_entitlements`'s read is pre-auth and cross-tenant and so cannot
   carry the GUC; enabling RLS there would fail-close the read to `None`, which
   `ensure_principal_usable` reads as "no entitlement row, never lock anybody out" and would
-  pass every suspended tenant. Read the entry's own comment for the full reason.
+  pass every suspended tenant. `mokosh_grant_invitations` carries a `tenant_id` on the owner
+  side, but three of its five route handlers read it cross-tenant (the grantee inbox and the
+  by-token metadata/accept/decline paths), so an RLS policy keyed on `app.current_tenant`
+  would fail-close each of those to zero rows; the service pins scope in the `WHERE` clause
+  instead. Read each entry's own comment for the full reason.
 
   What the near-empty allowlist guarantees, and the reason it is the useful fact for anyone
   adding a table: **a new table with a `tenant_id` column whose migration does not enable,

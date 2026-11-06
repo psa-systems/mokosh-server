@@ -58,11 +58,15 @@ pub fn staff_routes(db: Database) -> Router {
     // body is already buffered, so the route's `DefaultBodyLimit` has to
     // cover the largest of the three for its scope.
     // Dummy ids: max_bytes_for_scope only matches on the variant.
-    let company_max_bytes = store.max_bytes_for_scope(AssetScope::Company {
-        tenant: Uuid::nil(),
-        company: Uuid::nil(),
-    });
-    let tenant_max_bytes = store.max_bytes_for_scope(AssetScope::Tenant(Uuid::nil()));
+    let company_max_bytes = store
+        .max_bytes_for_scope(AssetScope::Company {
+            tenant: Uuid::nil(),
+            company: Uuid::nil(),
+        })
+        .expect("branding max-bytes config invalid");
+    let tenant_max_bytes = store
+        .max_bytes_for_scope(AssetScope::Tenant(Uuid::nil()))
+        .expect("branding max-bytes config invalid");
     let state = StaffBrandingState {
         // PMS-1234: gives the tenant-logo write path (only) a ledger, the
         // same way `TenantLogoStore::with_ledger` does.
@@ -205,10 +209,12 @@ pub fn contact_routes(
 ) -> Router {
     let store = BrandingAssetStore::from_env();
     // PMS-1233: see the matching comment in `staff_routes`.
-    let company_max_bytes = store.max_bytes_for_scope(AssetScope::Company {
-        tenant: Uuid::nil(),
-        company: Uuid::nil(),
-    });
+    let company_max_bytes = store
+        .max_bytes_for_scope(AssetScope::Company {
+            tenant: Uuid::nil(),
+            company: Uuid::nil(),
+        })
+        .expect("branding max-bytes config invalid");
     let state = ContactBrandingState {
         store: Arc::new(store.with_ledger(db.clone())),
         db,

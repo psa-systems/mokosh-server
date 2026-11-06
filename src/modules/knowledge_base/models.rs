@@ -407,6 +407,75 @@ pub struct TopTicketDrivingArticleRow {
     pub ticket_count: i64,
 }
 
+/// One step row inside a KB article execution. `index` is the 0-based
+/// ordinal in the rendered content. `checked_at` and `checked_by_user_id`
+/// move as a pair: a check sets both and an uncheck clears both. The row
+/// `id` is carried along for a future route that addresses a step by id;
+/// the index-based PATCH is the one Phase 2a wires up.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbExecutionStepResponse {
+    pub id: Uuid,
+    pub execution_id: Uuid,
+    pub index: i32,
+    pub text: String,
+    pub checked_at: Option<DateTime<Utc>>,
+    pub checked_by_user_id: Option<Uuid>,
+    pub checked_by_name: Option<String>,
+}
+
+/// The full KB article execution with its step list: what the create
+/// route and the single-get route answer with. `article_version_id` is
+/// NULL for the historic case where no `kb_article_versions` row exists
+/// at execution time; the write path resolves `MAX(version_number)` and
+/// stores the id of the matching version row.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbExecutionResponse {
+    pub id: Uuid,
+    pub ticket_id: Uuid,
+    pub article_id: Uuid,
+    pub article_name: String,
+    pub article_version_id: Option<Uuid>,
+    pub variable_values: std::collections::BTreeMap<String, String>,
+    pub started_at: DateTime<Utc>,
+    pub started_by_user_id: Uuid,
+    pub started_by_name: String,
+    pub steps: Vec<KbExecutionStepResponse>,
+}
+
+/// Row for the list endpoint, one per execution on a ticket. The
+/// rolled-up `total_steps` / `checked_steps` lets the ticket panel
+/// render progress without a per-execution fetch.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbExecutionSummary {
+    pub id: Uuid,
+    pub ticket_id: Uuid,
+    pub article_id: Uuid,
+    pub article_name: String,
+    pub article_version_id: Option<Uuid>,
+    pub started_at: DateTime<Utc>,
+    pub started_by_user_id: Uuid,
+    pub started_by_name: String,
+    pub total_steps: i64,
+    pub checked_steps: i64,
+}
+
+/// `POST /api/v1/tickets/{ticket_id}/kb-executions`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreateKbExecutionRequest {
+    pub article_id: Uuid,
+    /// Caller-supplied template variable values; same shape and
+    /// validation as `RenderKbArticleRequest`. An absent or empty
+    /// `values` is `{}`.
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, String>,
+}
+
+/// `PATCH /api/v1/kb-executions/{id}/steps/{index}`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CheckKbExecutionStepRequest {
+    pub checked: bool,
+}
+
 /// Returned by the helpful / not_helpful feedback endpoints so the portal
 /// (or agent UI) can render the updated tallies without a follow-up GET.
 ///
