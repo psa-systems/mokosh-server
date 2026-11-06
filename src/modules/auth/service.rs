@@ -284,6 +284,7 @@ impl AuthService {
     /// Entirely best-effort: every failure is logged and swallowed so it can
     /// never block a login, and the whole check no-ops when no IP2Location DB is
     /// configured.
+    // SPEC-5.56 SPEC-5.58 SPEC-5.59: no-op guards; detached spawn via direct mailer; country persisted even when email suppressed.
     async fn check_login_location(&self, user: &User, ip: Option<&str>, user_agent: Option<&str>) {
         let Some(geoip) = self.geoip.as_ref() else {
             return;
@@ -403,6 +404,7 @@ impl AuthService {
 
     /// Wrong-code attempts tolerated against a single approval challenge before
     /// it is destroyed and a fresh code must be requested.
+    // SPEC-5.51: constant pinned at 5; must not change without spec amendment.
     const LOGIN_APPROVAL_MAX_ATTEMPTS: i32 = 5;
 
     /// Resolve a client IP string to a public ISO country, or `None` when geoip
@@ -422,6 +424,7 @@ impl AuthService {
     /// the first login country is recorded, not alerted). An absent/blank
     /// `device_id` contributes no device signal (country only). Returns the
     /// resolved country + device hash to record once the login clears.
+    // SPEC-5.38: suspicious = country_new OR device_new; device_new requires non-blank hash + prior device + unseen hash.
     async fn assess_login(
         &self,
         user: &User,
@@ -544,6 +547,7 @@ impl AuthService {
     /// email the plaintext, and (by returning `Ok`) signal `approval_required`.
     /// Supersedes any prior unconsumed challenge so only the freshest code works.
     /// The email send is detached so it never adds latency to or fails the login.
+    // SPEC-5.52: 6-digit code, SHA-256 hash, DELETE prior unconsumed, 15-min expiry; detached-spawn email ungated.
     async fn issue_login_approval(
         &self,
         user: &User,
@@ -628,6 +632,7 @@ impl AuthService {
     /// marks it consumed and returns `Ok`; a mismatch increments `attempts` and,
     /// past [`Self::LOGIN_APPROVAL_MAX_ATTEMPTS`], destroys the challenge (forcing
     /// a fresh code). Absent / expired / over-limit challenges are `Unauthorized`.
+    // SPEC-5.53 SPEC-5.54: freshest unconsumed/unexpired; UPDATE RETURNING attempts; destroy at >=5; absent/over = 401.
     async fn verify_login_approval(
         &self,
         tenant_id: Uuid,
@@ -689,6 +694,7 @@ impl AuthService {
 
     /// Authenticate user with email and password
     #[tracing::instrument(skip_all)]
+    // SPEC-5.32: refuse before any credential check when Local provider disabled; same Unauthorized shape.
     pub async fn login(
         &self,
         request: &LoginRequest,
@@ -736,6 +742,7 @@ impl AuthService {
         // `resolve_tenant_for_login(None)` deliberately, so that
         // helper is left untouched and only this local-password
         // branch takes the stricter posture.
+        // SPEC-5.33: tenant_id wins; else trimmed non-blank tenant_slug; neither = Unauthorized (no default fallback).
         let tenant_hint = match request.tenant_id {
             Some(id) => Some(id),
             None => match request.tenant_slug.as_deref().map(str::trim) {
@@ -749,6 +756,7 @@ impl AuthService {
             // identifier" from "wrong credentials" to an unauth caller.
             return Err(AppError::Unauthorized);
         };
+        // SPEC-5.34: missing row = Unauthorized; non-Active status = Forbidden("Account is not active").
         let user = self
             .find_user_by_email_for_tenant(tenant_id, &request.email)
             .await?;
@@ -767,6 +775,7 @@ impl AuthService {
         // this is somebody presenting a password at a door that is supposed to
         // be closed, which is worth seeing in the log even though the outcome
         // is correct.
+        // SPEC-5.35: SSO-only refusal runs after user lookup/status check, before any password verify.
         if self.local_password_auth_disabled() {
             tracing::warn!(
                 user_id = %user.id,
@@ -776,13 +785,13 @@ impl AuthService {
             return Err(Self::sso_only_rejection());
         }
 
-        // Reject sign-in when the owning tenant is suspended/cancelled, so a
-        // tenant-level suspension takes effect immediately.
+        // SPEC-5.36: tenant-active check before password verify; suspended/entitlement-expired 403s here.
         self.ensure_tenant_active(user.tenant_id).await?;
 
         // Verify password
         let password_hash = user.password_hash.as_ref().ok_or(AppError::Unauthorized)?;
 
+        // SPEC-5.37: failed password audits on best-effort tenant-scoped tx; lost commit logged at error, still 401.
         if !verify_password(&request.password, password_hash).await? {
             // Record the failed attempt (PMS-117 AC3) before bailing.
             let ctx = AuditCtx {
@@ -933,6 +942,7 @@ impl AuthService {
             }
         }
 
+        // SPEC-5.55: suspicious gate runs AFTER password/MFA; missing code issues approval, present code verifies.
         // PMS-658: suspicious-login gate. Only when enabled; otherwise fall
         // through to the PMS-657 post-hoc alert below (unchanged). Runs after
         // password + MFA, so a flagged sign-in is a genuine authenticated one.
@@ -1054,6 +1064,7 @@ impl AuthService {
     /// the user's last password change (PMS-681), and the tenant must be active.
     /// Returns the user it loaded so the caller (the auth middleware) does not
     /// re-query it.
+    // SPEC-5.60: load+status+tenant+session_is_live, then token_iat < password_changed_at = 401 (not 403).
     pub async fn ensure_user_and_tenant_active(
         &self,
         tenant_id: Uuid,
@@ -1125,6 +1136,7 @@ impl AuthService {
     /// Runs on the migrator pool because the write is a cross-tenant
     /// integration write with no session GUC; the table is RLS-exempt
     /// for the same reason (auth reads on the pre-session path).
+    // SPEC-5.63: UPSERT on migrator pool; status must be one of active/suspended/unknown.
     pub async fn set_tenant_entitlement(
         &self,
         tenant_id: Uuid,
@@ -1171,6 +1183,7 @@ impl AuthService {
     /// `user_sessions` is RLS-covered, so the read runs inside the tenant
     /// transaction rather than on the bare pool, where it would fail closed to
     /// "no session" and 403 every request.
+    // SPEC-5.61: runs under begin_with_tenant; EXISTS with id+tenant+expires_at>NOW().
     pub async fn session_is_live(&self, tenant_id: Uuid, session_id: Uuid) -> AppResult<bool> {
         let live: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM user_sessions \
@@ -1238,6 +1251,7 @@ impl AuthService {
         Ok(())
     }
 
+    // SPEC-5.62: one-shot LEFT JOIN on .pool() of RLS-exempt tables; three failure branches share identical copy.
     async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
         // The tenant-status gate and the per-tenant Bunyip entitlement gate
         // are read in ONE statement: the auth path already spends the whole
@@ -1305,6 +1319,7 @@ impl AuthService {
 
     /// Refresh access token
     #[tracing::instrument(skip_all)]
+    // SPEC-5.67: typ=="refresh"; get_session; non-Active = 403; ensure_tenant_active; same sid reused; update_session_activity.
     pub async fn refresh_token(&self, refresh_token: &str) -> AppResult<RefreshTokenResponse> {
         // Decode and validate refresh token
         let claims = self.decode_token(refresh_token)?;
@@ -1348,6 +1363,7 @@ impl AuthService {
 
     /// Logout - invalidate session
     #[tracing::instrument(skip_all)]
+    // SPEC-5.68: single-row DELETE by primary key on migrator pool; unguessable id confines blast radius.
     pub async fn logout(&self, session_id: Uuid) -> AppResult<()> {
         // SAFETY (PMS-285): logout targets a single session by its primary key,
         // the unguessable session id the caller already holds. The handler does
@@ -1372,6 +1388,7 @@ impl AuthService {
     /// [`Self::ensure_user_and_tenant_active`] fails every legacy request whose
     /// `sid` no longer names a live row.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.68: logout_all DELETEs every row for the user under begin_with_tenant.
     pub async fn logout_all(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
         // Tenant is in scope, so run under the GUC: RLS scopes the delete to the
         // caller's tenant in addition to the explicit `WHERE tenant_id`.
@@ -1392,6 +1409,7 @@ impl AuthService {
     /// the same email exists under several tenants. `None` falls
     /// back to the default tenant.
     #[tracing::instrument(skip_all)]
+    // SPEC-5.74 SPEC-5.75: SSO-only refusal first; unknown email silently Ok; dual-hash store; dispatch "auth.password_reset".
     pub async fn request_password_reset(
         &self,
         tenant_hint: Option<Uuid>,
@@ -1519,6 +1537,7 @@ impl AuthService {
     /// expired, or already-redeemed token. Same error shape for
     /// every failure mode so an attacker cannot enumerate valid
     /// tokens through this surface.
+    // SPEC-5.76: NotFound("token") for every failure mode; verify_password_or_dummy preserves timing; no side-effect.
     pub async fn set_password_context(&self, token: &str) -> AppResult<(String, String)> {
         let (user_id, secret) =
             parse_user_bound_token(token).ok_or_else(|| AppError::NotFound("token".to_string()))?;
@@ -1567,6 +1586,7 @@ impl AuthService {
         Ok((name, slug))
     }
 
+    // SPEC-5.77 SPEC-5.78: SSO-only refusal first; confirm_password check; one tx revokes sessions fail-closed; skip-mirror GUC.
     pub async fn reset_password(&self, request: &ResetPasswordRequest) -> AppResult<()> {
         // PMS-905: refuse to redeem, ahead of every other check.
         //
@@ -1707,6 +1727,7 @@ impl AuthService {
     /// Change password (when logged in). PMS-4 AC6: bound to the
     /// caller's tenant on both SELECT and UPDATE.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.78 SPEC-5.79: NULL password_hash = Forbidden(no local); wrong current = validation error; sessions deleted in same tx.
     pub async fn change_password(
         &self,
         tenant_id: Uuid,
@@ -1794,6 +1815,7 @@ impl AuthService {
 
     /// Create a new user
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.85: EXISTS check -> conflict; INSERT status='pending'; secret-stripped audit; welcome mail gated by SSO policy.
     pub async fn create_user(
         &self,
         tenant_id: Uuid,
@@ -1975,6 +1997,7 @@ impl AuthService {
     /// Update user
     #[allow(unused_assignments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.88: dynamic UPDATE over exactly the allow-listed columns; first_name/last_name/phone not writable; empty = no-op.
     pub async fn update_user(
         &self,
         tenant_id: Uuid,
@@ -2160,6 +2183,7 @@ impl AuthService {
     /// at all, so no single tenant GUC covers the write. Both statements are
     /// pinned to the one email whose password (or, on the identity-first path,
     /// whose TOTP code) has already verified, and they write one column.
+    // SPEC-5.43: migrator pool; identities + users at lower(email) in one tx; AND mfa_secret=$previous when Some.
     async fn write_mfa_secret(
         &self,
         email: &str,
@@ -2209,6 +2233,7 @@ impl AuthService {
     /// `write_mfa_secret` uses it - the flag has to reach every tenant seat
     /// the human holds, not just the caller's, and `identities` has no
     /// tenant column for a single GUC to cover anyway.
+    // SPEC-5.44: users FIRST then identities in one tx on migrator pool; identities also resets mfa_last_totp_step=0.
     async fn write_mfa_enabled(&self, email: &str, enabled: bool) -> AppResult<()> {
         let mut tx = self.db.migrator_pool().begin().await?;
         // PMS-1120: `users` FIRST. The forward mirror locks `users`, then
@@ -2245,6 +2270,7 @@ impl AuthService {
     /// Called only after the presented code has verified against that very
     /// plaintext, so a wrong guess never triggers a write, and guarded on the
     /// plaintext so a re-enrolment that landed in between wins.
+    // SPEC-5.45: seal plaintext and call write_mfa_secret with previous=secret_b32; only after verified code.
     async fn upgrade_legacy_mfa_secret(&self, email: &str, secret_b32: &str) -> AppResult<()> {
         let sealed = mfa_secret::seal(secret_b32, &self.encryption_key)?;
         self.write_mfa_secret(email, Some(&sealed), Some(secret_b32))
@@ -2259,6 +2285,7 @@ impl AuthService {
     /// guarantees that an authenticator that was misconfigured (wrong
     /// time, wrong algorithm) cannot lock the user out.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.39 SPEC-5.40: Conflict if already enabled; seal+fan-out secret; issuer uses app_name().replace(':', " ").
     pub async fn start_mfa_enrollment(
         &self,
         tenant_id: Uuid,
@@ -2305,6 +2332,7 @@ impl AuthService {
     /// ONCE in [`MfaEnableResponse`]; only their SHA-256 hashes are
     /// persisted to `users.mfa_recovery_codes_hashes`.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.41: BadRequest when secret absent; +/-1 step verify; fan-out mfa_enabled; per-tenant recovery hashes; codes once.
     pub async fn enable_mfa(
         &self,
         tenant_id: Uuid,
@@ -2366,6 +2394,7 @@ impl AuthService {
     /// stolen session cannot quietly weaken the account. Zeroes the
     /// recovery code set for symmetry with `enable_mfa`.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.42: write order flag-off, clear recovery, then write secret=None; reverse order would lock out.
     pub async fn disable_mfa(
         &self,
         tenant_id: Uuid,
@@ -2415,6 +2444,7 @@ impl AuthService {
     /// `key_prefix` lookup column so future bearer auth can find the
     /// row in O(log n) before doing the expensive hash compare.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.91: 44-char psa_ key; key_prefix first 10; argon2 hash; scopes default ["*"]; audit strips key_hash; raw once.
     pub async fn create_api_key(
         &self,
         tenant_id: Uuid,
@@ -2494,6 +2524,7 @@ impl AuthService {
 
     /// List API keys owned by `user_id`. Never returns secret material.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.92: runs under tenant GUC; key_hash column never selected.
     pub async fn list_api_keys(
         &self,
         tenant_id: Uuid,
@@ -2532,6 +2563,7 @@ impl AuthService {
     /// Revoke (hard-delete) an API key. Scoped to the calling user +
     /// tenant so a stolen session for user A cannot kill user B's keys.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.93: DELETE scoped (id, tenant_id, user_id); 0 rows -> NotFound("API key").
     pub async fn revoke_api_key(
         &self,
         tenant_id: Uuid,
@@ -2577,6 +2609,7 @@ impl AuthService {
     /// is normally about current work; a mention of somebody who has left then
     /// renders as the plain text it always was, which is a truthful signal
     /// rather than a broken one.
+    // SPEC-5.89: three-column projection; email never enters response; log_unresolved_person_names on "Unnamed User" rows.
     pub async fn list_directory(
         &self,
         tenant_id: TenantId,
@@ -2635,6 +2668,7 @@ impl AuthService {
         ))
     }
 
+    // SPEC-5.90: hardcodes NOT LIKE 'system+%@mokosh.local'; supports q/role/status filters.
     pub async fn list_users(
         &self,
         tenant_id: Uuid,
@@ -2950,6 +2984,7 @@ impl AuthService {
     /// remains the identity source of truth on the OIDC path (PMS-512); this
     /// path fills the gap only when it is genuinely empty.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.83: name UPDATE gated on profile_completed_at IS NULL; timestamp stamp uses COALESCE for idempotency.
     pub async fn mark_profile_completed(
         &self,
         tenant_id: Uuid,
@@ -3462,6 +3497,7 @@ impl AuthService {
     /// PMS-502: read the per-account second-factor lockout window for
     /// `user_id`. Tenant-scoped (`begin_with_tenant`) like every other `users`
     /// access on the login path so RLS is satisfied.
+    // SPEC-5.46: reads mfa_locked_until under begin_with_tenant.
     async fn mfa_locked_until(
         &self,
         tenant_id: Uuid,
@@ -3487,6 +3523,7 @@ impl AuthService {
     /// same statement, so a burst of concurrent wrong codes counts every one
     /// of them. Taking no `prior_count` makes the stale-read defect
     /// unrepresentable.
+    // SPEC-5.46: relative increment + COALESCE(new window, existing) derived inside UPDATE (never from stale read).
     async fn register_failed_mfa(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
         // A NULL window (still under the threshold) leaves any existing
         // lockout in place rather than clearing it.
@@ -3517,6 +3554,7 @@ impl AuthService {
     /// advance is a compare-and-set. Returns `false` when no row moved, which
     /// means the step was already spent (a replay, possibly by a concurrent
     /// request that won the race); the caller must then fail closed.
+    // SPEC-5.47: CAS UPDATE where last_used_step IS NULL OR < used_step; 0 rows = replay (caller fails closed).
     async fn record_mfa_success(
         &self,
         tenant_id: Uuid,
@@ -3544,6 +3582,7 @@ impl AuthService {
     /// factor that is not a TOTP step (an accepted recovery code), leaving
     /// `mfa_last_used_step` untouched so the anti-replay watermark cannot be
     /// dragged forward by a non-TOTP credential.
+    // SPEC-5.48: zeros attempts + lockout without advancing mfa_last_used_step (recovery code != TOTP step).
     async fn clear_mfa_lockout(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
@@ -3627,6 +3666,7 @@ impl AuthService {
     /// storm. The mint side now emits iss / aud / nbf so the strict flip
     /// becomes a no-op after a rolling refresh-TTL window has rotated
     /// every live token.
+    // SPEC-5.66: explicit HS256; validate_exp=true; validate_aud=false (deferred); 30s leeway.
     pub fn decode_token(&self, token: &str) -> AppResult<JwtClaims> {
         let decoding_key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
         let mut validation = Validation::new(Algorithm::HS256);
@@ -3649,6 +3689,7 @@ impl AuthService {
     }
 
     /// Create a new session
+    // SPEC-5.64: fresh UUID; sha256_hex of generate_token(32); expires_at = NOW()+30d (remember) else +7d.
     async fn create_session(
         &self,
         tenant_id: Uuid,
@@ -3785,6 +3826,7 @@ impl AuthService {
     }
 
     /// Generate access and refresh tokens
+    // SPEC-5.65: iat=nbf=now; access exp +1h; refresh exp +7d; iss/aud/typ stamped; sid threaded; mid via repo; HS256.
     async fn generate_tokens(
         &self,
         user: &User,
@@ -3861,6 +3903,7 @@ impl AuthService {
     /// bearer. Carries `sub=identity_id` and `email` only; `tid` is
     /// `Uuid::nil()` (no tenant is scoped yet); `role`/`sid`/`mid`
     /// are placeholders.
+    // SPEC-5.97: 5-min token; typ="identity"; tid/sid=Uuid::nil(); mid=None; placeholder role.
     pub fn mint_identity_token(&self, identity_id: Uuid, email: &str) -> AppResult<String> {
         let now = Utc::now();
         let claims = JwtClaims {
@@ -3886,6 +3929,7 @@ impl AuthService {
     /// type or expired -> `AppError::Unauthorized`. Mirrors the
     /// `decode_token` validation shape: audience pinning is deferred
     /// (MAPPS-334 follow-up), 30s leeway matches the bunyip RS verifier.
+    // SPEC-5.97: any decode error or typ != "identity" returns Unauthorized.
     pub fn decode_identity_token(&self, token: &str) -> AppResult<(Uuid, String)> {
         let decoding_key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
         let mut validation = Validation::new(Algorithm::HS256);
@@ -3918,6 +3962,7 @@ impl AuthService {
     /// Login-approval (PMS-658) is intentionally NOT applied on this
     /// branch in phase 3; the follow-up plan tracks integration. The
     /// tenant-hint `login()` path keeps its existing approval gate.
+    // SPEC-5.94 SPEC-5.95 SPEC-5.96: IdentityRepo::find_by_email on migrator pool; verify per-tenant or against identity hash when empty; MFA on identity; branch on 0/1/N memberships.
     pub async fn authenticate_identity_first(
         &self,
         request: &LoginRequest,
@@ -4295,6 +4340,7 @@ impl AuthService {
     /// - `Unauthorized` on token decode failure, wrong `typ`, or expiry.
     /// - `NotFound` when the identity holds no active membership in
     ///   `tenant_id`.
+    // SPEC-5.98: decode identity token, MembershipRepo::find; missing/not-active -> NotFound; delegate to mint_session_for_membership.
     pub async fn select_tenant_for_identity(
         &self,
         identity_token: &str,
@@ -4377,6 +4423,7 @@ impl AuthService {
 
     /// Delete a specific session
     #[tracing::instrument(skip_all)]
+    // SPEC-5.73: DELETE WHERE id AND user_id on migrator pool; silent no-op when absent.
     pub async fn delete_session(&self, user_id: Uuid, session_id: Uuid) -> AppResult<()> {
         // SAFETY (PMS-285): self-service delete of one session by its primary key
         // plus owning `user_id`; the handler does not thread the tenant here, so
@@ -4576,6 +4623,7 @@ struct SessionRow {
 /// [`mfa_lock_seconds_sql`], the SQL twin that `register_failed_mfa` runs,
 /// against this Rust definition of the schedule.
 #[cfg(feature = "server")]
+// SPEC-5.49: <3 = None; >=3 = now + 30 * 2^(count-3) seconds, capped at 3600; exponent clamped against overflow.
 pub fn mfa_lockout_until(
     failed_count: i32,
     now: chrono::DateTime<Utc>,
@@ -4613,6 +4661,7 @@ pub fn mfa_lockout_until(
 /// `count_expr` is a caller-supplied SQL fragment (a column expression or a
 /// bind placeholder), never user input.
 #[cfg(feature = "server")]
+// SPEC-5.50: SQL twin of mfa_lockout_until; count_expr is SQL fragment never user input; parity test pins both.
 pub fn mfa_lock_seconds_sql(count_expr: &str) -> String {
     format!(
         "CASE WHEN ({count_expr}) >= 3 \
@@ -4760,6 +4809,7 @@ mod tests {
     /// IP2Location DB and no harness configures one. This is the level at which
     /// its gate is testable.
     #[tokio::test]
+    // SPEC-5.99: four-cell truth table pins (deployment_mode, sso_mounted); only (Saas, true) closes.
     async fn local_password_auth_closes_only_when_a_working_alternative_exists() {
         // `connect_lazy` opens no socket and nothing here issues a query: what
         // is under test is a pair of field reads, so a live database would be
@@ -4901,6 +4951,7 @@ mod tests {
     /// counter write assigns a bind placeholder instead of incrementing the
     /// column, or if either `register_failed_*` regrows a count parameter.
     #[test]
+    // SPEC-5.99: source-scan refuses banned stale-read shapes or pre-PMS-693 helper signatures.
     fn attempt_counters_are_incremented_in_sql() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         // mokosh-contact-login prompt 001: portal/service.rs retired.
@@ -4998,6 +5049,7 @@ mod tests {
     // PMS-657: None -> Record / same -> Unchanged / differ -> Alert decides
     // whether a login sends the new-location email.
     #[test]
+    // SPEC-5.57: None->Record / equal->Unchanged / differ->Alert (first geolocatable login records silently).
     fn login_location_decision_branches() {
         assert_eq!(
             login_location_decision(None, "US"),
@@ -5041,6 +5093,7 @@ mod mirror_direction {
     /// order asserted, rather than being waved through: naming it here is
     /// cheap, and the next person adding one has to say which order they took.
     #[test]
+    // SPEC-5.99: source-scans src/*.rs for UPDATE identities on mirrored columns; restricted to BOTH_PLANES or users-first.
     fn no_writer_takes_the_identity_row_before_the_users_row() {
         // Assembled so the needle is not its own hit; the prose above names
         // the statement.
