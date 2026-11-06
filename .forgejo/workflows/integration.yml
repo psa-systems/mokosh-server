@@ -259,18 +259,11 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_USER: postgres
           POSTGRES_DB: postgres
-        # Raise max_connections above the 100 default: the nextest matrix
-        # runs many tests in parallel, each with its own sqlx PgPool (up to
-        # 10 conns) against a freshly cloned per-test database. Under runner
-        # load the default ceiling exhausts, surfacing as 60s pool acquire
-        # timeouts in the harness. 300 gives headroom without needing
-        # shared_buffers tuning.
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-        command: postgres -c max_connections=300
 
     env:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres

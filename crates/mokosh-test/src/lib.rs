@@ -252,7 +252,12 @@ pub async fn acquire(test_path: &str) -> TestDatabase {
     }
     drop(admin);
 
+    // Cap the per-test pool: sqlx defaults to 10, nextest.toml runs 12 tests in
+    // parallel, 12 * 10 = 120 which exceeds the Postgres service's default
+    // max_connections=100. Each test body uses one or two connections, so 3 is
+    // plenty while keeping 12 * 3 = 36 well under the server ceiling.
     let pool = PgPoolOptions::new()
+        .max_connections(3)
         .acquire_timeout(CONNECT_TIMEOUT)
         .connect_with(connect_options(&base, &name))
         .await
