@@ -1062,7 +1062,7 @@ mod tests {
     /// mutation-gate middleware, so pin it explicitly. Every existing
     /// role passes; only `ReadOnly` fails. `from_str` + `as_str`
     /// round-trip through the `read_only` wire value so the DB
-    /// column can hold it after migration 225.
+    /// column can hold it after migration 295.
     #[test]
     fn read_only_role_cannot_write_and_round_trips_to_wire() {
         assert!(UserRole::SuperAdmin.can_write());
