@@ -137,9 +137,13 @@ jobs:
     # Backstop, not a target (PMS-829): 38 green runs between 2026-08-22 and
     # 2026-08-24 took 1.9-9.0 minutes, median 3.5. The headroom is for a cold
     # `rust-cache`, which none of those runs exercised and which recompiles the
-    # whole workspace. No step here has a reporting block to protect, so this
-    # is the job bound only, with no inner `timeout` wrapper.
-    timeout-minutes: 30
+    # whole workspace. PR 1276's run 11778 hit 30m with a cold cache on a
+    # loaded HEAVY runner; 45 absorbs a cache-miss full workspace rebuild +
+    # clippy/tests/machete without flapping on runner load, while leaving the
+    # cache-hit path (~3.5m) comfortably ahead of the bound.
+    # No step here has a reporting block to protect, so this is the job bound
+    # only, with no inner `timeout` wrapper.
+    timeout-minutes: 45
 
     steps:
       - name: Clone the repository

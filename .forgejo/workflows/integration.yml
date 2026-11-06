@@ -79,10 +79,14 @@ jobs:
     # the summary; replace each `timeout-minutes` with 1.5x the longest
     # observed value rounded up to 5 minutes, and record the measurements in
     # the per-job comment. The historical unsharded build step took 111-731s
-    # (`7959c0e1`'s own data), so this bound covers the cold case with
-    # headroom until the measured value lands.
+    # (`7959c0e1`'s own data). PR 1276's run 11780 lost 18 min to a failed
+    # cache-restore tar (exit 2) before compilation even started, hit the
+    # 25m ceiling before mokosh-server finished, and died on dind context
+    # deadline exceeded during cleanup. 45 absorbs a cold rebuild on top of
+    # a failed cache restore when the HEAVY runner is loaded; the common
+    # cache-hit path still finishes in 5-10 min.
     # SPEC-10.13
-    timeout-minutes: 25
+    timeout-minutes: 45
 
     # SPEC-10.13
     env:
