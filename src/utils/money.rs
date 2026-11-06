@@ -10,6 +10,7 @@ use rust_decimal::Decimal;
 /// Always suffixed with the currency code; no special-cased `$` for USD,
 /// because a document or a field that special-cases one currency disagrees
 /// with every other currency it also has to print.
+// SPEC-4.1: fixed two-decimal amount plus currency code, defaulting to USD.
 pub fn money(amount: Decimal, currency: Option<&str>) -> String {
     let code = currency.unwrap_or("USD");
     format!("{amount:.2} {code}")

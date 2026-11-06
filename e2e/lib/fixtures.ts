@@ -27,6 +27,7 @@ interface AuthFixtures {
   request: APIRequestContext;
 }
 
+// SPEC-10.207: attaches Authorization: Bearer on every request context.
 export const test = base.extend<AuthFixtures>({
   request: async ({ playwright: _playwright }, use, testInfo) => {
     const token = readToken();
@@ -40,6 +41,7 @@ export const test = base.extend<AuthFixtures>({
   },
 });
 
+// SPEC-10.207: replays OP cookie storage state; never attaches a bearer header.
 export const oidcTest = base.extend<AuthFixtures>({
   request: async ({ playwright: _playwright }, use) => {
     const storageState = readOpStorageState();

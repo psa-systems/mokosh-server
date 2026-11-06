@@ -44,7 +44,9 @@ use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::attachments::{
     kb_attachment_routes, public_kb_attachment_routes, KbAttachmentConfig, KbAttachmentService,
 };
-use crate::modules::knowledge_base::{kb_routes, KbService};
+use crate::modules::knowledge_base::{
+    kb_execution_routes, kb_routes, KbExecutionService, KbService,
+};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::platform::{platform_routes, PlatformAdminService};
@@ -357,6 +359,11 @@ pub fn create_api_router(
     let expenses_service = ExpensesService::new(db.clone());
     // PMS-1129: an @mention in a KB comment notifies through the queue.
     let kb_service = KbService::new(db.clone()).with_notifications(notifications_service.clone());
+    // KB article executions: the "I followed this article" record on a
+    // ticket. Reuses the KB render path, so a template change in the
+    // Phase 1a service propagates automatically.
+    let kb_execution_service =
+        KbExecutionService::new(db.clone(), std::sync::Arc::new(kb_service.clone()));
     // PMS-246: the SPA origin is the invite accept-link base (login-driven
     // acceptance), so created invites email the invitee. PMS-1378 routed
     // the invite mail through `NotificationsService::dispatch`
@@ -473,7 +480,10 @@ pub fn create_api_router(
     let email_intake_service = EmailIntakeService::new(
         db.clone(),
         ticket_service.clone(),
-        AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
+        AttachmentService::new(
+            db.clone(),
+            AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
+        ),
     );
     // PMS-451: per-ticket approval requests.
     let approvals_service = ApprovalsService::new(db.clone());
@@ -702,7 +712,10 @@ pub fn create_api_router(
             "/tickets",
             ticket_routes(
                 ticket_service.clone(),
-                AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
+                AttachmentService::new(
+                    db.clone(),
+                    AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
+                ),
                 // PMS-937: the tickets router now also owns
                 // `POST /tickets/{id}/approvals/request`, which needs
                 // the shared ApprovalsService instance (used for both
@@ -715,7 +728,7 @@ pub fn create_api_router(
         // path nests cleanly under the existing ticket tree.
         .merge(agent_attachment_routes(AttachmentService::new(
             db.clone(),
-            AttachmentConfig::from_env(),
+            AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
         )))
         // PMS-468: agent "all comments from this contact" feed. The
         // route lives on the tickets module (TicketService owns the
@@ -804,12 +817,16 @@ pub fn create_api_router(
         )
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
+        // KB article executions on tickets. Staff-only in this phase;
+        // the per-ticket surface and the per-execution step toggles
+        // share one service wired through the Phase 1a render path.
+        .merge(kb_execution_routes(kb_execution_service))
         // PMS-923: images an article embeds. Upload / list / delete are
         // manager-gated here; the READ is public (see the public tree below),
         // because an `<img>` cannot carry an Authorization header.
         .merge(kb_attachment_routes(KbAttachmentService::new(
             db.clone(),
-            KbAttachmentConfig::from_env(),
+            KbAttachmentConfig::from_env().expect("KB_ATTACHMENT_MAX_BYTES invalid"),
         )))
         // Org membership invitations (PMS-244): admin-only, tenant-scoped.
         .merge(invitations_routes(invitations_service))
@@ -1269,7 +1286,7 @@ pub fn create_api_router(
         // `internal` article. Same bargain as the logo above.
         .merge(public_kb_attachment_routes(KbAttachmentService::new(
             db.clone(),
-            KbAttachmentConfig::from_env(),
+            KbAttachmentConfig::from_env().expect("KB_ATTACHMENT_MAX_BYTES invalid"),
         )))
         // PMS-941: an image embedded in a ticket description or note, for the
         // same reason as the KB image above and with one extra guard: this
@@ -1278,7 +1295,7 @@ pub fn create_api_router(
         // `is_inline`. Anything else 404s here exactly as an unknown id does.
         .merge(public_ticket_attachment_routes(AttachmentService::new(
             db.clone(),
-            AttachmentConfig::from_env(),
+            AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
         )))
         .merge(public_form_routes(
             FormsService::with_request_links(
@@ -1425,7 +1442,7 @@ fn not_a_frontend_body(hub_link: &str) -> String {
          <title>API endpoint</title>\n\
          <meta name=\"robots\" content=\"noindex\">\n\
          {viewport}\n\
-         <style>{shell_css}a{{color:#0066cc}}</style>\n\
+         <style>{shell_css}a{{color:light-dark(#0066cc,#6cb4ff)}}</style>\n\
          </head>\n\
          <body>\n\
          <h1>This is an API endpoint.</h1>\n\
@@ -1734,6 +1751,18 @@ mod tests {
         assert!(body.contains("margin:2rem auto"));
         assert!(body.contains("color-scheme:light dark"));
         assert!(body.contains("max-width:36rem"));
+    }
+
+    /// PMS-1629: the body's `color-scheme: light dark` makes a dark browser
+    /// paint a near-black canvas, so the shell's `color`/`background-color`
+    /// pair and the page's own link color must both carry a dark-mode value
+    /// instead of a fixed light-mode one.
+    #[test]
+    fn not_a_frontend_pairs_colors_for_dark_mode() {
+        let body = not_a_frontend_body("https://example.com");
+        assert!(body.contains("background-color:light-dark(#fff,#121212)"));
+        assert!(body.contains("color:light-dark(#1a1a1a,#e8e8e8)"));
+        assert!(body.contains("a{color:light-dark(#0066cc,#6cb4ff)}"));
     }
 
     // SPEC-1 and 2.78: this test is itself the enforcement site. It textually scans tickets/routes.rs (mounted at `/tickets`) and tickets/attachments.rs (merged at the top level) for `.route(...)` calls, computes

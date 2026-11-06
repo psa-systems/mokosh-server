@@ -1,5 +1,7 @@
 #!/usr/bin/env nu
 
+# SPEC-10.170
+
 # PMS-1402: catch a prefix collision that only appears after the merge.
 #
 # `common/scripts/check-migration-versions.nu` scans the migrations

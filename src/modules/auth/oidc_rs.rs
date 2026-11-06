@@ -234,10 +234,12 @@ impl VerifierConfig {
         let audience = audience.ok_or_else(|| {
             "OIDC_AUDIENCE must be set (e.g. https://api.msp.a8n.systems)".to_string()
         })?;
-        let jwks_cache_ttl_secs = jwks_cache_ttl_secs
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(600);
-        let leeway_seconds = leeway_seconds.and_then(|v| v.parse().ok()).unwrap_or(30);
+        let jwks_cache_ttl_secs =
+            config::parse::parse_optional(&keys::OIDC_JWKS_CACHE_TTL_SECS, jwks_cache_ttl_secs)?
+                .unwrap_or(600);
+        let leeway_seconds =
+            config::parse::parse_optional(&keys::OIDC_LEEWAY_SECONDS, leeway_seconds)?
+                .unwrap_or(30);
         Ok(Self {
             issuer,
             audience,
@@ -804,15 +806,27 @@ mod tests {
         assert_eq!(config.jwks_cache_ttl_secs, 600);
         assert_eq!(config.leeway_seconds, 30);
 
-        // An unparseable knob keeps the built-in default rather than failing
-        // the whole verifier, exactly as it did before.
-        let tuned = VerifierConfig::from_values(
+        // A set-but-unparseable knob is now a boot error naming the
+        // variable and its raw value, rather than silently keeping the
+        // built-in default (PMS-1577).
+        let err = VerifierConfig::from_values(
             Some("https://issuer".into()),
             Some("https://rs".into()),
             Some("120".into()),
             Some("not-a-number".into()),
         )
-        .expect("the knobs are optional");
+        .expect_err("an unparseable OIDC_LEEWAY_SECONDS must refuse to boot");
+        assert!(err.contains("OIDC_LEEWAY_SECONDS"), "{err}");
+        assert!(err.contains("not-a-number"), "{err}");
+
+        // An unset knob still keeps its built-in default.
+        let tuned = VerifierConfig::from_values(
+            Some("https://issuer".into()),
+            Some("https://rs".into()),
+            Some("120".into()),
+            None,
+        )
+        .expect("the knobs are optional when unset");
         assert_eq!(tuned.jwks_cache_ttl_secs, 120);
         assert_eq!(tuned.leeway_seconds, 30);
     }

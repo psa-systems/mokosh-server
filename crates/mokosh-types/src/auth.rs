@@ -661,6 +661,7 @@ pub struct MfaEnableRequest {
 
 /// Validate that a TOTP code contains only ASCII digits. A length-only
 /// check would accept `"abc123"`; the second factor must be numeric.
+// SPEC-4.85: must be ASCII digits only and non-empty.
 fn validate_digits(code: &str) -> Result<(), validator::ValidationError> {
     if !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()) {
         Ok(())
@@ -673,6 +674,7 @@ fn validate_digits(code: &str) -> Result<(), validator::ValidationError> {
 /// The `users.theme_base_mode` check constraint also enforces this set, but
 /// catching it here turns a bad value into a clean 422 instead of a 500
 /// from the database CHECK violation.
+// SPEC-4.86: must be one of light, dark, system.
 fn validate_theme_base_mode(value: &str) -> Result<(), validator::ValidationError> {
     if matches!(value, "light" | "dark" | "system") {
         Ok(())

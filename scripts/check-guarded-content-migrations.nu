@@ -37,6 +37,8 @@ const CUTOFF_PREFIX = 209
 # same pattern on other seeded rows.
 const CONTENT_COLUMNS = [subject body_text body_html name description]
 
+# SPEC-10.169: only migrations numbered above CUTOFF_PREFIX are checked.
+
 def main [] {
     let files = (
         glob migrations/*.sql
@@ -58,6 +60,7 @@ def main [] {
                     $CONTENT_COLUMNS
                     | any {|col| $text =~ $"AND\\s+($col)\\s*\(=|LIKE\)\\s*'" }
                 )
+                # SPEC-10.169: a guarded UPDATE on a free-text column must call GET DIAGNOSTICS.
                 if $guarded and (not ($text | str contains "GET DIAGNOSTICS")) {
                     {file: $f, reason: "WHERE clause guards on a content-column literal with no GET DIAGNOSTICS assertion"}
                 } else {

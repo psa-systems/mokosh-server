@@ -229,6 +229,7 @@ impl Theme {
     /// `accent` is the tenant's `primary_color` as `#rrggbb`; an absent or
     /// unparseable value falls back to [`DEFAULT_ACCENT`] rather than to no
     /// colour, because a Modern document with no band is not Modern.
+    // SPEC-4.71: an absent or unparseable accent falls back to the default accent.
     pub fn resolve(template: Template, accent: Option<&str>) -> Self {
         let chosen = accent.and_then(parse_hex);
         if chosen.is_none() {
@@ -312,6 +313,7 @@ impl Theme {
     ///
     /// NOT hardcoded white. An MSP whose brand is pale yellow would otherwise
     /// get white on white, which is a document with no title on it.
+    // SPEC-4.71: near-black or white, chosen by the accent's relative luminance.
     pub fn band_text(&self) -> Ink {
         if relative_luminance(self.accent) > 0.45 {
             NEAR_BLACK
@@ -323,6 +325,7 @@ impl Theme {
 
 /// `#rrggbb` into a triple. `None` for anything else, so a colour the branding
 /// validator never saw cannot reach the page as an unrelated one.
+// SPEC-4.72: accepts only a leading # and exactly six ASCII hex digits.
 fn parse_hex(value: &str) -> Option<Ink> {
     let hex = value.strip_prefix('#')?;
     if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -663,6 +666,7 @@ fn faces() -> AppResult<&'static Faces> {
 /// nothing at all. Which characters those were is [`render`]'s to report; this
 /// function only collects them, because one warning per document beats one per
 /// character in a 400-row table.
+// SPEC-4.74: control characters and glyphs the face lacks become a placeholder; missing chars are collected, not logged per occurrence.
 fn for_font(s: &str, face: &ParsedFont, missing: &mut BTreeSet<char>) -> String {
     s.chars()
         .map(|c| match c {
@@ -698,6 +702,7 @@ fn for_font(s: &str, face: &ParsedFont, missing: &mut BTreeSet<char>) -> String 
 /// so a subsetter that refuses one glyph set must not withhold an invoice;
 /// nothing downstream reads the outcome, because either face renders the same
 /// page.
+// SPEC-4.73: embeds only the glyphs drawn, deterministically ordered; falls back to the whole face on failure.
 fn subset_face(weight: Weight, face: &ParsedFont, used: &BTreeSet<char>) -> Option<ParsedFont> {
     use allsorts::binary::read::ReadScope;
     use allsorts::font_data::FontData;
@@ -797,6 +802,7 @@ pub async fn render(document: Document, generated_on: NaiveDate) -> AppResult<Ve
         .map_err(|e| AppError::Internal(format!("PDF render task panicked: {}", e)))?
 }
 
+// SPEC-4.75: a pure function of document and generated_on; no system clock read, so output is byte-identical across renders.
 fn render_sync(document: &Document, generated_on: NaiveDate) -> AppResult<Vec<u8>> {
     let faces = faces()?;
     let theme = Theme::resolve(document.template, document.accent.as_deref());
@@ -931,6 +937,7 @@ fn render_sync(document: &Document, generated_on: NaiveDate) -> AppResult<Vec<u8
 /// altered the identifier's length or literal syntax would stop this matching,
 /// and the function would leave the file untouched rather than corrupt it -
 /// caught by `rendering_is_deterministic` rather than shipped.
+// SPEC-4.76: rewrites the trailer /ID from a digest of the blanked file, same length, same value in both slots; untouched if the markers are not found.
 fn stamp_deterministic_id(bytes: &mut [u8]) {
     const ID_LEN: usize = 32;
     let Some(open) = find(bytes, b"/ID[(") else {
@@ -977,6 +984,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// printpdf derives an image's physical size from its pixel count and its DPI:
 /// asking for a width in millimetres is the same as asking for the DPI at which
 /// that many pixels measure that many millimetres.
+// SPEC-4.77: scales the logo to fit its box while preserving aspect ratio.
 fn place_logo(doc: &mut PdfDocument, layout: &mut Layout, logo: &Logo) -> Result<f32, String> {
     let image = RawImage::decode_from_bytes(&logo.bytes, &mut Vec::new())?;
     let (px_w, px_h) = (image.width as f32, image.height as f32);
@@ -1028,6 +1036,7 @@ fn place_logo(doc: &mut PdfDocument, layout: &mut Layout, logo: &Logo) -> Result
 /// corrupt would withhold the document over its decoration. The refusal is
 /// logged rather than swallowed, so an MSP whose logo never appears can be told
 /// why.
+// SPEC-4.77: a logo that fails to decode is omitted with a warning, never fails the render.
 fn place_or_warn(doc: &mut PdfDocument, layout: &mut Layout, logo: &Logo) -> f32 {
     match place_logo(doc, layout, logo) {
         Ok(height) => height,
@@ -1506,6 +1515,7 @@ fn right_aligned_x(right_mm: f32, text: &str, size_pt: f32) -> f32 {
 ///
 /// A column is never narrower than [`MIN_COLUMN_MM`], so one long free-text
 /// column cannot squeeze a column of dates down to nothing.
+// SPEC-4.78: never narrows a column below the configured minimum; a column already within the narrow threshold keeps its full width.
 fn column_widths(
     headers: &[String],
     rows: &[Vec<String>],
@@ -1593,6 +1603,7 @@ fn fit_to(mut widths: Vec<f32>, available: f32) -> Vec<f32> {
 
 /// Cut a cell to what its column can show, with an ellipsis so a reader can
 /// see that something was cut.
+// SPEC-4.78: truncates with a trailing ellipsis rather than overflowing the column.
 fn truncate_to(text: &str, width_mm: f32, size_pt: f32) -> String {
     let usable = (width_mm - CELL_PAD_MM).max(0.0);
     let fits = (usable / (AVERAGE_CHAR_EM * size_pt * MM_PER_PT)).floor() as usize;

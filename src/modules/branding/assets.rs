@@ -277,11 +277,11 @@ impl BrandingAssetStore {
         }
     }
 
-    pub fn max_bytes(&self, kind: BrandAssetKind, scope: AssetScope) -> u64 {
-        config::get(kind.config_key(scope))
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or_else(|| kind.default_max_bytes())
+    pub fn max_bytes(&self, kind: BrandAssetKind, scope: AssetScope) -> AppResult<u64> {
+        let key = kind.config_key(scope);
+        Ok(config::parse::parse_positive(key, config::get(key))
+            .map_err(AppError::Configuration)?
+            .unwrap_or_else(|| kind.default_max_bytes()))
     }
 
     /// The largest cap across every [`BrandAssetKind`] for a scope VARIANT
@@ -290,7 +290,7 @@ impl BrandingAssetStore {
     /// resolves which cap applies inside `store`, after axum has already
     /// buffered the body, so the route's `DefaultBodyLimit` (PMS-1233) has to
     /// cover whichever of the three this request turns out to name.
-    pub fn max_bytes_for_scope(&self, scope: AssetScope) -> u64 {
+    pub fn max_bytes_for_scope(&self, scope: AssetScope) -> AppResult<u64> {
         [
             BrandAssetKind::Logo,
             BrandAssetKind::Favicon,
@@ -298,8 +298,8 @@ impl BrandingAssetStore {
         ]
         .into_iter()
         .map(|kind| self.max_bytes(kind, scope))
-        .max()
-        .unwrap_or(0)
+        .collect::<AppResult<Vec<u64>>>()
+        .map(|caps| caps.into_iter().max().unwrap_or(0))
     }
 
     /// PMS-1397: tenant-first layout.
@@ -355,7 +355,7 @@ impl BrandingAssetStore {
         if bytes.is_empty() {
             return Err(AppError::BadRequest("The uploaded file is empty.".into()));
         }
-        let cap = self.max_bytes(kind, scope);
+        let cap = self.max_bytes(kind, scope)?;
         if bytes.len() as u64 > cap {
             return Err(oversized_upload_error("image", cap));
         }

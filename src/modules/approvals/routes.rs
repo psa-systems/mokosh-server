@@ -312,6 +312,9 @@ async fn decide(
     State(s): State<ApprovalsRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
+    // PMS-1624: a staff decision on a quote can move the quote's status, and
+    // that write is audited like any other change to a quote.
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<DecideApprovalRequest>,
 ) -> AppResult<Json<ApprovalResponse>> {
@@ -320,7 +323,7 @@ async fn decide(
         CallerContext::Staff(auth) => {
             let u = staff_user(auth)?;
             s.service
-                .decide(u.tenant_id, id, u.id, u.role.as_str(), req)
+                .decide(u.tenant_id, id, u.id, u.role.as_str(), req, &ctx)
                 .await?
         }
         CallerContext::Contact(session) => {

@@ -32,7 +32,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 <a id="release-v0-17-0"></a>
 
-### v0.17.0
+### Unreleased (v0.17.0)
 
 #### Added
 
@@ -47,7 +47,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 <a id="release-v0-16-0"></a>
 
-### v0.16.0
+### Unreleased (v0.16.0)
 
 #### Added
 
@@ -68,7 +68,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 <a id="release-v0-15-0"></a>
 
-### v0.15.0
+### Unreleased (v0.15.0)
 
 #### Added
 
@@ -95,7 +95,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 <a id="release-v0-14-0"></a>
 
-### v0.14.0
+### Unreleased (v0.14.0)
 
 #### Added
 
@@ -146,11 +146,132 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 - [`GOOGLE_OAUTH_REDIRECT_URI`](#var-google-oauth-redirect-uri) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose variables; the Google sign-in routes it served are gone. (PMS-837)
 - [`OAUTH_SUPER_ADMIN_EMAILS`](#var-oauth-super-admin-emails) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose variables; only the removed Google sign-in path read it. (PMS-837)
 
-<a id="release-v0-13-0"></a>
+<a id="release-v0-12-0"></a>
 
-### v0.13.0
+### Unreleased (v0.12.0)
 
-No configuration changes.
+#### Added
+
+- [`ABUSE_CONTACT_EMAIL`](#var-abuse-contact-email) (Required: no) - Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces. (PMS-748)
+- [`INFISICAL_ADDRESS`](#var-infisical-address) (Required: no) - Optional. Blank reports Infisical as skipped in the readiness probe. (GOV-50)
+- [`PUBLIC_API_BASE_URL`](#var-public-api-base-url) (Required: no) - Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces. (PMS-748)
+- [`SPA_BASE_URL`](#var-spa-base-url) (Required: no) - Optional at the time (required since v0.14.0). Set it to the mokosh-apps origin so SPA-only email links land there. (MAPPS-425)
+- [`TENANT_LOGO_MAX_BYTES`](#var-tenant-logo-max-bytes) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-11-0"></a>
+
+### Unreleased (v0.11.0)
+
+#### Added
+
+- [`IP2PROXY_DB_PATH`](#var-ip2proxy-db-path) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-10-0"></a>
+
+### Unreleased (v0.10.0)
+
+#### Added
+
+- [`STRIPE_API_BASE`](#var-stripe-api-base) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-8-0"></a>
+
+### Unreleased (v0.8.0)
+
+#### Added
+
+- [`LOGIN_APPROVAL_ENABLED`](#var-login-approval-enabled) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-7-0"></a>
+
+### Unreleased (v0.7.0)
+
+#### Added
+
+- [`IP2LOCATION_DB_PATH`](#var-ip2location-db-path) (Required: no) - Optional. Leave it unset to keep the default.
+- [`TRUSTED_PROXY_CIDR`](#var-trusted-proxy-cidr) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-6-0"></a>
+
+### Unreleased (v0.6.0)
+
+#### Added
+
+- **Breaking: won't start:** [`BUNYIP_WEBHOOK_SECRET`](#var-bunyip-webhook-secret) (Required: yes) - Set it to bunyip-api's `BUNYIP_WEBHOOK_SIGNING_SECRET` before restarting; boot refuses without it outside dev/test. (PMS-591)
+
+<a id="release-v0-4-0"></a>
+
+### Unreleased (v0.4.0)
+
+#### Added
+
+- [`ATTACHMENT_DIR`](#var-attachment-dir) (Required: no) - Optional. Leave it unset to keep the default.
+- [`ATTACHMENT_MAX_BYTES`](#var-attachment-max-bytes) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_ADMIN_DATABASE_URL`](#var-mokosh-admin-database-url) (Required: no) - Optional. Leave it unset to keep the default.
+
+#### Changed
+
+- **Breaking: won't start:** [`ENCRYPTION_KEY`](#var-encryption-key) (Required: yes) - Now required outside dev/test: boot refuses an unset value or the built-in dev value. Set a real secret before restarting. (PMS-499)
+- **Breaking: won't start:** [`JWT_SECRET`](#var-jwt-secret) (Required: yes) - Now required outside dev/test: boot refuses an unset value or the built-in dev value. Set a real secret before restarting. (PMS-499)
+
+<a id="release-v0-3-0"></a>
+
+### Unreleased (v0.3.0)
+
+#### Added
+
+- [`MOKOSH_APP_DATABASE_URL`](#var-mokosh-app-database-url) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_APP_PASSWORD`](#var-mokosh-app-password) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_DEMO_SEED`](#var-mokosh-demo-seed) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_MIGRATOR_PASSWORD`](#var-mokosh-migrator-password) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_SEED_TENANT_ID`](#var-mokosh-seed-tenant-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_UPDATE_CHECK_URL`](#var-mokosh-update-check-url) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OAUTH_SUPER_ADMIN_EMAILS`](#var-oauth-super-admin-emails) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_AUDIENCE`](#var-oidc-audience) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_DEFAULT_TENANT_ID`](#var-oidc-default-tenant-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_ISSUER`](#var-oidc-issuer) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_JWKS_CACHE_TTL_SECS`](#var-oidc-jwks-cache-ttl-secs) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_LEEWAY_SECONDS`](#var-oidc-leeway-seconds) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-2-0"></a>
+
+### Unreleased (v0.2.0)
+
+#### Added
+
+- [`CLIENT_ORIGIN`](#var-client-origin) (Required: no) - Optional. Leave it unset to keep the default.
+- [`CORS_ORIGIN`](#var-cors-origin) (Required: no) - Optional. Leave it unset to keep the default.
+- [`GOOGLE_OAUTH_CLIENT_ID`](#var-google-oauth-client-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`GOOGLE_OAUTH_CLIENT_SECRET`](#var-google-oauth-client-secret) (Required: no) - Optional. Leave it unset to keep the default.
+- [`GOOGLE_OAUTH_REDIRECT_URI`](#var-google-oauth-redirect-uri) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_FROM`](#var-smtp-from) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_HOST`](#var-smtp-host) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_PASSWORD`](#var-smtp-password) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_PORT`](#var-smtp-port) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_TLS`](#var-smtp-tls) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_USERNAME`](#var-smtp-username) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-1-0"></a>
+
+### Unreleased (v0.1.0)
+
+#### Added
+
+- [`DATABASE_URL`](#var-database-url) (Required: yes) - Required: set it before the server starts.
+- [`ADMIN_EMAIL`](#var-admin-email) (Required: no) - Optional. Leave it unset to keep the default.
+- [`ADMIN_PASSWORD`](#var-admin-password) (Required: no) - Optional. Leave it unset to keep the default.
+- [`BASE_URL`](#var-base-url) (Required: no) - Optional. Leave it unset to keep the default.
+- [`ENCRYPTION_KEY`](#var-encryption-key) (Required: no) - Optional. Leave it unset to keep the default.
+- [`ENVIRONMENT`](#var-environment) (Required: no) - Optional. Leave it unset to keep the default.
+- [`HOST`](#var-host) (Required: no) - Optional. Leave it unset to keep the default.
+- [`INFISICAL_CLIENT_ID`](#var-infisical-client-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`INFISICAL_CLIENT_SECRET`](#var-infisical-client-secret) (Required: no) - Optional. Leave it unset to keep the default.
+- [`INFISICAL_ENVIRONMENT`](#var-infisical-environment) (Required: no) - Optional. Leave it unset to keep the default.
+- [`INFISICAL_PROJECT_ID`](#var-infisical-project-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`JWT_SECRET`](#var-jwt-secret) (Required: no) - Optional. Leave it unset to keep the default.
+- [`PORT`](#var-port) (Required: no) - Optional. Leave it unset to keep the default.
+- [`RUN_MIGRATIONS`](#var-run-migrations) (Required: no) - Optional. Leave it unset to keep the default.
+- [`RUST_LOG`](#var-rust-log) (Required: no) - Optional. Leave it unset to keep the default.
 
 <!-- END GENERATED: recently-added -->
 
@@ -166,12 +287,12 @@ No configuration changes.
 | --- | --- | --- | --- | --- |
 | <a id="var-mokosh-deployment-mode"></a>`MOKOSH_DEPLOYMENT_MODE` | yes | v0.14.0 | `.env` | `self-hosted` or `saas`. Selects the hosting profile, which supplies the default provider for every capability (configuration, secrets, authentication, email, storage). An unrecognized value fails startup naming both legal values (PMS-1011, PMS-1160). |
 | <a id="var-environment"></a>`ENVIRONMENT` | no, default `development` | v0.1.0 | `.env` | `development`, `dev` and `test` accept the built-in development secrets and skip the required-variable gate; every other value enforces both. A deployment sets `production` or `staging`. |
-| <a id="var-database-url"></a>`DATABASE_URL` | yes | v0.1.0 | `.env` for host-side tools, `compose.dev.yml` for the container | Privileged `mokosh_migrator` connection string (`BYPASSRLS`), used for migrations, bootstrap and cross-tenant workers. The built-in fallback is a localhost Postgres, so a deployment without it cannot start. |
+| <a id="var-database-url"></a>`DATABASE_URL` | yes | v0.1.0 | `.env` for host-side tools, `compose.dev.yml` for the container | Privileged `mokosh_migrator` connection string (`BYPASSRLS`), used for migrations, bootstrap and cross-tenant workers. Unset outside development/test now refuses to start naming the variable, instead of falling back to a localhost Postgres that likely does not exist on a deployed host (PMS-1577). |
 | <a id="var-mokosh-app-database-url"></a>`MOKOSH_APP_DATABASE_URL` | yes | v0.3.0; required since v0.14.0 | `.env` | Request-serving `mokosh_app` connection string (`NOBYPASSRLS`, PMS-285). Unset in development falls back to `DATABASE_URL`, single-role, and row-level security goes inert, which is why every other environment refuses to start without it (PMS-1160). |
 | <a id="var-mokosh-admin-database-url"></a>`MOKOSH_ADMIN_DATABASE_URL` | no, needed only on the first boot against an unprovisioned database | v0.4.0 | `.env` | Superuser connection the server uses once to create the `mokosh_migrator` and `mokosh_app` roles (PMS-489). Unused once both roles exist. |
 | <a id="var-mokosh-migrator-password"></a>`MOKOSH_MIGRATOR_PASSWORD` | no, needed only when the roles are provisioned | v0.3.0 | `.env` | Password given to the `mokosh_migrator` role when it is created. Generated per clone in development. |
 | <a id="var-mokosh-app-password"></a>`MOKOSH_APP_PASSWORD` | no, needed only when the roles are provisioned | v0.3.0 | `.env` | Password given to `mokosh_app`; boot reconciles the role's password from it. Generated per clone in development. |
-| <a id="var-run-migrations"></a>`RUN_MIGRATIONS` | no, default `true` | v0.1.0 | `.env` | Whether the server applies pending migrations on start. |
+| <a id="var-run-migrations"></a>`RUN_MIGRATIONS` | no, default `true` | v0.1.0 | `.env` | Whether the server applies pending migrations on start. Unset or blank keeps the default; set to a value other than a boolean fails startup naming the variable and the value (PMS-1577). |
 | <a id="var-rust-log"></a>`RUST_LOG` | no, default `info` | v0.1.0 | `.env` | Tracing filter (the dev stack sets `info,mokosh_server=debug`). |
 
 ### Secrets and encryption
@@ -208,14 +329,14 @@ No configuration changes.
 | Variable | Required | Added in | Where set | Purpose |
 | --- | --- | --- | --- | --- |
 | <a id="var-host"></a>`HOST` | no, default `0.0.0.0` | v0.1.0 | `.env` | Listen address. |
-| <a id="var-port"></a>`PORT` | no, default `8080` | v0.1.0 | `MOKOSH_PORT` in `.env` | Listen port inside the container, and the port Traefik forwards to. |
+| <a id="var-port"></a>`PORT` | no, default `8080` | v0.1.0 | `MOKOSH_PORT` in `.env` | Listen port inside the container, and the port Traefik forwards to. Unset or blank keeps the default; set to a non-numeric value fails startup naming the variable and the value (PMS-1577). |
 | <a id="var-base-url"></a>`BASE_URL` | yes | v0.1.0; required since v0.14.0 | `.env` | Base of platform-owned email links (password reset, portal grant, invoice pay). The development fallback is localhost, which outside development would send every link nowhere (PMS-1160). |
 | <a id="var-client-origin"></a>`CLIENT_ORIGIN` | yes | v0.2.0; required since v0.14.0 | `.env` | Browser-visible origin of the client that talks to this API: the `CORS_ORIGIN` default and the OAuth popup `postMessage` origin (PMS-1160). |
 | <a id="var-spa-base-url"></a>`SPA_BASE_URL` | yes | v0.12.0; required since v0.14.0 | `.env` | Base for emailed links to pages only mokosh-apps serves (request forms, portal set-password, invoice Pay Now). On a deployment `CLIENT_ORIGIN` is the apex, so falling back to it lands every such link on Bunyip's 404 (MAPPS-425, PMS-1160). |
 | <a id="var-cors-origin"></a>`CORS_ORIGIN` | no, default `CLIENT_ORIGIN` | v0.2.0 | `.env` | Comma-separated CORS allow-list. Every entry must be a valid header value or the server panics at startup. |
 | <a id="var-public-api-base-url"></a>`PUBLIC_API_BASE_URL` | no, unset sends request-form email without the logo | v0.12.0 | `.env` | This deployment's public API base, used to make the tenant logo absolute in request-form email (PMS-748, MAPPS-429). |
 | <a id="var-abuse-contact-email"></a>`ABUSE_CONTACT_EMAIL` | no, unset drops the report-abuse line | v0.12.0 | `.env` | Address a client can report an unwanted request-form email to (PMS-748). |
-| <a id="var-mokosh-max-tenants"></a>`MOKOSH_MAX_TENANTS` | no, unset leaves tenant creation uncapped | v0.14.0 | `.env` | Ceiling on tenants the super-admin can create; the create endpoint answers 409 at the cap (MAPPS-457). |
+| <a id="var-mokosh-max-tenants"></a>`MOKOSH_MAX_TENANTS` | no, unset leaves tenant creation uncapped | v0.14.0 | `.env` | Ceiling on tenants the super-admin can create; the create endpoint answers 409 at the cap (MAPPS-457). Set to a non-numeric or non-positive value fails startup naming the variable and the value, instead of silently reading as uncapped (PMS-1577). |
 | <a id="var-mokosh-update-check-url"></a>`MOKOSH_UPDATE_CHECK_URL` | no, unset disables the update probe | v0.3.0 | `.env` | Upstream version probe for the self-hosted update check (PMS-238). |
 
 ### Mail
@@ -224,7 +345,7 @@ No configuration changes.
 | --- | --- | --- | --- | --- |
 | <a id="var-mail-provider"></a>`MAIL_PROVIDER` | no, default the hosting profile's (`log` self-hosted, `smtp` saas) | v0.14.0 | `.env` | `log` (`LogMailer`, no bytes leave the box) or `smtp` (`SmtpMailer` against `SMTP_HOST`). Unset with `SMTP_HOST` set means `smtp`. An unrecognized value, or `smtp` without `SMTP_HOST`, fails startup (PMS-1013). |
 | <a id="var-smtp-host"></a>`SMTP_HOST` | no, unset selects `LogMailer` | v0.2.0 | `.env` | SMTP relay host; the dev stack points it at mailpit. The admin email settings override every `SMTP_*` value per field (PMS-638). |
-| <a id="var-smtp-port"></a>`SMTP_PORT` | no, default `587` | v0.2.0 | `.env` | SMTP relay port. |
+| <a id="var-smtp-port"></a>`SMTP_PORT` | no, default `587` | v0.2.0 | `.env` | SMTP relay port. Unset or blank keeps the default; set to a non-numeric value fails startup naming the variable and the value (PMS-1577). |
 | <a id="var-smtp-username"></a>`SMTP_USERNAME` | no, unset sends unauthenticated | v0.2.0 | `.env` | SMTP login; set without `SMTP_PASSWORD` it fails startup. |
 | <a id="var-smtp-password"></a>`SMTP_PASSWORD` | no, needed with `SMTP_USERNAME` | v0.2.0 | governed application-tier secret | SMTP relay password, served by the `APP_SECRET_BACKEND` provider. |
 | <a id="var-smtp-from"></a>`SMTP_FROM` | no, needed when `SMTP_HOST` is set | v0.2.0 | `.env` | Sender mailbox (RFC 5322). Its domain must be one the relay may send for. |
@@ -237,16 +358,16 @@ No configuration changes.
 | <a id="var-auth-providers"></a>`AUTH_PROVIDERS` | no, default the hosting profile's (`bunyip,local` saas, `local` self-hosted) | v0.14.0 | `.env` | Comma-separated authentication-provider priority list. `AuthService::login` refuses the local password path without `local`, and the middleware skips Bunyip verification without `bunyip` (PMS-981). |
 | <a id="var-oidc-issuer"></a>`OIDC_ISSUER` | no, unset turns Bunyip sign-in off | v0.3.0 | `compose.dev.yml`, derived from `${USER}` | Bunyip issuer; must equal the token `iss` and Bunyip's discovery issuer. |
 | <a id="var-oidc-audience"></a>`OIDC_AUDIENCE` | no, unset turns Bunyip sign-in off | v0.3.0 | `compose.dev.yml`, derived from `${USER}` | Audience on the mokosh-apps `oauth_clients` row in bunyip-api. |
-| <a id="var-oidc-jwks-cache-ttl-secs"></a>`OIDC_JWKS_CACHE_TTL_SECS` | no, default `600` | v0.3.0 | `.env` | How long Bunyip's JWKS is cached, in seconds. |
-| <a id="var-oidc-leeway-seconds"></a>`OIDC_LEEWAY_SECONDS` | no, default `30` | v0.3.0 | `.env` | Clock leeway for token validation, in seconds. |
-| <a id="var-oidc-default-tenant-id"></a>`OIDC_DEFAULT_TENANT_ID` | no, default the migration-023 seed tenant | v0.3.0 | `.env` | Shared landing tenant a Bunyip user is provisioned into (PMS-239). |
+| <a id="var-oidc-jwks-cache-ttl-secs"></a>`OIDC_JWKS_CACHE_TTL_SECS` | no, default `600` | v0.3.0 | `.env` | How long Bunyip's JWKS is cached, in seconds. Unset or blank keeps the default; set to a non-numeric value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-oidc-leeway-seconds"></a>`OIDC_LEEWAY_SECONDS` | no, default `30` | v0.3.0 | `.env` | Clock leeway for token validation, in seconds. Unset or blank keeps the default; set to a non-numeric value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-oidc-default-tenant-id"></a>`OIDC_DEFAULT_TENANT_ID` | no, default the migration-023 seed tenant | v0.3.0 | `.env` | Shared landing tenant a Bunyip user is provisioned into (PMS-239). Unset or blank keeps the default; set to a value that does not parse as a UUID fails startup naming the variable and the value (PMS-1577). |
 | <a id="var-oidc-backchannel-client-id"></a>`OIDC_BACKCHANNEL_CLIENT_ID` | no, unset refuses every back-channel logout token | v0.15.0 | `.env` | Client id Bunyip addresses a back-channel logout token to: the mokosh-apps row's `client_id`, not its audience (PMS-998). |
 | <a id="var-allow-uninvited-bunyip-signup"></a>`ALLOW_UNINVITED_BUNYIP_SIGNUP` | no, default off | v0.16.0 | `.env` | Lets a Bunyip identity with a verified email provision a personal tenant on first sight. Production stays invitation-only; staging turns it on (PMS-1457). |
 | <a id="var-bunyip-status-client-id"></a>`BUNYIP_STATUS_CLIENT_ID` | no, unset gates provider status on `RequireAdmin` alone | v0.14.0 | `.env` | Machine credential Bunyip's provider-status aggregator presents as HTTP Basic (PMS-1193). Set together with the secret below. |
 | <a id="var-bunyip-status-client-secret"></a>`BUNYIP_STATUS_CLIENT_SECRET` | no, unset gates provider status on `RequireAdmin` alone | v0.14.0 | `.env` | The secret half, compared in constant time. |
 | <a id="var-admin-email"></a>`ADMIN_EMAIL` | no, unset skips the first-run admin | v0.1.0 | `.env` | Optional first-run super-admin, development only; see [`first-run-onboarding.md`](first-run-onboarding.md). |
 | <a id="var-admin-password"></a>`ADMIN_PASSWORD` | no, unset skips the first-run admin | v0.1.0 | `.env` | Password for the first-run admin above. |
-| <a id="var-login-approval-enabled"></a>`LOGIN_APPROVAL_ENABLED` | no, default off | v0.8.0 | `.env` | The suspicious-login notify-and-approve gate (PMS-658), off by default because it can withhold a login. |
+| <a id="var-login-approval-enabled"></a>`LOGIN_APPROVAL_ENABLED` | no, default off | v0.8.0 | `.env` | The suspicious-login notify-and-approve gate (PMS-658), off by default because it can withhold a login. Unset or blank keeps the default; set to a value that is not a recognized boolean spelling fails startup naming the flag and the value (PMS-1577). |
 
 ### Features, network and payments
 
@@ -282,14 +403,14 @@ No configuration changes.
 | <a id="var-s3-path-style"></a>`S3_PATH_STYLE` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_PATH_STYLE` | `compose.dev.yml` | Deprecated alias, as above. |
 | <a id="var-s3-access-key-id"></a>`S3_ACCESS_KEY_ID` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ACCESS_KEY_ID` | `compose.dev.yml` | Deprecated alias, as above. |
 | <a id="var-s3-secret-access-key"></a>`S3_SECRET_ACCESS_KEY` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_SECRET_ACCESS_KEY` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-attachment-max-bytes"></a>`ATTACHMENT_MAX_BYTES` | no, default 25 MiB | v0.4.0 | `.env` | Per-attachment size cap in bytes. |
-| <a id="var-kb-attachment-max-bytes"></a>`KB_ATTACHMENT_MAX_BYTES` | no, default 5 MiB | v0.14.0 | `.env` | Cap on an image embedded in a knowledge base article (PMS-923). |
-| <a id="var-tenant-logo-max-bytes"></a>`TENANT_LOGO_MAX_BYTES` | no, default 1 MiB | v0.12.0 | `.env` | Cap on an uploaded tenant logo. |
-| <a id="var-branding-tenant-favicon-max-bytes"></a>`BRANDING_TENANT_FAVICON_MAX_BYTES` | no, default 512 KiB | v0.14.0 | `.env` | Cap on a tenant favicon (MAPPS-622). |
-| <a id="var-branding-tenant-background-max-bytes"></a>`BRANDING_TENANT_BACKGROUND_MAX_BYTES` | no, default 2 MiB | v0.14.0 | `.env` | Cap on a tenant sign-in background. |
-| <a id="var-branding-company-logo-max-bytes"></a>`BRANDING_COMPANY_LOGO_MAX_BYTES` | no, default 1 MiB | v0.14.0 | `.env` | Cap on a client company logo. |
-| <a id="var-branding-company-favicon-max-bytes"></a>`BRANDING_COMPANY_FAVICON_MAX_BYTES` | no, default 512 KiB | v0.14.0 | `.env` | Cap on a client company favicon. |
-| <a id="var-branding-company-background-max-bytes"></a>`BRANDING_COMPANY_BACKGROUND_MAX_BYTES` | no, default 2 MiB | v0.14.0 | `.env` | Cap on a client company sign-in background. |
+| <a id="var-attachment-max-bytes"></a>`ATTACHMENT_MAX_BYTES` | no, default 25 MiB | v0.4.0 | `.env` | Per-attachment size cap in bytes. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-kb-attachment-max-bytes"></a>`KB_ATTACHMENT_MAX_BYTES` | no, default 5 MiB | v0.14.0 | `.env` | Cap on an image embedded in a knowledge base article (PMS-923). Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-tenant-logo-max-bytes"></a>`TENANT_LOGO_MAX_BYTES` | no, default 1 MiB | v0.12.0 | `.env` | Cap on an uploaded tenant logo. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-branding-tenant-favicon-max-bytes"></a>`BRANDING_TENANT_FAVICON_MAX_BYTES` | no, default 512 KiB | v0.14.0 | `.env` | Cap on a tenant favicon (MAPPS-622). Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-branding-tenant-background-max-bytes"></a>`BRANDING_TENANT_BACKGROUND_MAX_BYTES` | no, default 2 MiB | v0.14.0 | `.env` | Cap on a tenant sign-in background. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-branding-company-logo-max-bytes"></a>`BRANDING_COMPANY_LOGO_MAX_BYTES` | no, default 1 MiB | v0.14.0 | `.env` | Cap on a client company logo. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-branding-company-favicon-max-bytes"></a>`BRANDING_COMPANY_FAVICON_MAX_BYTES` | no, default 512 KiB | v0.14.0 | `.env` | Cap on a client company favicon. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-branding-company-background-max-bytes"></a>`BRANDING_COMPANY_BACKGROUND_MAX_BYTES` | no, default 2 MiB | v0.14.0 | `.env` | Cap on a client company sign-in background. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
 
 ### Removed
 

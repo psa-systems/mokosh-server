@@ -15,6 +15,7 @@ const NONCE_LENGTH: usize = 12;
 /// Encrypt a string value using AES-256-GCM
 ///
 /// Returns a base64-encoded string containing the nonce and ciphertext
+// SPEC-4.32: random 12-byte nonce, store nonce || ciphertext, base64-encode.
 pub fn encrypt(plaintext: &str, key: &[u8; 32]) -> AppResult<String> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| AppError::Internal(format!("Encryption key error: {}", e)))?;
@@ -38,6 +39,7 @@ pub fn encrypt(plaintext: &str, key: &[u8; 32]) -> AppResult<String> {
 }
 
 /// Decrypt a base64-encoded ciphertext
+// SPEC-4.32: reverse of encrypt; rejects input shorter than the 12-byte nonce.
 pub fn decrypt(encrypted: &str, key: &[u8; 32]) -> AppResult<String> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| AppError::Internal(format!("Encryption key error: {}", e)))?;
@@ -73,6 +75,7 @@ pub fn decrypt(encrypted: &str, key: &[u8; 32]) -> AppResult<String> {
 /// got a key that differed from their intent. A 32-char hex string is
 /// ambiguous (is it raw bytes or half a hex key?), so it is rejected: hex
 /// keys must be the unambiguous 64-char form, which is hex-decoded.
+// SPEC-4.33: 64 hex chars decoded; 32 chars raw only if not all-hex; else rejected.
 pub fn parse_encryption_key(key_hex: &str) -> AppResult<[u8; 32]> {
     // 64 hex characters: hex-decode to 32 bytes.
     if key_hex.len() == 64 {
@@ -136,6 +139,7 @@ pub fn generate_api_key() -> String {
 /// standing between an attacker and the login page. All sensitive
 /// endpoints gate on capability + session; a leaked slug only reveals
 /// the login form.
+// SPEC-4.34: 16 chars, Crockford base32 minus I/L/O/U.
 pub fn generate_portal_slug() -> String {
     use rand::seq::IndexedRandom;
     // 32 chars: Crockford base32 minus I / L / O / U.
@@ -156,6 +160,7 @@ pub fn generate_portal_slug() -> String {
 /// 1%. `ContactService::grant_portal_access` retries UNIQUE-constraint
 /// bounces up to 5 times, so a collision is quietly recovered rather
 /// than surfacing as a create-Company failure.
+// SPEC-4.34: integer in [100_000_000, 1_000_000_000), always 9 digits.
 pub fn generate_portal_id() -> i64 {
     rand::rng().random_range(100_000_000..1_000_000_000)
 }
@@ -168,6 +173,7 @@ pub fn generate_portal_id() -> i64 {
 /// protection against an offline guess of a low-entropy secret, so it locates
 /// the row only, and the actual credential check stays the Argon2 compare
 /// against that one row's slow hash.
+// SPEC-4.35: lowercase hex SHA-256 digest.
 pub fn sha256_hex(input: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(input.as_bytes());
@@ -286,6 +292,7 @@ async fn dummy_password_hash() -> &'static str {
 /// Always returns `Ok(false)` for the no-row case; the dummy verify's own
 /// result is never a match.
 #[cfg(feature = "server")]
+// SPEC-4.35: one Argon2 verify either way; None row always returns Ok(false).
 pub async fn verify_password_or_dummy(secret: &str, row_hash: Option<&str>) -> AppResult<bool> {
     match row_hash {
         Some(hash) => verify_password(secret, hash).await,

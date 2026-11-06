@@ -35,6 +35,7 @@ const apiBaseURL = pick(
   spaBaseURL,
 ).replace(/\/+$/, '');
 
+// SPEC-10.212: one GET with a 30000ms timeout, exit 0 on ok, 1 otherwise.
 const healthUrl = `${apiBaseURL}/api/v1/health`;
 const TIMEOUT_MS = 30_000;
 

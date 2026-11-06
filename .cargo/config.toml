@@ -3,5 +3,6 @@
 # psa-systems crates (dunite-stripe-core, DEV-514) from
 # https://dev.a8n.run/psa-systems/dunite. Without this, libgit2 may fail to
 # authenticate against the private Forgejo repo. Mirrors bunyip's .cargo/config.
+# SPEC-10.154
 [net]
 git-fetch-with-cli = true

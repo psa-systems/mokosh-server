@@ -434,7 +434,9 @@ async fn stop_timer(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<TimeEntryResponse>> {
-    Ok(Json(state.service.stop_timer(user.tenant(), id).await?))
+    Ok(Json(
+        state.service.stop_timer(user.tenant(), id, user.id).await?,
+    ))
 }
 
 // ============================================================================

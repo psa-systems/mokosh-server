@@ -100,6 +100,7 @@ pub trait Mailer: Send + Sync {
     /// text alone and says so at `warn`, because a mailer that cannot carry
     /// an attachment must not silently pretend it did; the SMTP mailer
     /// overrides it with a `multipart/mixed` message.
+    // SPEC-4.64: the default sends the text alone and logs a warning when given attachments.
     async fn send_with_attachments(
         &self,
         to: &str,
@@ -330,6 +331,7 @@ pub enum SmtpTls {
 }
 
 impl SmtpTls {
+    // SPEC-4.66: fixed value mapping; any other value is rejected.
     pub fn parse(raw: &str) -> AppResult<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "implicit" | "tls" | "smtps" => Ok(Self::Implicit),
@@ -438,6 +440,7 @@ fn base_builder(from: &Mailbox, to: Mailbox) -> MessageBuilder {
 /// placeholders for users whose IdP email is not verified yet (PMS-635); handing
 /// one to the relay always bounces, so fail locally with an actionable error
 /// instead of emitting a message that can only be rejected.
+// SPEC-4.65: a recipient in the reserved .invalid TLD fails locally rather than reaching a transport.
 fn reject_undeliverable_recipient(to: &Mailbox) -> AppResult<()> {
     let domain = to.email.domain().to_ascii_lowercase();
     if domain == "invalid" || domain.ends_with(".invalid") {
@@ -625,6 +628,7 @@ impl Mailer for SmtpMailer {
     /// [`AppError::Configuration`] the caller reports the way `MailerConfig::build`
     /// does, so a boot-time verify fails loudly on the same class of error a
     /// live send would - just without asking somebody to receive a test message.
+    // SPEC-4.66: success only on a true NOOP result; unreachable and refused are distinct errors.
     async fn verify(&self) -> AppResult<()> {
         match self.transport.test_connection().await {
             Ok(true) => Ok(()),
@@ -802,11 +806,13 @@ impl MailerConfig {
     /// to walk. Until then the read stays on the configuration provider so
     /// a deployment whose `SMTP_PASSWORD` is a plain compose variable
     /// upgrades without a fatal boot.
+    // SPEC-4.67: rejects SMTP_USERNAME set without a non-empty SMTP_PASSWORD.
     pub fn from_env() -> AppResult<Self> {
         let host = config::get(&keys::SMTP_HOST).filter(|s| !s.is_empty());
-        let port = config::get(&keys::SMTP_PORT)
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(587);
+        let port =
+            crate::config::parse::parse_optional(&keys::SMTP_PORT, config::get(&keys::SMTP_PORT))
+                .map_err(AppError::Configuration)?
+                .unwrap_or(587);
         let username = config::get(&keys::SMTP_USERNAME).filter(|s| !s.is_empty());
         let password = config::get(&keys::SMTP_PASSWORD)
             .filter(|s| !s.is_empty())
@@ -833,6 +839,7 @@ impl MailerConfig {
 
     /// Build the appropriate mailer for the current config. Selects
     /// `LogMailer` when SMTP_HOST is unset, `SmtpMailer` otherwise.
+    // SPEC-4.67: LogMailer when SMTP_HOST is unset or empty, SmtpMailer otherwise.
     pub fn build(self) -> AppResult<Arc<dyn Mailer>> {
         let Some(host) = self.host else {
             tracing::info!("SMTP_HOST unset; using LogMailer (emails will not be sent)");
@@ -876,6 +883,7 @@ impl SharedMailer {
     }
 
     /// Replace the active mailer. Takes effect on every consumer's next send.
+    // SPEC-4.70: every subsequent send through this handle uses the new mailer.
     pub fn swap(&self, inner: Arc<dyn Mailer>) {
         *self.inner.write().expect("SharedMailer lock poisoned") = inner;
     }
@@ -1008,6 +1016,7 @@ impl EmailConfig {
     /// (`log` in self-hosted, `smtp` in saas). This module never holds the
     /// deployment shape - PMS-904's `only_the_auth_service_and_the_startup_wiring_know_the_deployment_mode`
     /// guard covers that - it only needs a resolved name.
+    // SPEC-4.68: explicit MAIL_PROVIDER wins, else an inferred smtp from SMTP_HOST, else the profile default.
     pub fn resolve(profile_default: &str, raw: &str, smtp_host_set: bool) -> AppResult<Self> {
         let raw = raw.trim();
         if !raw.is_empty() {
@@ -1060,6 +1069,7 @@ impl EmailConfig {
 /// Verifying that the relay actually answers is a separate step
 /// ([`Mailer::verify`]), so the boot log is one call per capability: build
 /// first, verify second.
+// SPEC-4.69: smtp with no SMTP_HOST refuses to build; log with SMTP_HOST set still builds but warns.
 pub fn build_mailer(
     kind: EmailProviderKind,
     mailer_config: MailerConfig,
