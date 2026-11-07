@@ -5093,7 +5093,7 @@ mod mirror_direction {
     /// order asserted, rather than being waved through: naming it here is
     /// cheap, and the next person adding one has to say which order they took.
     #[test]
-    // SPEC-5.99: source-scans src/*.rs for UPDATE identities on mirrored columns; restricted to BOTH_PLANES or users-first.
+    // SPEC-5.99: source scan of src/*.rs for identity-plane writes of mirrored columns; allowed only in BOTH_PLANES writers, users first.
     fn no_writer_takes_the_identity_row_before_the_users_row() {
         // Assembled so the needle is not its own hit; the prose above names
         // the statement.
