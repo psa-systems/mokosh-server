@@ -28,10 +28,10 @@ integration rather than per deployment as infrastructure, so they do not appear 
 `src/config/`, `src/secrets/`, `src/storage/` and `src/app_secrets/` implement the kinds above. `src/app_secrets/`
 (PMS-988) is Mokosh's application-tier `AppSecretProvider`, with a `GovernedSecret` registry holding `SMTP_PASSWORD`
 and, since PMS-1430, the host's Google OAuth client id and secret. A pair like that one joins as TWO entries rather
-than one holding two values: both halves then resolve from the same provider, and the four-way classification reports
+than one holding two values: both halves then resolve from the same provider, and the five-way classification reports
 each separately, which is what makes a half-configured host a boot error naming the key that is missing. Its selection
 variable is `APP_SECRET_BACKEND`, and NOT the tenant tier's `SECRET_BACKEND`: PMS-1424 split them, because this tier
-accepts all four providers while the tenant tier accepts only `database` and `infisical`. A tenant secret is a
+accepts all five providers while the tenant tier accepts only `database` and `infisical`. A tenant secret is a
 per-tenant write, which a read-only file or environment provider cannot hold, so sharing one variable made two of this
 tier's providers unselectable on any deployment that boots.
 [ROADMAP.md](ROADMAP.md) links the phase, and the issue, for every kind.

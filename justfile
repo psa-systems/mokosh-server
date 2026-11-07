@@ -54,7 +54,7 @@ compile_args := "--workspace --all-targets"
 test_args := "--workspace --lib"
 
 # `dev_extra_volumes` is deliberately unset: it configures common's `dev-clean`,
-# and this repo keeps its own (it removes five named volumes and prints a
+# and this repo keeps its own (it removes four named volumes and prints a
 # per-volume line). A value here would be read by nothing.
 
 # The local `build`, `build-docker`, `check`, `check-clippy`, `check-docker`,

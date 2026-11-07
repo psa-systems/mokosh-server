@@ -101,7 +101,7 @@ Leave `APP_SECRET_BACKEND` as it is for now. Restart the process so the file
 provider is built at boot beside the database one. Boot logs report both.
 
 Note which variable this is. `APP_SECRET_BACKEND` selects the APPLICATION tier
-and accepts all four providers; `SECRET_BACKEND` selects the TENANT tier and
+and accepts all five providers; `SECRET_BACKEND` selects the TENANT tier and
 accepts only `database` and `infisical`, because a tenant secret is a per-tenant
 write that a read-only provider cannot hold. Until PMS-1424 this runbook told
 you to set `SECRET_BACKEND=file`, which would have stopped the boot.
