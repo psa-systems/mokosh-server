@@ -95,7 +95,7 @@ jobs:
 
     steps:
       - name: Clone the repository
-        uses: https://code.forgejo.org/actions/checkout@v5
+        uses: https://code.forgejo.org/actions/checkout@v7
 
       - name: Require disk headroom for the link step
         # SPEC-10.14: exit 1 with ::error:: when free space is under 25G
@@ -139,7 +139,7 @@ jobs:
         # rationale. The key literal MUST match the matching cache step
         # in cache-warm.yml and integration-unsupported.yml, or the
         # three jobs restore from different caches on a version bump.
-        uses: https://github.com/actions/cache@v4
+        uses: https://github.com/actions/cache@v6
         with:
           path: /tmp/nextest.tar.gz
           key: cargo-nextest-tarball-0.9.145-linux
@@ -216,7 +216,7 @@ jobs:
         # runs it with `--archive-file`, so no shard recompiles the test
         # binaries. `retention-days: 1` is enough: the artifact is useful
         # only to the matrix shards that `needs: build` on this job.
-        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v5
         with:
           name: nextest-archive
           path: nextest-archive.tar.zst
@@ -287,12 +287,12 @@ jobs:
         # scripts/test-db-roles.sql and nextest's own config files are read
         # from the workspace, so each shard still clones the repo even
         # though the test binaries come from the archive artifact.
-        uses: https://code.forgejo.org/actions/checkout@v5
+        uses: https://code.forgejo.org/actions/checkout@v7
 
       - name: Download the nextest archive
         # SPEC-10.20: each shard downloads the archive before installing
         # nextest, creating DB roles and running its own partition.
-        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        uses: https://code.forgejo.org/forgejo/download-artifact@v7
         with:
           name: nextest-archive
           path: .
@@ -300,7 +300,7 @@ jobs:
       - name: Cache cargo-nextest tarball
         # PMS-1641: same version-keyed cache the build job above uses.
         # Key MUST stay in step with the other cargo-nextest sites.
-        uses: https://github.com/actions/cache@v4
+        uses: https://github.com/actions/cache@v6
         with:
           path: /tmp/nextest.tar.gz
           key: cargo-nextest-tarball-0.9.145-linux

@@ -12,4 +12,4 @@ path = "src/lib.rs"
 [dependencies]
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2", features = ["full"] }
+syn = { version = "3.0.9", features = ["full"] }

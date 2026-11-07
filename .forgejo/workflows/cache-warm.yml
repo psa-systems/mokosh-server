@@ -56,7 +56,7 @@ jobs:
 
     steps:
       - name: Clone the repository
-        uses: https://code.forgejo.org/actions/checkout@v5
+        uses: https://code.forgejo.org/actions/checkout@v7
         with:
           submodules: true
 
@@ -113,7 +113,7 @@ jobs:
 
     steps:
       - name: Clone the repository
-        uses: https://code.forgejo.org/actions/checkout@v5
+        uses: https://code.forgejo.org/actions/checkout@v7
 
       - name: Cap build parallelism
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
@@ -131,7 +131,7 @@ jobs:
         # Key literal MUST match the three cargo-nextest sites across
         # integration.yml, integration-unsupported.yml and this file,
         # or they restore different caches on a bump.
-        uses: https://github.com/actions/cache@v4
+        uses: https://github.com/actions/cache@v6
         with:
           path: /tmp/nextest.tar.gz
           key: cargo-nextest-tarball-0.9.145-linux
