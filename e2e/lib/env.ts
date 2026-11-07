@@ -111,7 +111,7 @@ export const env = {
 // one-line purpose so the aggregated error message names what each
 // missing value is for, not just which key is empty.
 // SPEC-10.198: each of these is required; E2E_ENVIRONMENT is read directly
-// via process.env by test specs, not through this module, defaulting to 'staging'.
+// via process.env by test specs, not through this module, defaulting to 'unknown'.
 const REQUIRED: Array<{ name: string; purpose: string }> = [
   {
     name: 'E2E_BASE_URL',

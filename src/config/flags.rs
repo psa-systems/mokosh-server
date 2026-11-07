@@ -11,9 +11,9 @@
 //! with the value type ([`FlagValue`]); the default stays with the
 //! flag ([`FlagDefault`]). A caller reads the flag through the ONE
 //! read path [`Flag::read`], which trims, parses, and falls back to
-//! the flag's default when a raw value did not parse. A typo does
-//! not stop the boot: a flag is never security-critical enough for
-//! that outcome, mirroring the PMS-902 rule for mail dispatch.
+//! the flag's default when a raw value did not parse. [`check_boot`]
+//! runs at startup and refuses to boot on a typo'd flag, rather than
+//! serving the default silently.
 //!
 //! # Undeclared keys do not compile
 //!

@@ -57,7 +57,8 @@ test_args := "--workspace --lib"
 # and this repo keeps its own (it removes five named volumes and prints a
 # per-volume line). A value here would be read by nothing.
 
-# The local `default`, `dev-clean`, `ensure-env`, `check-docker`, `build-docker`
+# The local `build`, `build-docker`, `check`, `check-clippy`, `check-docker`,
+# `check-fmt`, `default`, `dev-clean`, `dev-clean-all`, `ensure-env`, `fmt`
 # and `test` below intentionally shadow common's; last definition wins.
 # SPEC-10.53
 set allow-duplicate-recipes := true
