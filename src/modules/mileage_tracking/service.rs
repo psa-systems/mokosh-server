@@ -24,6 +24,7 @@ impl MileageTrackingService {
         Self { db }
     }
 
+    // SPEC-14.50: filtered page and a count over the same filter.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_mileage_entries(
         &self,
@@ -115,6 +116,7 @@ impl MileageTrackingService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-14.51, SPEC-14.52, SPEC-14.53, SPEC-14.54: distance 400, tenant checks, pricing, status, audit.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_mileage_entry(
         &self,
@@ -216,6 +218,7 @@ impl MileageTrackingService {
         self.get_mileage_entry(tenant_id, id).await
     }
 
+    // SPEC-14.50, SPEC-14.55: 404 "Mileage entry" when absent.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_mileage_entry(
         &self,
@@ -246,6 +249,7 @@ impl MileageTrackingService {
         Ok(row.into())
     }
 
+    // SPEC-14.56: ticket_id and project_id bind as given (null when omitted); billing status is untouched.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_mileage_entry(
         &self,
@@ -318,6 +322,7 @@ impl MileageTrackingService {
         self.get_mileage_entry(tenant_id, id).await
     }
 
+    // SPEC-14.55: 404 "Mileage entry" when absent.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_mileage_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -341,6 +346,7 @@ impl MileageTrackingService {
 
 /// The tenant default rate card's per-mile rate, if a default card exists and
 /// carries one. `None` => the entry is unpriced unless an explicit rate is set.
+// SPEC-14.53: the default rate card's per-mile rate, if any.
 async fn default_rate_card_per_mile<'e, E>(
     exec: E,
     tenant_id: TenantId,
@@ -363,6 +369,7 @@ where
 }
 
 /// Assert a ticket belongs to the tenant. `NotFound` cross-tenant.
+// SPEC-14.52, SPEC-14.56: 404 "Ticket" outside the tenant.
 async fn assert_ticket_in_tenant<'e, E>(
     exec: E,
     tenant_id: TenantId,
@@ -383,6 +390,7 @@ where
 }
 
 /// Assert a company belongs to the tenant. `NotFound` cross-tenant.
+// SPEC-14.52: 404 "Company" outside the tenant.
 async fn assert_company_in_tenant<'e, E>(
     exec: E,
     tenant_id: TenantId,

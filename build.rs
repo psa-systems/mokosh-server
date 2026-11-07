@@ -6,7 +6,7 @@
 //! workspace member's build script can share one implementation. The workspace
 //! root's `.git` sits alongside this manifest.
 
-// SPEC-1 and 2.151: build.rs delegates MOKOSH_GIT_HASH/MOKOSH_GIT_DESCRIBE/MOKOSH_BUILD_DATE emission to build-metadata::emit.
+// SPEC-2.253
 fn main() {
     build_metadata::emit(".git");
     // PMS-1398: `src/db/pool.rs` embeds `migrations/` with `sqlx::migrate!`,

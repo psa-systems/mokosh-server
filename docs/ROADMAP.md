@@ -5,7 +5,7 @@ is never restated here. Each phase links to its owning issue; open the issue for
 
 ## Providers
 
-Epic: [PMS-1009](https://youtrack.a8n.run/issue/PMS-1009). Model: [providers.md](providers.md).
+Epic: PMS-1009. Model: [providers.md](providers.md).
 
 ### Why
 
@@ -27,51 +27,51 @@ and 9 cover application secrets, authentication and email.
 
 The order is chosen so that each phase is usable on its own and no phase depends on one after it.
 
-**1. Write it down.** [PMS-980](https://youtrack.a8n.run/issue/PMS-980) produces `providers.md` and this file. It
+**1. Write it down.** PMS-980 produces `providers.md` and this file. It
 comes first because the vocabulary and the tier rule are what every later phase is judged against.
 
-**2. Settle the vocabulary.** [PMS-1010](https://youtrack.a8n.run/issue/PMS-1010) renames `SecretStore` and
+**2. Settle the vocabulary.** PMS-1010 renames `SecretStore` and
 `ObjectStore` to `SecretProvider` and `ObjectProvider`. Early and cheap: every later phase either uses these names
 or adds to the confusion. Bunyip's matching rename is
 [BUNYIP-642](https://youtrack.a8n.run/issue/BUNYIP-642).
 
-**3. The configuration seam.** [PMS-982](https://youtrack.a8n.run/issue/PMS-982) adds `ConfigProvider`
+**3. The configuration seam.** PMS-982 adds `ConfigProvider`
 (`src/config/`), the declared key registry with a tier on each key, and the build-time guard that fails on an
 environment read outside the provider and its named entry points. This is the phase that actually prevents the
 incident, because it is the one that makes bypassing impossible. Everything after it depends on the seam
 existing. It landed with every read moved and no allowlist of exceptions, which is why
-[PMS-1024](https://youtrack.a8n.run/issue/PMS-1024) was folded into it rather than sequenced after it: a
+PMS-1024 was folded into it rather than sequenced after it: a
 follow-up whose every criterion named an artefact this phase creates could not run on its own.
 
-**4. More configuration providers.** [PMS-987](https://youtrack.a8n.run/issue/PMS-987) adds file, database and
+**4. More configuration providers.** PMS-987 adds file, database and
 Bunyip implementations with declared priority and several enabled at once. Multiple providers of one kind is a
 requirement, not a luxury: it is the only way a value moves between providers without a flag day.
 
-**5. Application secrets.** [PMS-988](https://youtrack.a8n.run/issue/PMS-988) adds the governed-secret registry
+**5. Application secrets.** PMS-988 adds the governed-secret registry
 and its providers, adopting Bunyip's boot contract rather than inventing a second one. The tenant tier in
 `src/secrets/` is untouched.
 
-**6. Deployment shape.** [PMS-1011](https://youtrack.a8n.run/issue/PMS-1011) extends the existing
+**6. Deployment shape.** PMS-1011 extends the existing
 `DeploymentMode` so a hosting profile supplies default providers. One binary, two profiles, no cargo feature.
 
-**7. Refresh.** [PMS-986](https://youtrack.a8n.run/issue/PMS-986) makes application configuration re-resolvable as
-an atomic generation swap, and [PMS-984](https://youtrack.a8n.run/issue/PMS-984) surfaces staleness and the
+**7. Refresh.** PMS-986 makes application configuration re-resolvable as
+an atomic generation swap, and PMS-984 surfaces staleness and the
 refresh control. Together these are what remove the edit-restart-hope loop.
 
-**8. The operator tooling.** [PMS-1012](https://youtrack.a8n.run/issue/PMS-1012) adds `provider-status`,
+**8. The operator tooling.** PMS-1012 adds `provider-status`,
 `provider-migrate` and `provider-purge` with the verified purge interlock. This is the phase that answers the
 original incident end to end, and it needs the providers from phases 4 and 5 to have something to move between.
 
-**9. The remaining kinds.** [PMS-981](https://youtrack.a8n.run/issue/PMS-981) makes authentication a selectable
+**9. The remaining kinds.** PMS-981 makes authentication a selectable
 provider, keeping both current paths enabled for backward compatibility.
-[PMS-1013](https://youtrack.a8n.run/issue/PMS-1013) makes the email provider chosen by name instead of inferred
-from whether `SMTP_HOST` is set, and adds verify. [PMS-983](https://youtrack.a8n.run/issue/PMS-983) moves feature
+PMS-1013 makes the email provider chosen by name instead of inferred
+from whether `SMTP_HOST` is set, and adds verify. PMS-983 moves feature
 flags onto the configuration provider.
 
-**10. Visibility.** [PMS-989](https://youtrack.a8n.run/issue/PMS-989) serves the provider status as JSON for
+**10. Visibility.** PMS-989 serves the provider status as JSON for
 Bunyip and as an admin page for self-hosted deployments, from one collector.
 
-**11. Share what proved common.** [PMS-1014](https://youtrack.a8n.run/issue/PMS-1014) extracts the shared traits
+**11. Share what proved common.** PMS-1014 extracts the shared traits
 and the status contract into a crate, deliberately last. Extracting from three working implementations is a
 smaller and better-informed job than designing an abstraction for three that do not exist yet.
 
@@ -94,7 +94,7 @@ Bunyip can show them on one page and a discrepancy is visible without anyone kno
 
 ## Specification
 
-Epic: [PMS-1592](https://youtrack.a8n.run/issue/PMS-1592).
+Epic: PMS-1592.
 
 ### Why
 
@@ -107,16 +107,16 @@ site, built one module group at a time so each PR stays small enough to read in 
 
 Each phase owns its own sections of `docs/specification.md` and its own slice of the source tree, so the phases
 can land in any order without colliding on content; only this file and `CLAUDE.md`'s one-line pointer to the
-specification are shared.
+specification are shared. The requirement-level rewrite of every section is delivered as one pull request, tracked by
+the epic and the issues below.
 
-1. [PMS-1593](https://youtrack.a8n.run/issue/PMS-1593): sections 1-2, foundation and server core.
-2. [PMS-1594](https://youtrack.a8n.run/issue/PMS-1594): section 3, providers and secrets.
-3. [PMS-1595](https://youtrack.a8n.run/issue/PMS-1595): section 4, utilities, PDF and wire types.
-4. [PMS-1596](https://youtrack.a8n.run/issue/PMS-1596): section 5, identity, tenancy and audit.
-5. [PMS-1597](https://youtrack.a8n.run/issue/PMS-1597): section 6, billing and time.
-6. [PMS-1598](https://youtrack.a8n.run/issue/PMS-1598): section 7, service desk.
-7. [PMS-1599](https://youtrack.a8n.run/issue/PMS-1599): section 8, remaining modules.
-8. [PMS-1600](https://youtrack.a8n.run/issue/PMS-1600): section 9, data model and migrations. Done.
-9. [PMS-1601](https://youtrack.a8n.run/issue/PMS-1601): section 10, build, CI and deployment.
-10. [PMS-1602](https://youtrack.a8n.run/issue/PMS-1602): section 11, the cross-cutting index, sequenced last
-    because it is the only phase that reads every other section's final id range.
+1. PMS-1593: sections 1-2, foundation and server core.
+2. PMS-1594: section 3, providers and secrets.
+3. PMS-1595: section 4, utilities, PDF and wire types.
+4. PMS-1596: section 5, identity, tenancy and audit; section 6, configuration.
+5. PMS-1597: section 13, billing; section 14, time, mileage, expenses and opportunities.
+6. PMS-1598: section 7, service desk.
+7. PMS-1599: sections 8, 11 and 12, integrations, non-functional behavior and interfaces; section 15, remaining modules.
+8. PMS-1600: section 9, data model and migrations.
+9. PMS-1601: section 10, build, CI and deployment.
+10. PMS-1602: the whole-repository coverage check.

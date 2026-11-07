@@ -13,6 +13,7 @@ use crate::utils::pagination::PaginationParams;
 use super::models::*;
 
 /// How long a pending invite stays valid.
+// SPEC-5.542: invitation lifetime.
 const INVITE_TTL_DAYS: i64 = 14;
 
 #[derive(Clone)]
@@ -66,12 +67,14 @@ impl InvitationsService {
         request: &CreateInvitationRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvitationResponse> {
+        // SPEC-5.540: role outside the invitable set is a 400.
         if !INVITABLE_ROLES.contains(&request.role.as_str()) {
             return Err(AppError::BadRequest(format!(
                 "Role must be one of {}",
                 INVITABLE_ROLES.join(", ")
             )));
         }
+        // SPEC-5.542: stored email is trimmed and lowercased.
         let email = request.email.trim().to_ascii_lowercase();
         let expires_at = Utc::now() + Duration::days(INVITE_TTL_DAYS);
 
@@ -87,6 +90,7 @@ impl InvitationsService {
         // bypasses it (the migrator pool, or a test harness pool built with
         // `Database::from_pool`, which points both halves at one connection)
         // would otherwise see a foreign tenant's team as present.
+        // SPEC-5.541: only an active team of this tenant may be named.
         if let Some(team_id) = request.team_id {
             let team_exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM teams WHERE id = $1 AND tenant_id = $2 AND is_active = TRUE)",
@@ -103,6 +107,7 @@ impl InvitationsService {
             }
         }
 
+        // SPEC-5.542, SPEC-5.543: upsert on the pending (tenant, lower(email)) key.
         let invite = sqlx::query_as::<_, InvitationResponse>(
             r#"INSERT INTO tenant_invitations (tenant_id, email, role, invited_by, expires_at, team_id)
                VALUES ($1, $2, $3, $4, $5, $6)
@@ -125,6 +130,7 @@ impl InvitationsService {
 
         // A tenant that starts inviting people is no longer a one-person
         // personal tenant - promote it so it reads as an org everywhere.
+        // SPEC-5.544: personal becomes org; timesheets enabled only on that change.
         let promoted = sqlx::query("UPDATE tenants SET kind = 'org', updated_at = NOW() WHERE id = $1 AND kind = 'personal'")
             .bind(tenant_id)
             .execute(&mut *tx)
@@ -165,6 +171,7 @@ impl InvitationsService {
             None
         };
 
+        // SPEC-5.545: audit row shares the invitation transaction.
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM tenant_invitations t WHERE tenant_id = $1 AND id = $2",
         )
@@ -195,6 +202,7 @@ impl InvitationsService {
         // whose mail did not go is a visible operator state the SPA can
         // surface, which was already the shape of the old `INSERT INTO
         // notifications` after the row landed).
+        // SPEC-5.546: dispatch failure is a WARN, not a request failure.
         if let (Some(app_url), Some(notifications), Some(tenant_name)) = (
             self.app_url.as_deref(),
             self.notifications.as_ref(),
@@ -227,6 +235,7 @@ impl InvitationsService {
 
     /// List the tenant's pending invites, newest first.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.547: status pending only, newest first, no expiry filter.
     pub async fn list_pending(
         &self,
         tenant_id: TenantId,
@@ -269,6 +278,7 @@ impl InvitationsService {
     /// outstanding invites for an arbitrary address. The
     /// `routes_do_not_reach_global_login_helpers` regression test
     /// (`tests/suites/auth.rs`) pins that no `routes.rs` references it.
+    // SPEC-5.548: cross-tenant lookup for the pre-session login path only.
     pub async fn newest_pending_for(&self, email: &str) -> AppResult<Option<PendingInvite>> {
         let email = email.trim().to_ascii_lowercase();
         // SAFETY (PMS-285, step 9 decision (a)): kept as a deliberate pre-auth
@@ -324,6 +334,7 @@ impl InvitationsService {
         // The row was already accepted / revoked by a concurrent login; nothing
         // to add. Rolling back keeps the transaction hygiene clean even though
         // no side effect fired.
+        // SPEC-5.549: already-claimed invitation is a successful no-op.
         if updated == 0 {
             tx.rollback().await?;
             return Ok(());
@@ -338,6 +349,7 @@ impl InvitationsService {
         // accepts cleanly; the row survives (ON DELETE SET NULL on the FK
         // covers a hard delete, and `is_active = FALSE` covers a soft
         // delete).
+        // SPEC-5.550: enrol as member only into an active team of the invite's tenant.
         if let Some(team_id) = invite.team_id {
             sqlx::query(
                 r#"INSERT INTO team_members (tenant_id, team_id, user_id, role)
@@ -360,6 +372,7 @@ impl InvitationsService {
     /// Revoke a pending invite. 404 if it does not exist in this tenant or is
     /// no longer pending.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.551: 404 unless a pending invitation of this tenant matched.
     pub async fn revoke(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let res = sqlx::query(

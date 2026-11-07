@@ -1,5 +1,6 @@
 //! Database module for PostgreSQL connection and operations
 
+// SPEC-2.3
 #[cfg(feature = "server")]
 mod pool;
 

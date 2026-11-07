@@ -62,6 +62,7 @@ pub fn contact_routes(
     let mw = ContactAuthMiddleware {
         service: service_arc.clone(),
     };
+    // SPEC-5.457, SPEC-5.476
     let state = ContactRouterState {
         service: service_arc,
         reauth_limiter: crate::modules::auth::rate_limit::ReauthRateLimiter::new(10, 5),
@@ -69,10 +70,13 @@ pub fn contact_routes(
         set_password_limiter: crate::modules::auth::rate_limit::AuthRateLimiter::new(10, 3),
     };
     Router::new()
+        // SPEC-5.440
         .route("/auth/login", post(login))
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
+        // SPEC-5.457
         .route("/auth/set-password", post(set_password))
+        // SPEC-5.462
         // PMS-1343: `/auth/reset-password` and `/auth/forgot-password` are
         // gone. The MSP owns the client relationship and therefore owns the
         // reset: a portal user asks their provider, who reissues the link from
@@ -82,7 +86,9 @@ pub fn contact_routes(
         // invalidated every outstanding token on the way past (PMS-1297), so a
         // customer clicking "forgot password" silently killed the link their
         // MSP had just sent them.
+        // SPEC-5.463
         .route("/auth/login-link", post(request_login_link))
+        // SPEC-5.467
         .route("/auth/login-link/redeem", post(redeem_login_link))
         // MAPPS-637: `/auth/login-link/select` retired. The
         // multi-candidate picker + its "one selection token → any of
@@ -170,6 +176,7 @@ pub fn contact_routes(
 /// area is validated against the closed set and refused if the caller can
 /// already reach it; a second request for the same area answers the first one
 /// rather than opening another.
+// SPEC-5.485, SPEC-5.486
 async fn request_access(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -183,6 +190,7 @@ async fn request_access(
     Ok(Json(response))
 }
 
+// SPEC-5.440, SPEC-5.449
 async fn login(
     State(state): State<ContactRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -228,6 +236,7 @@ async fn login(
     ))
 }
 
+// SPEC-5.450, SPEC-5.454
 async fn refresh(
     State(state): State<ContactRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -249,6 +258,7 @@ async fn refresh(
     ))
 }
 
+// SPEC-5.455
 async fn logout(
     State(state): State<ContactRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -272,6 +282,7 @@ async fn logout(
 /// PMS-1297: spend the shared token-redemption budget for `token`. The
 /// account key is the contact id the token names; an unparseable token
 /// spends only the IP bucket.
+// SPEC-5.457
 fn redeem_throttle(
     state: &ContactRouterState,
     addr: SocketAddr,
@@ -298,6 +309,7 @@ fn redeem_throttle(
         })
 }
 
+// SPEC-5.457, SPEC-5.461
 async fn set_password(
     State(state): State<ContactRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -318,6 +330,7 @@ async fn set_password(
 /// mokosh-contact-login prompt 010 (PMS-918): POST /auth/login-link.
 /// Always returns 204 whether the (slug, email) matches a portal
 /// contact or not. Enumeration-resistant by construction.
+// SPEC-5.463
 async fn request_login_link(
     State(state): State<ContactRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -346,6 +359,7 @@ async fn request_login_link(
 /// Returns a `LoginLinkRedeemOutcome` JSON envelope. On the
 /// single-match auto path, also sets the refresh cookie so the SPA
 /// survives a hard-refresh cold-load.
+// SPEC-5.467, SPEC-5.469
 async fn redeem_login_link(
     State(state): State<ContactRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -386,6 +400,7 @@ async fn redeem_login_link(
 // selection-token machinery are gone; a caller who probes the URL
 // gets 404 from axum's route matcher.
 
+// SPEC-5.471
 async fn me(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -397,6 +412,7 @@ async fn me(
 /// PMS-1063: start MFA enrolment. Mints a fresh TOTP secret onto the
 /// contact row without flipping `portal_mfa_enabled`; the response
 /// carries the base32 secret and the `otpauth://` URI for a QR code.
+// SPEC-5.476, SPEC-5.478
 async fn mfa_setup(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -421,6 +437,7 @@ async fn mfa_setup(
 /// PMS-1063: finish MFA enrolment. Verifies one live code against the
 /// staged secret, flips `portal_mfa_enabled`, and returns the recovery
 /// codes once.
+// SPEC-5.476, SPEC-5.479
 async fn mfa_enable(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -447,6 +464,7 @@ async fn mfa_enable(
 
 /// PMS-1063: remove MFA. Needs the current password and a live code
 /// or a recovery code; clears the secret and the recovery codes.
+// SPEC-5.476, SPEC-5.480
 async fn mfa_disable(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -475,6 +493,7 @@ async fn mfa_disable(
 /// re-auth shares the failure budget with `mfa_disable` (PMS-881), so a
 /// stolen access token cannot grind the password at full rate through
 /// either route; a correct password never spends any.
+// SPEC-5.475, SPEC-5.476
 async fn change_password(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -512,6 +531,7 @@ fn reauth_client_ip(addr: SocketAddr, headers: &HeaderMap) -> std::net::IpAddr {
 
 /// 429 with the wait when either re-auth bucket is spent, BEFORE the
 /// credential is compared.
+// SPEC-5.476
 fn check_reauth_budget(
     state: &ContactRouterState,
     ip: std::net::IpAddr,
@@ -525,6 +545,7 @@ fn check_reauth_budget(
 
 /// Only a rejected re-auth (the service's 401) spends budget: a weak
 /// new password or a database error is not a credential guess.
+// SPEC-5.476
 fn spend_reauth_budget_on_refusal<T>(
     state: &ContactRouterState,
     ip: std::net::IpAddr,
@@ -538,6 +559,7 @@ fn spend_reauth_budget_on_refusal<T>(
 
 /// PMS-1085: the caller's live sessions, one per rotation family,
 /// with `current` on the one this access token belongs to.
+// SPEC-5.481
 async fn list_sessions(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -552,6 +574,7 @@ async fn list_sessions(
 /// PMS-1085: end one of the caller's other sessions. The caller's own
 /// is a 400 pointing at `/auth/logout`; an id that is not the caller's
 /// is a silent 204.
+// SPEC-5.482
 async fn revoke_session(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -584,6 +607,7 @@ async fn revoke_session(
 /// CRM owns portal identity and portals cannot self-serve an email
 /// change. Fields left as `None` are unchanged on the underlying
 /// contact row.
+// SPEC-5.473
 async fn update_me(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -611,6 +635,7 @@ async fn update_me(
 /// `settings:manage_company_branding` (a contact who cannot edit
 /// brand also does not need the raw tenant side; the merged
 /// `effective_branding` is already on `ContactMe` for painting).
+// SPEC-5.483
 async fn get_own_company_branding(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -631,6 +656,7 @@ async fn get_own_company_branding(
 /// (PMS-758). Server derives the target Company from the session
 /// (`companies/self`) so the caller can only ever paint their own
 /// Company. Gated on `settings:manage_company_branding`.
+// SPEC-5.484
 async fn update_own_company_branding(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -658,6 +684,7 @@ async fn update_own_company_branding(
 /// can see the underlying tickets / invoices / quotes / contracts
 /// via their own list endpoints, they can already count them
 /// themselves.
+// SPEC-5.488
 async fn dashboard_summary(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -675,6 +702,7 @@ async fn dashboard_summary(
     Ok(Json(summary))
 }
 
+// SPEC-5.490
 async fn portal_host(
     State(state): State<ContactRouterState>,
     Path(handle): Path<String>,
@@ -704,6 +732,7 @@ async fn portal_host(
 ///
 /// Enumeration-resistant by construction: an unknown slug and a
 /// known-slug-without-a-portal_id both return the same 404 shape.
+// SPEC-5.491
 async fn resolve_slug_to_portal_id(
     State(state): State<ContactRouterState>,
     Path(slug): Path<String>,
@@ -759,6 +788,7 @@ fn portal_cookie_domain() -> Option<String> {
 /// Pure cookie-builder; `domain` is the `Domain=` attribute to append (or
 /// `None` to omit it). Split out of `build_refresh_cookie` so unit tests can
 /// pin the attribute shape without initialising the config stack.
+// SPEC-5.449
 fn build_refresh_cookie_with_domain(refresh_token: &str, domain: Option<&str>) -> String {
     let base = format!(
         "{name}={value}; HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth; Max-Age={max_age}",
@@ -775,6 +805,7 @@ fn build_refresh_cookie_with_domain(refresh_token: &str, domain: Option<&str>) -
 /// Pure clear-cookie builder; shape mirrors `build_refresh_cookie_with_domain`
 /// so the browser matches the Set-Cookie against the earlier value and
 /// actually evicts it.
+// SPEC-5.455
 fn build_clear_cookie_with_domain(domain: Option<&str>) -> String {
     let base = format!(
         "{name}=; HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth; Max-Age=0",
@@ -827,6 +858,7 @@ struct StartAddPaymentMethodResponse {
 /// and is already 401 at the middleware. PMS-1199: this is a thin wrapper
 /// over `CallerContext::require_capability` (the one place the 403 message
 /// is built) rather than its own hand-rolled load-and-check.
+// SPEC-5.492
 async fn require_manage_own(
     state: &ContactRouterState,
     session: &super::models::ContactSession,
@@ -836,6 +868,7 @@ async fn require_manage_own(
         .await
 }
 
+// SPEC-5.492, SPEC-5.494
 async fn list_payment_methods(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -846,6 +879,7 @@ async fn list_payment_methods(
     Ok(Json(list))
 }
 
+// SPEC-5.492, SPEC-5.493
 async fn start_add_payment_method(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -881,6 +915,7 @@ async fn start_add_payment_method(
     }))
 }
 
+// SPEC-5.492, SPEC-5.495
 async fn remove_payment_method(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
@@ -892,6 +927,7 @@ async fn remove_payment_method(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// SPEC-5.492, SPEC-5.496
 async fn set_default_payment_method(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,

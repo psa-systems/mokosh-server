@@ -404,6 +404,7 @@ pub struct Ticket {
 /// at its default value automatically. The HTTP path still goes
 /// through `Deserialize + Validate`, which enforces the non-empty
 /// title + present company_id at the boundary.
+// SPEC-7.1092: title 1-500, source defaults portal, is_billable true, estimated_hours range, email ids max 255.
 #[derive(Debug, Clone, Default, Deserialize, Validate)]
 pub struct CreateTicketRequest {
     #[validate(length(min = 1, max = 500))]
@@ -627,6 +628,7 @@ pub const SLA_AT_RISK_LEAD_CEIL: chrono::Duration = chrono::Duration::hours(24);
 // SPEC-4.88: 20 percent of the window, clamped to [floor, ceil], floor on a
 // non-positive window.
 // SPEC-7.138: lead = 20% of (due - created_at), floor division, clamped to [5m, 24h].
+// SPEC-7.1045: shared by the sweep worker and the SLA status badge.
 pub fn sla_at_risk_lead(created_at: DateTime<Utc>, due: DateTime<Utc>) -> chrono::Duration {
     let window = due - created_at;
     // SPEC-7.139: returns exactly the 5-minute floor (not a clamped

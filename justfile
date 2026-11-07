@@ -366,6 +366,7 @@ check-clippy:
 check-fmt:
     cargo fmt --all --check
 
+# SPEC-10.387
 # Format code
 [group: 'format']
 fmt:
@@ -511,6 +512,7 @@ test-e2e *args:
 build:
     cargo build --release --bins
 
+# SPEC-10.391
 # SPEC-10.79
 # Build OCI image for validation (builder stage)
 [group: 'check']
@@ -521,6 +523,7 @@ check-docker:
     let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
     docker buildx build --target builder --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:check --file oci-build/Dockerfile .
 
+# SPEC-10.390
 # Create .env from the committed .env.example if missing, generating a strong
 # random value for every self-owned secret so a generic password never lands in
 # .env (PMS-490). Only the create path generates; an existing .env is left
@@ -588,6 +591,7 @@ ensure-env:
     $"($rendered)\n" | save .env
     print "ensure-env: created .env with freshly generated self-owned secrets"
 
+# SPEC-10.388: .env replaced via .env.new
 # Bring up the Traefik-routed dev stack (mokosh-server + Postgres + mailpit; no Infisical, use just dev-infisical). Routed at https://{USER}-mokosh-api.a8n.run. Trailing args go to `docker compose up` (e.g. --build --detach).
 # SPEC-10.81
 [doc("Start the Traefik-routed dev stack in Docker. Trailing args go to `docker compose up` (e.g. --build --detach).")]
@@ -618,6 +622,7 @@ dev *args: ensure-env
     mv .env.new .env
     docker compose --file {{ compose_file }} up {{ args }}
 
+# SPEC-10.388
 # Start only Infisical + its Postgres (opt-in; not started by `just dev`).
 # SPEC-10.82
 [doc("Start Infisical and its Postgres sidecar (compose profile: infisical)")]
@@ -639,6 +644,7 @@ dev-infisical *args: ensure-env
     mv .env.new .env
     docker compose --file {{ compose_file }} --profile infisical up {{ args }} infisical infisical-postgres
 
+# SPEC-10.388 SPEC-10.389
 # Start only MinIO (opt-in; not started by `just dev`). PMS-958.
 # SPEC-10.83
 [doc("Start a MinIO object store and point the blank STORAGE_S3_* keys in .env at it (compose profile: s3)")]
@@ -726,6 +732,7 @@ infisical-bootstrap: ensure-env
 dev-seed-portal: ensure-env
     docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo run --quiet --bin mokosh-bootstrap -- dev-seed-portal'
 
+# SPEC-10.391
 # SPEC-10.103: same build args as check-docker (SPEC-10.79), computed identically
 # Build OCI image
 [group: 'build']

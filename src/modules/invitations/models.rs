@@ -7,6 +7,7 @@ use validator::Validate;
 
 /// Roles a tenant admin may grant via an invite. `super_admin` is platform
 /// level and deliberately not invitable.
+// SPEC-5.540: closed set of invitable roles.
 pub const INVITABLE_ROLES: &[&str] = &[
     "admin",
     "manager",
@@ -65,6 +66,7 @@ pub struct CreateInvitationRequest {
     pub team_id: Option<Uuid>,
 }
 
+// SPEC-5.540: omitted role means admin.
 fn default_role() -> String {
     "admin".to_string()
 }

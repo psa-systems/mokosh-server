@@ -66,8 +66,9 @@ impl DatabaseProvider {
     /// `app_config`. Refuses any bootstrap-tier key naming it, before
     /// touching the pool: an operator who wired the DB provider up for a
     /// bootstrap key gets a startup error, never a boot that fails midway.
-    // SPEC-1 and 2.137: refuses any bootstrap-tier key before any pool I/O, and
+    // refuses any bootstrap-tier key before any pool I/O, and
     // the cache only ever holds the app-tier keys it was given.
+    // SPEC-6.22
     pub async fn build(db: &Database, keys: &[&'static ConfigKey]) -> AppResult<Self> {
         refuse_bootstrap(keys)?;
 
@@ -84,6 +85,7 @@ impl DatabaseProvider {
         // request-serving `mokosh_app` pool, which has SELECT on the table
         // per migration 210.
         let rows: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
+            // SPEC-2.208
             "SELECT name, value FROM app_config WHERE name = ANY($1)",
         )
         .bind(&names)
@@ -113,6 +115,7 @@ impl DatabaseProvider {
     }
 }
 
+// SPEC-2.207
 /// Refuse any bootstrap-tier entry in `keys`, listing all offenders.
 ///
 /// Pure function split out from [`DatabaseProvider::build`] so it is
@@ -171,11 +174,13 @@ impl ConfigProvider for DatabaseProvider {
     /// cache. The row and the cache move together, so a read that follows
     /// a write sees the new value. A failing DB write leaves the cache and
     /// the previous value serving.
-    // SPEC-1 and 2.138: set writes app_config through the migrator pool (not the
+    // set writes app_config through the migrator pool (not the
     // request-serving pool) and syncs the cache so a read-after-write sees it.
+    // SPEC-6.23: the write goes through the migrator pool and the cache moves with the row.
     async fn set(&self, key: &str, value: &str) -> AppResult<()> {
         if super::registry::tier_of(key) == Some(Tier::Bootstrap) {
             return Err(AppError::Configuration(format!(
+                // SPEC-2.210
                 "{key} is a bootstrap-tier key and cannot be written to the database \
                  configuration provider"
             )));
@@ -202,6 +207,7 @@ impl ConfigProvider for DatabaseProvider {
         )
         .bind(key)
         .bind(value)
+        // SPEC-2.209
         .execute(db.migrator_pool())
         .await
         .map_err(|e| AppError::Database(format!("could not write app_config row: {e}")))?;
@@ -212,6 +218,7 @@ impl ConfigProvider for DatabaseProvider {
         Ok(())
     }
 
+    // SPEC-6.23
     /// PMS-1012: delete the `app_config` row and drop the cached value. A
     /// row that is already gone is not an error.
     async fn delete(&self, key: &str) -> AppResult<()> {
@@ -234,6 +241,7 @@ impl ConfigProvider for DatabaseProvider {
         };
         sqlx::query("DELETE FROM app_config WHERE name = $1")
             .bind(key)
+            // SPEC-2.209
             .execute(db.migrator_pool())
             .await
             .map_err(|e| AppError::Database(format!("could not delete app_config row: {e}")))?;

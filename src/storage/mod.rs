@@ -476,6 +476,8 @@ impl ObjectKey {
     // every kind except the two Legacy* variants, which must not,
     // because those address pre-existing layouts from before tenant
     // scoping was added.
+    // SPEC-3.1020: fixed per-kind layout: documents/, kb-articles/, branding/, contact-imports/,
+    // logo.{ext}.
     pub fn relative_path(&self) -> AppResult<PathBuf> {
         let path = match &self.kind {
             ObjectKind::TicketAttachment { id } => {
@@ -562,6 +564,7 @@ fn validate_digest(digest: &str) -> AppResult<()> {
 
 #[async_trait]
 impl ObjectProvider for LocalProvider {
+    // SPEC-3.1021: local put and rename create parent dirs; rename is an in-root atomic move.
     async fn put(&self, key: &ObjectKey, bytes: &[u8]) -> AppResult<()> {
         let path = self.path_for(key)?;
         if let Some(parent) = path.parent() {
@@ -711,6 +714,7 @@ impl StorageProviderKind {
             provider::LOCAL => Ok(StorageProviderKind::Local),
             provider::S3 => Ok(StorageProviderKind::S3),
             other => Err(AppError::Configuration(format!(
+                // SPEC-2.246
                 "STORAGE_PROVIDER {other} is not a known provider; expected 'local' or 's3'"
             ))),
         }
@@ -755,6 +759,7 @@ static SHARED: OnceLock<Arc<dyn ObjectProvider>> = OnceLock::new();
 /// Returns the selection it made (PMS-1011), so the boot record reports what
 /// serves storage and who chose it without reading `STORAGE_BACKEND` a second
 /// time.
+// SPEC-3.1022: builds the shared provider once; shared() with none installed builds local.
 pub fn init_from_env(profile_default: &str) -> AppResult<(StorageProviderKind, EnablementSource)> {
     let (kind, source) = StorageProviderKind::from_env(profile_default)?;
     if SHARED.get().is_none() {
@@ -782,6 +787,7 @@ pub fn init_from_env(profile_default: &str) -> AppResult<(StorageProviderKind, E
 /// 500 and no startup to end.
 /// PMS-1238: remove the blobs and ledger rows of attachments whose rows a
 /// cascade delete (ticket, KB article) already took, best effort after commit.
+// SPEC-3.1023: best-effort blob and ledger delete; each failure logged at warn, nothing returned.
 pub async fn purge_attachment_blobs(
     db: &crate::db::Database,
     tenant_id: Uuid,

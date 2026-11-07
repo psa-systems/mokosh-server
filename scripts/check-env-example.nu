@@ -99,6 +99,8 @@ const TEMPLATE_UNREAD = {}
 # list of keys the application reads through the provider (PMS-982).
 const REGISTRY_FILE = "src/config/registry.rs"
 
+# SPEC-10.373: registry parse failures
+
 # Every key `declare_keys!` declares, with its tier. The macro body is
 # `<Tier> <IDENT> = "NAME", since "vX.Y.Z", required|optional;` per line (PMS-1442), and the tier is captured so a mismatch
 # between the name and the constant is visible rather than silently accepted.
@@ -174,6 +176,8 @@ def code-reads [] {
 
     $names | uniq | sort
 }
+
+# SPEC-10.374: template and compose key shapes
 
 # Every key assigned in .env.example, commented-out assignments included.
 def template-keys [] {

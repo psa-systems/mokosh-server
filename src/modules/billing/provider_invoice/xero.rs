@@ -49,6 +49,7 @@ use crate::utils::error::{AppError, AppResult};
 /// `Built`. The descriptor has flipped, and that guard now asserts the
 /// opposite: a built provider must have a real host behind it, and these
 /// literals are what it finds.
+// SPEC-13.765
 fn default_identity_base() -> String {
     "https://identity.xero.com".to_string()
 }
@@ -61,6 +62,7 @@ fn default_api_base() -> String {
 /// `Retry-After` value Xero returned (seconds), so three retries covers
 /// a short burst above the per-minute cap without turning a daily-cap
 /// breach into a very long synchronous wait.
+// SPEC-13.767
 const MAX_RETRIES: u32 = 3;
 
 /// A single Xero connection, built once per tenant and reused for the
@@ -502,6 +504,7 @@ impl Default for XeroClient {
 }
 
 impl XeroClient {
+    // SPEC-13.765
     pub fn new() -> Self {
         Self {
             http: reqwest::Client::builder()
@@ -570,6 +573,7 @@ impl XeroClient {
     /// Returns the provider's payment id, which is what a reconciliation
     /// reads back; the amount is sent as a decimal string for the reason
     /// every other money field here is, so no float reaches the wire.
+    // SPEC-13.777
     pub async fn pay_bill(
         &self,
         creds: &XeroCredentials,
@@ -604,6 +608,7 @@ impl XeroClient {
             .ok_or_else(|| AppError::internal("Xero returned no payment".to_string()))
     }
 
+    // SPEC-13.776
     pub async fn record_spend(
         &self,
         creds: &XeroCredentials,
@@ -652,6 +657,7 @@ impl XeroClient {
         })
     }
 
+    // SPEC-13.774
     pub async fn create_bill(
         &self,
         creds: &XeroCredentials,
@@ -708,6 +714,7 @@ impl XeroClient {
     /// repeated byte for byte from the state row, because Xero compares it
     /// to the one the authorization request carried and a deployment can
     /// change `PUBLIC_API_BASE_URL` while a consent screen is open.
+    // SPEC-13.771
     pub async fn exchange_code(
         &self,
         client_id: &str,
@@ -748,6 +755,7 @@ impl XeroClient {
     /// authorized, so this is the call that answers it. The
     /// `Xero-Tenant-Id` header is deliberately absent: it is what this asks
     /// FOR.
+    // SPEC-13.772
     pub async fn list_connections(&self, access_token: &str) -> AppResult<Vec<XeroConnection>> {
         let url = format!("{}/connections", self.api_base);
         let resp = self
@@ -770,6 +778,7 @@ impl XeroClient {
             .map_err(|e| AppError::internal(format!("Xero connections did not parse: {e}")))
     }
 
+    // SPEC-13.769
     pub async fn refresh_access_token(
         &self,
         creds: &XeroCredentials,
@@ -809,6 +818,7 @@ impl XeroClient {
     /// Issue an invoice on behalf of the tenant. Returns the Xero id
     /// and the human-readable number for the caller to persist on the
     /// local row (`external_invoice_id` + `external_number`).
+    // SPEC-13.773
     pub async fn issue_invoice(
         &self,
         creds: &XeroCredentials,
@@ -861,6 +871,7 @@ impl XeroClient {
     /// a 400 Xero refuses and the client classifies that as
     /// `AppError::Conflict` so the caller treats it as "already voided"
     /// rather than an outage.
+    // SPEC-13.775
     pub async fn void_invoice(
         &self,
         creds: &XeroCredentials,
@@ -899,6 +910,7 @@ impl XeroClient {
     /// `AUTHORISED`, because the credit note exists in Mokosh before this
     /// call and is not awaiting anybody's approval, and Xero refuses to
     /// allocate one that is still `DRAFT`.
+    // SPEC-13.778
     pub async fn issue_credit_note(
         &self,
         creds: &XeroCredentials,
@@ -956,6 +968,7 @@ impl XeroClient {
     /// Xero refuses an amount over what the invoice still owes, so a
     /// caller crediting an invoice the customer has already settled over
     /// there gets a refusal rather than a negative balance.
+    // SPEC-13.779
     pub async fn allocate_credit_note(
         &self,
         creds: &XeroCredentials,
@@ -995,6 +1008,7 @@ impl XeroClient {
     /// answer and not a failure, exactly as the QuickBooks void target
     /// treats a 404: a credit note that is not there is already in the
     /// state a void is asking for.
+    // SPEC-13.780
     pub async fn fetch_credit_note(
         &self,
         creds: &XeroCredentials,
@@ -1035,6 +1049,7 @@ impl XeroClient {
     /// refused until the application is taken off; doing it in that order
     /// also puts the invoice back to the balance it had, which is what
     /// voiding the credit means.
+    // SPEC-13.781
     pub async fn delete_credit_note_allocation(
         &self,
         creds: &XeroCredentials,
@@ -1063,6 +1078,7 @@ impl XeroClient {
     /// URL: a status write, idempotent on the id, with a second call
     /// against an already-voided document answering the 400 the client
     /// classifies as a conflict.
+    // SPEC-13.782
     pub async fn void_credit_note(
         &self,
         creds: &XeroCredentials,
@@ -1102,6 +1118,7 @@ impl XeroClient {
     /// endpoint and one webhook category, so a receiver that did not look
     /// would happily read an `ACCREC` invoice as a bill and record the
     /// customer's payment as the MSP's.
+    // SPEC-13.783
     pub async fn fetch_bill_settlement(
         &self,
         creds: &XeroCredentials,
@@ -1137,6 +1154,7 @@ impl XeroClient {
         }))
     }
 
+    // SPEC-13.784
     pub async fn fetch_invoice_status(
         &self,
         creds: &XeroCredentials,
@@ -1169,6 +1187,7 @@ impl XeroClient {
     /// anything else. The closure must build the request fresh on each
     /// attempt because `reqwest::RequestBuilder` consumes itself on
     /// `send()`.
+    // SPEC-13.766, SPEC-13.767, SPEC-13.768
     async fn call_with_retry<T>(
         &self,
         mut build: impl FnMut() -> reqwest::RequestBuilder,
@@ -1246,6 +1265,7 @@ fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Duration {
 /// the path. `places = 2` matches every currency Mokosh issues in
 /// today (zero-decimal currencies are out of scope for the first
 /// Xero slice, same as `provider::stripe`).
+// SPEC-13.785
 fn minor_to_decimal(minor: i64, places: u32) -> String {
     let scale: u64 = 10_u64.pow(places);
     let sign = if minor < 0 { "-" } else { "" };
@@ -1262,6 +1282,7 @@ fn minor_to_decimal(minor: i64, places: u32) -> String {
 /// should refresh before using it. 60-second skew covers clock drift
 /// between Mokosh and Xero plus the round-trip of the invoice call
 /// itself.
+// SPEC-13.770
 pub fn access_token_near_expiry(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     expires_at <= now + chrono::Duration::seconds(60)
 }

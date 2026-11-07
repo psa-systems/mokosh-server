@@ -55,6 +55,7 @@ use super::provider::{SourceError, SourceResult};
 /// The iCloud CardDAV entry point. Overridable so a test can point the client at
 /// a local server, and so a self-hosted CardDAV (Fastmail, Nextcloud) is a
 /// configuration change rather than a second implementation.
+// SPEC-15.659
 pub const ICLOUD_BASE_URL: &str = "https://contacts.icloud.com";
 
 /// One `<D:response>` worth of what this client reads: where the resource is,
@@ -115,6 +116,7 @@ fn local_name(raw: &[u8]) -> String {
 /// elements this module needs, so an unknown property is skipped rather than
 /// being a parse failure. A CardDAV server is free to return more than was asked
 /// for, and iCloud does.
+// SPEC-15.662, SPEC-15.663
 pub fn parse_multistatus(xml: &str) -> SourceResult<MultiStatus> {
     // No `trim_text`: entity references split text into several events (see the
     // `GeneralRef` arm), and trimming each one would eat the spaces and line
@@ -382,6 +384,7 @@ impl CardDavClient {
     /// An absolute URL for a path the server gave us. A DAV href is a path, and
     /// pasting it onto the base is the only join that is correct for both the
     /// absolute hrefs iCloud returns and a relative one another server might.
+    // SPEC-15.659
     fn url(&self, href: &str) -> String {
         if href.starts_with("http://") || href.starts_with("https://") {
             href.to_string()
@@ -392,6 +395,7 @@ impl CardDavClient {
 
     /// One DAV request, with the credential, the depth and the body, classified
     /// by status into the three outcomes a caller can act on.
+    // SPEC-15.661
     async fn dav(
         &self,
         method: &str,
@@ -473,6 +477,7 @@ impl CardDavClient {
 
     /// Discovery: the principal, its address-book home, and the first collection
     /// under it whose `resourcetype` says addressbook.
+    // SPEC-15.660
     pub async fn address_book(&self) -> SourceResult<String> {
         const PRINCIPAL_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <D:propfind xmlns:D="DAV:"><D:prop><D:current-user-principal/></D:prop></D:propfind>"#;
@@ -510,6 +515,7 @@ impl CardDavClient {
     }
 
     /// Every card in the book, with its `address-data`.
+    // SPEC-15.669
     pub async fn all_cards(&self, book: &str) -> SourceResult<Vec<String>> {
         const QUERY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <C:addressbook-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
@@ -524,6 +530,7 @@ impl CardDavClient {
     }
 
     /// The book's current sync token, for the next delta.
+    // SPEC-15.669
     pub async fn sync_token(&self, book: &str) -> SourceResult<Option<String>> {
         const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <D:propfind xmlns:D="DAV:"><D:prop><D:sync-token/></D:prop></D:propfind>"#;
@@ -539,6 +546,7 @@ impl CardDavClient {
     /// What changed since `token`: the cards that were added or edited, and
     /// separately the hrefs that are gone, which arrive as `404` responses
     /// inside the same multistatus (RFC 6578 section 3.2).
+    // SPEC-15.664
     pub async fn changed_cards(&self, book: &str, token: &str) -> SourceResult<CardDelta> {
         // The token goes in the body, so it cannot be built from a static string;
         // `dav` takes `&'static str` to keep every request body a literal, so the

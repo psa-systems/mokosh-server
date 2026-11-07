@@ -38,6 +38,7 @@ pub struct TeamsRouterState {
     pub teams_service: Arc<TeamsService>,
 }
 
+// SPEC-5.552: the full teams route table; all routes need an authenticated caller.
 pub fn teams_routes(teams_service: TeamsService) -> Router {
     let state = TeamsRouterState {
         teams_service: Arc::new(teams_service),
@@ -82,6 +83,7 @@ pub struct ListTeamsQuery {
 }
 
 impl ListTeamsQuery {
+    // SPEC-5.554: case-insensitive active filter; unknown values mean active only.
     fn to_filters(&self) -> TeamListFilters {
         let active_raw = self
             .active
@@ -114,6 +116,7 @@ pub struct GetTeamQuery {
 /// `GET /api/v1/teams` - list teams in the caller's tenant, paginated. The
 /// response carries the tenant-wide total so the client can render a real
 /// page count instead of the current page's length.
+// SPEC-5.553: paginated list; 422 on sort.
 async fn list_teams(
     State(state): State<TeamsRouterState>,
     RequireAuth(user): RequireAuth,
@@ -133,6 +136,7 @@ async fn list_teams(
 }
 
 /// `POST /api/v1/teams` — RequireAdmin. Creates one team.
+// SPEC-5.555: admin-only create answering 201.
 async fn create_team(
     State(state): State<TeamsRouterState>,
     admin: RequireAdmin,
@@ -149,6 +153,7 @@ async fn create_team(
 
 /// `GET /api/v1/teams/{team_id}` — one team, optionally with member roster
 /// via `?include=members`.
+// SPEC-5.560: include=members (any case) returns the roster envelope.
 async fn get_team(
     State(state): State<TeamsRouterState>,
     RequireAuth(user): RequireAuth,
@@ -182,6 +187,7 @@ async fn get_team(
 /// Called INLINE from each write handler that needs it, not as an extractor,
 /// because the check needs the team row's `manager_id`, and reading the row
 /// lives on the service, not the extractor stack.
+// SPEC-5.561: admin or the team's own manager; runs before body validation.
 async fn assert_can_manage_team(
     state: &TeamsRouterState,
     user: &CurrentUser,
@@ -201,6 +207,7 @@ async fn assert_can_manage_team(
 
 /// `PUT /api/v1/teams/{team_id}` — PMS-1162 projection guard. Admin or the
 /// team's own `manager_id` may edit.
+// SPEC-5.561, SPEC-5.562, SPEC-5.563: guarded partial update.
 async fn update_team(
     State(state): State<TeamsRouterState>,
     RequireAuth(user): RequireAuth,
@@ -219,6 +226,7 @@ async fn update_team(
 
 /// `DELETE /api/v1/teams/{team_id}` — PMS-1162 projection guard. Admin or the
 /// team's own `manager_id` may soft-delete.
+// SPEC-5.561, SPEC-5.564: guarded archive answering 204.
 async fn soft_delete_team(
     State(state): State<TeamsRouterState>,
     RequireAuth(user): RequireAuth,
@@ -234,6 +242,7 @@ async fn soft_delete_team(
 }
 
 /// `GET /api/v1/teams/{team_id}/members` — member roster with user joins.
+// SPEC-5.565: roster read for any authenticated member.
 async fn list_members(
     State(state): State<TeamsRouterState>,
     RequireAuth(user): RequireAuth,
@@ -247,6 +256,7 @@ async fn list_members(
 }
 
 /// `POST /api/v1/teams/{team_id}/members` — PMS-1162 projection guard.
+// SPEC-5.561, SPEC-5.566, SPEC-5.567: guarded add answering 201.
 async fn add_member(
     State(state): State<TeamsRouterState>,
     RequireAuth(user): RequireAuth,
@@ -265,6 +275,7 @@ async fn add_member(
 
 /// `PUT /api/v1/teams/{team_id}/members/{user_id}` — PMS-1162 projection
 /// guard.
+// SPEC-5.561, SPEC-5.568: guarded role change.
 async fn update_member_role(
     State(state): State<TeamsRouterState>,
     RequireAuth(user): RequireAuth,
@@ -283,6 +294,7 @@ async fn update_member_role(
 
 /// `DELETE /api/v1/teams/{team_id}/members/{user_id}` — PMS-1162 projection
 /// guard. Idempotent: a repeat delete returns 204, not 404.
+// SPEC-5.561, SPEC-5.569: guarded idempotent remove answering 204.
 async fn remove_member(
     State(state): State<TeamsRouterState>,
     RequireAuth(user): RequireAuth,
@@ -298,6 +310,7 @@ async fn remove_member(
 }
 
 /// `GET /api/v1/me/teams` — teams the caller belongs to.
+// SPEC-5.570: caller's own active teams.
 async fn list_my_teams(
     State(state): State<TeamsRouterState>,
     RequireAuth(user): RequireAuth,

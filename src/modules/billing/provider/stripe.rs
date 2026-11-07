@@ -35,6 +35,7 @@ use crate::utils::error::{AppError, AppResult};
 
 /// Stripe REST API base. Overridable via `STRIPE_API_BASE` so an integration
 /// test can point the checkout call at a stub; defaults to the live host.
+// SPEC-13.714
 fn api_base() -> String {
     crate::config::get(&crate::config::registry::STRIPE_API_BASE)
         .filter(|s| !s.is_empty())
@@ -74,6 +75,7 @@ struct StripeCredentials {
 /// A blob that does not parse is a `Configuration` error and not a 500 with a
 /// serde message: the operator stored it, so the fix is theirs, and the error
 /// text must never carry the plaintext it failed to parse.
+// SPEC-13.715, SPEC-13.707
 pub fn from_config(plaintext: &str, http: reqwest::Client) -> AppResult<StripeProvider> {
     let creds: StripeCredentials = serde_json::from_str(plaintext).map_err(|_| {
         AppError::Configuration("stored Stripe config is not valid JSON".to_string())
@@ -110,10 +112,12 @@ impl StripeProvider {
 
 #[async_trait]
 impl PaymentProvider for StripeProvider {
+    // SPEC-13.709
     fn id(&self) -> &'static str {
         "stripe"
     }
 
+    // SPEC-13.716, SPEC-13.717, SPEC-13.718, SPEC-13.719
     async fn create_checkout_session(
         &self,
         params: &CheckoutParams<'_>,
@@ -194,6 +198,7 @@ impl PaymentProvider for StripeProvider {
         })
     }
 
+    // SPEC-13.720, SPEC-13.721, SPEC-13.710
     async fn verify_and_parse_webhook(
         &self,
         raw_body: &[u8],
@@ -229,6 +234,7 @@ impl PaymentProvider for StripeProvider {
     /// an endpoint that takes one, and the only proof is a delivery it
     /// verifies, so the shape is checked here and the rest is reported as
     /// unchecked rather than dressed up as a pass.
+    // SPEC-13.729, SPEC-13.730
     async fn check(&self) -> AppResult<Vec<GatewayCheck>> {
         let url = format!("{}/v1/account", api_base());
         let resp = self
@@ -266,6 +272,7 @@ impl PaymentProvider for StripeProvider {
         Ok(vec![key_check, webhook_check])
     }
 
+    // SPEC-13.731
     async fn capture(&self, order_id: &str) -> AppResult<()> {
         // Checkout charges when the buyer completes, so there is never anything
         // to capture. Reaching here means a `RequiresCapture` event was routed
@@ -285,6 +292,7 @@ impl PaymentProvider for StripeProvider {
     /// database join. `payment_method_data[allow_redisplay] = always` lets
     /// Stripe show this card again on a future checkout session for the
     /// same Customer, which is the whole point of saving it.
+    // SPEC-13.732
     async fn create_setup_intent_session(
         &self,
         params: &SetupIntentParams<'_>,
@@ -357,6 +365,7 @@ impl PaymentProvider for StripeProvider {
     /// if the detach fails we surface the error and keep the row, so the
     /// contact can retry; if the row deleted first and the detach then
     /// failed, the card would stay attached with no mokosh record of it.
+    // SPEC-13.733
     async fn detach_payment_method(&self, provider_pm_id: &str) -> AppResult<()> {
         if provider_pm_id.is_empty() {
             return Err(AppError::BadRequest(
@@ -405,6 +414,7 @@ const SIGNATURE_HEADER: &str = "Stripe-Signature";
 /// `payment_status` is not `paid`, or one missing our metadata (an unrelated
 /// session on the tenant's account) - becomes [`PaymentEvent::Ignored`] so the
 /// handler answers 200 rather than provoking retries.
+// SPEC-13.722, SPEC-13.723, SPEC-13.726, SPEC-13.727
 fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
     // DEV-514: envelope parse (id + type + raw JSON) comes from the shared
     // dunite-stripe-core crate; mokosh maps `data.object` to its own
@@ -472,6 +482,7 @@ fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
 
 /// Split out from [`parse_stripe_event`] so a `checkout.session.completed`
 /// in `mode: 'payment'` keeps the exact pre-MAPPS-674 shape.
+// SPEC-13.724, SPEC-13.725
 fn parse_stripe_payment_session(
     raw: &Value,
     object: &Value,
@@ -524,6 +535,7 @@ fn parse_stripe_payment_session(
 /// Any field absent means an unrelated session on the tenant's account,
 /// which is [`PaymentEvent::Ignored`] so the receiver 200s and the provider
 /// stops retrying.
+// SPEC-13.728
 fn parse_stripe_setup_session(
     raw: &Value,
     object: &Value,

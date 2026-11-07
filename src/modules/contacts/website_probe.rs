@@ -36,6 +36,7 @@ use crate::utils::net::{
 /// but a redirect `Location` a remote origin controls could set
 /// `user:pass@host`, so every log of a URL that may have followed a hop logs
 /// this instead of the URL itself.
+// SPEC-15.125: strip userinfo before logging a URL
 fn loggable_url(url: &Url) -> Url {
     let mut cleaned = url.clone();
     let _ = cleaned.set_username("");
@@ -211,6 +212,7 @@ pub struct ProbeTarget {
 /// Parse and validate probe input. Anything that cannot be a website at all is
 /// a 400 with a field message, never a silently "unreachable" 200: the two mean
 /// different things to the form showing the result.
+// SPEC-15.116: non-website input is a 400, never an unreachable 200
 pub fn parse_target(input: &str) -> Result<ProbeTarget, AppError> {
     let raw = input.trim();
     if raw.is_empty() {
@@ -263,6 +265,7 @@ pub fn parse_target(input: &str) -> Result<ProbeTarget, AppError> {
 
 /// Fold the two per-scheme outcomes into the response body. Pure: every rule
 /// the client depends on is decided here and is unit tested without a socket.
+// SPEC-15.122, SPEC-15.123: result fields derived from the two outcomes
 pub fn classify(
     input: &str,
     requested_host: &str,
@@ -358,6 +361,7 @@ fn www_change(requested: &str, final_host: &str) -> WwwChange {
 /// connections) and were awaited one after the other, doubling the wall-clock
 /// cost of a probe that ends up reachable on both. `tokio::join!` runs them
 /// concurrently instead.
+// SPEC-15.117: both schemes attempted concurrently
 pub async fn probe<F: WebsiteFetcher + ?Sized>(fetcher: &F, target: &ProbeTarget) -> WebsiteProbe {
     let (https, http) = tokio::join!(
         timed_attempt(fetcher, &target.host, "https"),
@@ -369,6 +373,7 @@ pub async fn probe<F: WebsiteFetcher + ?Sized>(fetcher: &F, target: &ProbeTarget
 /// One scheme, hard-capped at [`ATTEMPT_TIMEOUT`] end to end. The client's
 /// own timeout bounds a single request; this bounds the whole redirect chain,
 /// so five slow hops cannot add up past the budget.
+// SPEC-15.117: 5s cap per scheme, logged on expiry
 async fn timed_attempt<F: WebsiteFetcher + ?Sized>(
     fetcher: &F,
     host: &str,
@@ -390,6 +395,7 @@ async fn timed_attempt<F: WebsiteFetcher + ?Sized>(
 
 /// One scheme's attempt: guard the host, request, follow up to [`MAX_HOPS`]
 /// redirects, re-guarding each hop.
+// SPEC-15.119: at most 5 redirects, each re-guarded
 async fn attempt<F: WebsiteFetcher + ?Sized>(fetcher: &F, host: &str, scheme: &str) -> Outcome {
     let Ok(mut url) = Url::parse(&format!("{scheme}://{host}/")) else {
         tracing::warn!(host, scheme, "website probe could not build a start URL");
@@ -479,6 +485,7 @@ async fn attempt<F: WebsiteFetcher + ?Sized>(fetcher: &F, host: &str, scheme: &s
 /// The shared SSRF gate, applied before the first connect and again for every
 /// hop, with its refusal mapped onto the coarse wire reason. A resolution
 /// failure is `dns`; everything else the guard rejects is `blocked_host`.
+// SPEC-15.118: SSRF guard before every request; refusal is logged
 async fn guard_url<F: WebsiteFetcher + ?Sized>(
     fetcher: &F,
     url: &Url,
@@ -516,6 +523,7 @@ pub struct ReqwestFetcher {
 }
 
 impl ReqwestFetcher {
+    // SPEC-15.120: no auto-redirects, 5s timeout, named user agent
     pub fn new() -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder()
             .timeout(ATTEMPT_TIMEOUT)
@@ -537,6 +545,7 @@ impl HostResolver for ReqwestFetcher {
 
 #[async_trait]
 impl WebsiteFetcher for ReqwestFetcher {
+    // SPEC-15.120: GET only after 405 or 501
     async fn head_or_get(&self, url: &Url) -> Result<HopResponse, FetchError> {
         let head = self.send(reqwest::Method::HEAD, url).await?;
         // Some origins answer HEAD with "not allowed" and serve the same
@@ -549,6 +558,7 @@ impl WebsiteFetcher for ReqwestFetcher {
 }
 
 impl ReqwestFetcher {
+    // SPEC-15.120: body never read; unreadable Location is warned
     async fn send(&self, method: reqwest::Method, url: &Url) -> Result<HopResponse, FetchError> {
         let response = self
             .client
@@ -576,6 +586,7 @@ impl ReqwestFetcher {
     }
 }
 
+// SPEC-15.121: timeout, tls or refused
 fn classify_transport_error(e: reqwest::Error) -> FetchError {
     if e.is_timeout() {
         FetchError::Timeout
@@ -632,6 +643,7 @@ impl WebsiteProbeService {
     /// PMS-1246: `get_with` single-flights concurrent misses for the same key,
     /// so two callers racing an uncached host share the one probe underneath
     /// rather than each firing their own pair of requests.
+    // SPEC-15.124: per-host cache, single flight, caller input echoed
     pub async fn probe_input(&self, input: &str) -> Result<WebsiteProbe, AppError> {
         let target = parse_target(input)?;
         let host = target.host.clone();
@@ -679,6 +691,7 @@ pub struct WebsiteProbeLimiter {
 
 impl WebsiteProbeLimiter {
     pub fn new() -> Arc<Self> {
+        // SPEC-15.10: 30 probes per minute per tenant
         let quota = governor::Quota::per_minute(
             std::num::NonZeroU32::new(30).expect("30 probes per minute is non-zero"),
         );

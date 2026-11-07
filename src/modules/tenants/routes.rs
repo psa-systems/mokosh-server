@@ -50,6 +50,7 @@ pub enum TenantOrPlatformCaller {
     Tenant(CurrentUser),
 }
 
+// SPEC-5.324
 impl<S> axum::extract::FromRequestParts<S> for TenantOrPlatformCaller
 where
     S: Send + Sync,
@@ -84,6 +85,7 @@ pub struct DeploymentOperator;
 /// `system_tenant`, `OIDC_DEFAULT_TENANT_ID`).
 pub const SYSTEM_TENANT_ID: Uuid = Uuid::from_u128(1);
 
+// SPEC-5.327
 impl<S> axum::extract::FromRequestParts<S> for DeploymentOperator
 where
     S: Send + Sync,
@@ -104,6 +106,7 @@ where
 impl TenantOrPlatformCaller {
     /// Read-side gate: platform admin can read any tenant; a tenant
     /// caller can read only their own.
+    // SPEC-5.325
     pub(crate) fn require_read_access(&self, tenant_id: Uuid) -> AppResult<()> {
         match self {
             TenantOrPlatformCaller::Platform => Ok(()),
@@ -116,6 +119,7 @@ impl TenantOrPlatformCaller {
 
     /// Write-side gate: platform admin can write any tenant; a tenant
     /// caller must be the admin of their own tenant.
+    // SPEC-5.326
     pub(crate) fn require_admin_write_access(&self, tenant_id: Uuid) -> AppResult<()> {
         match self {
             TenantOrPlatformCaller::Platform => Ok(()),
@@ -156,6 +160,7 @@ pub struct TenantRouterState {
 /// Create the tenant management router. `settings_service` is threaded
 /// in so the `/tenants/:id/modules/:module` endpoints delegate to the
 /// canonical SettingsService (PMS-113 AC2).
+// SPEC-5.328
 pub fn tenant_routes(
     tenant_service: TenantService,
     settings_service: Arc<SettingsService>,
@@ -241,6 +246,7 @@ pub fn tenant_routes(
 }
 
 /// List all tenants (super admin only)
+// SPEC-5.328, SPEC-5.329
 async fn list_tenants(
     State(state): State<TenantRouterState>,
     _platform: RequirePlatformAdmin,
@@ -261,6 +267,7 @@ async fn list_tenants(
 }
 
 /// Create a new tenant (super admin only)
+// SPEC-5.328, SPEC-5.330, SPEC-5.333
 async fn create_tenant(
     State(state): State<TenantRouterState>,
     _platform: RequirePlatformAdmin,
@@ -282,6 +289,7 @@ async fn create_tenant(
 /// Refuses when the caller already holds at least one active membership
 /// (they should use the in-app "Create org" button instead — that lands
 /// in phase 5 as part of the switcher work).
+// SPEC-5.337, SPEC-5.338
 async fn self_serve_tenant(
     State(state): State<TenantRouterState>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -370,6 +378,7 @@ async fn self_serve_tenant(
 /// (`RequireAuthState`) and does NOT return a fresh session. The client
 /// keeps its existing session and just refetches memberships +
 /// optionally switches when ready.
+// SPEC-5.339
 async fn create_additional_tenant(
     State(state): State<TenantRouterState>,
     RequireAuthState(auth_state): RequireAuthState,
@@ -409,6 +418,7 @@ async fn create_additional_tenant(
 }
 
 /// Get tenant by ID. MAPPS-518: platform admin OR same-tenant caller.
+// SPEC-5.325, SPEC-5.340
 async fn get_tenant(
     State(state): State<TenantRouterState>,
     caller: TenantOrPlatformCaller,
@@ -458,6 +468,7 @@ struct PublicTenantState {
 /// way it can reach an email. A tenant with no logo is a 404, identical to a
 /// tenant id that does not exist, so this does not answer "does this tenant
 /// exist" any more precisely than it has to.
+// SPEC-5.385
 async fn get_public_logo(
     State(s): State<PublicTenantState>,
     Path(tenant_id): Path<Uuid>,
@@ -496,6 +507,7 @@ async fn get_public_logo(
 ///
 /// Admin-gated like the rename: the logo is what every client sees on the forms
 /// and email this tenant sends, so it is tenant-wide configuration.
+// SPEC-5.386
 async fn upload_current_logo(
     State(state): State<TenantRouterState>,
     RequireAuth(user): RequireAuth,
@@ -565,6 +577,7 @@ async fn upload_current_logo(
 /// Remove the logo. Clears the branding pointer first: a file left on disk that
 /// nothing points at is invisible, while a pointer to a deleted file is a
 /// broken image in every email the tenant sends.
+// SPEC-5.387
 async fn delete_current_logo(
     State(state): State<TenantRouterState>,
     _admin: RequireAdmin,
@@ -600,6 +613,7 @@ async fn delete_current_logo(
 /// here they could not learn from any other tenant-scoped response. The
 /// cross-tenant read stays on `GET /{tenant_id}`, which keeps its super-admin
 /// guard.
+// SPEC-5.344
 async fn get_current_tenant(
     State(state): State<TenantRouterState>,
     RequireAuth(user): RequireAuth,
@@ -615,6 +629,7 @@ async fn get_current_tenant(
 /// configuration rather than personal preference. A super_admin is an admin for
 /// this purpose, so the check is `is_admin()` alone; the cross-tenant case is
 /// what `PUT /{tenant_id}` is for.
+// SPEC-5.344
 async fn update_current_tenant(
     State(state): State<TenantRouterState>,
     RequireAuth(user): RequireAuth,
@@ -641,6 +656,7 @@ async fn update_current_tenant(
 /// admin gate as the rename it performs: the organisation name, contact and
 /// website are what every client sees on the forms and email this tenant sends.
 /// A non-admin's onboarding does not reach here (MAPPS-524).
+// SPEC-5.345
 async fn update_current_organization(
     State(state): State<TenantRouterState>,
     RequireAuth(user): RequireAuth,
@@ -661,6 +677,7 @@ async fn update_current_organization(
 }
 
 /// Update tenant
+// SPEC-5.326, SPEC-5.341
 async fn update_tenant(
     State(state): State<TenantRouterState>,
     caller: TenantOrPlatformCaller,
@@ -683,6 +700,7 @@ async fn update_tenant(
 }
 
 /// Suspend tenant (super admin only)
+// SPEC-5.346
 async fn suspend_tenant(
     State(state): State<TenantRouterState>,
     _platform: RequirePlatformAdmin,
@@ -779,6 +797,7 @@ async fn resend_admin_welcome(
 }
 
 /// Activate tenant (super admin only)
+// SPEC-5.346
 async fn activate_tenant(
     State(state): State<TenantRouterState>,
     _platform: RequirePlatformAdmin,
@@ -797,6 +816,7 @@ async fn activate_tenant(
 
 /// Get tenant usage statistics. MAPPS-518: platform admin OR
 /// same-tenant caller.
+// SPEC-5.325, SPEC-5.347
 async fn get_tenant_usage(
     State(state): State<TenantRouterState>,
     caller: TenantOrPlatformCaller,
@@ -821,6 +841,7 @@ async fn get_tenant_usage(
 /// this surface deliberately exposes cross-tenant operations for
 /// super-admins, while `/api/v1/settings/modules/:module` is scoped
 /// implicitly to the caller's own tenant.
+// SPEC-5.325, SPEC-5.348
 async fn get_module_config(
     State(state): State<TenantRouterState>,
     caller: TenantOrPlatformCaller,
@@ -841,6 +862,7 @@ async fn get_module_config(
 
 /// Update a tenant's per-module config (audit F5). PMS-113 AC2:
 /// delegates to the canonical `SettingsService`.
+// SPEC-5.326, SPEC-5.348
 async fn update_module_config(
     State(state): State<TenantRouterState>,
     caller: TenantOrPlatformCaller,

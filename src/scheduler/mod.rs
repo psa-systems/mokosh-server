@@ -59,13 +59,13 @@ use tracing::Instrument;
 
 use crate::utils::error::AppResult;
 
+// SPEC-2.117
 /// A background job that the scheduler ticks at a fixed interval.
 ///
 /// Implementations are owned by the scheduler after [`Scheduler::register`]
 /// so they must be `Send + Sync + 'static`. Errors returned from
 /// [`run`](Self::run) are logged at `warn` and discarded; the next
 /// tick fires on schedule.
-// SPEC-1 and 2.94: one job per registration, ticked at a fixed interval on its own tokio task.
 #[async_trait]
 pub trait Job: Send + Sync + 'static {
     /// Stable identifier used in span fields and log lines, e.g.
@@ -105,7 +105,6 @@ struct Entry {
 /// import, and that stays true: the worker still owns execution, it just does
 /// not sleep first.
 ///
-// SPEC-1 and 2.97: tokio::sync::Notify::notify_one retains at most one permit, so any number of wakes before the next notified() collapse into a single extra run rather than one run per wake.
 /// [`Notify::notify_one`] holds one permit when nobody is waiting, so a wake
 /// that arrives WHILE the job is running is not lost: the loop's next
 /// `notified()` returns immediately and the work is picked up on the spot.
@@ -125,6 +124,7 @@ impl JobWake {
         Self::default()
     }
 
+    // SPEC-2.125
     /// Run the job this handle was registered with as soon as it is free.
     pub fn wake(&self) {
         self.0.notify_one();
@@ -170,14 +170,14 @@ impl Scheduler {
         self.push(Arc::new(job), interval, None);
     }
 
-    // SPEC-1 and 2.96: a wakeable job keeps its interval; JobWake only runs it sooner, it never changes the cadence.
+    // SPEC-2.124
     /// Register a job that can also be run on demand through [`JobWake`]
     /// (PMS-1429), keeping its interval for the cadence nobody watches.
     pub fn register_wakeable<J: Job>(&mut self, job: J, interval: Duration, wake: &JobWake) {
         self.push(Arc::new(job), interval, Some(Arc::clone(&wake.0)));
     }
 
-    // SPEC-1 and 2.95: a second job with the same name panics at registration rather than silently shadowing the first.
+    // SPEC-2.118
     fn push(&mut self, job: Arc<dyn Job>, interval: Duration, wake: Option<Arc<Notify>>) {
         let name = job.name();
         if self.entries.iter().any(|e| e.job.name() == name) {
@@ -190,6 +190,7 @@ impl Scheduler {
         });
     }
 
+    // SPEC-1.7 SPEC-2.119
     /// Consume the scheduler and spawn one tokio task per registered
     /// job. Returns the `JoinHandle`s in registration order; the
     /// caller may drop them for fire-and-forget daemon semantics or
@@ -234,10 +235,10 @@ impl Default for Scheduler {
     }
 }
 
+// SPEC-2.120
 /// Per-job loop. Pulled out of `Scheduler::start` so each spawn site
 /// has a clean async fn (cleaner tracing spans + easier to reason
 /// about in profiles than a nested closure).
-// SPEC-1 and 2.98: tokio::time::interval fires its first tick immediately, then every `interval`, with missed ticks skipped rather than queued.
 async fn run_job_loop(job: Arc<dyn Job>, interval: Duration, wake: Option<Arc<Notify>>) {
     let name = job.name();
     let mut ticker = tokio::time::interval(interval);
@@ -263,6 +264,7 @@ async fn run_job_loop(job: Arc<dyn Job>, interval: Duration, wake: Option<Arc<No
                 ticker.tick().await;
             }
         }
+        // SPEC-2.121
         let span = tracing::info_span!("scheduler_tick", job = name);
         // Use `Instrument` so the span stays attached to the future
         // even if the tokio scheduler moves this task between
@@ -270,7 +272,7 @@ async fn run_job_loop(job: Arc<dyn Job>, interval: Duration, wake: Option<Arc<No
         // `.await` ties the span to the current OS thread and the
         // log lines drift off the wrong context once the task
         // resumes elsewhere.
-        // SPEC-1 and 2.99: a tick that returns Err is logged at warn and discarded; the loop never stops or retries early.
+        // SPEC-2.122 SPEC-2.123
         let result = job.run().instrument(span).await;
         if let Err(e) = result {
             tracing::warn!(

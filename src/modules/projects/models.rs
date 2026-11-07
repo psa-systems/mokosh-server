@@ -123,6 +123,7 @@ pub struct ProjectResponse {
 /// retired portal router served (`PortalProject`), which PMS-1025's sweep
 /// replaced with the staff type. Every key is always present (`null`
 /// when unset) so the shape is stable.
+// SPEC-7.1058: the contact projection omits rate, money, actuals, billing and manager
 #[derive(Debug, Clone, Serialize)]
 pub struct ContactProjectResponse {
     pub id: Uuid,
@@ -190,6 +191,7 @@ pub struct CreateProjectRequest {
     // SPEC-7.429: billing_method defaults to "time_and_materials" when omitted
     pub billing_method: String,
     #[validate(custom(function = mokosh_types::validation::validate_rate))]
+    // SPEC-7.1054: hourly_rate is validated on create and update
     pub hourly_rate: Option<Decimal>,
     #[serde(default = "default_true")] // SPEC-7.430: is_billable defaults to true when omitted
     pub is_billable: bool,
@@ -214,6 +216,7 @@ fn default_true() -> bool {
     true
 }
 
+// SPEC-7.1055: no company_id, contract_id, project_type or project_number on update
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateProjectRequest {
     // SPEC-7.450: name (1 to 80 chars), default_due_business_days (0..=365), and budget_hours/budget_amount follow the same validation as create

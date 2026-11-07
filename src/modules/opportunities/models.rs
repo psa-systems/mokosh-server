@@ -8,6 +8,7 @@ use validator::Validate;
 
 /// The six pipeline stages. Kept as a constant slice so the SPA can list
 /// them without a second copy of the enum.
+// SPEC-14.84: the closed set of stages.
 pub const STAGES: &[&str] = &[
     "lead",
     "qualified",
@@ -19,6 +20,7 @@ pub const STAGES: &[&str] = &[
 
 /// A closed opportunity carries one of these outcomes; an open one
 /// carries `None`.
+// SPEC-14.89: the closed set of outcomes.
 pub const OUTCOMES: &[&str] = &["won", "lost"];
 
 /// True for the two stages that close an opportunity.
@@ -51,6 +53,7 @@ pub struct CreateOpportunityRequest {
     pub company_id: Uuid,
     #[serde(default)]
     pub contact_id: Option<Uuid>,
+    // SPEC-14.83: title 1..=255 characters.
     #[validate(length(min = 1, max = 255))]
     pub title: String,
     #[serde(default)]
@@ -70,6 +73,7 @@ pub struct CreateOpportunityRequest {
 pub struct UpdateOpportunityRequest {
     #[serde(default)]
     pub contact_id: Option<Option<Uuid>>,
+    // SPEC-14.87: a supplied title is 1..=255 characters.
     #[serde(default)]
     #[validate(length(min = 1, max = 255))]
     pub title: Option<String>,

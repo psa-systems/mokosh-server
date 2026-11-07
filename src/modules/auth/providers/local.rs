@@ -40,6 +40,7 @@ impl AuthProvider for LocalProvider {
         self.is_enabled
     }
 
+    // SPEC-5.184: always available.
     fn is_available(&self) -> bool {
         // The credential path is the process and its database. Both are
         // preconditions for booting at all, so availability is not a

@@ -24,6 +24,7 @@
 //!   a match on its own.
 
 /// The comparison key for an email address, or `None` when it has none.
+// SPEC-15.678
 pub fn email_key(raw: &str) -> Option<String> {
     let trimmed = raw.trim().to_lowercase();
     let (local, domain) = trimmed.split_once('@')?;
@@ -38,6 +39,7 @@ pub fn email_key(raw: &str) -> Option<String> {
 }
 
 /// The comparison key for a phone number, or `None` when it has none.
+// SPEC-15.679
 pub fn phone_key(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     let international = trimmed.starts_with('+') || trimmed.starts_with("00");
@@ -58,6 +60,7 @@ pub fn phone_key(raw: &str) -> Option<String> {
 }
 
 /// The comparison key for a person's or company's name.
+// SPEC-15.680
 pub fn name_key(raw: &str) -> Option<String> {
     let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     let key = collapsed.to_lowercase();

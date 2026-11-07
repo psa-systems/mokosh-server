@@ -86,6 +86,8 @@ def check-gate [] {
     $errors
 }
 
+# SPEC-10.362: resolver cases
+
 # Every publish decision the workflow can reach, asserted on the resolver.
 def check-resolver [] {
     let base_cases = [

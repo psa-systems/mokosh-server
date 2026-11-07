@@ -61,11 +61,13 @@ use crate::utils::upload_limits::{body_limit_bytes, oversized_upload_error};
 // refused there, for the reason the module header of `inline_image` states.
 use crate::utils::inline_image::check_inline_image_mime;
 
+// SPEC-15.1098
 /// Default cap when `KB_ATTACHMENT_MAX_BYTES` is unset. 5 MiB: generous for a
 /// screenshot or a diagram, well under the 25 MiB a ticket attachment allows,
 /// because these are embedded in a page rather than downloaded on purpose.
 const DEFAULT_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
+// SPEC-15.1104
 /// PMS-1246: the public read is streamed and immutable (the id names one set
 /// of bytes for its whole life), the same shape as the ticket inline image;
 /// see `tickets::attachments::INLINE_CACHE_CONTROL_VALUE`.
@@ -77,6 +79,7 @@ pub struct KbAttachmentConfig {
 }
 
 impl KbAttachmentConfig {
+    // SPEC-15.1098
     pub fn from_env() -> AppResult<Self> {
         let key = &crate::config::registry::KB_ATTACHMENT_MAX_BYTES;
         let max_bytes = crate::config::parse::parse_positive(key, crate::config::get(key))
@@ -99,6 +102,7 @@ pub struct KbAttachmentResponse {
     pub url: String,
 }
 
+// SPEC-15.1101
 /// The path a client fetches an attachment from.
 pub fn attachment_path(id: Uuid) -> String {
     format!("/api/v1/public/kb/attachments/{id}")
@@ -124,6 +128,7 @@ impl KbAttachmentService {
         }
     }
 
+    // SPEC-15.1100, SPEC-15.1101
     /// Store an image against an article the caller can reach.
     pub async fn create(
         &self,
@@ -213,6 +218,7 @@ impl KbAttachmentService {
         })
     }
 
+    // SPEC-15.1102
     /// Every image on an article, so the editor can offer what is already
     /// uploaded rather than making the author re-upload.
     pub async fn list(
@@ -248,6 +254,7 @@ impl KbAttachmentService {
             .collect())
     }
 
+    // SPEC-15.1103
     /// Remove an image, row and file both.
     pub async fn delete(
         &self,
@@ -297,6 +304,7 @@ impl KbAttachmentService {
         unlinked
     }
 
+    // SPEC-15.1104, SPEC-15.1106
     /// Metadata for an id, for the PUBLIC read path: enough to answer a
     /// conditional request and set headers without opening the blob.
     ///
@@ -333,6 +341,7 @@ impl KbAttachmentService {
         })
     }
 
+    // SPEC-15.1106
     /// PMS-1246: stream rather than buffer the blob. Same legacy-path fallback
     /// as the old `read_public` (see the module header): the tenant on both
     /// keys is the row's own, never the request's.
@@ -361,6 +370,7 @@ struct PublicAttachmentRow {
     file_size: i64,
 }
 
+// SPEC-15.1104
 /// Strong validator for an immutable blob: the uuid that addresses it plus the
 /// size recorded on the row. Mirrors
 /// `tickets::attachments::attachment_etag` (PMS-783); duplicated rather than
@@ -370,6 +380,7 @@ fn attachment_etag(id: Uuid, file_size: i64) -> String {
     format!("\"{id}-{file_size}\"")
 }
 
+// SPEC-15.1105
 /// RFC 9110 compares `If-None-Match` with the WEAK function, so `W/"x"` matches
 /// `"x"`, `*` matches any existing representation, and the value may be a list.
 fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
@@ -389,6 +400,7 @@ pub struct KbAttachmentRouterState {
     pub service: Arc<KbAttachmentService>,
 }
 
+// SPEC-15.1099
 /// Authenticated routes: upload, list, delete.
 pub fn kb_attachment_routes(service: KbAttachmentService) -> Router {
     // PMS-1233: read before `service` moves into the state, so the route's
@@ -412,6 +424,7 @@ pub fn kb_attachment_routes(service: KbAttachmentService) -> Router {
         .with_state(state)
 }
 
+// SPEC-15.1104
 /// The PUBLIC read route. Mounted by the caller under `/api/v1/public`.
 ///
 /// Separate router because the subtree it lands in is unauthenticated by
@@ -429,6 +442,7 @@ pub fn public_kb_attachment_routes(service: KbAttachmentService) -> Router {
         .with_state(state)
 }
 
+// SPEC-15.1099
 async fn upload_attachment(
     State(s): State<KbAttachmentRouterState>,
     manager: RequireManager,
@@ -477,6 +491,7 @@ async fn upload_attachment(
     ))
 }
 
+// SPEC-15.1102
 async fn list_attachments(
     State(s): State<KbAttachmentRouterState>,
     manager: RequireManager,
@@ -485,6 +500,7 @@ async fn list_attachments(
     Ok(Json(s.service.list(manager.0.tenant(), article_id).await?))
 }
 
+// SPEC-15.1103
 async fn delete_attachment(
     State(s): State<KbAttachmentRouterState>,
     manager: RequireManager,
@@ -496,6 +512,7 @@ async fn delete_attachment(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// SPEC-15.1104, SPEC-15.1105, SPEC-15.1107
 /// UNAUTHENTICATED. The id in the path is the only identity; see the module
 /// header for why an `<img>` leaves no other option.
 ///

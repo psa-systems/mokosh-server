@@ -62,6 +62,8 @@ def release-anchor [v: string] {
 
 # -- Inputs ---------------------------------------------------------------------
 
+# SPEC-10.376: registry shape check
+
 # Every `declare_keys!` declaration as {name, since, required, required_since}.
 def parse-registry [text: string] {
     let rows = (
@@ -84,6 +86,8 @@ def parse-registry [text: string] {
         }
     }
 }
+
+# SPEC-10.377: catalog sources and validation
 
 # Registry keys plus variables.toml's variables and tombstones, one row each.
 def build-catalog [registry: list, meta: record] {
@@ -139,6 +143,8 @@ def default-action [e: record] {
     if $e.group != "Added" { return "" }
     if $e.required { "Required: set it before the server starts." } else { "Optional. Leave it unset to keep the default." }
 }
+
+# SPEC-10.378 SPEC-10.379: derived and explicit changelog entries
 
 # Every changelog entry the facts imply, with authored wording attached.
 def build-entries [catalog: list, meta: record] {
@@ -243,6 +249,8 @@ def render-entry [e: record] {
     let issue = if ($e.issue | is-empty) { "" } else { $" \(($e.issue))" }
     $"- ($mark)[`($e.var)`]\(#(slug $e.var)) \(Required: ($req)) - ($feature)($e.action)($issue)"
 }
+
+# SPEC-10.380: release window and ordering
 
 def render-recent [entries: list, tags: list] {
     let w = (window $entries $tags)
@@ -435,6 +443,8 @@ def discover [files: list] {
     $names | uniq | sort
 }
 
+# SPEC-10.383: source guard
+
 def guard-errors [discovered: list, catalog: list] {
     let registry = ($catalog | where source == "registry" | get name)
     let listed = ($catalog | where source == "variables.toml" | get name)
@@ -516,12 +526,16 @@ def fail-on [errors: list, what: string] {
     exit 1
 }
 
+# SPEC-10.375: usage and error exit
+
 def main [] {
     print "usage: nu scripts/config-docs.nu <generate|check|since <version>|release-notes <version>|self-test>"
 }
 
 # SPEC-10.186: rewrites only the Recently-added block and the All-variables
 # table rows; a second run is idempotent.
+
+# SPEC-10.381: what generate rewrites
 
 def "main generate" [] {
     let repo = (load-repo)
@@ -535,6 +549,8 @@ def "main generate" [] {
 
 # SPEC-10.185: fails on a catalog defect (duplicate name, malformed field, or a
 # code-read var missing from the registry) or a docs/configuration.md mismatch.
+
+# SPEC-10.382: what check verifies
 
 def "main check" [] {
     let repo = (load-repo)
@@ -551,6 +567,8 @@ def "main check" [] {
 
 # SPEC-10.187: one row per catalog change after `version`, sorted by release,
 # breaking-level, required-first, name.
+
+# SPEC-10.384: since output and sort
 
 def "main since" [
     version: string   # the release you run now, e.g. v0.13.0
@@ -580,6 +598,8 @@ def "main since" [
     let off = ($after | where level == "feature-off" | length)
     print $"($rows | length) changes after ($version): ($wont) WON'T START \(apply before restarting), ($off) FEATURE OFF \(review and acknowledge before restarting)."
 }
+
+# SPEC-10.385: release-notes output
 
 def "main release-notes" [
     version: string    # the release being cut, e.g. v0.17.0
@@ -661,6 +681,8 @@ def generated [f: record] {
     let built = (build-entries $catalog $f.meta)
     generate-doc (fixture-doc) $catalog $built.entries $f.tags
 }
+
+# SPEC-10.386: self-test contract
 
 def "main self-test" [] {
     let f = (fixture)

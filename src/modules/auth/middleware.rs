@@ -19,6 +19,7 @@ use uuid::Uuid;
 /// the portal middleware) so the extractors can render the RFC 6750
 /// `WWW-Authenticate` challenge that matches the actual failure instead of a
 /// single opaque 401.
+// SPEC-5.140: Absent, Accepted, Expired, SessionEnded, Rejected classify the presented bearer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BearerOutcome {
     /// No `Authorization: Bearer` header was presented.
@@ -46,6 +47,7 @@ pub enum BearerOutcome {
 /// absence as a refusal would 401 every caller the moment this shipped. The
 /// lookup is one `HashMap::get` behind a read lock over a map that is empty
 /// until a logout arrives.
+// SPEC-5.142: a token with no sid is never treated as ended.
 async fn session_ended(
     revoked: &crate::modules::auth::backchannel_logout::RevokedSessions,
     claims: &super::oidc_rs::AtClaims,
@@ -59,6 +61,7 @@ async fn session_ended(
 /// PMS-1299 (F7a): a rejection any anonymous caller can trigger with a junk
 /// token stays at `debug`; only a JWKS or discovery outage is an operator
 /// problem and stays at `warn`.
+// SPEC-5.143: JWKS/discovery outages log at warn, every other rejection at debug.
 fn is_anonymous_rejection(error: &VerifyError) -> bool {
     !matches!(
         error,
@@ -70,6 +73,7 @@ impl BearerOutcome {
     /// Classify a bunyip verification failure. Only `Expired` is singled out;
     /// every other variant is an ordinary `invalid_token` rejection as far as
     /// RFC 6750 section 3.1 is concerned.
+    // SPEC-5.140: only Expired is singled out; other verify errors are Rejected.
     fn from_verify_error(error: &VerifyError) -> Self {
         match error {
             VerifyError::Expired => Self::Expired,
@@ -79,11 +83,13 @@ impl BearerOutcome {
 
     /// The `WWW-Authenticate` value a 401 for this outcome must carry
     /// (RFC 6750 section 3).
+    // SPEC-5.150: exact WWW-Authenticate values per outcome.
     fn challenge(self) -> &'static str {
         match self {
             Self::Expired => {
                 r#"Bearer error="invalid_token", error_description="The access token expired""#
             }
+            // SPEC-2.93
             Self::Rejected => r#"Bearer error="invalid_token""#,
             Self::SessionEnded => {
                 r#"Bearer error="invalid_token", error_description="The session was ended at the identity provider""#
@@ -123,6 +129,7 @@ impl From<AppError> for AuthRejection {
     /// Forbidden, the 404 module gate, the 500 wiring bug) never concern a
     /// bearer, so they render unchanged with no challenge. This also carries
     /// the `?` conversions inside the extractor bodies.
+    // SPEC-5.151: post-credential errors carry no challenge.
     fn from(error: AppError) -> Self {
         Self {
             error,
@@ -160,6 +167,7 @@ impl axum::response::IntoResponse for AuthRejection {
 /// Read the bearer outcome the middleware recorded. Defaults to `Absent`, so a
 /// route somehow mounted without the middleware still answers a bare `Bearer`
 /// challenge rather than claiming a credential was rejected.
+// SPEC-5.151: a missing extension reads as Absent.
 pub(crate) fn bearer_outcome(parts: &axum::http::request::Parts) -> BearerOutcome {
     parts
         .extensions
@@ -244,6 +252,7 @@ impl AuthMiddleware {
 /// when absent, the membership id is resolved from
 /// `(email, tenant_id)`. Runs on the migrator pool because both
 /// identity-plane tables are RLS-exempt.
+// SPEC-5.148: identity, membership id and tenant-scoped memberships; no-op when unauthenticated.
 async fn enrich_auth_state_with_identity(
     auth_service: &AuthService,
     state: AuthState,
@@ -284,6 +293,8 @@ async fn enrich_auth_state_with_identity(
     }
 }
 
+// SPEC-5.140 SPEC-5.141 SPEC-5.144 SPEC-5.145: never rejects a bad credential; Bunyip first, legacy second.
+// SPEC-5.143: verify failures are logged by severity.
 /// Extract auth state from request
 pub async fn auth_middleware(
     State(auth_middleware): State<AuthMiddleware>,
@@ -499,6 +510,7 @@ pub async fn auth_middleware(
     // decoded - a missing or unparseable token skips the extra query. The
     // probe is unscoped (bypasses the tenant GUC) so it works for both auth
     // paths and for tenant-mismatched tokens.
+    // SPEC-5.147: tombstone probe only when unauthenticated and a sub was decoded.
     let auth_state = if !auth_state.is_authenticated {
         if let Some(sub) = candidate_sub {
             let probe = auth_middleware.auth_service.is_user_tombstoned(sub).await;
@@ -518,6 +530,7 @@ pub async fn auth_middleware(
     // sign in again). The MAPPS-348 tombstone upgrade above takes precedence
     // over principal_rejection - a deleted-account 410 is more specific than a
     // suspended-tenant 403.
+    // SPEC-5.146: a captured principal rejection answers directly, skipping the handler.
     if !auth_state.is_authenticated && !auth_state.deleted {
         if let Some(err) = principal_rejection {
             return err.into_response();
@@ -547,6 +560,7 @@ pub async fn auth_middleware(
 /// database error is logged with the user id first, because reading it as
 /// "definitely not tombstoned" the same way a real negative answer is read
 /// would hide a database outage behind an identical response.
+// SPEC-5.147: Ok(true) deleted, Ok(false) unchanged, Err warned and unchanged.
 fn resolve_tombstone_probe(auth_state: AuthState, sub: Uuid, probe: AppResult<bool>) -> AuthState {
     match probe {
         Ok(true) => AuthState::deleted(),
@@ -558,6 +572,7 @@ fn resolve_tombstone_probe(auth_state: AuthState, sub: Uuid, probe: AppResult<bo
     }
 }
 
+// SPEC-5.139: case-sensitive "Bearer " prefix on a text header.
 fn bearer(req: &Request) -> Option<&str> {
     req.headers()
         .get("Authorization")?
@@ -576,6 +591,7 @@ fn bearer(req: &Request) -> Option<&str> {
 /// PMS-769: when the request does end at a 401, `outcome` decides both the
 /// error code (`TOKEN_EXPIRED` for a presented-but-expired bearer, else
 /// `UNAUTHORIZED`) and the RFC 6750 challenge attached to the response.
+// SPEC-5.149: deleted is 410, expired is TokenExpired, otherwise Unauthorized.
 fn user_or_auth_error(
     auth_state: &AuthState,
     outcome: BearerOutcome,
@@ -593,6 +609,7 @@ fn user_or_auth_error(
     }
 }
 
+// SPEC-5.152: missing AuthState extension is unauthenticated (401).
 /// Extractor for requiring authentication
 #[derive(Clone)]
 pub struct RequireAuth(pub CurrentUser);
@@ -625,6 +642,7 @@ where
 /// memberships, plus the user + tenant). Handlers that need the
 /// membership set — currently `GET /auth/memberships` — reach for this
 /// instead of `RequireAuth`, which only exposes `CurrentUser`.
+// SPEC-5.152: same 401/410 gate as RequireAuth.
 #[derive(Clone)]
 pub struct RequireAuthState(pub AuthState);
 
@@ -672,6 +690,7 @@ where
 /// The `tenant_id` field is hard-bound to the authenticated user's
 /// claim; handlers that need to switch tenants (super-admin only) must
 /// take an additional path / query parameter and gate it on role.
+// SPEC-5.152: tenant id comes only from the authenticated user.
 #[derive(Clone, Debug)]
 pub struct TenantScope {
     pub tenant_id: super::tenant::TenantId,
@@ -707,6 +726,7 @@ pub trait RoleRequirement {
     fn allowed_roles() -> &'static [&'static str];
 }
 
+// SPEC-5.152 SPEC-5.153: 401 when unauthenticated, 403 when the role string is not allowed.
 /// Extractor for requiring a specific role
 #[derive(Clone)]
 pub struct RequireRole<R: RoleRequirement>(pub CurrentUser, std::marker::PhantomData<R>);
@@ -738,6 +758,7 @@ where
     }
 }
 
+// SPEC-5.153: role allow-lists for Admin, SuperAdmin, Manager, Finance gates.
 /// Admin role requirement
 pub struct AdminRoles;
 impl RoleRequirement for AdminRoles {
@@ -838,6 +859,7 @@ pub trait ModuleGate: Send + Sync + 'static {
 ///
 /// The extractor reads an `Arc<SettingsService>` from the request's
 /// extensions; `create_api_router` adds it via `.layer(Extension(...))`.
+// SPEC-5.152 SPEC-5.154: auth first, then settings lookup; disabled or missing row is 404.
 #[derive(Clone, Debug)]
 pub struct RequireModuleEnabled<G: ModuleGate> {
     pub user: CurrentUser,
@@ -907,6 +929,7 @@ macro_rules! gated_module {
     };
 }
 
+// SPEC-5.155: the gateable module names and their 404 labels.
 gated_module!(BillingModule, "billing", "Billing", RequireBilling);
 gated_module!(ProjectsModule, "projects", "Projects", RequireProjects);
 gated_module!(CalendarModule, "calendar", "Calendar", RequireCalendar);
@@ -955,6 +978,7 @@ gated_module!(
 /// when the resolved principal fails `AuthService::ensure_principal_usable`
 /// (inactive user / non-active tenant, PMS-698). The caller treats `None` as
 /// "drop the bunyip path" and falls back to legacy.
+// SPEC-5.156: userinfo fetched only when local state is insufficient.
 async fn ensure_user_from_bunyip(
     auth_service: &Arc<AuthService>,
     tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
@@ -1008,6 +1032,7 @@ async fn ensure_user_from_bunyip(
                 // name hints) on mismatch so we never JIT a wrong-identity row, but
                 // keep the request alive so a transient OP glitch does not 401 the
                 // user across the whole site.
+                // SPEC-5.159: userinfo must be for the verified sub; absent email_verified is false below.
                 let info = info.filter(|i| {
                     if i.sub == claims.sub {
                         true
@@ -1082,6 +1107,7 @@ pub enum LocalPlacement {
 /// Public because it is the branch production takes for an already-provisioned
 /// caller, and the query-budget regression test
 /// (`tests/suites/bunyip_query_budget.rs`) asserts its cost directly.
+// SPEC-5.156 SPEC-5.158 SPEC-5.170: no-userinfo path; read failure places without userinfo; grant tokens go grantee.
 pub async fn place_bunyip_user_from_local_state(
     auth_service: &Arc<AuthService>,
     tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
@@ -1228,6 +1254,7 @@ pub async fn bunyip_userinfo_needed(
 /// reads the caller's `users` row and the "is an invite waiting" flag together.
 /// Everything after that is a pure function of that row, so a `Skip` hands the
 /// row straight to [`place_bunyip_caller`] rather than making it re-read.
+// SPEC-5.156 SPEC-5.157 SPEC-5.158: gate and grant check precede placement; read error is warned, not Needed.
 async fn resolve_bunyip_caller(
     auth_service: &Arc<AuthService>,
     invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
@@ -1341,6 +1368,7 @@ async fn resolve_bunyip_caller(
 /// grant claim naming a Mokosh tenant Mokosh does not know about, so
 /// from the caller's point of view the grant is not active on this
 /// instance.
+// SPEC-5.171: grant gate first; unresolved slug is 403; lookup errors request userinfo.
 async fn resolve_grantee_caller(
     auth_service: &Arc<AuthService>,
     sub: uuid::Uuid,
@@ -1422,6 +1450,7 @@ async fn resolve_grantee_caller(
 /// Absent placement is JIT-provisioned via
 /// [`AuthService::place_grantee_user`], which is where the fresh
 /// `users.id` + `bunyip_user_id = sub` axis comes from.
+// SPEC-5.170 SPEC-5.171 SPEC-5.172 SPEC-5.173: grant gate, slug, role mapping, verified-email JIT.
 async fn place_grantee_caller(
     auth_service: &Arc<AuthService>,
     sub: uuid::Uuid,
@@ -1637,6 +1666,7 @@ pub async fn place_bunyip_user(
 /// 403 response instead of dropping to a generic 401 the SPA reads as
 /// "session expired" and loops on.
 #[allow(clippy::too_many_arguments)]
+// SPEC-5.170: any mokosh_grant_account_id claim routes to the grantee path.
 pub async fn place_bunyip_user_with_rejection(
     auth_service: &Arc<AuthService>,
     tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
@@ -1689,6 +1719,8 @@ pub async fn place_bunyip_user_with_rejection(
 /// (every test call site, and the userinfo branch) resolves from the database
 /// exactly as before.
 #[allow(clippy::too_many_arguments)]
+// SPEC-5.160 SPEC-5.161 SPEC-5.162 SPEC-5.163 SPEC-5.164 SPEC-5.165 SPEC-5.166 SPEC-5.167 SPEC-5.168 SPEC-5.169:
+// owner placement: refusal, tenant choice, best-effort side effects, post-gate, role reconcile.
 async fn place_bunyip_caller(
     auth_service: &Arc<AuthService>,
     tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
@@ -2053,6 +2085,7 @@ async fn place_bunyip_caller(
 /// - absent claim (`None`) -> keep the local role unchanged. Back-compatible:
 ///   the legacy HS256 / standalone paths (which never carry the claim) are
 ///   unaffected.
+// SPEC-5.169: any claim value maps to Admin, never SuperAdmin; no claim keeps the local role.
 fn effective_role_from_bunyip(bunyip_role: Option<&str>, local: UserRole) -> UserRole {
     match bunyip_role {
         None => local,
@@ -2071,6 +2104,7 @@ fn effective_role_from_bunyip(bunyip_role: Option<&str>, local: UserRole) -> Use
     }
 }
 
+// SPEC-5.174: configured UUID, else UUID 1; unparseable value warns and falls back.
 fn default_bunyip_tenant_id() -> uuid::Uuid {
     let raw = crate::config::get(&crate::config::registry::OIDC_DEFAULT_TENANT_ID);
     match crate::config::parse::parse_optional::<uuid::Uuid>(
@@ -2103,6 +2137,7 @@ fn default_bunyip_tenant_id() -> uuid::Uuid {
 /// integration-test fixtures that still seed a role='super_admin' row
 /// in the default tenant (`common::seed_admin`) to keep those tests
 /// stable; it is a no-op in production.
+// SPEC-5.175: default tenant, no invite, role other than super_admin.
 fn is_stuck_in_default(
     current: Option<uuid::Uuid>,
     default_tenant: uuid::Uuid,

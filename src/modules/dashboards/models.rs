@@ -18,6 +18,7 @@ pub struct SavedDashboardResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-15.1638, SPEC-15.1639
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateSavedDashboardRequest {
     #[validate(length(min = 1, max = 200))]
@@ -34,6 +35,7 @@ pub struct CreateSavedDashboardRequest {
     pub is_default: bool,
 }
 
+// SPEC-15.1640, SPEC-15.1639
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateSavedDashboardRequest {
     #[validate(length(min = 1, max = 200))]
@@ -46,6 +48,7 @@ pub struct UpdateSavedDashboardRequest {
     pub is_default: Option<bool>,
 }
 
+// SPEC-15.1645
 /// PMS-471: one scheduled delivery for a saved dashboard. The owner
 /// (`user_id`) is the visibility identity for the materialise call,
 /// and the default recipient when `recipient_email` is null.
@@ -65,6 +68,7 @@ pub struct ScheduledDashboardResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-15.1642
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateScheduledDashboardRequest {
     #[validate(length(min = 1, max = 100), custom(function = crate::utils::validation::validate_cron))]
@@ -77,6 +81,7 @@ pub struct CreateScheduledDashboardRequest {
     pub is_active: bool,
 }
 
+// SPEC-15.1646
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateScheduledDashboardRequest {
     #[validate(length(min = 1, max = 100), custom(function = crate::utils::validation::validate_cron))]

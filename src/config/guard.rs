@@ -30,8 +30,10 @@ pub struct EntryPoint {
 /// This is NOT a list of reads waiting to be migrated. There is no such list:
 /// PMS-982 landed the seam and every read together, and the guard's own
 /// `MIGRATED_READS` is empty with a test saying so.
-// SPEC-1 and 2.146: the complete, named allowlist of files permitted to read the
+// the complete, named allowlist of files permitted to read the
 // environment directly instead of through crate::config::get.
+// SPEC-6.33: a direct environment read outside this list fails cargo test --lib.
+// SPEC-2.223
 pub const ENTRY_POINTS: &[EntryPoint] = &[
     EntryPoint {
         path: "src/bin/mokosh-bootstrap.rs",
@@ -201,8 +203,9 @@ mod tests {
     /// The acceptance criterion in executable form: a configuration read added
     /// outside the provider and `ENTRY_POINTS` fails the build.
     #[test]
-    // SPEC-1 and 2.147: the acceptance criterion in executable form; a new
+    // the acceptance criterion in executable form; a new
     // direct environment read outside the seam and ENTRY_POINTS fails the build.
+    // SPEC-2.224
     fn every_env_read_goes_through_the_provider() {
         let needle = needle();
         let root = crate_root();

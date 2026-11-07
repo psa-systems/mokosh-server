@@ -170,6 +170,7 @@ impl TicketService {
     /// must not be undone by a broken SLA policy. A no-op when no
     /// `SlaService` was wired (test fixtures built via `new` /
     /// `with_mailer` / `with_dispatcher`).
+    // SPEC-7.1041: failure is logged at warn and never fails the create or update.
     async fn evaluate_sla(&self, tenant_id: TenantId, ticket_id: Uuid) {
         if let Some(sla) = &self.sla {
             if let Err(e) = sla.evaluate_for_ticket(tenant_id, ticket_id).await {
@@ -303,6 +304,7 @@ impl TicketService {
 
     /// Generate next ticket number for tenant
     // SPEC-7.1: ticket_number is formatted "T{:06}" from the tenant's next sequence value.
+    // SPEC-7.1091: the sequence bump commits in its own transaction, so a failed create leaves a gap.
     async fn next_ticket_number(&self, tenant_id: TenantId) -> AppResult<String> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, (i32,)>(
@@ -1205,6 +1207,7 @@ impl TicketService {
     }
 
     /// Add note to ticket
+    // SPEC-7.1096: ticket checked in tenant, note inserted, ticket touched, audit row, one transaction.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn add_note(
         &self,
@@ -1436,6 +1439,7 @@ impl TicketService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // SPEC-7.1098: content only; touches the ticket (not first_response_at); audit row has old and new.
         // `updated_at` is set explicitly: `ticket_notes` carries no trigger for
         // it, which is why the column has sat equal to `created_at` on every row
         // since migration 005.
@@ -1549,6 +1553,7 @@ impl TicketService {
                 return;
             }
         };
+        // SPEC-7.1097: ticket.note_added template via the dispatcher, else a direct send with this subject.
         let contact_line = org.contact_line("Questions about this ticket?", None);
         let subject = format!("[{ticket_number}] {title}");
         let body = format!(
@@ -1830,6 +1835,7 @@ impl TicketService {
 
     // ========================================================================
     // LOOKUP MANAGEMENT (PMS-321)
+    // SPEC-7.1104: create_* writes an audit row; update_* and delete_* write none.
     //
     // Create/update/delete for the ticket lookup tables, mirroring the
     // asset-type CRUD. All tenant-scoped; the routes admin-gate the mutations.
@@ -2547,6 +2553,7 @@ impl TicketService {
     /// contacts are not in the `users` table); the customer-visible
     /// identity is captured by `contact_id`. Returns the fully-joined
     /// response so the portal client renders names not UUIDs.
+    // SPEC-7.1093: contact-plane create forces company/contact, source portal, and a fallback admin creator.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_portal_ticket(
@@ -2776,6 +2783,7 @@ impl TicketService {
     /// renders the comment as customer-originated. Bumps the
     /// ticket's `first_response_at` like the agent-add path so SLA
     /// math sees the customer reply.
+    // SPEC-7.1099: contact note is public, fallback-admin created_by_id, stamps first_response_at.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_portal_ticket_note(
         &self,
@@ -3122,6 +3130,7 @@ impl TicketService {
         filter: &TicketFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketResponse>, u64)> {
+        // SPEC-7.1105: team_id checked against the tenant (400); q matches title, number, company, assignee.
         // PMS-406: reject a `team_id` that does not belong to this tenant
         // before binding it, so a caller cannot probe another tenant's
         // team ids; cross-tenant ids 4xx rather than silently returning an
@@ -3197,6 +3206,7 @@ impl TicketService {
 
     // ========================================================================
     // MAPPS-998: per-user saved views for the Tickets list.
+    // SPEC-7.1108: names are trimmed and unique per user (409); update is partial; list is name ASC.
     //
     // Every method scopes on `(tenant_id, user_id)`: the UNIQUE on
     // `(tenant_id, user_id, name)` is per-user, and a view id this user does
@@ -3560,6 +3570,7 @@ fn build_ticket_filter_sql(
             binds.push(TicketFilterBind::Id(caller_id));
         }
     }
+    // SPEC-7.1106: is_unassigned, is_overdue and is_open are literal SQL conditions.
     // The remaining conditions are literal SQL (no placeholders, no
     // binds), so they do not touch the indices.
     if filter.is_unassigned == Some(true) {
@@ -3582,6 +3593,7 @@ fn build_ticket_filter_sql(
     }
 }
 
+// SPEC-7.1107: the response joins every display name; unresolved person names are logged with their id.
 /// SELECT clause shared by [`TicketService::get_ticket_response`] and
 /// [`TicketService::list_ticket_responses`]. Centralised so the column
 /// list, JOIN graph, and alias names stay in sync between the two.

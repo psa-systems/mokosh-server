@@ -26,6 +26,7 @@ pub fn sla_routes(service: SlaService) -> Router {
     let state = SlaRouterState {
         service: Arc::new(service),
     };
+    // SPEC-7.1028: route table; GETs need auth only, writes need an admin.
     Router::new()
         // PMS-108 policies
         .route("/sla/policies", get(list_policies).post(create_policy))
@@ -71,6 +72,7 @@ async fn list_policies(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<SlaPolicyResponse>>> {
+    // SPEC-7.1036: every list rejects an unsupported sort before querying.
     pagination.reject_unsupported_sort()?;
     let (items, total) = s.service.list_policies(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
@@ -93,6 +95,7 @@ async fn create_policy(
     Ok(Json(s.service.create_policy(u.tenant(), &req, &ctx).await?))
 }
 
+// SPEC-7.1029: get is auth-only and 404s "SLA policy" for an unknown id.
 async fn get_policy(
     State(s): State<SlaRouterState>,
     RequireAuth(u): RequireAuth,

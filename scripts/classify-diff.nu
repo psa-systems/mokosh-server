@@ -39,6 +39,8 @@ const HASH_FAMILY_EXTS = [
     ".just" ".justfile" "Dockerfile"
 ]
 
+# SPEC-10.312: code-file extension lists
+
 # Return "c", "hash", or "non-code" for a given path.
 def file_family [path: string] {
     for ext in $C_FAMILY_EXTS {
@@ -54,6 +56,8 @@ def file_family [path: string] {
     }
     return "non-code"
 }
+
+# SPEC-10.313: comment and whitespace rule
 
 # True when `content` (one changed line, minus its leading +/- marker) is
 # a comment or whitespace in a file of the given `family` ("c" or "hash").
@@ -93,6 +97,8 @@ def classify_file [base: string, head: string, path: string, family: string] {
     if $saw_change { "comments-only" } else { "no-change" }
 }
 
+# SPEC-10.311 SPEC-10.314: git error falls back to code
+
 # Classify the whole diff between $base and $head.
 def classify_diff [base: string, head: string] {
     let changed_paths = (
@@ -120,6 +126,8 @@ def classify_diff [base: string, head: string] {
     }
     if $saw_code_file { "comments-only" } else { "non-code" }
 }
+
+# SPEC-10.315: six-case self-test
 
 # Self-test: build a fresh tempdir with a tiny git repo, make a comment-only
 # change, a code change, a docs-only change, and assert the classifier
@@ -193,6 +201,8 @@ def assert_eq [got: string, want: string, label: string] {
     }
     print $"ok: ($label) -> ($got)"
 }
+
+# SPEC-10.310: CLI contract and exit codes
 
 def main [
     base?: string

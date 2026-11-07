@@ -53,6 +53,7 @@ pub struct AssetCatalogRouterState {
     pub features: Option<FeatureSnapshot>,
 }
 
+// SPEC-15.1000, SPEC-15.1002, SPEC-15.1003: route table, extractor gates, literal-before-{id} order
 pub fn asset_catalog_routes(service: AssetCatalogService, features: FeatureSnapshot) -> Router {
     let state = AssetCatalogRouterState {
         service: Arc::new(service),
@@ -87,6 +88,7 @@ pub fn asset_catalog_routes(service: AssetCatalogService, features: FeatureSnaps
         .with_state(state)
 }
 
+// SPEC-15.1001: feature gate answers 404 before any DB access
 fn require_catalog(state: &AssetCatalogRouterState) -> AppResult<()> {
     let on = state
         .features

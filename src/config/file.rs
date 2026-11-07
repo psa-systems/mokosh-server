@@ -64,8 +64,10 @@ impl FileProvider {
     /// directory is a construction input for THIS provider, which is the
     /// PMS-1009 rule for a provider of record. `src/config/guard.rs`
     /// documents the exemption.
-    // SPEC-1 and 2.133: reads CONFIG_FILE_DIR directly as the provider's own
+    // reads CONFIG_FILE_DIR directly as the provider's own
     // construction input, per the guard.rs provider-of-record exemption.
+    // SPEC-6.19: unset or blank CONFIG_FILE_DIR is silent enablement, not an error.
+    // SPEC-2.201
     pub fn from_env() -> Self {
         let dir = std::env::var("CONFIG_FILE_DIR")
             .ok()
@@ -82,14 +84,16 @@ impl FileProvider {
 
     /// Load a directory explicitly. Public so tests drive it without touching
     /// process-global env under a concurrent test runner.
-    // SPEC-1 and 2.134: a missing directory is silent-empty (enablement); an
+    // a missing directory is silent-empty (enablement); an
     // unreadable one logs an error. Both collapse to an empty provider.
+    // SPEC-6.19, SPEC-6.20: a non-directory and an unreadable path log at error; each key reads from the file named for it.
     pub fn load(dir: PathBuf) -> Self {
         let mut values = BTreeMap::new();
 
         // `metadata` distinguishes "no directory" from "cannot read the
         // directory". The first is enablement; the second is worth an
         // operator log line before it collapses to an empty provider.
+        // SPEC-2.202
         match std::fs::metadata(&dir) {
             Ok(meta) if meta.is_dir() => {}
             Ok(_) => {
@@ -126,6 +130,7 @@ impl FileProvider {
         // Only declared keys are loaded. A file named for something that is
         // not a registered key gets one `warn`, the same silence-into-visible
         // trade the app_secrets file provider makes.
+        // SPEC-2.203
         for key in REGISTRY {
             let path = dir.join(key.name());
             match std::fs::read_to_string(&path) {
@@ -193,8 +198,10 @@ impl ConfigProvider for FileProvider {
     /// refuses the write with a named `AppError::Configuration`, so an
     /// operator asking to migrate TO the file provider without pointing it
     /// anywhere gets a clear message rather than a silent success.
-    // SPEC-1 and 2.136: set/delete both refuse a bootstrap-tier key before
+    // set/delete both refuse a bootstrap-tier key before
     // touching the filesystem.
+    // SPEC-6.21
+    // SPEC-2.205
     async fn set(&self, key: &str, value: &str) -> AppResult<()> {
         if registry::tier_of(key) == Some(Tier::Bootstrap) {
             return Err(AppError::Configuration(format!(
@@ -202,6 +209,7 @@ impl ConfigProvider for FileProvider {
                  configuration provider"
             )));
         }
+        // SPEC-2.206
         let root = self.root.as_ref().ok_or_else(|| {
             AppError::Configuration(
                 "file configuration provider has no directory; set CONFIG_FILE_DIR to enable \
@@ -231,6 +239,7 @@ impl ConfigProvider for FileProvider {
         Ok(())
     }
 
+    // SPEC-6.21
     /// PMS-1012: remove the per-key file. Absence is not an error.
     async fn delete(&self, key: &str) -> AppResult<()> {
         if registry::tier_of(key) == Some(Tier::Bootstrap) {
@@ -264,8 +273,10 @@ impl ConfigProvider for FileProvider {
 /// "insert final newline" leaves one. Anything more is a value the operator
 /// wrote on purpose - preserving embedded whitespace matters for compose
 /// keys like `SMTP_FROM` and multi-line PEM material.
-// SPEC-1 and 2.135: exactly one trailing newline is stripped per file; anything
+// exactly one trailing newline is stripped per file; anything
 // else in the value is preserved.
+// SPEC-6.20
+// SPEC-2.204
 fn strip_trailing_newline(input: &str) -> String {
     let stripped = input
         .strip_suffix("\r\n")

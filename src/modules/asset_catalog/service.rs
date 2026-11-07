@@ -26,6 +26,7 @@ impl AssetCatalogService {
     /// (migration 271) serves the predicate. Empty / whitespace `q`
     /// returns the tenant's N most-used models so the picker is useful
     /// even before the operator types.
+    // SPEC-15.1004, SPEC-15.1005, SPEC-15.1006, SPEC-15.1021
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn search_models(
         &self,
@@ -82,6 +83,7 @@ impl AssetCatalogService {
     /// `(tenant_id, lower(manufacturer), lower(model), asset_type_id)`
     /// produces a 409-shaped error up at the mapper when a row of the
     /// same shape already exists.
+    // SPEC-15.1007, SPEC-15.1008
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_model(
         &self,
@@ -132,6 +134,7 @@ impl AssetCatalogService {
     }
 
     /// Read one, scoped to tenant.
+    // SPEC-15.1010
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_model(&self, tenant_id: TenantId, id: Uuid) -> AppResult<AssetModelResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -156,6 +159,7 @@ impl AssetCatalogService {
     /// may raise 23505 when a rename moves two models into the same
     /// shape; mapped to 409 at the HTTP layer the same way `create_model`
     /// does.
+    // SPEC-15.1011
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_model(
         &self,
@@ -222,6 +226,7 @@ impl AssetCatalogService {
     /// templates referencing the row are cascade-deleted by their own
     /// FK (so the operator's intent "I don't want this model anymore"
     /// implies the dependent templates go too).
+    // SPEC-15.1012
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_model(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -244,6 +249,7 @@ impl AssetCatalogService {
     /// eagerly joined to its asset_model so the typeahead can render
     /// "<name> - <manufacturer> <model>" inline without a second round
     /// trip. Ordered by `updated_at DESC` so recent edits float.
+    // SPEC-15.1013
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_templates(
         &self,
@@ -266,6 +272,7 @@ impl AssetCatalogService {
         Ok(rows)
     }
 
+    // SPEC-15.1014
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_template(
         &self,
@@ -290,6 +297,7 @@ impl AssetCatalogService {
         Ok(row)
     }
 
+    // SPEC-15.1015
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_template(
         &self,
@@ -336,6 +344,7 @@ impl AssetCatalogService {
         self.get_template(tenant_id, row.0).await
     }
 
+    // SPEC-15.1016
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_template(
         &self,
@@ -394,6 +403,7 @@ impl AssetCatalogService {
         self.get_template(tenant_id, id).await
     }
 
+    // SPEC-15.1017
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_template(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -413,6 +423,7 @@ impl AssetCatalogService {
     /// Internal helper for `bulk_create_assets` to resolve a template id
     /// into the model + per-order context it carries. Returns the row
     /// shape as a tuple of (asset_model_id, context overlay).
+    // SPEC-15.1020
     #[allow(clippy::type_complexity)]
     pub async fn resolve_template_for_bulk(
         &self,
@@ -428,6 +439,7 @@ impl AssetCatalogService {
     /// yet "owned" by writing a `tenant_authored` catalog row. An
     /// `auto_derived` row still returns (the detector is the write path
     /// for those, so the banner can still prompt).
+    // SPEC-15.1018
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn signature_detector(
         &self,
@@ -473,6 +485,7 @@ impl AssetCatalogService {
         })
     }
 
+    // SPEC-15.1007: asset type must belong to the caller's tenant
     async fn assert_asset_type_in_tenant(
         &self,
         tenant_id: TenantId,

@@ -109,6 +109,7 @@ fn demo_seed() -> &'static DemoSeed {
 
 /// The service SLA policy to create. Names are obviously-fake so an operator can
 /// tell demo rows from real data at a glance.
+// SPEC-15.2060
 pub fn demo_sla() -> UpsertSlaPolicyRequest {
     let s = &demo_seed().sla;
     UpsertSlaPolicyRequest {
@@ -127,6 +128,7 @@ pub fn demo_sla_company_index() -> usize {
 /// The sample client companies. `sla_policy_id` is stamped onto the company the
 /// bundle's `sla.company_index` points at, so the demo shows an SLA attached to
 /// a client; the others carry no SLA.
+// SPEC-15.2060
 pub fn demo_companies(sla_policy_id: Uuid) -> Vec<CreateCompanyRequest> {
     let sla_idx = demo_sla_company_index();
     demo_seed()
@@ -171,6 +173,7 @@ pub const fn demo_multi_company_contact_index() -> usize {
 /// One contact (see [`demo_multi_company_contact_index`]) drives the PMS-806
 /// child lists directly; the rest keep the scalar `company_id` / `phone` shape,
 /// so the bundle exercises both write paths.
+// SPEC-15.2060
 pub fn demo_contacts(company_ids: &[Uuid]) -> Vec<CreateContactRequest> {
     demo_seed()
         .contacts
@@ -251,6 +254,7 @@ pub struct DemoProjectBuild {
 /// The demo projects, linked to their bundle company via `company_ids` and
 /// managed by the seeding user. Structural fields (dates, budget, billing) are
 /// set here to sensible, obviously-illustrative values.
+// SPEC-15.2061
 pub fn demo_projects(company_ids: &[Uuid], manager_id: Uuid) -> Vec<DemoProjectBuild> {
     let today = Utc::now().date_naive();
     demo_seed()
@@ -301,6 +305,7 @@ pub fn demo_projects(company_ids: &[Uuid], manager_id: Uuid) -> Vec<DemoProjectB
 /// relationship. `sla_id` is left unset: the SLA subsystem assigns due dates
 /// from the applicable policy, and the durable "this client is on an SLA"
 /// relationship is carried by the company's `sla_id`, not the ticket's.
+// SPEC-15.2062
 pub fn demo_tickets(company_ids: &[Uuid], contact_ids: &[Uuid]) -> Vec<CreateTicketRequest> {
     demo_seed()
         .tickets

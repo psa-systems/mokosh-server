@@ -172,6 +172,7 @@ impl From<crate::modules::integrations::registry::SetupSurface> for SetupSurface
     }
 }
 
+// SPEC-15.1508: credential_elsewhere composition
 /// The descriptor's credential home as the response carries it.
 ///
 /// A free function rather than a method on the descriptor so the mapping from
@@ -206,6 +207,7 @@ fn credential_elsewhere(descriptor: &ProviderDescriptor) -> Option<CredentialEls
 }
 
 impl IntegrationResponse {
+    // SPEC-15.1503, SPEC-15.1504, SPEC-15.1505, SPEC-15.1506, SPEC-15.1507, SPEC-15.1509: registry half of an entry
     /// The row as it reads for a tenant that has installed nothing: the
     /// registry's half filled in and the tenant's half empty.
     ///

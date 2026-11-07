@@ -37,6 +37,7 @@ fn seed_source_tenant_id() -> AppResult<Uuid> {
 
 /// The pure parse, split out so it is unit-testable without process env
 /// (same shape as `seed::service::seed_enabled_for`).
+// SPEC-5.351
 fn parse_seed_source_tenant_id(raw: Option<&str>) -> AppResult<Uuid> {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
         Some(value) => Uuid::parse_str(value).map_err(|e| {
@@ -76,6 +77,7 @@ const MAX_TENANT_NAME_LEN: usize = 255;
 ///
 /// The possessive is always `'s`, including after a trailing s ("Chris's
 /// workspace"), which is the common style and avoids branching on spelling.
+// SPEC-5.356
 fn personal_tenant_name(given_name: Option<&str>, email: Option<&str>) -> String {
     let from_given = given_name
         .map(str::trim)
@@ -155,6 +157,7 @@ fn seeded_tenants_cache() -> &'static moka::future::Cache<Uuid, ()> {
 
 /// Drop a tenant's "already seeded" memo. Call after anything that wipes the
 /// tenant's lookup tables, so the next request re-runs the guarded seed.
+// SPEC-5.349
 pub async fn forget_seeded_tenant(tenant_id: Uuid) {
     seeded_tenants_cache().invalidate(&tenant_id).await;
 }
@@ -199,6 +202,7 @@ impl TenantService {
         self
     }
 
+    // SPEC-5.332
     /// MAPPS-457: attach an instance-wide tenant creation cap. `None`
     /// leaves creation uncapped; `Some(N)` (N > 0) makes
     /// [`create_tenant`] return `AppError::Conflict` once the tenants
@@ -209,6 +213,7 @@ impl TenantService {
         self
     }
 
+    // SPEC-5.331, SPEC-5.332, SPEC-5.333, SPEC-5.334, SPEC-5.335
     /// Create a new tenant
     #[tracing::instrument(skip_all)]
     pub async fn create_tenant(
@@ -423,6 +428,7 @@ impl TenantService {
         self.get_tenant(TenantId::from_trusted(tenant_id)).await
     }
 
+    // SPEC-5.331, SPEC-5.332, SPEC-5.336
     /// MAPPS-493 (MAPPS-474 phase 4): create a tenant on behalf of an
     /// already-authenticated identity. Unlike `create_tenant` (which is
     /// the super-admin "provision a tenant for someone else" flow), the
@@ -1001,6 +1007,7 @@ impl TenantService {
     /// default `ticket_statuses` row AND a `ticket_sequences` row
     /// (`tickets/service.rs`) - 500s. The placement path calls this so any
     /// tenant a user actually lands in is seeded.
+    // SPEC-5.349
     pub async fn ensure_default_config(&self, tenant_id: Uuid) -> AppResult<()> {
         // PMS-777: this runs on the per-request bunyip auth path
         // (place_bunyip_user). "Cheap" still meant three round-trip-bearing
@@ -1018,6 +1025,7 @@ impl TenantService {
 
     /// The guarded seeding itself, split out of [`Self::ensure_default_config`]
     /// so the PMS-777 memo wraps exactly one success path.
+    // SPEC-5.350
     async fn seed_default_config(&self, tenant_id: Uuid) -> AppResult<()> {
         // The already-seeded case stays cheap on its own terms too: a couple of
         // `SELECT EXISTS` and no write transaction. The sequence step is guarded
@@ -1069,6 +1077,7 @@ impl TenantService {
         self.ensure_own_company(tenant_id).await
     }
 
+    // SPEC-5.355, SPEC-5.356
     /// Find-or-provision the `personal` tenant owned by `owner_id` (PMS-244).
     /// A brand-new SSO user with no invite lands here: their own one-person org.
     ///
@@ -1168,6 +1177,7 @@ impl TenantService {
         )
     }
 
+    // SPEC-5.340
     /// Get tenant by ID
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_tenant(&self, tenant_id: TenantId) -> AppResult<Tenant> {
@@ -1193,6 +1203,7 @@ impl TenantService {
         Ok(row.into())
     }
 
+    // SPEC-5.329
     /// List all tenants, with a live user-count per row and a configurable
     /// sort. The admin surface renders Client, Users and Created columns and
     /// paginates server-side; picking the ORDER BY here means a single page
@@ -1248,6 +1259,7 @@ impl TenantService {
         ))
     }
 
+    // SPEC-5.331, SPEC-5.342, SPEC-5.343
     /// Update tenant
     #[allow(unused_assignments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -1636,6 +1648,7 @@ impl TenantService {
         self.get_tenant_admin(tenant_id).await
     }
 
+    // SPEC-5.346
     /// Suspend tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn suspend_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
@@ -1649,6 +1662,7 @@ impl TenantService {
         Ok(())
     }
 
+    // SPEC-5.346
     /// Activate tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn activate_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
@@ -1684,6 +1698,7 @@ impl TenantService {
         Ok(())
     }
 
+    // SPEC-5.347
     /// Get tenant usage statistics
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_tenant_usage(&self, tenant_id: TenantId) -> AppResult<TenantUsage> {
@@ -1795,6 +1810,7 @@ impl TenantService {
     ///
     /// SAFETY (PMS-285): runs under the new tenant's GUC tx so the
     /// `portal_roles` RLS WITH CHECK policy sees `app.current_tenant`.
+    // SPEC-5.354
     pub async fn seed_builtin_portal_roles(&self, tenant_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         for (name, capabilities, builtin_key) in
@@ -1819,6 +1835,7 @@ impl TenantService {
         Ok(())
     }
 
+    // SPEC-5.353
     pub async fn ensure_own_company(&self, tenant_id: Uuid) -> AppResult<()> {
         // Cheap guard so the already-provisioned common case skips the write tx.
         // SAFETY (PMS-285 / PMS-692): `tenants` is the RLS-exempt isolation root
@@ -1894,6 +1911,7 @@ impl TenantService {
     /// skipped, so a re-run (or a retried provisioning) never double-seeds.
     /// The copy runs in one transaction so a fresh tenant is either fully
     /// seeded or not at all.
+    // SPEC-5.351, SPEC-5.352
     async fn copy_default_config(&self, new_tenant_id: Uuid) -> AppResult<()> {
         let default_tenant = seed_source_tenant_id()?;
 

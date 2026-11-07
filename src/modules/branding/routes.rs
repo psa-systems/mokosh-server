@@ -89,6 +89,7 @@ pub fn staff_routes(db: Database) -> Router {
         .with_state(state)
 }
 
+// SPEC-15.2091
 async fn staff_upload_company_asset(
     State(state): State<StaffBrandingState>,
     RequireAuth(user): RequireAuth,
@@ -118,6 +119,7 @@ async fn staff_upload_company_asset(
     .await
 }
 
+// SPEC-15.2093
 async fn staff_delete_company_asset(
     State(state): State<StaffBrandingState>,
     _admin: RequireAdmin,
@@ -145,6 +147,7 @@ async fn staff_delete_company_asset(
 // STAFF - TENANT SCOPE (MSP defaults)
 // ============================================================================
 
+// SPEC-15.2092
 async fn staff_upload_tenant_asset(
     State(state): State<StaffBrandingState>,
     RequireAuth(user): RequireAuth,
@@ -170,6 +173,7 @@ async fn staff_upload_tenant_asset(
     .await
 }
 
+// SPEC-15.2093
 async fn staff_delete_tenant_asset(
     State(state): State<StaffBrandingState>,
     _admin: RequireAdmin,
@@ -230,6 +234,7 @@ pub fn contact_routes(
         .with_state(state)
 }
 
+// SPEC-15.2094
 async fn contact_upload_asset(
     State(state): State<ContactBrandingState>,
     crate::modules::contact_portal::RequireContactAuth(session): crate::modules::contact_portal::RequireContactAuth,
@@ -253,6 +258,7 @@ async fn contact_upload_asset(
     .await
 }
 
+// SPEC-15.2094
 async fn contact_delete_asset(
     State(state): State<ContactBrandingState>,
     crate::modules::contact_portal::RequireContactAuth(session): crate::modules::contact_portal::RequireContactAuth,
@@ -308,6 +314,7 @@ pub fn public_routes(db: Database) -> Router {
         .with_state(state)
 }
 
+// SPEC-15.2098
 async fn serve_company_asset(
     State(state): State<PublicBrandingState>,
     headers: HeaderMap,
@@ -334,6 +341,7 @@ async fn serve_company_asset(
     serve_asset(&state.store, scope, kind, &mime, &headers).await
 }
 
+// SPEC-15.2098
 async fn serve_tenant_asset(
     State(state): State<PublicBrandingState>,
     headers: HeaderMap,
@@ -359,6 +367,7 @@ async fn serve_tenant_asset(
 /// `If-None-Match` gets a 304 with no blob read at all; see
 /// `BrandingAssetStore::stat` for what the ETag is built from and its
 /// tradeoff.
+// SPEC-15.2099
 async fn serve_asset(
     store: &BrandingAssetStore,
     scope: AssetScope,
@@ -402,6 +411,7 @@ async fn serve_asset(
 /// matches `"x"`, `*` matches any existing representation, and the value may
 /// be a list. Mirrors `tickets::attachments::if_none_match_matches`;
 /// duplicated for the same reason the KB module's copy is.
+// SPEC-15.2099
 fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
     let Some(raw) = headers
         .get(header::IF_NONE_MATCH)
@@ -421,6 +431,7 @@ fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
 /// Do the upload dance for a scope (tenant or Company): parse the
 /// multipart body, store the bytes on disk, JSONB-merge the URL +
 /// MIME into the row.
+// SPEC-15.2096
 async fn upload_asset(
     store: &BrandingAssetStore,
     db: &Database,
@@ -449,6 +460,7 @@ async fn upload_asset(
     .into_response())
 }
 
+// SPEC-15.2097
 async fn delete_asset(
     store: &BrandingAssetStore,
     db: &Database,
@@ -473,6 +485,7 @@ fn segment_for(kind: BrandAssetKind) -> &'static str {
 
 /// Pull the first multipart field named `"file"`; error otherwise.
 /// Matches the tenant-logo upload's shape.
+// SPEC-15.2095
 async fn read_multipart_file(mut multipart: Multipart) -> AppResult<(String, Vec<u8>)> {
     while let Some(field) = multipart
         .next_field()
@@ -500,6 +513,7 @@ async fn read_multipart_file(mut multipart: Multipart) -> AppResult<(String, Vec
 /// Company's or the Tenant's `branding` block. `None` on either value
 /// emits an explicit JSON `null` so the merge resolver falls back to
 /// the parent default on the next fetch.
+// SPEC-15.2096, SPEC-15.2097
 async fn write_branding_asset(
     db: &Database,
     scope: AssetScope,
@@ -547,6 +561,7 @@ async fn write_branding_asset(
 /// Confirm the target Company exists under the caller's tenant.
 /// Missing row → 404 (enum-resistant); foreign tenant → 404, same
 /// shape.
+// SPEC-15.2091, SPEC-15.2093
 async fn verify_company_in_tenant(
     db: &Database,
     tenant_id: Uuid,
@@ -570,6 +585,7 @@ async fn verify_company_in_tenant(
 /// hand-rolled load-and-check shape. `RequireContactAuth` does not go
 /// through `CallerContext`, so this wraps the session the same way
 /// `contact_portal::routes` does for its own `settings:*`-gated routes.
+// SPEC-15.2094
 async fn require_branding_cap(
     service: &crate::modules::contact_portal::ContactAuthService,
     session: &crate::modules::contact_portal::models::ContactSession,

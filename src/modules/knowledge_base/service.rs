@@ -30,12 +30,14 @@ impl KbService {
         }
     }
 
+    // SPEC-15.1146: the dispatcher used for mention notices
     /// PMS-1129: thread the dispatcher in, the `TicketService` shape.
     pub fn with_notifications(mut self, notifications: NotificationsService) -> Self {
         self.notifications = Some(notifications);
         self
     }
 
+    // SPEC-15.1122
     /// Refuse a parent id that names another tenant's article or the
     /// article itself. A `None` parent is always accepted (that is the
     /// "top-level article" state).
@@ -100,6 +102,7 @@ impl KbService {
         Ok(())
     }
 
+    // SPEC-15.1123
     /// Reject a declared template-variables set with duplicate names or
     /// with a `default` that is not one of its own `allowed_values`
     /// (when `allowed_values` is non-empty). A variable with no
@@ -134,6 +137,7 @@ impl KbService {
         Ok(())
     }
 
+    // SPEC-15.1121
     /// Reject any `company_ids` entry that is not a company owned by this
     /// tenant, so a `client_specific` article cannot be scoped to another
     /// tenant's company (PMS-341). No-op for an empty set.
@@ -159,6 +163,7 @@ impl KbService {
     }
 
     // PMS-81 categories -------------------------------------------------------
+    // SPEC-15.1115, SPEC-15.1148
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_categories(
         &self,
@@ -186,6 +191,7 @@ impl KbService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-15.1115
     /// PMS-1082: the contact arm of `GET /kb/categories`. A category
     /// carries no Company scope, so the rule is only that an
     /// `internal` category stays with the staff; the articles under a
@@ -220,6 +226,7 @@ impl KbService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-15.1116
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_category(
         &self,
@@ -289,6 +296,7 @@ impl KbService {
         })
     }
 
+    // SPEC-15.1117
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_category(
         &self,
@@ -329,6 +337,7 @@ impl KbService {
         })
     }
 
+    // SPEC-15.1117
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_category(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -346,6 +355,7 @@ impl KbService {
     }
 
     // PMS-82 / PMS-83 articles + versions -------------------------------------
+    // SPEC-15.1118
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_articles(
         &self,
@@ -357,6 +367,7 @@ impl KbService {
             .await
     }
 
+    // SPEC-15.1119
     /// PMS-1082: the contact arm of `GET /kb/articles`. The same
     /// builder as the staff list (so `category_id` and `q` behave the
     /// same for a customer), with the portal visibility rule appended
@@ -397,6 +408,7 @@ impl KbService {
         .await
     }
 
+    // SPEC-15.1118, SPEC-15.1119
     async fn list_articles_in_scope(
         &self,
         tenant_id: TenantId,
@@ -520,6 +532,7 @@ impl KbService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-15.1120, SPEC-15.1121, SPEC-15.1123, SPEC-15.1124
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_article(
         &self,
@@ -633,12 +646,14 @@ impl KbService {
         self.get_article_inner(tenant_id, id, false).await
     }
 
+    // SPEC-15.1125
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_article(&self, tenant_id: TenantId, id: Uuid) -> AppResult<KbArticleResponse> {
         // Public reads count as a view.
         self.get_article_inner(tenant_id, id, true).await
     }
 
+    // SPEC-15.1125, SPEC-15.1126
     /// Fetch an article, bumping `view_count` only when `bump_view` is
     /// true. Internal refetches after create/update pass `false` so the
     /// write path does not inflate the counter (PMS-195: a single
@@ -674,6 +689,7 @@ impl KbService {
         Ok(row.into())
     }
 
+    // SPEC-15.1125
     /// Increment `view_count` for a tenant-scoped article as its own
     /// transaction, independent of the read that triggered it. Kept
     /// separate so a failure here never aborts or hides behind the read's
@@ -688,6 +704,7 @@ impl KbService {
         Ok(())
     }
 
+    // SPEC-15.1127, SPEC-15.1128, SPEC-15.1129
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_article(
         &self,
@@ -873,6 +890,7 @@ impl KbService {
         .await?)
     }
 
+    // SPEC-15.1130
     /// PMS-922: upsert the caller's draft for `article_id`.
     ///
     /// Writes NO `kb_article_versions` row, which is the entire point: autosave
@@ -921,6 +939,7 @@ impl KbService {
         })
     }
 
+    // SPEC-15.1130
     /// The caller's draft for `article_id`, if they have one.
     pub async fn get_draft(
         &self,
@@ -947,6 +966,7 @@ impl KbService {
         }))
     }
 
+    // SPEC-15.1130
     /// Discard the caller's draft. Idempotent: discarding one that is already
     /// gone is a success, because the caller's intent is satisfied either way.
     pub async fn delete_draft(
@@ -969,6 +989,7 @@ impl KbService {
         Ok(())
     }
 
+    // SPEC-15.1129
     /// Append a new monotonic version row for `article_id` inside an open
     /// transaction. Shared by `update_article` (snapshot-on-edit) and
     /// `restore_article_version` (snapshot-on-restore) so the
@@ -1023,6 +1044,7 @@ impl KbService {
         Ok(row.into())
     }
 
+    // SPEC-15.1132
     /// Restore a prior version's `title`/`content` onto the live article
     /// and record the restore as a NEW monotonic version (so the history
     /// is append-only and the restore itself is auditable). Tenant-scoped:
@@ -1098,6 +1120,7 @@ impl KbService {
         Ok(written)
     }
 
+    // SPEC-15.1133
     /// Record a `helpful` vote for `user_id` on a tenant-scoped article.
     ///
     /// Thin wrapper over [`record_vote`](Self::record_vote) so existing
@@ -1113,6 +1136,7 @@ impl KbService {
         self.record_vote(tenant_id, id, user_id, "helpful").await
     }
 
+    // SPEC-15.1133
     /// Record a `not_helpful` vote for `user_id` on a tenant-scoped
     /// article. Thin wrapper over [`record_vote`](Self::record_vote).
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -1126,6 +1150,7 @@ impl KbService {
             .await
     }
 
+    // SPEC-15.1133
     /// Record (or toggle) one user's vote on a tenant-scoped article and
     /// return the recomputed tallies plus the caller's resulting vote.
     ///
@@ -1241,6 +1266,7 @@ impl KbService {
         })
     }
 
+    // SPEC-15.1134
     /// Read the current tallies for a tenant-scoped article plus the
     /// caller's own vote, without mutating anything. Backs
     /// `GET /kb/articles/{id}/vote` so the client can render the active
@@ -1282,6 +1308,7 @@ impl KbService {
         })
     }
 
+    // SPEC-15.1135
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_article(
         &self,
@@ -1328,6 +1355,7 @@ impl KbService {
         Ok(())
     }
 
+    // SPEC-15.1131
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_article_versions(
         &self,
@@ -1379,6 +1407,7 @@ impl KbService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-15.1136
     /// PMS-1127: the tickets that reference `article_id` through either FK,
     /// open first and then most recently touched first, paginated. An
     /// article outside the caller's tenant answers 404 before any ticket is
@@ -1440,6 +1469,7 @@ impl KbService {
     // PMS-1128: comments
     // ------------------------------------------------------------------
 
+    // SPEC-15.1140
     /// Every comment on the article as a two-level tree: roots oldest first,
     /// each with its replies oldest first. Deleted rows stay in place with an
     /// empty body. 404 for an article outside the tenant, before any comment
@@ -1490,6 +1520,7 @@ impl KbService {
         Ok(roots)
     }
 
+    // SPEC-15.1141
     /// A new root, or a reply to a root. A reply must answer a live root on
     /// the same article and carries no anchor; an anchored root records the
     /// article's current version as `anchor_version`, the version the quote
@@ -1588,6 +1619,7 @@ impl KbService {
         Ok(written)
     }
 
+    // SPEC-15.1142
     /// The author, or an admin, rewrites the text; `edited_at` says so. A
     /// deleted comment cannot be edited back into existence.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -1635,6 +1667,7 @@ impl KbService {
         Ok(written)
     }
 
+    // SPEC-15.1145
     /// PMS-1129: write one `kb_comment_mentions` row per person the body
     /// names and answer the people whose row THIS write inserted, minus the
     /// actor. The primary key is the once-only guard: an edit that adds a
@@ -1689,6 +1722,7 @@ impl KbService {
         Ok(inserted)
     }
 
+    // SPEC-15.1146
     /// PMS-1129: one `kb.comment.mention` dispatch per newly mentioned
     /// person, after the comment has committed so a rolled-back comment
     /// queues nothing. A dispatch that fails is logged and does not fail
@@ -1766,6 +1800,7 @@ impl KbService {
         }
     }
 
+    // SPEC-15.1146
     async fn stamp_notified(
         db: &Database,
         tenant_id: TenantId,
@@ -1786,6 +1821,7 @@ impl KbService {
         Ok(())
     }
 
+    // SPEC-15.1143
     /// Soft: the row keeps its place so the thread keeps its shape, and the
     /// text is what goes. The author, or an admin.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -1825,6 +1861,7 @@ impl KbService {
         Ok(())
     }
 
+    // SPEC-15.1144
     /// Resolve or reopen a root. Any staff role: an article accumulates
     /// fixed issues and folding one away is not editing anyone's words.
     /// A reply cannot be resolved on its own and a deleted root cannot be.
@@ -1888,6 +1925,7 @@ impl KbService {
         Ok(written)
     }
 
+    // SPEC-15.1142, SPEC-15.1143
     /// The ticket-note rule: the author, or an admin; a manager is
     /// deliberately not enough, because changing another person's words is
     /// granted on purpose. A deleted comment is not changed again.
@@ -1944,6 +1982,7 @@ impl KbService {
         .await?)
     }
 
+    // SPEC-15.1125, SPEC-15.1119
     /// Portal single-article read for a specific customer contact. Enforces
     /// the same publish + visibility rules as
     /// [`Self::list_portal_articles_for_company`]: `status = 'published'` AND
@@ -1988,6 +2027,7 @@ impl KbService {
         Ok(row.into())
     }
 
+    // SPEC-15.1139
     /// Render a staff-visible article against the caller's values map,
     /// then run the output through the invisible-character sanitizer
     /// the un-templated write path already applies. The engine's
@@ -2005,6 +2045,7 @@ impl KbService {
         self.render_article_body(article, values)
     }
 
+    // SPEC-15.1139
     /// Portal counterpart of [`Self::render_article`]: the same visibility
     /// gate as [`Self::get_portal_article`] (published + public OR
     /// `client_specific` with the caller's `company_id`), rendered the
@@ -2023,6 +2064,7 @@ impl KbService {
         self.render_article_body(article, values)
     }
 
+    // SPEC-15.1139
     fn render_article_body(
         &self,
         article: KbArticleResponse,
@@ -2077,6 +2119,7 @@ impl KbService {
         })
     }
 
+    // SPEC-15.1119
     /// Portal feed for a specific customer contact (PMS-84 / PMS-32).
     ///
     /// The contact-facing visibility rule with no other filter: a
@@ -2102,6 +2145,7 @@ impl KbService {
         .await
     }
 
+    // SPEC-15.1137
     /// PMS-485: list KB articles ordered by how many tickets cite them
     /// as `source_kb_article_id`, restricted to the tenant + a recency
     /// window (`since`). The partial index added in PMS-452 migration
@@ -2181,6 +2225,7 @@ impl From<CatRow> for KbCategoryResponse {
 /// is blank, which the Rust side prints as "Unknown".
 const USER_NAME_SQL: &str = "NULLIF(TRIM(u.first_name || ' ' || u.last_name), '')";
 
+// SPEC-15.1126: author/editor/version provenance resolved in one select
 /// PMS-1126: the one column list every `ArticleRow` read shares, with the
 /// provenance the page prints resolved beside the row: the author's name,
 /// the last editor (the row's `updated_by_id`, else the latest version's
@@ -2259,6 +2304,7 @@ fn unresolved_article_person_ids(rows: &[ArticleRow]) -> Vec<Uuid> {
         .collect()
 }
 
+// SPEC-15.1126
 impl From<ArticleRow> for KbArticleResponse {
     fn from(r: ArticleRow) -> Self {
         Self {
@@ -2462,6 +2508,7 @@ struct VersionRow {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+// SPEC-15.1126
 /// PMS-1126: what the page prints for a user whose row is gone. Never an
 /// id: the reader cannot do anything with one.
 fn unknown_user() -> String {
@@ -2521,6 +2568,7 @@ pub struct ArticleMeasuredDuration {
 const ARTICLE_DURATION_WINDOW_DAYS: i64 = 90;
 
 impl KbService {
+    // SPEC-15.1138
     /// Measured duration for the request types documented by `article_id`.
     ///
     /// Walks time_entries -> tickets -> form_submissions -> form_definitions,

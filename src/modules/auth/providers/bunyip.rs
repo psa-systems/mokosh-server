@@ -56,6 +56,7 @@ impl AuthProvider for BunyipOidcProvider {
         self.is_enabled
     }
 
+    // SPEC-5.184: available exactly when the verifier was built.
     fn is_available(&self) -> bool {
         self.verifier_present
     }

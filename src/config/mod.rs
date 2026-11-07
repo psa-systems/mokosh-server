@@ -166,6 +166,7 @@ pub trait ConfigProvider: Send + Sync {
         )))
     }
 
+    // SPEC-6.26: the default refusal that makes the environment and bunyip providers read-only for deletes.
     /// PMS-1012: delete one configuration value. Same default posture as
     /// [`ConfigProvider::set`]. The CLI's `provider-purge` reports the
     /// refusal per key.
@@ -340,6 +341,7 @@ pub struct Generation {
 }
 
 impl Generation {
+    // SPEC-6.6: one entry per declared key; bootstrap entries are carried from the previous generation.
     /// Resolve every declared key against `provider`.
     ///
     /// `previous` carries the bootstrap tier forward: those resolve exactly
@@ -474,6 +476,8 @@ impl ConfigProviderKind {
     /// Legal names for the operator-facing error on an unrecognised value.
     pub const LEGAL_VALUES: &'static str = "environment, file, database, bunyip";
 
+    // SPEC-6.49: an unknown provider name is a boot error naming the legal values, never the profile default.
+    // SPEC-2.229
     /// A provider NAME to a kind. Blank is not a name: the caller resolves an
     /// unset selection variable against the hosting profile's default before
     /// it gets here.
@@ -496,6 +500,8 @@ impl ConfigProviderKind {
         }
     }
 
+    // SPEC-6.16: blank and repeated entries are errors with these texts.
+    // SPEC-2.194
     /// Parse a comma-separated priority list (PMS-987). Empty entries are
     /// refused (a blank name is not a name), and a duplicate is refused
     /// (a provider listed twice makes the priority ambiguous). The order
@@ -557,8 +563,10 @@ impl ConfigSelection {
     /// `environment` is reachable through it until the migrate CLI
     /// (PMS-1012) rewires this. An operator asking for one of the other
     /// three here is a wiring error pointing them at `CONFIG_PROVIDERS`.
-    // SPEC-1 and 2.128: CONFIG_BACKEND is a single-provider slot that can only resolve to Environment today;
+    // CONFIG_BACKEND is a single-provider slot that can only resolve to Environment today;
     // any other legal provider name is a wiring error directing the operator to CONFIG_PROVIDERS (PMS-987).
+    // SPEC-6.15: CONFIG_BACKEND resolves only to environment; blank takes the profile default.
+    // SPEC-2.189
     pub fn resolve(profile_default: &str, raw: &str) -> AppResult<Self> {
         let raw = raw.trim();
         let (provider, source) = if raw.is_empty() {
@@ -574,6 +582,7 @@ impl ConfigSelection {
         };
         if provider != ConfigProviderKind::Environment {
             return Err(AppError::Configuration(format!(
+                // SPEC-2.190
                 "CONFIG_BACKEND {:?} names a provider the single-provider slot cannot yet \
                  construct (only 'environment' is reachable that way); enable it through \
                  CONFIG_PROVIDERS instead once the chain wiring lands (PMS-987)",
@@ -719,8 +728,10 @@ pub fn snapshot() -> Arc<Generation> {
     current()
 }
 
-// SPEC-1 and 2.124: get/has/served_by are the one read path every caller outside
+// get/has/served_by are the one read path every caller outside
 // the ENTRY_POINTS allowlist must use; guard.rs::every_env_read_goes_through_the_provider enforces it.
+// SPEC-6.6: a blank value comes back as Some(""); the caller owns blank-as-unset.
+// SPEC-2.180
 /// The value for a declared key, or `None` when no provider holds it.
 ///
 /// This is the one read path. Trimming, emptiness and defaults stay with the
@@ -729,6 +740,7 @@ pub fn get(key: &ConfigKey) -> Option<String> {
     current().value(key)
 }
 
+// SPEC-2.181
 /// Whether any provider held `key` at resolution time.
 pub fn has(key: &ConfigKey) -> bool {
     current().served_by(key).is_some()
@@ -751,8 +763,10 @@ pub fn served_by(key: &ConfigKey) -> Option<&'static str> {
 /// PMS-986: this is a thin wrapper around
 /// `try_refresh(RefreshRequest::system())`. A rejected outcome hands back the
 /// PREVIOUS generation (still live), matching current best-effort semantics.
-// SPEC-1 and 2.125: refresh re-resolves every application-tier key atomically and
+// refresh re-resolves every application-tier key atomically and
 // falls back to the previous generation on a rejected outcome.
+// SPEC-6.9: rejected refresh hands back the previous generation.
+// SPEC-2.182
 pub fn refresh() -> Arc<Generation> {
     match try_refresh(RefreshRequest::system()) {
         RefreshOutcome::Applied { generation, .. } => generation,
@@ -782,8 +796,9 @@ pub fn refresh() -> Arc<Generation> {
 /// The `providers_consulted` field is shaped for the PMS-987 chain: today it
 /// lists the single installed provider, but the shape survives without a
 /// second API change.
-// SPEC-1 and 2.126: a bootstrap-tier required key is refused before any I/O, and a
+// a bootstrap-tier required key is refused before any I/O, and a
 // rejected outcome leaves the live generation and its counter untouched.
+// SPEC-6.10
 pub fn try_refresh(request: RefreshRequest) -> RefreshOutcome {
     let previous = current();
 
@@ -794,6 +809,7 @@ pub fn try_refresh(request: RefreshRequest) -> RefreshOutcome {
         .filter(|key| key.tier() == Tier::Bootstrap)
         .copied()
         .collect();
+    // SPEC-2.184
     if !bootstrap_refused.is_empty() {
         return RefreshOutcome::Rejected {
             reason: RefreshRejection {
@@ -815,6 +831,7 @@ pub fn try_refresh(request: RefreshRequest) -> RefreshOutcome {
     );
 
     // Rule 3: validate every required key resolved. On failure, DO NOT swap.
+    // SPEC-2.183
     let unresolved: Vec<&'static ConfigKey> = request
         .required_keys
         .iter()
@@ -847,6 +864,7 @@ pub fn try_refresh(request: RefreshRequest) -> RefreshOutcome {
 
 // -- PMS-984: staleness report -------------------------------------------
 
+// SPEC-2.192
 /// What the current provider's `list()` said about its contents, in the shape
 /// a staleness report renders.
 ///
@@ -897,7 +915,7 @@ impl std::fmt::Debug for EnumerationStatus {
 /// The four variants stay OPEN even where today's single-provider slot
 /// cannot itself produce a given transition, so wiring the PMS-987 provider
 /// chain later lights up a variant instead of adding one.
-// SPEC-1 and 2.129: the staleness report compares a recorded generation to a live
+// the staleness report compares a recorded generation to a live
 // provider probe without ever exposing a value, only key/provider identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StalenessState {
@@ -1035,6 +1053,7 @@ impl std::fmt::Debug for StalenessReport {
     }
 }
 
+// SPEC-6.12
 /// Run a live presence check against every enabled provider and pair it with
 /// the recorded generation (PMS-984).
 ///
@@ -1087,6 +1106,7 @@ fn check_staleness_against(
     }
 }
 
+// SPEC-2.191
 /// Reduce a recorded serving provider and a live presence result to one of
 /// the four [`StalenessState`] variants.
 ///
@@ -1127,10 +1147,12 @@ fn derive_staleness_state(
 /// No such endpoint exists yet (PMS-1012 owns the CLI half; the admin
 /// endpoint lands in its own PR), so this is the seam for that future
 /// caller.
-// SPEC-1 and 2.126: the per-key form of the same bootstrap-refresh refusal rule.
+// the per-key form of the same bootstrap-refresh refusal rule.
+// SPEC-6.11
 pub fn refuse_refresh_of_bootstrap(key: &'static ConfigKey) -> AppResult<()> {
     match key.tier() {
         Tier::Bootstrap => Err(AppError::Configuration(format!(
+            // SPEC-2.185
             "bootstrap keys cannot be refreshed; {} is Bootstrap tier",
             key.name()
         ))),
@@ -1149,8 +1171,10 @@ pub fn refuse_refresh_of_bootstrap(key: &'static ConfigKey) -> AppResult<()> {
 /// shape, for the reason PMS-904 states: only the auth service and the startup
 /// wiring know which mode this is, and a capability module cares which
 /// provider it got rather than which profile chose it.
-// SPEC-1 and 2.127: the boot entry point that installs a provider from
+// the boot entry point that installs a provider from
 // CONFIG_BACKEND (or the hosting profile's default) before any other read.
+// SPEC-6.7: the boot-time selection and the "read ran before init_from_env" refusal.
+// SPEC-2.186
 pub fn init_from_env(profile_default: &str) -> AppResult<ConfigSelection> {
     let selection = ConfigSelection::from_env(profile_default)?;
     let chosen = build(selection.provider);
@@ -1160,6 +1184,7 @@ pub fn init_from_env(profile_default: &str) -> AppResult<ConfigSelection> {
         // default is already installed. Silently keeping it would mean an
         // operator's explicit choice is ignored with nothing said, so the
         // mismatch ends the boot and the agreeing case is merely logged.
+        // SPEC-2.187
         if installed.name() != chosen_name {
             return Err(AppError::Configuration(format!(
                 "the configuration provider was already resolved as {:?} before startup \
@@ -1179,6 +1204,8 @@ pub fn init_from_env(profile_default: &str) -> AppResult<ConfigSelection> {
     // disables a specific capability. Keys without a `feature` annotation are
     // legitimately unset by design (see `registry.rs`) and stay silent, so a
     // healthy deployment logs nothing here.
+    // SPEC-6.8: only keys that carry a feature annotation are named.
+    // SPEC-2.188
     for (key, feature) in current().unresolved_with_features() {
         tracing::warn!(
             key = key.name(),
@@ -1283,7 +1310,7 @@ pub enum ConfigClassification {
 /// The FIRST element is the highest priority. Sorting is the caller's:
 /// the chain builder respects the order `CONFIG_PROVIDERS` was written in
 /// (that is the operator declaration the boot report echoes).
-// SPEC-1 and 2.130: the PMS-987 priority-list chain and its classification are wired but dormant; no boot
+// the PMS-987 priority-list chain and its classification are wired but dormant; no boot
 // path installs one, so CONFIG_PROVIDERS still only feeds the single-provider slot via ConfigSelection.
 pub struct ConfigProviderChain {
     providers: Vec<(ConfigProviderKind, Arc<dyn ConfigProvider>)>,
@@ -1316,6 +1343,7 @@ impl ConfigProviderChain {
             .collect()
     }
 
+    // SPEC-6.17: first provider that holds and decodes the key wins; the rest are reported as also holding it.
     /// Walk the chain for `key`, taking the first provider's value and
     /// naming every OTHER provider that also holds it.
     pub fn resolve(&self, key: &ConfigKey) -> ChainResolution {
@@ -1329,6 +1357,7 @@ impl ConfigProviderChain {
                 // (a non-UTF-8 environment value) must not be taken as the
                 // serving copy, or `provider-purge` would treat the decodable
                 // copy further down the chain as the redundant one.
+                // SPEC-2.195
                 let decoded = if served_by.is_none() {
                     provider.get(name)
                 } else {
@@ -1381,6 +1410,8 @@ pub fn classify(chain: &ConfigProviderChain) -> ChainClassification {
     ChainClassification { top, rows }
 }
 
+// SPEC-6.17: names keys and providers, never values.
+// SPEC-2.196
 /// Log the classification.
 ///
 /// - `Used` writes one `info` per key: the provider that served.
@@ -1482,6 +1513,8 @@ pub fn init_chain(chain: ConfigProviderChain) -> AppResult<()> {
     Ok(())
 }
 
+// SPEC-6.16: only the provider operator commands call this; the server installs no chain.
+// SPEC-2.193
 /// Build the chain from `CONFIG_PROVIDERS`, using `profile_default` when
 /// unset (see [`ConfigSelection`] for the same rule). The `db` handle is
 /// used only when the chain enables the database provider; the Bunyip
@@ -1509,8 +1542,10 @@ pub async fn build_chain_from_env(
             ConfigProviderKind::Environment => Arc::new(EnvProvider),
             ConfigProviderKind::File => Arc::new(FileProvider::from_env()),
             ConfigProviderKind::Database => {
+                // SPEC-6.18
                 let Some(db) = db else {
                     return Err(AppError::Configuration(
+                        // SPEC-2.197
                         "CONFIG_PROVIDERS enables the database provider, but the chain \
                          builder was called without a database handle; wire the pool in \
                          before enabling the database configuration provider (PMS-987)"

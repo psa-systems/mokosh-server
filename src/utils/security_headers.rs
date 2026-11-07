@@ -24,6 +24,8 @@ use axum::http::{header::HeaderName, HeaderValue};
 /// Static (name, value) header pairs applied to every response. Kept as raw
 /// string literals so the whole set is auditable in one place; all are valid
 /// `HeaderValue`s and are parsed once per response with `from_static`.
+// SPEC-4.1005: the default header values: HSTS 1y preload, nosniff, DENY, no-referrer, CSP
+// default-src none.
 const SECURITY_HEADERS: &[(&str, &str)] = &[
     // One year, include subdomains, preload-eligible. Ignored by browsers over
     // plain HTTP, so safe to send unconditionally behind the TLS proxy.

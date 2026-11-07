@@ -60,6 +60,7 @@ pub struct IntegrationsRouterState {
     pub service: Arc<IntegrationsService>,
 }
 
+// SPEC-15.1501: list is the only mounted route
 pub fn integration_routes(service: IntegrationsService) -> Router {
     let state = IntegrationsRouterState {
         service: Arc::new(service),
@@ -69,6 +70,7 @@ pub fn integration_routes(service: IntegrationsService) -> Router {
         .with_state(state)
 }
 
+// SPEC-15.1500: admin-only list
 async fn list_integrations(
     State(state): State<IntegrationsRouterState>,
     _admin: RequireAdmin,

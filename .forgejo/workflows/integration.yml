@@ -49,6 +49,7 @@ on:
   # one non-doc edit still triggers the full suite. `check.yml` is NOT
   # treated the same way because several of its guards exist to run on
   # doc changes.
+  # SPEC-10.327
   pull_request:
     branches:
       - main
@@ -61,6 +62,7 @@ on:
       - "renovate.json"
 
 # PMS-1633: supersede obsolete PR runs. See check.yml for the ref-shape note.
+# SPEC-10.328
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -97,6 +99,7 @@ jobs:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
 
+      # SPEC-10.330
       - name: Require disk headroom for the link step
         # SPEC-10.14: exit 1 with ::error:: when free space is under 25G
         # PMS-740: the archive step used to link one debug binary per
@@ -134,6 +137,7 @@ jobs:
           shared-key: integration
           cache-on-failure: true
 
+      # SPEC-10.329
       - name: Cache cargo-nextest tarball
         # PMS-1641: see check.yml's cargo-machete cache step for the full
         # rationale. The key literal MUST match the matching cache step
@@ -175,6 +179,7 @@ jobs:
       - name: Cap build parallelism
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
+      # SPEC-10.331
       - name: Build the integration test archive
         # SPEC-10.17: disk sampler must never change the step's propagated exit status
         # PMS-1177: `cargo nextest archive` compiles every `tests/*.rs`
@@ -274,6 +279,7 @@ jobs:
           --health-timeout 5s
           --health-retries 20
 
+    # SPEC-10.333
     env:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
       # Job-level rather than step-level (PMS-1177): the template-build step
@@ -297,6 +303,7 @@ jobs:
           name: nextest-archive
           path: .
 
+      # SPEC-10.329
       - name: Cache cargo-nextest tarball
         # PMS-1641: same version-keyed cache the build job above uses.
         # Key MUST stay in step with the other cargo-nextest sites.
@@ -387,6 +394,7 @@ jobs:
           cargo nextest run --archive-file nextest-archive.tar.zst --profile ci \
             --no-capture -E 'test(/^suites::template_database::/)'
 
+      # SPEC-10.332
       - name: Integration tests (shard ${{ matrix.shard }}/3)
         # PMS-1253: `--partition hash:k/N` keeps every test in the same
         # shard across runs so a slow case stays attributable; `count:k/N`
