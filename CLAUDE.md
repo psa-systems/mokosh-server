@@ -43,7 +43,7 @@ just check-docker          # validate OCI image builder stage (NOT part of `just
 just build-docker          # build production OCI image (oci-build/Dockerfile)
 ```
 
-`just check` and `just pre-push` together cover `check.yml` except its doc tests ([details](docs/dev-docs/local-vs-ci-checks.md#how-the-two-recipes-relate)). `pre-commit`, `pre-push`, `install-hooks` and `create-release` come from the `common` submodule, so a fresh clone runs `git submodule update --init` first.
+`just check` and `just pre-push` together cover `check.yml` except its doc tests ([details](docs/dev-docs/local-vs-ci-checks.md#how-the-two-recipes-relate)). Every `just` recipe needs the `common` submodule fetched first, because `justfile` unconditionally imports `common/common.just`; `pre-commit`, `pre-push`, `install-hooks` and `create-release` additionally run recipe bodies defined inside it.
 
 A new `check.yml` step needs its recipe in `just check` or `just pre-push`, and its line in `docs/recipes.md`.
 
