@@ -51,6 +51,9 @@ def is-version [v: any] {
 def release-tags [] {
     # Best-effort: an offline clone or one with no `origin` keeps whatever
     # tags it already has rather than failing the whole run (PMS-1675).
+    # check.yml's "nu guards + migrations + routes" job, which runs this,
+    # already clones with fetch-depth: 0 and no fetch-tags override, so it
+    # already has every tag; this fetch is for a developer's local clone.
     do -i { ^git fetch --tags --quiet }
     ^git tag --list "v*" | lines | where {|t| is-version $t }
 }
