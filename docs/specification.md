@@ -6106,7 +6106,7 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
 
 ### 10.23 Repo hygiene (`.gitignore`, `.gitmodules`)
 
-- **SPEC-10.161** `.gitmodules` must declare submodule `common` at path `common`, url `https://<forge-host>/<org>/common.git`; a fresh clone must run `git submodule update --init` before `pre-commit`, `pre-push`, `install-hooks` or `create-release` resolve, since those recipes are implemented in the `common` submodule.
+- **SPEC-10.161** `.gitmodules` must declare submodule `common` at path `common`, url `https://dev.a8n.run/psa-systems/common.git`; a fresh clone must run `git submodule update --init` before any `just` recipe resolves, because the unconditional import in `justfile` (SPEC-10.52) fails first; `pre-commit`, `pre-push`, `install-hooks` and `create-release` additionally depend on the submodule's own recipe bodies.
 - **SPEC-10.162** `.gitignore` must exclude every `.env*` file except `.env.example` (`.env*` then `!.env.example`), so a generated `.env` with live secrets is never committed while the template always is.
 - **SPEC-10.163** `.gitignore` must exclude `/secrets/` (generated OIDC signing keys), `/gen/` (build output), `/assets/styles.css` (Tailwind-generated CSS), `data/` (the dev Postgres bind-mount directory), `.claude/` (agent scratch/config), `For AI/` (local-only AI scratch context), and `/attachments/` (the default local-storage root for a bare `cargo run` or a test).
 
