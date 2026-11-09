@@ -49,6 +49,12 @@ def is-version [v: any] {
 }
 
 def release-tags [] {
+    # Best-effort: an offline clone or one with no `origin` keeps whatever
+    # tags it already has rather than failing the whole run (PMS-1675).
+    # check.yml's "nu guards + migrations + routes" job, which runs this,
+    # already clones with fetch-depth: 0 and no fetch-tags override, so it
+    # already has every tag; this fetch is for a developer's local clone.
+    do -i { ^git fetch --tags --quiet }
     ^git tag --list "v*" | lines | where {|t| is-version $t }
 }
 
@@ -357,11 +363,15 @@ def check-recent [lines: list, entries: list, tags: list] {
     let anchors = ($lines | str join "\n" | parse --regex '<a id="(?<id>[^"]+)"></a>' | get id)
     mut errors = []
     mut found = []
+    mut headings = []
     mut release: any = null
     mut group: any = null
     for line in ($lines | skip ($bounds.start + 1) | first ($bounds.stop - $bounds.start - 1)) {
         if ($line starts-with "### ") {
             $release = ($line | parse --regex '(?<v>v\d+\.\d+\.\d+)' | get 0?.v)
+            if $release != null {
+                $headings = ($headings | append { v: $release, unreleased: ($line | str contains "Unreleased") })
+            }
             $group = null
             continue
         }
@@ -402,6 +412,14 @@ def check-recent [lines: list, entries: list, tags: list] {
         }
     }
     let w = (window $entries $tags)
+    for h in $headings {
+        let want = ($h.v in $w.unreleased)
+        if $h.unreleased != $want {
+            let got = if $h.unreleased { "Unreleased" } else { "released" }
+            let expect = if $want { "Unreleased" } else { "released" }
+            $errors = ($errors | append $"($DOC_FILE): ($h.v) heading is labeled '($got)', a fresh `window` call says it is '($expect)'; run `just config-docs`")
+        }
+    }
     let covered = ($w.unreleased | append $w.released)
     for e in ($entries | where {|e| $e.release in $covered }) {
         if not ($"($e.release)|($e.group)|($e.var)" in $found) {
@@ -716,6 +734,7 @@ def "main self-test" [] {
         ["a Breaking change without an issue and action fails", (build-entries (build-catalog (parse-registry $new_req) $f.meta) $f.meta | get errors), 1]
         ["a wrong Required flag in the changelog fails", (all-errors $f.registry_text $f.meta $f.tags ($good | str replace '[`OPT_KEY`](#var-opt-key) (Required: no)' '[`OPT_KEY`](#var-opt-key) (Required: yes)')), 1]
         ["an entry linking to a missing anchor fails", (all-errors $f.registry_text $f.meta $f.tags ($good | str replace '[`OPT_KEY`](#var-opt-key)' '[`OPT_KEY`](#var-nope)')), 1]
+        ["a stale 'Unreleased' heading on an already-tagged release fails", (all-errors $f.registry_text $f.meta $f.tags ($good | str replace '### v9.1.0' '### Unreleased (v9.1.0)')), 1]
         ["a read outside the registry that is not listed fails", (guard-errors ["BOOT_KEY" "SURPRISE_KEY"] (build-catalog (parse-registry $f.registry_text) $f.meta)), 1]
         ["a listed variable nothing reads fails", (guard-errors [] (build-catalog (parse-registry $f.registry_text) $f.meta)), 1]
         ["discover finds env::var, helpers, consts and EnvFilter", (do {
