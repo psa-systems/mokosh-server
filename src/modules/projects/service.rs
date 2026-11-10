@@ -312,6 +312,9 @@ impl ProjectsService {
         .await?;
 
         // SPEC-7.447: every field uses COALESCE($n, column), so an omitted field in the request leaves the stored value unchanged
+        // PMS-1679: except the four the edit modal can blank, which are double
+        // options: `$16`-`$19` say whether each was sent, so an explicit null
+        // clears the column instead of COALESCE keeping it.
         let affected = sqlx::query(
             r#"
             UPDATE projects SET
@@ -319,11 +322,11 @@ impl ProjectsService {
                 description = COALESCE($4, description),
                 status = COALESCE($5, status),
                 project_manager_id = COALESCE($6, project_manager_id),
-                start_date = COALESCE($7, start_date),
-                target_end_date = COALESCE($8, target_end_date),
+                start_date = CASE WHEN $16 THEN $7 ELSE start_date END,
+                target_end_date = CASE WHEN $17 THEN $8 ELSE target_end_date END,
                 actual_end_date = COALESCE($9, actual_end_date),
-                budget_hours = COALESCE($10, budget_hours),
-                budget_amount = COALESCE($11, budget_amount),
+                budget_hours = CASE WHEN $18 THEN $10 ELSE budget_hours END,
+                budget_amount = CASE WHEN $19 THEN $11 ELSE budget_amount END,
                 billing_method = COALESCE($12, billing_method),
                 hourly_rate = COALESCE($13, hourly_rate),
                 is_billable = COALESCE($14, is_billable),
@@ -338,15 +341,19 @@ impl ProjectsService {
         .bind(&request.description)
         .bind(&request.status)
         .bind(request.project_manager_id)
-        .bind(request.start_date)
-        .bind(request.target_end_date)
+        .bind(request.start_date.flatten())
+        .bind(request.target_end_date.flatten())
         .bind(request.actual_end_date)
-        .bind(request.budget_hours)
-        .bind(request.budget_amount)
+        .bind(request.budget_hours.flatten())
+        .bind(request.budget_amount.flatten())
         .bind(&request.billing_method)
         .bind(request.hourly_rate)
         .bind(request.is_billable)
         .bind(request.default_due_business_days)
+        .bind(request.start_date.is_some())
+        .bind(request.target_end_date.is_some())
+        .bind(request.budget_hours.is_some())
+        .bind(request.budget_amount.is_some())
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1134,15 +1141,19 @@ impl ProjectsService {
                 .and_then(|v| v.as_str())
                 .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
         };
-        let effective_start = request.start_date.or_else(|| stored_date("start_date"));
-        let effective_due = request.due_date.or_else(|| stored_date("due_date"));
+        // PMS-1679: an absent date is the stored one; an explicit null is no
+        // date at all, so it cannot invert the range.
+        let effective_start = request
+            .start_date
+            .unwrap_or_else(|| stored_date("start_date"));
+        let effective_due = request.due_date.unwrap_or_else(|| stored_date("due_date"));
         if !task_dates_ok(effective_start, effective_due) {
             return Err(AppError::BadRequest(
                 "Due date must be on or after the start date".to_string(),
             ));
         }
 
-        // SPEC-7.494: every field except completed_at uses COALESCE($n, column), so an omitted field in the request leaves the stored value unchanged
+        // SPEC-7.494: every field except completed_at, start_date and due_date uses COALESCE($n, column), so an omitted field in the request leaves the stored value unchanged; the two dates are cleared by an explicit null (PMS-1679)
         // SPEC-7.495: completed_at is inferred from the supplied status_id's is_completed flag via a CASE, not a second read: moving to a completed status stamps it (if not already stamped), moving to a non-completed status clears it, and an omitted status_id leaves it untouched
         // When the new status is completed, stamp completed_at; clearing
         // back to non-completed clears it. Two reads (status flag check)
@@ -1157,8 +1168,8 @@ impl ProjectsService {
                   priority = COALESCE($7, priority),
                   assigned_to_id = COALESCE($8, assigned_to_id),
                   estimated_hours = COALESCE($9, estimated_hours),
-                  start_date = COALESCE($10, start_date),
-                  due_date = COALESCE($11, due_date),
+                  start_date = CASE WHEN $13 THEN $10 ELSE start_date END,
+                  due_date = CASE WHEN $14 THEN $11 ELSE due_date END,
                   sort_order = COALESCE($12, sort_order),
                   completed_at = CASE
                       WHEN $5::uuid IS NOT NULL AND EXISTS (
@@ -1181,9 +1192,11 @@ impl ProjectsService {
         .bind(&request.priority)
         .bind(request.assigned_to_id)
         .bind(request.estimated_hours)
-        .bind(request.start_date)
-        .bind(request.due_date)
+        .bind(request.start_date.flatten())
+        .bind(request.due_date.flatten())
         .bind(request.sort_order)
+        .bind(request.start_date.is_some())
+        .bind(request.due_date.is_some())
         .execute(&mut *tx)
         .await?
         .rows_affected();
