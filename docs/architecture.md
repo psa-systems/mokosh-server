@@ -113,7 +113,6 @@ compose.dev.yml    Dev stack: mokosh-server + Postgres + mailpit, routed by the 
 .env.example       Committed template; the first `just dev` generates .env from it with fresh per-clone secrets.
 justfile           Task runner.
 .forgejo/          CI workflows (Forgejo).
-.devcontainer/     VS Code devcontainer config.
 docs/              This documentation set; docs/dev-docs/ holds the internal notes.
 ```
 

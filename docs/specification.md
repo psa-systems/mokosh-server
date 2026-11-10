@@ -2554,7 +2554,7 @@ Every migration under `migrations/` is embedded at compile time via `sqlx::migra
 ## 10. Build, CI and deployment
 
 This section covers `.forgejo/workflows/`, `oci-build/`, `Dockerfile`, `compose.dev.yml`, `justfile`, `.env.example`,
-`Cargo.toml`, `rust-toolchain.toml`, `.cargo/`, `.config/`, `.devcontainer/`, `renovate.json`, `.gitignore`,
+`Cargo.toml`, `rust-toolchain.toml`, `.cargo/`, `.config/`, `renovate.json`, `.gitignore`,
 `.gitmodules`, `.noseyparker-ignore.txt`, `scripts/*.nu`, and the non-test configuration and helpers under `e2e/`.
 Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enforcing site with a 1-2 line comment.
 
@@ -2758,13 +2758,6 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
 - **SPEC-10.142** Traefik routing labels for `server` must use YAML list syntax, not map syntax, since Compose does not interpolate `${USER}` inside map keys, only inside string values.
 - **SPEC-10.143** `minio`'s image must be pinned by digest `docker.io/bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c`, with its data volume mounted at `/bitnami/minio/data`, not `/data`, because the Bitnami non-root image cannot `chown` a freshly created volume mounted at `/data`.
 
-### 10.20 Devcontainer (`.devcontainer/`)
-
-- **SPEC-10.144** `devcontainer.json` must use image `ghcr.io/niceguyit/opensuse-dev:v0.7.0-leap-16.0`, and must run `config-devcontainer.sh dev` via `sudo su --login --command` on `postCreateCommand`, `updateContentCommand`, and `postStartCommand` alike, a JetBrains-only workaround since JetBrains does not run those hooks as the configured user.
-- **SPEC-10.145** `config-devcontainer.sh` must add the `dev` user to a `docker-host` group matching the host docker socket's gid (creating the group if absent) whenever that gid is non-zero and not already present in `/etc/group`, so `dev` can reach `/var/run/docker.sock`.
-- **SPEC-10.146** Under JetBrains (`/.jbdevcontainer/` present), the script must move each of `chezmoi`, `nushell`, and `bun`'s config directories under `/.jbdevcontainer/config/` on first run and replace the original path with a symlink owned by `dev:dev`, so JetBrains' use of `XDG_CONFIG_HOME`/`XDG_DATA_HOME` still persists configuration across container rebuilds.
-- **SPEC-10.147** When `bun` is on `PATH`, the script must globally install `prettier`, `cspell`, `corepack`, `@anthropic-ai/claude-code`, `@tailwindcss/cli`, then run `bun update --global --latest` against every global package.
-
 ### 10.21 Rust toolchain and workspace (`Cargo.toml`, `rust-toolchain.toml`, `.cargo/config.toml`)
 
 - **SPEC-10.148** The workspace must resolve with `resolver = "2"` and contain exactly four members: the root `mokosh-server` package, `crates/mokosh-types`, `crates/build-metadata`, `crates/mokosh-test-macros`, `crates/mokosh-test`; a member outside this list, or a missing one, breaks `cargo check --workspace` with an unresolved-path error.
@@ -2786,7 +2779,7 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
 
 ### 10.23 Repo hygiene (`.gitignore`, `.gitmodules`)
 
-- **SPEC-10.161** `.gitmodules` must declare submodule `common` at path `common`, url `https://dev.a8n.run/psa-systems/common.git`; a fresh clone must run `git submodule update --init` before `pre-commit`, `pre-push`, `install-hooks` or `create-release` resolve, since those recipes are implemented in the `common` submodule.
+- **SPEC-10.161** `.gitmodules` must declare submodule `common` at path `common`, url `https://dev.a8n.run/psa-systems/common.git`; a fresh clone must run `git submodule update --init` before any `just` recipe resolves, because the unconditional import in `justfile` (SPEC-10.52) fails first; `pre-commit`, `pre-push`, `install-hooks` and `create-release` additionally depend on the submodule's own recipe bodies.
 - **SPEC-10.162** `.gitignore` must exclude every `.env*` file except `.env.example` (`.env*` then `!.env.example`), so a generated `.env` with live secrets is never committed while the template always is.
 - **SPEC-10.163** `.gitignore` must exclude `/secrets/` (generated OIDC signing keys), `/gen/` (build output), `/assets/styles.css` (Tailwind-generated CSS), `data/` (the dev Postgres bind-mount directory), `.claude/` (agent scratch/config), `For AI/` (local-only AI scratch context), and `/attachments/` (the default local-storage root for a bare `cargo run` or a test).
 
