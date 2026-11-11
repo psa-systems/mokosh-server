@@ -44,6 +44,16 @@ mod decimal_opt {
             ))),
         }
     }
+
+    /// PMS-1679: the same parsing for an update field, kept apart from
+    /// absence: absent is `None` (via `#[serde(default)]`), `null` or a blank
+    /// string is `Some(None)` (clear), a value is `Some(Some(v))`.
+    pub fn deserialize_double<'de, D>(deserializer: D) -> Result<Option<Option<Decimal>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize(deserializer).map(Some)
+    }
 }
 
 /// PMS-894: the tenant-wide project totals, so a client can render them
@@ -222,15 +232,21 @@ pub struct UpdateProjectRequest {
     pub description: Option<String>,
     pub status: Option<String>,
     pub project_manager_id: Option<Uuid>,
-    pub start_date: Option<NaiveDate>,
-    pub target_end_date: Option<NaiveDate>,
+    /// PMS-1679: the four fields the edit modal can blank are double options:
+    /// absent leaves the column alone, `null` clears it, a value sets it. A
+    /// single `Option` read `null` as "unchanged", so a blanked date or
+    /// budget was accepted and kept.
+    #[serde(default, deserialize_with = "mokosh_types::deserialize_double_option")]
+    pub start_date: Option<Option<NaiveDate>>,
+    #[serde(default, deserialize_with = "mokosh_types::deserialize_double_option")]
+    pub target_end_date: Option<Option<NaiveDate>>,
     pub actual_end_date: Option<NaiveDate>,
-    #[serde(default, deserialize_with = "decimal_opt::deserialize")]
+    #[serde(default, deserialize_with = "decimal_opt::deserialize_double")]
     #[validate(custom(function = crate::utils::validation::validate_budget_hours))]
-    pub budget_hours: Option<Decimal>,
-    #[serde(default, deserialize_with = "decimal_opt::deserialize")]
+    pub budget_hours: Option<Option<Decimal>>,
+    #[serde(default, deserialize_with = "decimal_opt::deserialize_double")]
     #[validate(custom(function = crate::utils::validation::validate_budget_amount))]
-    pub budget_amount: Option<Decimal>,
+    pub budget_amount: Option<Option<Decimal>>,
     pub billing_method: Option<String>,
     #[validate(custom(function = mokosh_types::validation::validate_rate))]
     pub hourly_rate: Option<Decimal>,
@@ -407,7 +423,7 @@ fn validate_create_task_dates(req: &CreateTaskRequest) -> Result<(), validator::
 /// to the service layer, which combines the request values with the stored row.
 // SPEC-7.482: applies the identical cross-field date check when both dates are supplied in the same PUT
 fn validate_update_task_dates(req: &UpdateTaskRequest) -> Result<(), validator::ValidationError> {
-    if !task_dates_ok(req.start_date, req.due_date) {
+    if !task_dates_ok(req.start_date.flatten(), req.due_date.flatten()) {
         return Err(crate::utils::validation::cross_field_error(
             "task_dates_inverted",
             "due_date",
@@ -455,8 +471,12 @@ pub struct UpdateTaskRequest {
     pub assigned_to_id: Option<Uuid>,
     #[validate(custom(function = mokosh_types::validation::validate_hours))]
     pub estimated_hours: Option<Decimal>,
-    pub start_date: Option<NaiveDate>,
-    pub due_date: Option<NaiveDate>,
+    /// PMS-1679: absent leaves the date alone, `null` clears it, a value sets
+    /// it (see `UpdateProjectRequest`).
+    #[serde(default, deserialize_with = "mokosh_types::deserialize_double_option")]
+    pub start_date: Option<Option<NaiveDate>>,
+    #[serde(default, deserialize_with = "mokosh_types::deserialize_double_option")]
+    pub due_date: Option<Option<NaiveDate>>,
     pub sort_order: Option<i32>,
 }
 

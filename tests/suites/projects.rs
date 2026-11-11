@@ -1859,3 +1859,187 @@ async fn project_search_matches_names_and_counts(pool: PgPool) {
     assert!(names.is_empty());
     assert_eq!(total, 0);
 }
+
+async fn put(
+    app: &common::TestApp,
+    token: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    app.client
+        .put(app.url(path))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("send PUT")
+}
+
+/// PMS-1679: `start_date`, `target_end_date`, `budget_hours` and
+/// `budget_amount` were single options written as `COALESCE($n, col)`, so the
+/// edit modal's `null` for a blanked field was read as "unchanged" and the
+/// value stayed. Absent must keep, null must clear, a value must set.
+#[mokosh_test]
+async fn a_project_update_clears_a_blanked_date_or_budget(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let project: serde_json::Value = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({
+            "name": "Rollout",
+            "company_id": company,
+            "start_date": "2026-01-05",
+            "target_end_date": "2026-06-30",
+            "budget_hours": "120",
+            "budget_amount": "5000",
+        }),
+    )
+    .await
+    .json()
+    .await
+    .expect("project JSON");
+    let id = project["id"].as_str().expect("project id").to_string();
+    let path = format!("/api/v1/projects/{id}");
+
+    // Absent: a rename leaves all four alone.
+    let resp = put(
+        &app,
+        &token,
+        &path,
+        serde_json::json!({ "name": "Rollout v2" }),
+    )
+    .await;
+    assert!(resp.status().is_success(), "rename: {}", resp.status());
+    let kept = get_json(&app, &token, &path).await;
+    assert_eq!(kept["start_date"].as_str(), Some("2026-01-05"));
+    assert_eq!(kept["target_end_date"].as_str(), Some("2026-06-30"));
+    assert_eq!(dec(&kept["budget_hours"]), 120.0);
+    assert_eq!(dec(&kept["budget_amount"]), 5000.0);
+
+    // Null: each is cleared.
+    let resp = put(
+        &app,
+        &token,
+        &path,
+        serde_json::json!({
+            "start_date": null,
+            "target_end_date": null,
+            "budget_hours": null,
+            "budget_amount": null,
+        }),
+    )
+    .await;
+    assert!(resp.status().is_success(), "clear: {}", resp.status());
+    let cleared = get_json(&app, &token, &path).await;
+    for key in [
+        "start_date",
+        "target_end_date",
+        "budget_hours",
+        "budget_amount",
+    ] {
+        assert!(cleared[key].is_null(), "{key} cleared: {cleared}");
+    }
+
+    // A value sets it again; an out-of-range budget is still refused.
+    let resp = put(
+        &app,
+        &token,
+        &path,
+        serde_json::json!({ "start_date": "2026-02-01", "budget_hours": "40" }),
+    )
+    .await;
+    assert!(resp.status().is_success(), "set: {}", resp.status());
+    let set = get_json(&app, &token, &path).await;
+    assert_eq!(set["start_date"].as_str(), Some("2026-02-01"));
+    assert_eq!(dec(&set["budget_hours"]), 40.0);
+    let resp = put(
+        &app,
+        &token,
+        &path,
+        serde_json::json!({ "budget_hours": "-1" }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "budget validation still applies"
+    );
+}
+
+/// PMS-1679: the same for a task's `start_date` and `due_date`.
+#[mokosh_test]
+async fn a_task_update_clears_a_blanked_date(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+    let project: serde_json::Value = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Delivery", "company_id": company }),
+    )
+    .await
+    .json()
+    .await
+    .expect("project JSON");
+    let project_id = project["id"].as_str().expect("project id").to_string();
+    let status_id = first_task_status(&app, &token).await;
+    let task: serde_json::Value = post(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        serde_json::json!({
+            "title": "Build",
+            "status_id": status_id,
+            "start_date": "2026-03-01",
+            "due_date": "2026-03-20",
+        }),
+    )
+    .await
+    .json()
+    .await
+    .expect("task JSON");
+    let path = format!("/api/v1/tasks/{}", task["id"].as_str().expect("task id"));
+
+    let resp = put(
+        &app,
+        &token,
+        &path,
+        serde_json::json!({ "title": "Build it" }),
+    )
+    .await;
+    assert!(resp.status().is_success(), "rename: {}", resp.status());
+    let kept = get_json(&app, &token, &path).await;
+    assert_eq!(kept["start_date"].as_str(), Some("2026-03-01"));
+    assert_eq!(kept["due_date"].as_str(), Some("2026-03-20"));
+
+    let resp = put(&app, &token, &path, serde_json::json!({ "due_date": null })).await;
+    assert!(resp.status().is_success(), "clear due: {}", resp.status());
+    let cleared = get_json(&app, &token, &path).await;
+    assert!(cleared["due_date"].is_null(), "due_date cleared: {cleared}");
+    assert_eq!(
+        cleared["start_date"].as_str(),
+        Some("2026-03-01"),
+        "start_date untouched"
+    );
+
+    // A due date before the stored start is still refused.
+    let resp = put(
+        &app,
+        &token,
+        &path,
+        serde_json::json!({ "due_date": "2026-02-01" }),
+    )
+    .await;
+    assert!(
+        resp.status().is_client_error(),
+        "inverted range: {}",
+        resp.status()
+    );
+}
