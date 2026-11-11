@@ -2040,7 +2040,7 @@ Requirements for the service desk modules: `src/modules/tickets`, `ticket_templa
 - **SPEC-7.444**: Default sort is created_at; order_by rejects any key outside mokosh_types::sort::PROJECTS.
 - **SPEC-7.445**: Q filters name ILIKE '%<q>%', applied as the last optional condition in both queries.
 - **SPEC-7.446**: Before/after snapshots are taken inside one transaction, for the audit diff.
-- **SPEC-7.447**: Every field uses COALESCE($n, column), so an omitted field in the request leaves the stored value unchanged.
+- **SPEC-7.447**: Every field uses COALESCE($n, column), so an omitted field in the request leaves the stored value unchanged, except `start_date`, `target_end_date`, `budget_hours` and `budget_amount`: each is a double option (absent leaves it unchanged, an explicit `null` or, for a budget, a blank string clears it to NULL, a value sets it), so the edit form can clear them (PMS-1679).
 - **SPEC-7.448**: Zero rows affected (missing or foreign-tenant id) 404s.
 - **SPEC-7.449**: A description-only change that is purely a checklist checkbox toggle writes no audit row.
 - **SPEC-7.450**: Name (1 to 80 chars), default_due_business_days (0..=365), and budget_hours/budget_amount follow the same validation as create.
@@ -2087,7 +2087,7 @@ Requirements for the service desk modules: `src/modules/tickets`, `ticket_templa
 - **SPEC-7.491**: A missing or foreign-tenant task id 404s.
 - **SPEC-7.492**: Before/after snapshots are taken inside one transaction, for the audit diff.
 - **SPEC-7.493**: An effective start/due range combining the request's supplied fields with the stored row's existing values is validated before the UPDATE runs, so a partial PUT cannot invert the range against unsupplied stored dates.
-- **SPEC-7.494**: Every field except completed_at uses COALESCE($n, column), so an omitted field in the request leaves the stored value unchanged.
+- **SPEC-7.494**: Every field except completed_at, start_date and due_date uses COALESCE($n, column), so an omitted field in the request leaves the stored value unchanged. `start_date` and `due_date` are double options: absent leaves the date unchanged, an explicit `null` clears it, a value sets it; the inverted-range check compares the request's value where one was sent (a null being no date) and the stored date otherwise (PMS-1679).
 - **SPEC-7.495**: Completed_at is inferred from the supplied status_id's is_completed flag via a CASE, not a second read: moving to a completed status stamps it (if not already stamped), moving to a non-completed status clears it, and an omitted status_id leaves it untouched.
 - **SPEC-7.496**: Completed_at only stamps NOW() the first time (COALESCE keeps an existing timestamp), so re-saving an already-completed task does not move its completion time.
 - **SPEC-7.497**: Zero rows affected (missing or foreign-tenant id) 404s.
