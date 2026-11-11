@@ -458,7 +458,7 @@ impl AppSecretsSelection {
     /// So the tiers are selected independently now. The cost is that an operator
     /// who wants both in Infisical sets two variables; the benefit is that
     /// `SMTP_PASSWORD` can come from a file without moving every tenant's
-    /// secrets, which is the whole reason this tier has four providers.
+    /// secrets, which is the whole reason this tier has five providers.
     ///
     /// It is deliberately not a registry key and is read here rather than
     /// through [`crate::config::get`]: provider enablement is bootstrap
