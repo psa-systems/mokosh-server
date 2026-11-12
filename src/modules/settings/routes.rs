@@ -1,4 +1,11 @@
 //! Settings HTTP routes.
+//!
+//! parity record 2026-11-12: `/settings/microsoft-contacts-client` has
+//! no SPA caller yet. The matching Integrations admin page lives at
+//! `/settings/integrations/microsoft-contacts/client` in `mokosh-apps`
+//! and ships as a follow-up (same shape as the Google client page
+//! above). The server route lands here now so the SPA can build against
+//! a stable surface. The note comes off with the first SPA call.
 
 use std::sync::Arc;
 
