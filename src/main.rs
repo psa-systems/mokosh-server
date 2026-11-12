@@ -94,8 +94,9 @@ pub struct AppConfig {
     /// (`LOGIN_APPROVAL_ENABLED`). Off by default.
     pub login_approval_enabled: bool,
     /// MAPPS-457: instance-wide hard cap on how many tenants a super-admin can
-    /// create. Unset (or `<=0`) leaves creation uncapped, matching production
-    /// today. Positive integer rejects further `create_tenant` calls with 409
+    /// create. Unset leaves creation uncapped, matching production today. Set
+    /// and malformed or non-positive is a boot error naming the variable and
+    /// value. Positive integer rejects further `create_tenant` calls with 409
     /// once `SELECT COUNT(*) FROM tenants` reaches the value.
     ///
     /// Set via `MOKOSH_MAX_TENANTS`. Read once at boot into `AppConfig`;

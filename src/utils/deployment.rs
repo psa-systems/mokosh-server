@@ -534,7 +534,7 @@ impl fmt::Display for EnablementSource {
 ///
 /// A kind with no entry takes the profile's default. This is deliberately not
 /// an env reader: each capability already owns the one reader of its own
-/// selection variable (`SECRET_BACKEND` in `crate::secrets`, `STORAGE_BACKEND`
+/// selection variable (`SECRET_BACKEND` in `crate::secrets`, `STORAGE_PROVIDER`
 /// in `crate::storage`, `SMTP_HOST` in `crate::utils::email`), and a second
 /// reader here is exactly how two parts of one process come to disagree about
 /// what is serving a capability. The callers hand over what they resolved, so
