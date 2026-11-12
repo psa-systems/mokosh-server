@@ -563,10 +563,63 @@ pub fn to_csv(r: &CustomReportResponse) -> String {
 }
 
 /// Quote a CSV cell if it contains a comma, quote, or newline.
+///
+/// PMS-1665: cells whose first character is `=`, `+`, `-` or `@` are
+/// neutralised with a leading `'` (apostrophe) so Excel, LibreOffice
+/// Calc and Google Sheets treat them as literal text instead of a
+/// formula. Without this, a report row carrying a hostile value such
+/// as `=HYPERLINK("https://evil", ...)` or `=cmd|' /c calc'!A1` would
+/// open and execute on a reader's machine the moment they clicked the
+/// cell. Applied before the quote decision so a comma-containing
+/// hostile value still gets both treatments.
 pub(super) fn csv_cell(v: &str) -> String {
-    if v.contains([',', '"', '\n']) {
-        format!("\"{}\"", v.replace('"', "\"\""))
+    let neutralised = match v.chars().next() {
+        Some('=' | '+' | '-' | '@') => format!("'{v}"),
+        _ => v.to_string(),
+    };
+    if neutralised.contains([',', '"', '\n']) {
+        format!("\"{}\"", neutralised.replace('"', "\"\""))
     } else {
-        v.to_string()
+        neutralised
+    }
+}
+
+#[cfg(test)]
+mod csv_cell_tests {
+    use super::csv_cell;
+
+    #[test]
+    fn plain_text_is_passed_through() {
+        assert_eq!(csv_cell("Alice"), "Alice");
+        assert_eq!(csv_cell(""), "");
+    }
+
+    #[test]
+    fn a_comma_newline_or_quote_still_triggers_quoting() {
+        assert_eq!(csv_cell("a, b"), "\"a, b\"");
+        assert_eq!(csv_cell("a\nb"), "\"a\nb\"");
+        assert_eq!(csv_cell("he said \"hi\""), "\"he said \"\"hi\"\"\"");
+    }
+
+    /// PMS-1665: a cell starting with a formula-trigger character must be
+    /// neutralised so a spreadsheet client does not execute it.
+    #[test]
+    fn a_formula_prefix_is_neutralised() {
+        assert_eq!(csv_cell("=1+1"), "'=1+1");
+        assert_eq!(csv_cell("+1"), "'+1");
+        assert_eq!(csv_cell("-1"), "'-1");
+        assert_eq!(csv_cell("@SUM(A1:A2)"), "'@SUM(A1:A2)");
+    }
+
+    /// PMS-1665: a hostile value that both opens with `=` AND carries a
+    /// comma must get BOTH the apostrophe prefix AND the surrounding
+    /// quotes, so parse-time neither the spreadsheet nor the CSV reader
+    /// misinterprets it.
+    #[test]
+    fn a_formula_with_a_comma_is_both_neutralised_and_quoted() {
+        assert_eq!(
+            csv_cell("=HYPERLINK(\"https://evil\",\"click\")"),
+            "\"'=HYPERLINK(\"\"https://evil\"\",\"\"click\"\")\""
+        );
     }
 }
