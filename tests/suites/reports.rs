@@ -1198,3 +1198,87 @@ async fn custom_report_is_tenant_scoped(pool: PgPool) {
         "tenant A counts only its own asset, not tenant B's three"
     );
 }
+
+/// PMS-1665: `limit`, `format`, and `from`/`to` on a date-less source each
+/// used to be silently swallowed - limit clamped to 1..=1000, unknown
+/// format fell through to JSON, from/to on `assets` dropped. All three
+/// now 400 before any SQL runs so the caller sees what their spec asked
+/// for versus what the server will honour.
+#[mokosh_test]
+async fn custom_report_refuses_out_of_range_limit_bad_format_and_date_range_on_assets(
+    pool: PgPool,
+) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // Limit above the cap.
+    let s = custom_post_status(
+        &app,
+        &token,
+        json!({
+            "source": "assets",
+            "measures": ["count"],
+            "limit": 2000,
+        }),
+    )
+    .await;
+    assert_eq!(s, 400, "limit > 1000 must 400");
+
+    // Limit below the floor.
+    let s = custom_post_status(
+        &app,
+        &token,
+        json!({
+            "source": "assets",
+            "measures": ["count"],
+            "limit": 0,
+        }),
+    )
+    .await;
+    assert_eq!(s, 400, "limit < 1 must 400");
+
+    // Unknown format.
+    let s = custom_post_status(
+        &app,
+        &token,
+        json!({
+            "source": "assets",
+            "measures": ["count"],
+            "format": "pdf",
+        }),
+    )
+    .await;
+    assert_eq!(s, 400, "format outside the two accepted values must 400");
+
+    // Date range on a source that has no date column.
+    let s = custom_post_status(
+        &app,
+        &token,
+        json!({
+            "source": "assets",
+            "measures": ["count"],
+            "from": "2026-01-01",
+            "to": "2026-01-31",
+        }),
+    )
+    .await;
+    assert_eq!(s, 400, "from/to on a source without a date column must 400");
+
+    // And a clean request still works.
+    let s = custom_post_status(
+        &app,
+        &token,
+        json!({
+            "source": "assets",
+            "measures": ["count"],
+            "limit": 10,
+            "format": "json",
+        }),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&s),
+        "clean spec must still succeed; got {s}"
+    );
+}
