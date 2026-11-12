@@ -2328,7 +2328,7 @@ async fn create_ticket_rejects_a_foreign_tenant_priority_id(pool: PgPool) {
     let (tenant_b, _ub, _eb, _pb) = common::seed_tenant_with_admin(&pool, "ptb").await;
     let foreign_priority = uuid::Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO ticket_priorities (id, tenant_id, name, is_default) VALUES ($1, $2, 'B-high', FALSE)",
+        "INSERT INTO ticket_priorities (id, tenant_id, name, color, is_default) VALUES ($1, $2, 'B-high', '#ff0000', FALSE)",
     )
     .bind(foreign_priority)
     .bind(tenant_b)
@@ -2372,7 +2372,7 @@ async fn update_ticket_rejects_a_foreign_tenant_status_id(pool: PgPool) {
     let (tenant_b, _ub, _eb, _pb) = common::seed_tenant_with_admin(&pool, "stb").await;
     let foreign_status = uuid::Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO ticket_statuses (id, tenant_id, name, is_closed) VALUES ($1, $2, 'B-done', TRUE)",
+        "INSERT INTO ticket_statuses (id, tenant_id, name, color, is_closed) VALUES ($1, $2, 'B-done', '#00ff00', TRUE)",
     )
     .bind(foreign_status)
     .bind(tenant_b)
