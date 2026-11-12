@@ -181,6 +181,24 @@ impl TeamsService {
         if let Some(new_name) = request.name.as_deref() {
             self.assert_name_unique(*tenant_id, new_name, Some(team_id))
                 .await?;
+        } else if request.is_active == Some(true) {
+            // PMS-1659: reactivating an archived team without passing `name`
+            // in the same request skipped the uniqueness probe, so a
+            // collision with an active team surfaced only as the database
+            // unique-index error (a generic 500) rather than the 409
+            // "A team with this name already exists" the same collision
+            // produces on create and rename. Probe against the team's
+            // stored name so the operator sees the named conflict here.
+            let stored_name: Option<String> =
+                sqlx::query_scalar("SELECT name FROM teams WHERE tenant_id = $1 AND id = $2")
+                    .bind(*tenant_id)
+                    .bind(team_id)
+                    .fetch_optional(self.db.migrator_pool())
+                    .await?;
+            if let Some(name) = stored_name {
+                self.assert_name_unique(*tenant_id, &name, Some(team_id))
+                    .await?;
+            }
         }
 
         // Dynamic UPDATE. `param_idx` starts at 3 because $1 = tenant_id
