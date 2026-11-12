@@ -537,6 +537,34 @@ mod server_impl {
     }
 }
 
+/// Escape the two SQL LIKE / ILIKE wildcards in `needle` so a user-typed
+/// `%` or `_` matches literally instead of expanding across every row.
+///
+/// Callers wrap the returned string with their own `%...%` on either side
+/// (substring) or `...` (prefix) and bind with `ESCAPE '\'`: the backslash
+/// is the SQL-standard escape char and does not collide with any
+/// Postgres-standard meta character inside the pattern.
+///
+/// PMS-1664: typeahead endpoints that did `format!("%{needle}%")` on a
+/// user-typed string matched `%` as "anything" and `_` as "any single
+/// character", so a user who searched for literal `100%` or `a_b` got
+/// the wrong rows and leaked some intent to the next read. This escapes
+/// the wildcards so the query asks what the user actually typed.
+#[inline]
+pub fn escape_like_wildcards(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len());
+    for c in needle.chars() {
+        match c {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(c);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,5 +598,20 @@ mod tests {
         ] {
             assert!(!is_secret_field(ordinary), "{ordinary} should be sanitized");
         }
+    }
+
+    #[test]
+    fn like_escape_passes_text_through_untouched() {
+        assert_eq!(escape_like_wildcards(""), "");
+        assert_eq!(escape_like_wildcards("acme"), "acme");
+        assert_eq!(escape_like_wildcards("Acme Co."), "Acme Co.");
+    }
+
+    #[test]
+    fn like_escape_prefixes_percent_underscore_and_backslash() {
+        assert_eq!(escape_like_wildcards("100%"), "100\\%");
+        assert_eq!(escape_like_wildcards("a_b"), "a\\_b");
+        assert_eq!(escape_like_wildcards(r"c:\path"), r"c:\\path");
+        assert_eq!(escape_like_wildcards("%_"), "\\%\\_");
     }
 }
