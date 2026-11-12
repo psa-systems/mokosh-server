@@ -13,7 +13,7 @@
 //! whole purpose was a one-time correction, which reads to anyone looking at
 //! the process as ongoing maintenance the design still depends on, and which
 //! has to be explained every time somebody asks what runs every hour and why.
-//! David asked that question and it is a fair one.
+//! That question is a fair one.
 //!
 //! So a one-shot says so. It runs once per process start and never again, and
 //! the retry it gives up is the difference between a failure being corrected an

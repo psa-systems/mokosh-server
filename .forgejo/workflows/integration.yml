@@ -16,14 +16,19 @@
 # the "same tree twice" trap DEV-612's deleted `check-single-build.nu` existed
 # to catch does not fire for the warm run.
 #
-# PMS-1253: this file now has three jobs. `build` compiles the nextest archive
-# ONCE under the full disk-headroom + cache + sampler shape; `test` is a
-# fail-fast=false matrix of N shards that download the archive and run
-# `--partition hash:k/N` under their own Postgres service; `summary` fails the
-# workflow if any shard failed, which is the one job name branch protection
-# needs to require. `hash:` keeps a test in the same shard across runs so a
-# slow case stays attributable (`count:k/N` would reassign on every added test
-# file, which makes per-shard timings incomparable across runs).
+# PMS-1253: `build` compiles the nextest archive ONCE under the full
+# disk-headroom + cache + sampler shape; `test` is a fail-fast=false matrix
+# of N shards that download the archive and run `--partition hash:k/N`
+# under their own Postgres service; `summary` fails the workflow if any
+# shard failed, which is the one job name branch protection needs to
+# require. `hash:` keeps a test in the same shard across runs so a slow case
+# stays attributable (`count:k/N` would reassign on every added test file,
+# which makes per-shard timings incomparable across runs).
+#
+# PMS-1652: `classify` (PC-134's shared action, STD-3.1/STD-3.2) precedes
+# those three. `build` runs only when the result is `code`; `test` and
+# `summary` cascade to `skipped` on anything else, and `summary` treats that
+# the same as `success` so the required check still posts green.
 #
 # PMS-1394: this file runs the SUPPORTED suites. The tests for functionality
 # nothing currently uses run weekly in `integration-unsupported.yml` instead,
@@ -43,23 +48,18 @@ name: Integration
 
 # SPEC-10.12: pull_request into main only, never push; three jobs (build, test, summary)
 on:
-  # PMS-1634: integration tests read no Markdown and no `docs/` file, so a
-  # pull request touching only those paths cannot regress what this suite
-  # proves. `paths-ignore` skips the run when EVERY changed path matches;
-  # one non-doc edit still triggers the full suite. `check.yml` is NOT
-  # treated the same way because several of its guards exist to run on
+  # PMS-1652: integration tests read no Markdown and no `docs/` file, so a
+  # pull request touching only those paths (or only comments/whitespace in a
+  # code file) cannot regress what this suite proves. The `classify` job
+  # below and `build`'s job-level `if:` decide the skip (STD-3.1); no
+  # `paths-ignore` here, because a workflow-level path filter makes Forgejo
+  # drop the whole workflow and a required check never posts. `check.yml` is
+  # NOT treated the same way because several of its guards exist to run on
   # doc changes.
   # SPEC-10.327
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "LICENSE"
-      - ".gitignore"
-      - ".editorconfig"
-      - "renovate.json"
 
 # PMS-1633: supersede obsolete PR runs. See check.yml for the ref-shape note.
 # SPEC-10.328
@@ -68,7 +68,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  classify:
+    name: classify diff
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    outputs:
+      result: ${{ steps.classify.outputs.result }}
+    steps:
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v5
+
+      - name: Classify diff
+        id: classify
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/classify-diff@main
+
   build:
+    needs: classify
+    # PMS-1652: the suite reads no docs and `comments-only` cannot change
+    # what it proves, so only `code` runs it. `test` (needs: build) and
+    # `summary` (needs: test) cascade to skipped automatically.
+    if: needs.classify.outputs.result == 'code'
     name: build nextest archive
     # Dev label: `cargo nextest archive` compiles natively on the runner, and
     # only the dev image ships the C toolchain + OpenSSL headers that needs
@@ -444,12 +462,15 @@ jobs:
       - name: Fail if any shard failed
         # SPEC-10.21
         # Reads the matrix job's aggregate result; `success` is the only
-        # value that lets the summary pass. A cancelled or skipped shard
-        # fails the workflow, same as the single-job gate did.
+        # value that lets the summary pass. PMS-1652: `skipped` also passes,
+        # because that is what `test` reports when `build` skipped it
+        # (classify result not `code`), and a required check must still post
+        # green on that path rather than fail the PR. Any other value
+        # (failure, cancelled) still fails the workflow, same as before.
         run: |
           result="${{ needs.test.result }}"
           echo "test matrix result: ${result}"
-          if [ "${result}" != "success" ]; then
+          if [ "${result}" != "success" ] && [ "${result}" != "skipped" ]; then
             echo "::error::integration test matrix did not succeed (result=${result})"
             exit 1
           fi

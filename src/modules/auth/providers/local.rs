@@ -3,9 +3,9 @@
 //! An adapter over [`crate::modules::auth::middleware`] and
 //! [`crate::modules::auth::service::AuthService`]. Like
 //! [`super::bunyip::BunyipOidcProvider`], this holds one boolean and
-//! nothing else from the request-authentication path: the provider is
-//! dormant in this change and `create_api_router` continues to mount the
-//! underlying middleware exactly as it did before.
+//! nothing else from the request-authentication path: `AuthService::login`
+//! reads the installed selection through `providers::is_enabled` and
+//! refuses the local password path when the operator excludes it.
 //!
 //! `is_available` is a constant `true`. The local path only needs the
 //! process itself and its Postgres, both of which the whole application

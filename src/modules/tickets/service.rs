@@ -1018,10 +1018,12 @@ impl TicketService {
         // SPEC-7.10: run_ticket_status_changed/run_ticket_priority_changed fire inside the same transaction as the field UPDATE, only when the value actually changes.
         // PMS-448 phase 2: fire transition triggers. Each runs in
         // this same transaction so a logged rule firing commits
-        // atomically with the underlying transition. Both
-        // executors only LOG the matching rules to
-        // `workflow_rule_runs`; mutating actions on transitions are
-        // Phase 3.
+        // atomically with the underlying transition. The executors
+        // record the matching rules to `workflow_rule_runs` AND
+        // apply their mutating actions (`set_status_id`,
+        // `set_priority_id`, `assign_to_*`, `add_tag`,
+        // `add_internal_note`), so a post-update cascade happens in
+        // the same transaction.
         if let Some(new_status_id) = request.status_id {
             if new_status_id != old_status_id {
                 crate::modules::workflows::WorkflowExecutor::run_ticket_status_changed(
@@ -3602,6 +3604,9 @@ SELECT
     t.id, t.ticket_number, t.title, t.description,
     t.source, t.company_id, t.contact_id, t.assigned_to_id,
     t.created_by_id,
+    -- MAPPS-1223: the ids behind the editable lookups, each with its name
+    -- below, so the response carries what PMS-1565 lets a client write.
+    t.type_id, t.category_id, t.site_id, t.team_id, t.contract_id, t.sla_id,
     t.asset_id, t.procedure_kb_article_id, t.parent_ticket_id,
     t.sla_due_date, t.is_billable, t.billing_status,
     t.estimated_hours, t.actual_hours, t.tags,
@@ -3621,6 +3626,11 @@ SELECT
     tc.name AS category_name,
     co.name AS company_name,
     NULLIF(TRIM(COALESCE(ct.first_name, '') || ' ' || COALESCE(ct.last_name, '')), '') AS contact_name,
+    si.name AS site_name,
+    tm.name AS team_name,
+    ctr.contract_number AS contract_number,
+    ctr.name AS contract_name,
+    slp.name AS sla_name,
     NULLIF(TRIM(COALESCE(au.first_name, '') || ' ' || COALESCE(au.last_name, '')), '') AS assigned_to_name,
     -- PMS-344: include the asset display name so the SPA's ticket
     -- detail can render a link directly without a second fetch. NULL
@@ -3638,6 +3648,10 @@ LEFT  JOIN ticket_types       tt ON t.type_id     = tt.id
 LEFT  JOIN ticket_categories  tc ON t.category_id = tc.id
 INNER JOIN companies          co ON t.company_id  = co.id
 LEFT  JOIN contacts           ct ON t.contact_id  = ct.id
+LEFT  JOIN sites              si ON t.site_id     = si.id
+LEFT  JOIN teams              tm ON t.team_id     = tm.id
+LEFT  JOIN contracts          ctr ON t.contract_id = ctr.id
+LEFT  JOIN sla_policies       slp ON t.sla_id     = slp.id
 LEFT  JOIN users              au ON t.assigned_to_id = au.id
 LEFT  JOIN assets             a  ON t.asset_id   = a.id
 LEFT  JOIN kb_articles        pka ON t.procedure_kb_article_id = pka.id
@@ -3755,6 +3769,12 @@ struct TicketResponseRow {
     contact_id: Option<Uuid>,
     assigned_to_id: Option<Uuid>,
     created_by_id: Uuid,
+    type_id: Option<Uuid>,
+    category_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    team_id: Option<Uuid>,
+    contract_id: Option<Uuid>,
+    sla_id: Option<Uuid>,
     asset_id: Option<Uuid>,
     procedure_kb_article_id: Option<Uuid>,
     sla_due_date: Option<chrono::DateTime<Utc>>,
@@ -3779,6 +3799,11 @@ struct TicketResponseRow {
     category_name: Option<String>,
     company_name: String,
     contact_name: Option<String>,
+    site_name: Option<String>,
+    team_name: Option<String>,
+    contract_number: Option<String>,
+    contract_name: Option<String>,
+    sla_name: Option<String>,
     assigned_to_name: Option<String>,
     asset_name: Option<String>,
     procedure_kb_article_title: Option<String>,
@@ -3857,7 +3882,9 @@ impl From<TicketResponseRow> for TicketResponse {
                 name: r.priority_name,
                 color: r.priority_color,
             },
+            type_id: r.type_id,
             type_name: r.type_name,
+            category_id: r.category_id,
             category_name: r.category_name,
             queue_name: r.queue_name,
             source: TicketSource::from_str(&r.source).unwrap_or_default(),
@@ -3865,6 +3892,15 @@ impl From<TicketResponseRow> for TicketResponse {
             company_name: r.company_name,
             contact_id: r.contact_id,
             contact_name: r.contact_name,
+            site_id: r.site_id,
+            site_name: r.site_name,
+            team_id: r.team_id,
+            team_name: r.team_name,
+            contract_id: r.contract_id,
+            contract_number: r.contract_number,
+            contract_name: r.contract_name,
+            sla_id: r.sla_id,
+            sla_name: r.sla_name,
             assigned_to_id: r.assigned_to_id,
             assigned_to_name: r.assigned_to_name,
             sla_due_date: r.sla_due_date,

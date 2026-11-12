@@ -2168,3 +2168,146 @@ async fn update_ticket_persists_every_accepted_field(pool: PgPool) {
         "tags must be untouched by an absent field"
     );
 }
+
+/// MAPPS-1223: PMS-1565 made `PUT /tickets/{id}` write `type_id`,
+/// `category_id`, `site_id`, `team_id`, `contract_id` and `sla_id`, but the
+/// response the detail page reads carried none of the ids and only two of the
+/// names, so a client could set a site and never see it again on reload.
+/// Both read paths share `TICKET_RESPONSE_SELECT`; this asserts each of them.
+#[mokosh_test]
+async fn ticket_response_carries_every_editable_lookup(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let team_id = common::seed_team(&pool, common::DEFAULT_TENANT_ID, "Field team", None).await;
+    let lookup = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Uuid, String)>(sql)
+                .bind(common::DEFAULT_TENANT_ID)
+                .fetch_one(&pool)
+                .await
+                .expect(sql)
+        }
+    };
+    let (type_id, type_name) =
+        lookup("SELECT id, name FROM ticket_types WHERE tenant_id = $1 LIMIT 1").await;
+    let (category_id, category_name) =
+        lookup("SELECT id, name FROM ticket_categories WHERE tenant_id = $1 LIMIT 1").await;
+    let (sla_id, sla_name) =
+        lookup("SELECT id, name FROM sla_policies WHERE tenant_id = $1 LIMIT 1").await;
+
+    let site_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO sites (id, tenant_id, company_id, name) VALUES ($1, $2, $3, 'North office')",
+    )
+    .bind(site_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("seed site");
+    let contract_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contracts (id, tenant_id, name, contract_number, company_id, contract_type, start_date) \
+         VALUES ($1, $2, 'Managed services', 'MSA-7', $3, 'managed_services', CURRENT_DATE)",
+    )
+    .bind(contract_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("seed contract");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let created: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "title": "Round trip", "company_id": company_id, "custom_fields": {} }))
+        .send()
+        .await
+        .expect("send create ticket")
+        .json()
+        .await
+        .expect("create ticket JSON");
+    let ticket_id = created["id"]
+        .as_str()
+        .expect("created ticket has id")
+        .to_string();
+
+    let get = |path: String| {
+        let app = &app;
+        let token = token.clone();
+        async move {
+            let resp = app
+                .client
+                .get(app.url(&path))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .expect("send GET");
+            assert!(resp.status().is_success(), "GET {path}: {}", resp.status());
+            resp.json::<serde_json::Value>().await.expect("GET JSON")
+        }
+    };
+    let pairs = [
+        ("type_id", "type_name"),
+        ("category_id", "category_name"),
+        ("site_id", "site_name"),
+        ("team_id", "team_name"),
+        ("contract_id", "contract_name"),
+        ("sla_id", "sla_name"),
+    ];
+    let before = get(format!("/api/v1/tickets/{ticket_id}")).await;
+    for (id, name) in pairs {
+        assert!(
+            before.get(id).is_some_and(|v| v.is_null()),
+            "{id} is present and null before a save: {before}"
+        );
+        assert!(
+            before.get(name).is_some_and(|v| v.is_null()),
+            "{name} is present and null before a save"
+        );
+    }
+
+    let resp = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "type_id": type_id,
+            "category_id": category_id,
+            "site_id": site_id,
+            "team_id": team_id,
+            "contract_id": contract_id,
+            "sla_id": sla_id,
+        }))
+        .send()
+        .await
+        .expect("send update ticket");
+    assert!(resp.status().is_success(), "update: {}", resp.status());
+
+    let expected = serde_json::json!({
+        "type_id": type_id, "type_name": type_name,
+        "category_id": category_id, "category_name": category_name,
+        "site_id": site_id, "site_name": "North office",
+        "team_id": team_id, "team_name": "Field team",
+        "contract_id": contract_id, "contract_number": "MSA-7", "contract_name": "Managed services",
+        "sla_id": sla_id, "sla_name": sla_name,
+    });
+    let detail = get(format!("/api/v1/tickets/{ticket_id}")).await;
+    let list = get("/api/v1/tickets?per_page=100".to_string()).await;
+    let listed = list["data"]
+        .as_array()
+        .expect("paginated data")
+        .iter()
+        .find(|t| t["id"] == ticket_id.as_str())
+        .expect("the ticket is listed")
+        .clone();
+    for (surface, body) in [("detail", &detail), ("list", &listed)] {
+        for (key, want) in expected.as_object().expect("object") {
+            assert_eq!(&body[key], want, "{surface}: {key}");
+        }
+    }
+}

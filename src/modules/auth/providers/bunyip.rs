@@ -1,19 +1,16 @@
 //! Bunyip Resource-Server auth provider adapter (PMS-981).
 //!
 //! An adapter over [`crate::modules::auth::oidc_rs`]. Holds two booleans
-//! and NOTHING ELSE from the request-authentication path, because this
-//! provider is dormant in this change: `create_api_router` continues to
-//! mount the underlying verifier through
-//! [`crate::modules::auth::middleware::AuthMiddleware::with_bunyip`], and
-//! no non-test caller invokes the trait yet (see `providers/mod.rs`).
+//! and NOTHING ELSE from the request-authentication path: the bearer
+//! middleware mounted through
+//! [`crate::modules::auth::middleware::AuthMiddleware::with_bunyip`] reads
+//! the installed selection through `providers::is_enabled` and skips the
+//! Bunyip verify when the operator excludes it (see `providers/mod.rs`).
 //!
 //! The adapter deliberately does NOT hold a
 //! [`crate::modules::auth::oidc_rs::Verifier`]: doing so would couple this
 //! module to `reqwest`, `jsonwebtoken` and Bunyip's JWKS cache for
-//! reporting a boolean the startup wiring already computed. When the
-//! deferred-wiring PR routes real requests through the trait, that PR is
-//! free to hold a verifier here; today doing so would only widen the
-//! surface without changing behaviour.
+//! reporting a boolean the startup wiring already computed.
 
 use crate::utils::deployment::provider;
 

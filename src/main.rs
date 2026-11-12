@@ -94,14 +94,14 @@ pub struct AppConfig {
     /// (`LOGIN_APPROVAL_ENABLED`). Off by default.
     pub login_approval_enabled: bool,
     /// MAPPS-457: instance-wide hard cap on how many tenants a super-admin can
-    /// create. Unset (or `<=0`) leaves creation uncapped, matching production
-    /// today. Positive integer rejects further `create_tenant` calls with 409
+    /// create. Unset leaves creation uncapped, matching production today. Set
+    /// and malformed or non-positive is a boot error naming the variable and
+    /// value. Positive integer rejects further `create_tenant` calls with 409
     /// once `SELECT COUNT(*) FROM tenants` reaches the value.
     ///
-    /// Set via `MOKOSH_MAX_TENANTS`. Bumped without a code change so an
-    /// operator can raise the ceiling on the running instance and see the
-    /// effect on the next create call (no restart needed for lowering /
-    /// raising - re-read at each create request).
+    /// Set via `MOKOSH_MAX_TENANTS`. Read once at boot into `AppConfig`;
+    /// changing the ceiling on a running instance needs a restart to take
+    /// effect.
     pub max_tenants: Option<usize>,
     /// PMS-902 / PMS-904: whether this instance owns its platform identities
     /// (`self-hosted`, the default) or federates them to Bunyip SSO (`saas`).
@@ -164,11 +164,12 @@ fn is_hex64(s: &str) -> bool {
 /// One essential deployment-shape variable's boot-check contract.
 ///
 /// Every field is a `&'static str` or a `fn` pointer because the set is closed
-/// and known at compile time: five vars whose "wrong default" is silent-but-
-/// consequential on a real deployment (`MOKOSH_DEPLOYMENT_MODE` selects the
-/// hosting profile defaults per capability, `MOKOSH_APP_DATABASE_URL` decides
-/// whether RLS bites at all, and the three URLs decide where emailed and
-/// browser links land). See PMS-1160.
+/// and known at compile time: six vars whose "wrong default" is silent-but-
+/// consequential on a real deployment (`DATABASE_URL` is the privileged
+/// migrator connection, `MOKOSH_DEPLOYMENT_MODE` selects the hosting profile
+/// defaults per capability, `MOKOSH_APP_DATABASE_URL` decides whether RLS
+/// bites at all, and the three URLs decide where emailed and browser links
+/// land). See PMS-1160.
 ///
 /// The reader is a `fn` rather than a `&'static ConfigKey` because
 /// `MOKOSH_DEPLOYMENT_MODE` is deliberately NOT in the config-provider

@@ -546,7 +546,11 @@ pub struct TicketResponse {
     pub description: Option<String>,
     pub status: TicketStatusSummary,
     pub priority: TicketPrioritySummary,
+    /// MAPPS-1223: the id beside each name, so a client binds its editor to
+    /// the saved value instead of matching the name against a lookup list.
+    pub type_id: Option<Uuid>,
     pub type_name: Option<String>,
+    pub category_id: Option<Uuid>,
     pub category_name: Option<String>,
     pub queue_name: String,
     pub source: TicketSource,
@@ -554,6 +558,20 @@ pub struct TicketResponse {
     pub company_name: String,
     pub contact_id: Option<Uuid>,
     pub contact_name: Option<String>,
+    /// MAPPS-1223: the four PMS-1565 made writable on `UpdateTicketRequest`
+    /// and the response never carried, so a client could set them and never
+    /// read them back. Id plus display name, the `contact_*` shape.
+    pub site_id: Option<Uuid>,
+    pub site_name: Option<String>,
+    pub team_id: Option<Uuid>,
+    pub team_name: Option<String>,
+    pub contract_id: Option<Uuid>,
+    /// Nullable on the contract, so `contract_name` (never null) is carried
+    /// too for a label that always exists.
+    pub contract_number: Option<String>,
+    pub contract_name: Option<String>,
+    pub sla_id: Option<Uuid>,
+    pub sla_name: Option<String>,
     pub assigned_to_id: Option<Uuid>,
     pub assigned_to_name: Option<String>,
     pub sla_due_date: Option<DateTime<Utc>>,

@@ -1561,13 +1561,13 @@ mod finance_gate {
 
     /// The dual-plane handlers whose staff branch carries the gate in the
     /// body rather than in the argument list (PMS-1041; PMS-1088 added the
-    /// sixth). They take
+    /// seventh). They take
     /// `RequireCallerContext` because they serve the contact plane too, and
     /// stacking `RequireBilling` on top would resolve the caller twice.
     ///
-    /// The list is exhaustive on purpose: adding a sixth is a deliberate act,
-    /// because the inline form is the one that already lost the module gate
-    /// once and the compiler cannot see the omission.
+    /// The list is exhaustive on purpose: adding an eighth is a deliberate
+    /// act, because the inline form is the one that already lost the module
+    /// gate once and the compiler cannot see the omission.
     const INLINE_STAFF_GATE: &[&str] = &[
         "get_invoice",
         // MAPPS-984: the aggregate `/invoices/summary` the dashboard Open
@@ -1581,7 +1581,7 @@ mod finance_gate {
         "get_invoice_pdf",
         "pay_invoice",
         "get_invoice_payment_readiness",
-        // PMS-1088: the invoice ledger, the sixth dual-plane read.
+        // PMS-1088: the invoice ledger, the seventh dual-plane read.
         "list_invoice_payments",
     ];
 

@@ -11,9 +11,9 @@
 //! with the value type ([`FlagValue`]); the default stays with the
 //! flag ([`FlagDefault`]). A caller reads the flag through the ONE
 //! read path [`Flag::read`], which trims, parses, and falls back to
-//! the flag's default when a raw value did not parse. A typo does
-//! not stop the boot: a flag is never security-critical enough for
-//! that outcome, mirroring the PMS-902 rule for mail dispatch.
+//! the flag's default when a raw value did not parse. [`check_boot`]
+//! runs at startup and refuses to boot on a typo'd flag, rather than
+//! serving the default silently.
 //!
 //! # Undeclared keys do not compile
 //!
@@ -253,10 +253,10 @@ impl<T: FlagValue> std::fmt::Debug for Flag<T> {
 /// PMS-983: the organizations feature.
 ///
 /// A SaaS deployment has multi-user organizations enabled by
-/// default, matching the current shipping behaviour on nc-01 and
-/// c-01. A self-hosted deployment starts with organizations off,
-/// matching the single-user default the customer image ships with
-/// today.
+/// default, matching the current shipping behaviour on the hosted
+/// deployments. A self-hosted deployment starts with organizations
+/// off, matching the single-user default the customer image ships
+/// with today.
 pub static ORGANIZATIONS_ENABLED: Flag<bool> = Flag::new(
     &registry::ORGANIZATIONS_ENABLED,
     FlagDefault::PerProfile {
