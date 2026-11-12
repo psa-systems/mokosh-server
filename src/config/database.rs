@@ -84,8 +84,8 @@ impl DatabaseProvider {
         // RLS policy; there is no tenant GUC to set. `db.pool()` is the
         // request-serving `mokosh_app` pool, which has SELECT on the table
         // per migration 210.
+        // SPEC-2.208; SAFETY (PMS-285) above.
         let rows: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
-            // SPEC-2.208
             "SELECT name, value FROM app_config WHERE name = ANY($1)",
         )
         .bind(&names)
