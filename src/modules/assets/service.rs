@@ -1573,10 +1573,16 @@ impl AssetsService {
         .fetch_one(&mut *tx)
         .await?;
 
+        // PMS-1664: without ORDER BY, LIMIT/OFFSET paged against whatever
+        // physical order Postgres returned, so two calls with the same
+        // `(page, per_page)` could serve different rows and a given edge
+        // could appear on two pages or none. Order by id for a stable key
+        // that is already indexed through the primary key.
         let rows = sqlx::query_as::<_, RelRow>(
             r#"SELECT id, parent_asset_id, child_asset_id, relationship_type
                FROM asset_relationships
                WHERE tenant_id = $1 AND (parent_asset_id = $2 OR child_asset_id = $2)
+               ORDER BY id
                LIMIT $3 OFFSET $4"#,
         )
         .bind(tenant_id)

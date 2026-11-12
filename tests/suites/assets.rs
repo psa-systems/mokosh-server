@@ -340,6 +340,73 @@ async fn asset_relationships(pool: PgPool) {
     );
 }
 
+/// PMS-1664: the relationship list ran LIMIT/OFFSET without an ORDER BY, so
+/// two consecutive pages against the same `(page, per_page)` could serve
+/// different rows depending on whatever physical order Postgres returned,
+/// and an edge could appear on two pages or none. Pin stability by
+/// requesting one row per page across a small set and asserting the
+/// returned ids partition the full set without overlap or gap.
+#[mokosh_test]
+async fn asset_relationship_list_is_stable_across_pages(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Paging Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let type_id = create_asset_type(&app, &token, "Server").await;
+    let parent = create_asset(&app, &token, "p-host", &type_id, company).await;
+    let mut created_ids: Vec<String> = Vec::new();
+    for i in 0..3 {
+        let child = create_asset(&app, &token, &format!("p-child-{i}"), &type_id, company).await;
+        let resp: serde_json::Value = app
+            .client
+            .post(app.url(&format!("/api/v1/assets/{parent}/relationships")))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "child_asset_id": child,
+                "relationship_type": "hosts",
+            }))
+            .send()
+            .await
+            .expect("create relationship")
+            .json()
+            .await
+            .expect("relationship JSON");
+        created_ids.push(resp["id"].as_str().expect("id").to_string());
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    for page in 1..=3u32 {
+        let resp: serde_json::Value = app
+            .client
+            .get(app.url(&format!(
+                "/api/v1/assets/{parent}/relationships?page={page}&per_page=1"
+            )))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("list relationships")
+            .json()
+            .await
+            .expect("relationships JSON");
+        let data = resp["data"].as_array().expect("data array");
+        assert_eq!(
+            data.len(),
+            1,
+            "page {page} must serve exactly one row with per_page=1 (got {})",
+            data.len()
+        );
+        seen.push(data[0]["id"].as_str().expect("id").to_string());
+    }
+    seen.sort();
+    let mut expected = created_ids.clone();
+    expected.sort();
+    assert_eq!(
+        seen, expected,
+        "the three single-row pages must partition the full set with no duplicates or gaps"
+    );
+}
+
 // AC4 (credentials): encrypted at rest, NEVER leaked in a list, reveal is
 // authz-gated + audited.
 #[mokosh_test]
