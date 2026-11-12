@@ -4,7 +4,7 @@
 //!
 //! `credential_vault` stores encrypted credential secrets locally. Every
 //! plaintext read runs through the audited reveal endpoint at
-//! `POST /assets/{asset_id}/credentials/{id}/reveal`, which writes an
+//! `GET /api/v1/assets/credentials/{id}`, which writes an
 //! `asset_audit_log` row per read. This is deliberate: the per-client
 //! documentation surface is here so a technician working a ticket does
 //! not have to hop between systems, and referencing an external vault
