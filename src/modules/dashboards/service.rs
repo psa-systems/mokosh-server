@@ -259,7 +259,7 @@ impl DashboardsService {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        self.schedule_get(tenant_id, id).await
+        self.schedule_get(tenant_id, user_id, id).await
     }
 
     pub async fn schedule_list(
@@ -283,9 +283,14 @@ impl DashboardsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// PMS-1665: owner-only. Same shape as the saved_reports fix: update
+    /// and delete already filter by `user_id` but GET-by-id used to leak
+    /// another user's schedule (recipient, cron, last_error, is_active)
+    /// to any viewer of the parent dashboard.
     pub async fn schedule_get(
         &self,
         tenant_id: Uuid,
+        user_id: Uuid,
         id: Uuid,
     ) -> AppResult<ScheduledDashboardResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -294,10 +299,11 @@ impl DashboardsService {
                     recipient_email, is_active, last_run_at, next_run_at, \
                     last_error, created_at, updated_at \
              FROM scheduled_dashboards \
-             WHERE tenant_id = $1 AND id = $2",
+             WHERE tenant_id = $1 AND id = $2 AND user_id = $3",
         )
         .bind(tenant_id)
         .bind(id)
+        .bind(user_id)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(AppError::NotFound("Scheduled dashboard".into()))?;
@@ -339,7 +345,7 @@ impl DashboardsService {
         if rows == 0 {
             return Err(AppError::NotFound("Scheduled dashboard".into()));
         }
-        self.schedule_get(tenant_id, id).await
+        self.schedule_get(tenant_id, user_id, id).await
     }
 
     pub async fn schedule_delete(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {

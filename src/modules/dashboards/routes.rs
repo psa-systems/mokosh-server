@@ -146,7 +146,10 @@ async fn get_schedule(
     RequireAuth(u): RequireAuth,
     Path(schedule_id): Path<Uuid>,
 ) -> AppResult<Json<ScheduledDashboardResponse>> {
-    let row = s.service.schedule_get(u.tenant_id, schedule_id).await?;
+    let row = s
+        .service
+        .schedule_get(u.tenant_id, u.id, schedule_id)
+        .await?;
     Ok(Json(row))
 }
 
