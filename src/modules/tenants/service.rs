@@ -1641,11 +1641,15 @@ impl TenantService {
     pub async fn suspend_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
         // SAFETY (PMS-285): super-admin tenant-lifecycle handler writing the
         // RLS-exempt `tenants` root row by id. Migrator pool.
-        sqlx::query("UPDATE tenants SET status = 'suspended', updated_at = NOW() WHERE id = $1")
-            .bind(tenant_id)
-            .execute(self.db.migrator_pool())
-            .await?;
-
+        let res = sqlx::query(
+            "UPDATE tenants SET status = 'suspended', updated_at = NOW() WHERE id = $1",
+        )
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(AppError::NotFound("Tenant".to_string()));
+        }
         Ok(())
     }
 
@@ -1659,11 +1663,14 @@ impl TenantService {
         // status flips back to 'active' here, so an operator who
         // clicks Reactivate on a Cancelled row gets the same restore
         // shape as they do on a Suspended row.
-        sqlx::query("UPDATE tenants SET status = 'active', updated_at = NOW() WHERE id = $1")
-            .bind(tenant_id)
-            .execute(self.db.migrator_pool())
-            .await?;
-
+        let res =
+            sqlx::query("UPDATE tenants SET status = 'active', updated_at = NOW() WHERE id = $1")
+                .bind(tenant_id)
+                .execute(self.db.migrator_pool())
+                .await?;
+        if res.rows_affected() == 0 {
+            return Err(AppError::NotFound("Tenant".to_string()));
+        }
         Ok(())
     }
 
@@ -1676,11 +1683,15 @@ impl TenantService {
     pub async fn cancel_tenant(&self, tenant_id: TenantId) -> AppResult<()> {
         // SAFETY (PMS-285): super-admin tenant-lifecycle handler writing the
         // RLS-exempt `tenants` root row by id. Migrator pool.
-        sqlx::query("UPDATE tenants SET status = 'cancelled', updated_at = NOW() WHERE id = $1")
-            .bind(tenant_id)
-            .execute(self.db.migrator_pool())
-            .await?;
-
+        let res = sqlx::query(
+            "UPDATE tenants SET status = 'cancelled', updated_at = NOW() WHERE id = $1",
+        )
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(AppError::NotFound("Tenant".to_string()));
+        }
         Ok(())
     }
 
