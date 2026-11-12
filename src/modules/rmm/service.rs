@@ -1008,6 +1008,13 @@ fn severity_rank(s: Option<&str>) -> u8 {
 /// therefore should be dropped before any ticket is created). When the
 /// rule has no `suppression_rules` or no `min_severity` key, returns
 /// false (accept).
+///
+/// PMS-1667: an unknown `min_severity` string (a typo, a rule copied
+/// from another vendor's vocabulary) used to rank as `u8::MAX` through
+/// `severity_rank`, so EVERY known-severity alert compared less than it
+/// and was silently suppressed. A whole tenant could stop getting
+/// tickets because of one typo. Refuse to suppress on an unknown
+/// min_severity and log a WARN so an operator can find the rule.
 fn alert_suppressed(rules: Option<&serde_json::Value>, alert: &IngestAlertRequest) -> bool {
     let Some(rules) = rules else {
         return false;
@@ -1015,7 +1022,25 @@ fn alert_suppressed(rules: Option<&serde_json::Value>, alert: &IngestAlertReques
     let Some(min_sev) = rules.get("min_severity").and_then(|v| v.as_str()) else {
         return false;
     };
+    if !is_known_severity(min_sev) {
+        tracing::warn!(
+            min_severity = %min_sev,
+            "rmm rule's suppression_rules.min_severity is not one of {{low, info, medium, warning, high, critical}}; accepting the alert instead of silently dropping every incoming alert",
+        );
+        return false;
+    }
     severity_rank(alert.severity.as_deref()) < severity_rank(Some(min_sev))
+}
+
+/// The vocabulary `severity_rank` recognises explicitly; used by
+/// `alert_suppressed` so a typo in a rule's `min_severity` does not get
+/// quietly ranked as `u8::MAX` (above everything) and suppress every
+/// alert.
+fn is_known_severity(s: &str) -> bool {
+    matches!(
+        s,
+        "low" | "info" | "medium" | "warning" | "high" | "critical"
+    )
 }
 
 /// Pulls `dedupe_window_minutes` out of the rule's `suppression_rules`
@@ -1081,6 +1106,24 @@ mod tests {
         assert!(!alert_suppressed(None, &alert(Some("low"))));
         let rules = serde_json::json!({});
         assert!(!alert_suppressed(Some(&rules), &alert(Some("low"))));
+    }
+
+    /// PMS-1667: a typoed or alien min_severity used to rank as u8::MAX
+    /// through `severity_rank`, so every known-severity alert was less
+    /// than it and silently suppressed. The fix refuses to suppress when
+    /// min_severity is not in the known vocabulary; a typo stops being a
+    /// silent kill-switch and the operator sees a WARN they can trace.
+    #[test]
+    fn suppression_does_not_drop_everything_on_a_typoed_min_severity() {
+        for bad in ["catastrophic", "Critical", "LOW", "WARN", "", "9999"] {
+            let rules = serde_json::json!({"min_severity": bad});
+            for incoming in ["low", "info", "medium", "warning", "high", "critical"] {
+                assert!(
+                    !alert_suppressed(Some(&rules), &alert(Some(incoming))),
+                    "min_severity={bad:?}, incoming={incoming:?}: unknown rule value must not suppress a known-severity alert"
+                );
+            }
+        }
     }
 
     #[test]
