@@ -940,8 +940,11 @@ impl BillingService {
             idx += 1;
         }
         if filter.q.is_some() {
+            // PMS-1660: `ESCAPE '\'` pairs with the backslash-escaped `%` and
+            // `_` the pattern below carries so a literal metacharacter in the
+            // caller's needle is matched literally.
             conds.push(format!(
-                "(invoice_number ILIKE ${idx} OR po_number ILIKE ${idx})"
+                "(invoice_number ILIKE ${idx} ESCAPE '\\' OR po_number ILIKE ${idx} ESCAPE '\\')"
             ));
             idx += 1;
         }
@@ -973,7 +976,10 @@ impl BillingService {
             q = q.bind(cid);
         }
         if let Some(qstr) = &filter.q {
-            q = q.bind(format!("%{qstr}%"));
+            q = q.bind(format!(
+                "%{}%",
+                crate::utils::text::escape_like_wildcards(qstr)
+            ));
         }
         if filter.overdue.is_some() {
             q = q.bind(today);
@@ -1022,11 +1028,13 @@ impl BillingService {
             count_idx += 1;
         }
         if filter.q.is_some() {
+            // PMS-1660: `ESCAPE '\'` on both the data and count branches so a
+            // literal `%` or `_` in the needle is matched literally.
             data_conds.push(format!(
-                "(invoice_number ILIKE ${data_idx} OR po_number ILIKE ${data_idx})"
+                "(invoice_number ILIKE ${data_idx} ESCAPE '\\' OR po_number ILIKE ${data_idx} ESCAPE '\\')"
             ));
             count_conds.push(format!(
-                "(invoice_number ILIKE ${count_idx} OR po_number ILIKE ${count_idx})"
+                "(invoice_number ILIKE ${count_idx} ESCAPE '\\' OR po_number ILIKE ${count_idx} ESCAPE '\\')"
             ));
             data_idx += 1;
             count_idx += 1;
@@ -1104,7 +1112,7 @@ impl BillingService {
             cq = cq.bind(ctid);
         }
         if let Some(ref s) = filter.q {
-            let pattern = format!("%{s}%");
+            let pattern = format!("%{}%", crate::utils::text::escape_like_wildcards(s));
             q = q.bind(pattern.clone());
             cq = cq.bind(pattern);
         }
@@ -7959,13 +7967,19 @@ impl BillingService {
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ProductResponse>, u64)> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let pattern = filter.q.as_ref().map(|q| format!("%{}%", q.trim()));
+        // PMS-1660: escape the `%` and `_` the caller typed so a literal
+        // metacharacter does not expand to a wildcard. `ESCAPE '\'` on the
+        // ILIKE keeps the pair in force across list + count.
+        let pattern = filter
+            .q
+            .as_ref()
+            .map(|q| format!("%{}%", crate::utils::text::escape_like_wildcards(q.trim())));
         let total: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM products
             WHERE tenant_id = $1
               AND ($2::bool IS NULL OR is_active = $2)
-              AND ($3::text IS NULL OR name ILIKE $3 OR sku ILIKE $3)
+              AND ($3::text IS NULL OR name ILIKE $3 ESCAPE '\' OR sku ILIKE $3 ESCAPE '\')
             "#,
         )
         .bind(tenant_id)
@@ -7980,7 +7994,7 @@ impl BillingService {
             FROM products p
             WHERE p.tenant_id = $1
               AND ($2::bool IS NULL OR p.is_active = $2)
-              AND ($3::text IS NULL OR p.name ILIKE $3 OR p.sku ILIKE $3)
+              AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\' OR p.sku ILIKE $3 ESCAPE '\')
             ORDER BY p.name
             LIMIT $4 OFFSET $5
             "#
