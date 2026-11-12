@@ -6624,7 +6624,7 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
   link to `docs/configuration.md#release-vX-Y-Z` in the repository (the tag path for the version, or the branch path
   when `--ref` differs) with the entry count and the won't-start and feature-off counts, followed by one bullet per
   breaking entry, won't-start first; for a release with no entries it must print `No configuration changes in <version>.
-  Full list: [docs/configuration.md](<link>).`.
+  Full list: `, followed by the same link in Markdown form pointing at `docs/configuration.md`.
 - **SPEC-10.386**: `config-docs.nu self-test` must run its fixture cases (generated document passes; generating twice
   changes nothing; each of a missing row, a Required mismatch, an Added-in mismatch, an unknown row, a missing or
   unmarked breaking entry, a wrong mark, a missing feature, a missing anchor and an unlisted or unread variable fails)
