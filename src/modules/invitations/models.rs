@@ -30,6 +30,15 @@ pub struct InvitationResponse {
     /// originally shipped).
     #[serde(default)]
     pub team_id: Option<Uuid>,
+    /// PMS-1659: whether the invite email dispatch succeeded on the one
+    /// interaction that tried to send it (i.e. the create response). The
+    /// invite row is committed either way, but an admin whose SMTP relay
+    /// is broken needs to see that the email did not go out without
+    /// paging through the server log. `None` on list/revoke responses
+    /// which do not themselves try to send mail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[sqlx(default)]
+    pub mail_sent: Option<bool>,
 }
 
 /// Slim projection the login path consumes to place an invited user (PMS-244).

@@ -268,3 +268,47 @@ async fn first_invite_promotes_personal_tenant_to_org(pool: PgPool) {
         .expect("read kind");
     assert_eq!(kind, "org", "inviting promotes a personal tenant to org");
 }
+
+/// PMS-1659: a failed invite mail dispatch was only a WARN log; the create
+/// response was a plain success with no field saying the mail did not go.
+/// The response now carries `mail_sent` on the create path: `None` when no
+/// dispatcher is configured (nothing to try), `Some(true)` on a clean send,
+/// `Some(false)` when dispatch was attempted and failed. The admin sees the
+/// failure in the same interaction instead of having to page through logs.
+///
+/// This case covers the "no dispatcher configured" shape: the pure
+/// `InvitationsService::new(db)` path has no notifier, so `mail_sent` must
+/// be absent on the response.
+#[mokosh_test]
+async fn create_without_a_notifier_omits_mail_sent(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let svc = svc(&pool);
+    let req = CreateInvitationRequest {
+        email: "pms1659-no-notifier@example.com".to_string(),
+        role: "user".to_string(),
+        team_id: None,
+    };
+
+    let invite = svc
+        .create(
+            TenantId::from_trusted(common::DEFAULT_TENANT_ID),
+            admin_id,
+            &req,
+            &actx(),
+        )
+        .await
+        .expect("create invite");
+
+    assert!(
+        invite.mail_sent.is_none(),
+        "with no dispatcher configured, create must leave mail_sent absent; got {:?}",
+        invite.mail_sent
+    );
+
+    // Confirm the field serialises as absent, not as explicit null.
+    let body = serde_json::to_value(&invite).expect("serialize invite");
+    assert!(
+        body.get("mail_sent").is_none(),
+        "mail_sent must omit when None, not render as null: {body}"
+    );
+}
