@@ -1821,6 +1821,19 @@ impl AssetsService {
         let encrypted = crate::utils::crypto::encrypt(&request.value, &self.encryption_key)?;
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1664: a bare INSERT used to fall through to a 23503 (500) on an
+        // unknown asset, which the caller had to tell apart from a real 500.
+        // Refuse with a named 404 after the tenant-scoped existence check.
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2)",
+        )
+        .bind(asset_id)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            return Err(AppError::NotFound("Asset".to_string()));
+        }
         sqlx::query(
             r#"INSERT INTO configuration_items
                (id, tenant_id, asset_id, name, category, value_encrypted, notes)
@@ -2043,13 +2056,20 @@ impl AssetsService {
             None => None,
         };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        // Fetch company_id from the asset for the credential row.
-        let company_id: Option<Uuid> =
-            sqlx::query_scalar("SELECT company_id FROM assets WHERE id = $1 AND tenant_id = $2")
-                .bind(asset_id)
-                .bind(tenant_id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        // PMS-1664: a `fetch_optional` that returned None used to flow straight
+        // into the INSERT with company_id NULL, and the outcome then depended
+        // on whether the FK resolved against a foreign-tenant row (silent
+        // cross-tenant link) or a missing one (500 at commit). Fetch the row
+        // itself and refuse with a named 404 when it is not there; keep the
+        // nullable column as the credential's company.
+        let company_id: Option<Uuid> = sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT company_id FROM assets WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(asset_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Asset".to_string()))?;
         let id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO credential_vault
