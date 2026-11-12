@@ -42,10 +42,10 @@ async fn list_members(
 ) -> AppResult<Json<MembersResponse>> {
     filter.validate()?;
     filter.validate_enums()?;
-    // PMS-1194: the service sorts the merged set in Rust after the fan-out
-    // (there is no single ORDER BY to delegate `?sort=` to), so an
-    // unsupported `sort` query parameter is refused here rather than
-    // silently ignored.
+    // PMS-1194: the service's union exposes `sort_last`/`sort_first`/
+    // `sort_email`/`sort_id` so the caller can `ORDER BY` the union in
+    // SQL; `?sort=` is still refused here when it names a column the
+    // union does not expose, rather than being silently ignored.
     pagination.reject_unsupported_sort()?;
     let caller = manager.0;
     let response = state

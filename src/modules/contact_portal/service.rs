@@ -33,8 +33,7 @@ use super::models::*;
 const ACCESS_TOKEN_TTL_MIN: i64 = 15;
 /// 30 days. Same as the pre-pivot portal refresh token.
 const REFRESH_TOKEN_TTL_DAYS: i64 = 30;
-/// 30 min. Same as PMS-729 phase 2 H3 - long enough to check email +
-/// short enough to blunt exposure of a leaked link.
+
 /// The JWT `typ` claim value that identifies a contact-plane token.
 /// Middleware (`portal_contact_middleware`) checks this string
 /// exactly so a staff-plane bearer cannot cross the plane.

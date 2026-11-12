@@ -14,9 +14,11 @@
 //!   `tickets.team_id` (NO ACTION) per the cascade audit in
 //!   docs/mokosh-orgs/01-data-model.md.
 //! - `team_members.role = 'leader'` is a display / notification hint and
-//!   grants NO additional authorization (F4). This is enforced by the
-//!   route layer: every write is `RequireAdmin`, never `RequireAuth +
-//!   is-leader`.
+//!   grants NO additional authorization (F4). Route-level authorization
+//!   is split per write (PMS-1162): team creation stays `RequireAdmin`;
+//!   per-team edits widen to `RequireAuth` plus a `TeamManagementGuard`
+//!   that admits an admin or the team's recorded manager, and the leader
+//!   role is never a factor.
 //! - `list_members` filters `WHERE users.deleted_at IS NULL` so
 //!   soft-deleted user tombstones do not leak (F13).
 //! - Every write calls `audit_write` in the same transaction (F10).
