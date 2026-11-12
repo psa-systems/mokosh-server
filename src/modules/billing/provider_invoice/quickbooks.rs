@@ -1212,7 +1212,11 @@ impl QuickBooksClient {
                 return Err(AppError::Unauthorized);
             }
             if status == reqwest::StatusCode::NOT_FOUND {
-                return Err(AppError::NotFound("QuickBooks invoice".to_string()));
+                // PMS-1660: this `call_with_retry` wraps every QBO
+                // resource (invoices, credit memos, bills, connections,
+                // vendor payments, ...), not just invoices. Say
+                // "resource" instead of lying about what was not found.
+                return Err(AppError::NotFound("QuickBooks resource".to_string()));
             }
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();

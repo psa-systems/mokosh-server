@@ -1197,7 +1197,15 @@ impl XeroClient {
                 return Err(AppError::Unauthorized);
             }
             if status == reqwest::StatusCode::NOT_FOUND {
-                return Err(AppError::NotFound("Xero invoice".to_string()));
+                // PMS-1660: `call_with_retry` is the shared Xero HTTP
+                // helper used by every resource (invoices, credit notes,
+                // bills, connections, payments, ...), not just invoices.
+                // Naming it "Xero invoice" lied for every non-invoice
+                // caller - a credit-note lookup against an unknown id
+                // surfaced as `NotFound("Xero invoice")`. Say "resource"
+                // instead; the surrounding log context identifies the
+                // Mokosh call path.
+                return Err(AppError::NotFound("Xero resource".to_string()));
             }
             if status == reqwest::StatusCode::CONFLICT {
                 return Err(AppError::Conflict(
