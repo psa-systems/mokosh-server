@@ -88,6 +88,12 @@ struct VerifyReport {
 
 /// `mokosh-server verify-providers [--json | --text]`. Text is the default
 /// and prints one row per kind plus a summary; JSON prints a single envelope.
+// SPEC-3.90: reproduces main's own boot order (configuration, then
+// application-tier secrets, then storage, then email) before
+// collecting the provider-status report, and fails if DATABASE_URL
+// or ENCRYPTION_KEY is unset; a failure to read the database-stored
+// email override falls back to MailerConfig::from_env() with a
+// warning rather than failing the whole run.
 pub async fn run(args: &[String]) -> AppResult<()> {
     let mode = parse_args(args)?;
 
@@ -161,6 +167,10 @@ enum Mode {
     Json,
 }
 
+// SPEC-3.89: --help/-h prints help and exits the process directly
+// with status 0, which differs from every other operator
+// subcommand's --help, whose usage text flows back as an Err and
+// therefore a non-zero exit.
 fn parse_args(args: &[String]) -> AppResult<Mode> {
     let mut mode = Mode::Text;
     for arg in &args[2..] {
@@ -196,7 +206,7 @@ fn init_bootstrap_config() -> AppResult<()> {
     let profile = DeploymentMode::from_env_for_providers()
         .map_err(|e| AppError::Configuration(e.to_string()))?;
     let default = profile.default_provider_for(ProviderKind::Configuration)?;
-    let _ = crate::config::init_from_env(default);
+    crate::config::init_from_env(default)?;
     Ok(())
 }
 
@@ -229,7 +239,8 @@ async fn init_application_secrets(
     let profile = DeploymentMode::from_env_for_providers()
         .map_err(|e| AppError::Configuration(e.to_string()))?;
     let default = profile.default_provider_for(ProviderKind::Secrets)?;
-    crate::app_secrets::init_from_env(default, db.clone(), encryption_key).await?;
+    let per_secret = crate::app_secrets::per_secret_defaults(profile.default_secret_providers())?;
+    crate::app_secrets::init_from_env(default, &per_secret, db.clone(), encryption_key).await?;
     Ok(())
 }
 
@@ -254,6 +265,14 @@ fn init_email() -> AppResult<EmailConfig> {
 /// provider is unreachable or no provider is serving; otherwise `pass` if
 /// there is a serving provider and `profile_default` when only the profile
 /// left one on.
+// SPEC-3.91: classifies a kind's row as Fail when any enabled
+// provider is unreachable, when nothing is serving, or when no
+// provider was built at all; the email row is additionally verified
+// with an actual SMTP NOOP bounded by a 10-second timeout, and a
+// pre-existing build failure for email is never overwritten by a
+// passing verify, while a passing build result is overwritten by
+// the verify's own verdict; the overall process exits non-zero
+// whenever any row's verdict is Fail.
 fn row_from_kind(kind: &ProviderKindReport) -> ProviderRow {
     let unreachable: Vec<&EnabledProviderReport> =
         kind.enabled.iter().filter(|e| !e.reachable).collect();

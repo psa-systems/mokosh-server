@@ -36,6 +36,8 @@ if (!opBaseURL) {
   process.exit(0);
 }
 
+// SPEC-10.211: skip=true only on an exact {bootstrapped:false}; any non-2xx,
+// network error, or parse failure falls through to running the suite.
 const url = `${opBaseURL}/e2e-bootstrapped`;
 const TIMEOUT_MS = 15_000;
 const controller = new AbortController();

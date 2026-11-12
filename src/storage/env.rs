@@ -150,6 +150,9 @@ pub fn from_env(var: StorageVar) -> Option<String> {
 /// Which name supplied this setting in the process environment, for the
 /// `provider-status` report. Never returns the VALUE, so a credential cannot
 /// reach a report through it.
+// SPEC-3.51: STORAGE_S3_ACCESS_KEY_ID and STORAGE_S3_SECRET_ACCESS_KEY
+// are the only two storage settings marked secret, and this reports
+// only which variable name supplied a setting, never its value.
 pub fn supplied_by(var: StorageVar) -> SuppliedBy {
     resolve(var, |name| std::env::var(name).ok()).1
 }
@@ -163,6 +166,11 @@ pub fn supplied_by(var: StorageVar) -> SuppliedBy {
 /// Takes a lookup for the same reason `resolve` does: tests set the
 /// environment through a lookup rather than `std::env::set_var`, which
 /// is not safe under a concurrent test runner.
+// SPEC-3.50: every storage configuration variable name is
+// STORAGE_-prefixed and declared centrally; a deprecated alias no
+// longer supplies a value at all, and this refuses to boot if any is
+// set to a non-blank value, naming every retired-to-replacement pair
+// at once; a forwarded-but-blank variable is treated as unset.
 pub fn check_boot_env(lookup: impl Fn(&str) -> Option<String>) -> Result<(), String> {
     let read = |name: &str| {
         lookup(name)

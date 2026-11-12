@@ -11,9 +11,9 @@
 //! with the value type ([`FlagValue`]); the default stays with the
 //! flag ([`FlagDefault`]). A caller reads the flag through the ONE
 //! read path [`Flag::read`], which trims, parses, and falls back to
-//! the flag's default when a raw value did not parse. A typo does
-//! not stop the boot: a flag is never security-critical enough for
-//! that outcome, mirroring the PMS-902 rule for mail dispatch.
+//! the flag's default when a raw value did not parse. [`check_boot`]
+//! runs at startup and refuses to boot on a typo'd flag, rather than
+//! serving the default silently.
 //!
 //! # Undeclared keys do not compile
 //!
@@ -116,6 +116,8 @@ pub enum FlagDefault<T: FlagValue> {
 /// of the default (`Constant` or `PerProfile`), never the flag's
 /// resolved value. A boolean is not sensitive on its own, but the
 /// pattern holds for future non-bool flags whose value may be.
+// SPEC-1 and 2.143: a Flag is a declared application-tier key plus a typed default, distinct
+// from a ConfigKey's own Tier (a flag always stays on Application so it is refresh-visible).
 pub struct Flag<T: FlagValue> {
     key: &'static ConfigKey,
     default: FlagDefault<T>,
@@ -145,13 +147,47 @@ impl<T: FlagValue> Flag<T> {
     /// value (trimmed length zero) is treated as unset for the same
     /// reason [`AppConfig::from_env`] treats blanks as unset: a
     /// compose key forwarded but unset arrives as `""` (PMS-836).
+    // SPEC-1 and 2.144: the one read path for a flag; a blank or unparsable raw
+    // value falls back to the flag's default rather than failing the read.
     pub fn read(&self) -> T {
         match config::get(self.key) {
             Some(raw) if !raw.trim().is_empty() => match T::parse(&raw) {
                 Some(value) => value,
-                None => self.resolved_default(),
+                None => {
+                    // PMS-1577: the boot-time pass (`check_boot`) is supposed to
+                    // have already refused a set-but-unparseable flag, but a
+                    // refresh after boot can still land one; warn so a value
+                    // that silently reverted to the default is visible.
+                    tracing::warn!(
+                        key = self.key.name(),
+                        value = %raw,
+                        "flag value failed to parse; serving the flag's default"
+                    );
+                    self.resolved_default()
+                }
             },
             _ => self.resolved_default(),
+        }
+    }
+
+    /// `Ok(())` when this flag is unset, blank, or set to a value that
+    /// parses; `Err` naming the flag and its raw value otherwise. The boot
+    /// pass ([`check_boot`]) runs this over every declared flag so a typo
+    /// (`LOGIN_APPROVAL_ENABLED=ture`) refuses to start rather than silently
+    /// reading as the default.
+    pub fn check(&self) -> Result<(), String> {
+        match config::get(self.key) {
+            Some(raw) if !raw.trim().is_empty() => {
+                if T::parse(&raw).is_some() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{} is set to {raw:?}, which is not a valid value",
+                        self.key.name()
+                    ))
+                }
+            }
+            _ => Ok(()),
         }
     }
 
@@ -165,6 +201,8 @@ impl<T: FlagValue> Flag<T> {
     /// `MOKOSH_DEPLOYMENT_MODE`, and PMS-902 already argued the case
     /// for the lenient reader when the answer only gates behaviour
     /// with a safe default.
+    // SPEC-1 and 2.145: FlagDefault::PerProfile resolves against the current
+    // DeploymentMode on every read rather than freezing a mode at construction.
     pub fn resolved_default(&self) -> T {
         match self.default {
             FlagDefault::Constant(value) => value,
@@ -207,10 +245,10 @@ impl<T: FlagValue> std::fmt::Debug for Flag<T> {
 /// PMS-983: the organizations feature.
 ///
 /// A SaaS deployment has multi-user organizations enabled by
-/// default, matching the current shipping behaviour on nc-01 and
-/// c-01. A self-hosted deployment starts with organizations off,
-/// matching the single-user default the customer image ships with
-/// today.
+/// default, matching the current shipping behaviour on the hosted
+/// deployments. A self-hosted deployment starts with organizations
+/// off, matching the single-user default the customer image ships
+/// with today.
 pub static ORGANIZATIONS_ENABLED: Flag<bool> = Flag::new(
     &registry::ORGANIZATIONS_ENABLED,
     FlagDefault::PerProfile {
@@ -249,6 +287,47 @@ pub static ALLOW_UNINVITED_BUNYIP_SIGNUP: Flag<bool> = Flag::new(
     &registry::ALLOW_UNINVITED_BUNYIP_SIGNUP,
     FlagDefault::Constant(false),
 );
+
+/// Object-safe view of [`Flag::check`], so every declared flag (whatever its
+/// `T`) can sit in one list for [`check_boot`] regardless of value type.
+trait FlagCheck: Sync {
+    fn check(&self) -> Result<(), String>;
+}
+
+impl<T: FlagValue + Sync> FlagCheck for Flag<T> {
+    fn check(&self) -> Result<(), String> {
+        Flag::check(self)
+    }
+}
+
+/// Every declared flag. A flag added above and left out of this list would
+/// not be covered by [`check_boot`], so a typo in it would go back to
+/// reading silently as the default; there is no other enforcement that this
+/// list stays complete.
+static ALL_FLAGS: &[&dyn FlagCheck] = &[
+    &ORGANIZATIONS_ENABLED,
+    &LOGIN_APPROVAL_ENABLED,
+    &ALLOW_UNINVITED_BUNYIP_SIGNUP,
+];
+
+/// PMS-1577: refuse to start when any declared flag is set but unparseable.
+/// Collects every failing flag into one combined error, mirroring
+/// `main.rs`'s `check_deployment_requirements`.
+pub fn check_boot() -> Result<(), String> {
+    let errors: Vec<String> = ALL_FLAGS
+        .iter()
+        .filter_map(|flag| flag.check().err())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "boot refused: {} feature flag(s) set to an unparseable value.\n\n{}",
+            errors.len(),
+            errors.join("\n")
+        ))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -414,6 +493,46 @@ mod tests {
         std::env::set_var("LOGIN_APPROVAL_ENABLED", "true");
         let _ = config::refresh();
         assert!(LOGIN_APPROVAL_ENABLED.read());
+    }
+
+    /// `check` is `Ok` when unset, blank, or a valid value, and names the
+    /// flag and the raw value when it is set but unparseable.
+    #[test]
+    fn check_is_ok_for_unset_blank_and_valid_err_for_unparseable() {
+        let _serial = refresh_test_lock();
+        let _cleanup = EnvGuard::new(&["LOGIN_APPROVAL_ENABLED"]);
+
+        assert!(LOGIN_APPROVAL_ENABLED.check().is_ok(), "unset");
+
+        std::env::set_var("LOGIN_APPROVAL_ENABLED", "  ");
+        let _ = config::refresh();
+        assert!(LOGIN_APPROVAL_ENABLED.check().is_ok(), "blank");
+
+        std::env::set_var("LOGIN_APPROVAL_ENABLED", "true");
+        let _ = config::refresh();
+        assert!(LOGIN_APPROVAL_ENABLED.check().is_ok(), "valid");
+
+        std::env::set_var("LOGIN_APPROVAL_ENABLED", "ture");
+        let _ = config::refresh();
+        let err = LOGIN_APPROVAL_ENABLED.check().expect_err("typo must fail");
+        assert!(err.contains("LOGIN_APPROVAL_ENABLED"), "{err}");
+        assert!(err.contains("ture"), "{err}");
+    }
+
+    /// `check_boot` collects every failing flag's error into one message and
+    /// is clean when every declared flag is unset or valid.
+    #[test]
+    fn check_boot_fails_on_an_unparseable_flag_and_is_clean_otherwise() {
+        let _serial = refresh_test_lock();
+        let _cleanup = EnvGuard::new(&["LOGIN_APPROVAL_ENABLED"]);
+
+        assert!(check_boot().is_ok());
+
+        std::env::set_var("LOGIN_APPROVAL_ENABLED", "ture");
+        let _ = config::refresh();
+        let err = check_boot().expect_err("a typo'd flag must refuse to boot");
+        assert!(err.contains("LOGIN_APPROVAL_ENABLED"), "{err}");
+        assert!(err.contains("ture"), "{err}");
     }
 
     /// `served_by` names the provider that held the flag's raw

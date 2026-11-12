@@ -5,6 +5,7 @@ import { runSuffix } from './run';
 // Create a run-tagged company in the E2E tenant. The tenant scope is implied by
 // the authenticated session (every service method scopes to the caller's
 // tenant), so no tenant id is sent in the body. Returns the created id + name.
+// SPEC-10.209: asserts a 200 response with a truthy id.
 export async function createCompany(
   request: APIRequestContext,
 ): Promise<{ id: string; name: string }> {
@@ -25,6 +26,7 @@ export async function createCompany(
 // field-level 422 ever since. The address carries the run tag too, in the
 // `${suffix}@e2e.example` shape the vCard specs already use, so a contact is
 // identifiable from its address as well as its name.
+// SPEC-10.209: asserts a 200 response with a truthy id.
 export async function createContact(
   request: APIRequestContext,
   companyId: string,
@@ -51,6 +53,8 @@ export async function createContact(
 // module is turned on. The settings upsert route is admin-gated and
 // idempotent. A 403 here means the E2E account is not an admin, which is a
 // real environment problem the assertion should surface, not swallow.
+// SPEC-10.209: PUTs is_enabled:true and asserts success, so a 403 (missing
+// admin privilege) surfaces as a test failure rather than being swallowed.
 export async function enableModule(
   request: APIRequestContext,
   module: string,

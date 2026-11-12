@@ -35,6 +35,37 @@ fn default_internal() -> String {
     "internal".into()
 }
 
+/// One declared template variable on a KB article. The render endpoint
+/// accepts a `{name: value}` map that must be a subset of these names;
+/// an unknown name is a 400. A variable with no `allowed_values` is
+/// free-text, otherwise the value must be one of them. `default` seeds
+/// the value when the caller does not pass one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KbTemplateVariable {
+    pub name: String,
+    pub label: String,
+    #[serde(default)]
+    pub allowed_values: Vec<String>,
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+/// Body of POST /kb/articles/{id}/render. An absent or empty `values`
+/// is `{}`.
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
+pub struct RenderKbArticleRequest {
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, String>,
+}
+
+/// The rendered article body; the id so a caller re-reading several
+/// articles can match the response to its request.
+#[derive(Debug, Clone, Serialize)]
+pub struct RenderKbArticleResponse {
+    pub id: Uuid,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct KbArticleResponse {
     pub id: Uuid,
@@ -79,6 +110,11 @@ pub struct KbArticleResponse {
     /// `None` for a top-level article. The parent is scoped to the same
     /// tenant; a cross-tenant link cannot be written through the API.
     pub parent_article_id: Option<Uuid>,
+    /// Declared template variables, carried through write + restore so a
+    /// `/render` call knows what names it accepts. Empty for an article
+    /// that has none, which is how every pre-templating row reads.
+    #[serde(default)]
+    pub template_variables: Vec<KbTemplateVariable>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -101,6 +137,14 @@ pub struct ContactKbArticleResponse {
     pub category_id: Option<Uuid>,
     pub published_at: Option<DateTime<Utc>>,
     pub tags: Vec<String>,
+    /// Declared template variables, so the portal's variable picker
+    /// knows what names to prompt for before calling `/render`. The
+    /// contact never sees `default` leaking out on a staff article it
+    /// is not supposed to read: `template_variables` is only populated
+    /// for an article the portal already resolved as published +
+    /// visible.
+    #[serde(default)]
+    pub template_variables: Vec<KbTemplateVariable>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -115,6 +159,7 @@ impl From<KbArticleResponse> for ContactKbArticleResponse {
             category_id: a.category_id,
             published_at: a.published_at,
             tags: a.tags,
+            template_variables: a.template_variables,
             updated_at: a.updated_at,
         }
     }
@@ -147,6 +192,11 @@ pub struct CreateKbArticleRequest {
     /// self-reference.
     #[serde(default)]
     pub parent_article_id: Option<Uuid>,
+    /// Declared template variables (optional on create). Service-side
+    /// validation refuses duplicate names and a default that is not in
+    /// a non-empty `allowed_values`.
+    #[serde(default)]
+    pub template_variables: Option<Vec<KbTemplateVariable>>,
 }
 
 fn default_draft() -> String {
@@ -181,6 +231,11 @@ pub struct UpdateKbArticleRequest {
     /// no version for it to explain.
     #[validate(length(max = 500))]
     pub change_note: Option<String>,
+    /// Declared template variables; `Some(vec)` replaces the whole set,
+    /// `None` leaves it alone. The service applies the same duplicate /
+    /// default-in-allowed-values rules as create.
+    #[serde(default)]
+    pub template_variables: Option<Vec<KbTemplateVariable>>,
 }
 
 /// A JSON `null` deserializes into `Some(None)`, an absent field into
@@ -350,6 +405,75 @@ pub struct TopTicketDrivingArticleRow {
     pub id: Uuid,
     pub title: String,
     pub ticket_count: i64,
+}
+
+/// One step row inside a KB article execution. `index` is the 0-based
+/// ordinal in the rendered content. `checked_at` and `checked_by_user_id`
+/// move as a pair: a check sets both and an uncheck clears both. The row
+/// `id` is carried along for a future route that addresses a step by id;
+/// the index-based PATCH is the one Phase 2a wires up.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbExecutionStepResponse {
+    pub id: Uuid,
+    pub execution_id: Uuid,
+    pub index: i32,
+    pub text: String,
+    pub checked_at: Option<DateTime<Utc>>,
+    pub checked_by_user_id: Option<Uuid>,
+    pub checked_by_name: Option<String>,
+}
+
+/// The full KB article execution with its step list: what the create
+/// route and the single-get route answer with. `article_version_id` is
+/// NULL for the historic case where no `kb_article_versions` row exists
+/// at execution time; the write path resolves `MAX(version_number)` and
+/// stores the id of the matching version row.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbExecutionResponse {
+    pub id: Uuid,
+    pub ticket_id: Uuid,
+    pub article_id: Uuid,
+    pub article_name: String,
+    pub article_version_id: Option<Uuid>,
+    pub variable_values: std::collections::BTreeMap<String, String>,
+    pub started_at: DateTime<Utc>,
+    pub started_by_user_id: Uuid,
+    pub started_by_name: String,
+    pub steps: Vec<KbExecutionStepResponse>,
+}
+
+/// Row for the list endpoint, one per execution on a ticket. The
+/// rolled-up `total_steps` / `checked_steps` lets the ticket panel
+/// render progress without a per-execution fetch.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbExecutionSummary {
+    pub id: Uuid,
+    pub ticket_id: Uuid,
+    pub article_id: Uuid,
+    pub article_name: String,
+    pub article_version_id: Option<Uuid>,
+    pub started_at: DateTime<Utc>,
+    pub started_by_user_id: Uuid,
+    pub started_by_name: String,
+    pub total_steps: i64,
+    pub checked_steps: i64,
+}
+
+/// `POST /api/v1/tickets/{ticket_id}/kb-executions`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreateKbExecutionRequest {
+    pub article_id: Uuid,
+    /// Caller-supplied template variable values; same shape and
+    /// validation as `RenderKbArticleRequest`. An absent or empty
+    /// `values` is `{}`.
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, String>,
+}
+
+/// `PATCH /api/v1/kb-executions/{id}/steps/{index}`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CheckKbExecutionStepRequest {
+    pub checked: bool,
 }
 
 /// Returned by the helpful / not_helpful feedback endpoints so the portal

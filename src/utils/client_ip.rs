@@ -40,6 +40,7 @@ static TRUSTED_PROXIES: OnceLock<Vec<IpNetwork>> = OnceLock::new();
 /// skipped with a warning rather than aborting boot, so a single typo cannot
 /// take the server down; if every configured entry is invalid the list is
 /// empty and the forwarded header is trusted from no one (peer address wins).
+// SPEC-4.13: skip unparseable CIDR entries with a warning, fall back to the built-in default list.
 pub fn trusted_proxies() -> &'static [IpNetwork] {
     // PMS-982: the value comes from the configuration provider; the `OnceLock`
     // stays, so when it is read is unchanged.
@@ -76,6 +77,7 @@ fn is_trusted(ip: IpAddr, trusted: &[IpNetwork]) -> bool {
 /// accidental `:port` suffix or `[ipv6]:port` bracket form. Returns `None`
 /// for anything that is not a recognisable address (garbled header), so the
 /// caller skips it rather than panicking.
+// SPEC-4.16: bare address, bracketed IPv6 with optional :port, or IPv4 host:port; else None.
 fn parse_forwarded_ip(element: &str) -> Option<IpAddr> {
     // Bare address first: covers IPv4 and bracketless IPv6 (which contains
     // colons, so it must be tried before the `host:port` split below).
@@ -109,6 +111,8 @@ fn parse_forwarded_ip(element: &str) -> Option<IpAddr> {
 /// `peer` is NOT trusted (a direct client, possibly spoofing the header) the
 /// header is ignored entirely and `peer` is returned. Never panics on a
 /// missing or garbled header.
+// SPEC-4.14, SPEC-4.15: untrusted peer returns peer; trusted peer walks the
+// forwarded chain right to left for the first untrusted address, else peer.
 pub fn extract_client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNetwork]) -> IpAddr {
     if !is_trusted(peer, trusted) {
         return peer;

@@ -1,3 +1,5 @@
+# SPEC-1 and 2.148: documentation data for scripts/config-docs.nu, not read by declare_keys! or any
+# Rust code; it carries since/required/changelog facts for variables read outside the registry.
 # Release facts `declare_keys!` cannot carry (PMS-1442); `just config-docs` renders them.
 # [[variable]]: read outside crate::config::get; `required` = boot refuses it outside dev/test.
 
@@ -26,6 +28,24 @@ required = false
 reader = "src/app_secrets/mod.rs"
 
 [[variable]]
+name = "BUNYIP_SECRETS_URL"
+since = "v0.18.0"
+required = false
+reader = "src/app_secrets/bunyip.rs"
+
+[[variable]]
+name = "BUNYIP_SECRETS_CLIENT_ID"
+since = "v0.18.0"
+required = false
+reader = "src/app_secrets/bunyip.rs"
+
+[[variable]]
+name = "BUNYIP_SECRETS_CLIENT_SECRET"
+since = "v0.18.0"
+required = false
+reader = "src/app_secrets/bunyip.rs"
+
+[[variable]]
 name = "GOOGLE_CONTACTS_CLIENT_ID"
 since = "v0.14.0"
 required = false
@@ -45,6 +65,42 @@ reader = "src/app_secrets/mod.rs"
 
 [[variable]]
 name = "MICROSOFT_CONTACTS_CLIENT_SECRET"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "QUICKBOOKS_CLIENT_ID"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "QUICKBOOKS_CLIENT_SECRET"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "QUICKBOOKS_VERIFIER_TOKEN"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "XERO_CLIENT_ID"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "XERO_CLIENT_SECRET"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "XERO_WEBHOOK_KEY"
 since = "v0.17.0"
 required = false
 reader = "src/app_secrets/mod.rs"
@@ -266,6 +322,15 @@ feature = "application-tier secrets (`SMTP_PASSWORD` for outbound mail, the Goog
 action = "Now selects tenant-tier secrets only. If you set it expecting application secrets (`SMTP_PASSWORD`, the Google client pair) to move too, also set `APP_SECRET_BACKEND` to the same provider before restarting."
 
 [[change]]
+release = "v0.17.0"
+group = "Added"
+variables = ["XERO_CLIENT_ID", "XERO_CLIENT_SECRET", "XERO_WEBHOOK_KEY", "QUICKBOOKS_CLIENT_ID", "QUICKBOOKS_CLIENT_SECRET", "QUICKBOOKS_VERIFIER_TOKEN"]
+issue = "MAPPS-1139"
+breaking = "feature-off"
+feature = "delegated invoice issuing through Xero and QuickBooks"
+action = "Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh."
+
+[[change]]
 release = "v0.16.0"
 group = "Changed"
 variables = ["GOOGLE_CONTACTS_CLIENT_ID", "GOOGLE_CONTACTS_CLIENT_SECRET"]
@@ -286,7 +351,7 @@ release = "v0.15.0"
 group = "Added"
 variables = ["STORAGE_PROVIDER", "STORAGE_ROOT", "STORAGE_S3_ENDPOINT", "STORAGE_S3_BUCKET", "STORAGE_S3_REGION", "STORAGE_S3_PATH_STYLE", "STORAGE_S3_ACCESS_KEY_ID", "STORAGE_S3_SECRET_ACCESS_KEY"]
 issue = "PMS-1317"
-action = "Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit."
+action = "Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443)."
 
 [[change]]
 release = "v0.14.0"
@@ -422,3 +487,10 @@ variables = ["JWT_SECRET", "ENCRYPTION_KEY"]
 issue = "PMS-499"
 breaking = "wont-start"
 action = "Now required outside dev/test: boot refuses an unset value or the built-in dev value. Set a real secret before restarting."
+
+[[change]]
+release = "v0.18.0"
+group = "Added"
+variables = ["BUNYIP_SECRETS_URL", "BUNYIP_SECRETS_CLIENT_ID", "BUNYIP_SECRETS_CLIENT_SECRET"]
+issue = "PMS-1537"
+action = "Optional, and set together or not at all. A hosted deployment points these at bunyip's host-secrets route and the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is then read from there instead of from this deployment's own provider: an operator sets it once in bunyip under Admin > Mokosh. A URL with only one half of the credential refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says."

@@ -6,7 +6,7 @@ sitting rather than an afternoon of rediscovering how to force each condition.
 ## What this covers, and what it does not
 
 The suites already drive every shape below through the real engine against a real Postgres, with the provider
-faked: `tests/contact_sync_engine.rs::the_awkward_account_imports_through_the_engine` imports one account holding
+faked: `tests/suites/contact_sync_engine.rs::the_awkward_account_imports_through_the_engine` imports one account holding
 all six awkward shapes and asserts what lands in `contacts`, and `contact_sync::google`'s own tests drive the
 People API's wire format against a stub that answers pages, a `410`, a `429` and a `403`.
 
@@ -33,7 +33,7 @@ fails, suspect the assumption about Google rather than the code, and check the s
 
 Import the two files in [`google-contacts-seed/`](google-contacts-seed/) rather than typing seven contacts. They
 hold the same values the offline test drives
-(`tests/contact_sync_engine.rs::the_awkward_account_imports_through_the_engine`), so a difference in what lands is
+(`tests/suites/contact_sync_engine.rs::the_awkward_account_imports_through_the_engine`), so a difference in what lands is
 a difference in Google rather than in the data, which is the whole point of this pass.
 
 At <https://contacts.google.com>, left rail, Import, Select file:

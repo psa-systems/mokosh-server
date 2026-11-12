@@ -62,22 +62,20 @@ impl DocumentationService {
             company_id: Some(company_id),
             ..AssetFilter::default()
         };
-        let (assets, _total_assets) = self
-            .assets
-            .list_assets(tenant_id, &asset_filter, &page)
-            .await?;
-
-        let credentials = self
-            .assets
-            .list_credentials_for_company(tenant_id, company_id)
-            .await?;
-
         let kb_filter = KbArticleFilter {
             company_id: Some(company_id),
             ..KbArticleFilter::default()
         };
-        let (articles, _total_articles) =
-            self.kb.list_articles(tenant_id, &kb_filter, &page).await?;
+
+        // Each call opens its own transaction over an independent, bounded
+        // query with no ordering dependency between the three, so they run
+        // concurrently.
+        #[rustfmt::skip]
+        let ((assets, _total_assets), credentials, (articles, _total_articles)) = tokio::try_join!(
+            self.assets.list_assets(tenant_id, &asset_filter, &page),
+            self.assets.list_credentials_for_company(tenant_id, company_id),
+            self.kb.list_articles(tenant_id, &kb_filter, &page)
+        )?;
 
         Ok(CompanyDocumentation {
             assets,

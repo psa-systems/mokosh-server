@@ -94,6 +94,7 @@ impl DeploymentMode {
     /// continuation is the self-hosted default. An unrecognised value is
     /// logged at `warn` so a typo is visible in the log rather than only in
     /// the absence of email a week later.
+    // SPEC-4.59: mail dispatch's reader falls back to self-hosted on an unrecognized value.
     pub fn from_env() -> Self {
         Self::parse(&raw_from_env())
     }
@@ -102,6 +103,7 @@ impl DeploymentMode {
     /// boot failure naming the legal values rather than a silent fall back to
     /// a different set of providers. See the module doc for why the two
     /// readers disagree on purpose.
+    // SPEC-4.60: provider selection's reader errors, naming the accepted values, on an unrecognized value.
     pub fn from_env_for_providers() -> AppResult<Self> {
         Self::parse_for_providers(&raw_from_env())
     }
@@ -136,6 +138,7 @@ impl DeploymentMode {
 
     /// The vocabulary, in one place, so the lenient and the strict reader
     /// cannot come to accept different values.
+    // SPEC-4.61: case-insensitive, trimmed; an empty value means self-hosted, same as absent.
     fn recognise(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             // An empty value is what a forwarded-but-unset compose key looks
@@ -163,6 +166,15 @@ impl DeploymentMode {
         match self {
             Self::SelfHosted => &SELF_HOSTED_PROVIDER_DEFAULTS,
             Self::Saas => &SAAS_PROVIDER_DEFAULTS,
+        }
+    }
+
+    /// The profile's per-secret provider declarations (PMS-1537). Empty for
+    /// every profile that declares none, which is the common case.
+    pub fn default_secret_providers(self) -> &'static [SecretProviderDefault] {
+        match self {
+            Self::SelfHosted => &SELF_HOSTED_SECRET_PROVIDERS,
+            Self::Saas => &SAAS_SECRET_PROVIDERS,
         }
     }
 
@@ -202,6 +214,7 @@ impl DeploymentMode {
     /// wins for its kind; the kinds nobody overrode keep the profile's row and
     /// are recorded as such, which is what makes a provider left on by a
     /// default visible rather than assumed.
+    // SPEC-4.62: an explicit per-capability override wins for that capability only; the source of each choice is recorded.
     pub fn resolve_providers(self, overrides: &ProviderOverrides) -> ProviderSelection {
         let choices = ProviderKind::ALL
             .iter()
@@ -362,6 +375,7 @@ pub mod provider {
 /// image boots and serves with no Bunyip, no Infisical and no object store"
 /// means concretely; `the_self_hosted_defaults_need_no_external_service`
 /// enforces it.
+// SPEC-4.63: the self-hosted profile's defaults name none of these.
 pub const EXTERNAL_SERVICE_PROVIDERS: &[&str] = &[
     provider::INFISICAL,
     provider::BUNYIP,
@@ -454,6 +468,44 @@ pub const SAAS_PROVIDER_DEFAULTS: [ProviderDefaults; 5] = [
     },
 ];
 
+/// PMS-1537: the secrets a hosting profile declares to a provider OTHER than
+/// the one its `ProviderKind::Secrets` row names, as `(secret name, provider
+/// name)`.
+///
+/// A per-secret declaration, not a precedence chain: every secret still has
+/// exactly one provider, and this table says which when it is not the
+/// process's. It exists because bunyip holds the suite's Google OAuth client
+/// (BUNYIP-983) and nothing else of Mokosh's: declaring the whole tier to
+/// bunyip would leave `SMTP_PASSWORD` and the three invoicing client pairs
+/// resolving to nothing.
+///
+/// Secret NAMES rather than `GovernedSecret` values, for the reason the
+/// provider rows are names: this module holds the deployment shape and must
+/// not depend on the secret registry, which depends on it.
+pub struct SecretProviderDefault {
+    pub secret: &'static str,
+    pub provider: &'static str,
+}
+
+/// `self-hosted` declares none: a self-hosted Mokosh has no bunyip to read
+/// from, and its Google client (if it has one) is its own.
+pub const SELF_HOSTED_SECRET_PROVIDERS: [SecretProviderDefault; 0] = [];
+
+/// `saas` reads the Google OAuth client pair from bunyip, which is where an
+/// operator sets it once for the whole suite (BUNYIP-983, PMS-1537). Both
+/// halves, because they are one key over there and a half-declared pair is
+/// the shape PMS-1430 made a boot error.
+pub const SAAS_SECRET_PROVIDERS: [SecretProviderDefault; 2] = [
+    SecretProviderDefault {
+        secret: "GOOGLE_CONTACTS_CLIENT_ID",
+        provider: provider::BUNYIP,
+    },
+    SecretProviderDefault {
+        secret: "GOOGLE_CONTACTS_CLIENT_SECRET",
+        provider: provider::BUNYIP,
+    },
+];
+
 /// Who decided a kind's providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnablementSource {
@@ -482,7 +534,7 @@ impl fmt::Display for EnablementSource {
 ///
 /// A kind with no entry takes the profile's default. This is deliberately not
 /// an env reader: each capability already owns the one reader of its own
-/// selection variable (`SECRET_BACKEND` in `crate::secrets`, `STORAGE_BACKEND`
+/// selection variable (`SECRET_BACKEND` in `crate::secrets`, `STORAGE_PROVIDER`
 /// in `crate::storage`, `SMTP_HOST` in `crate::utils::email`), and a second
 /// reader here is exactly how two parts of one process come to disagree about
 /// what is serving a capability. The callers hand over what they resolved, so
@@ -600,6 +652,49 @@ mod tests {
     fn the_default_is_self_hosted() {
         assert_eq!(DeploymentMode::default(), DeploymentMode::SelfHosted);
         assert!(!DeploymentMode::default().is_saas());
+    }
+
+    /// PMS-1537: `saas` reads the Google client pair from bunyip and nothing
+    /// else, and `self-hosted` reads nothing from bunyip.
+    ///
+    /// BOTH halves or neither: PMS-1430 made a half-configured pair a boot
+    /// error, so a table that declared the id to bunyip and left the secret on
+    /// the process provider would turn a working deployment into a refusing
+    /// one the first time somebody rotated either half.
+    #[test]
+    fn saas_declares_both_halves_of_the_google_client_to_bunyip() {
+        let declared: Vec<(&str, &str)> = DeploymentMode::Saas
+            .default_secret_providers()
+            .iter()
+            .map(|row| (row.secret, row.provider))
+            .collect();
+        assert_eq!(
+            declared,
+            vec![
+                ("GOOGLE_CONTACTS_CLIENT_ID", provider::BUNYIP),
+                ("GOOGLE_CONTACTS_CLIENT_SECRET", provider::BUNYIP),
+            ]
+        );
+        assert!(
+            DeploymentMode::SelfHosted
+                .default_secret_providers()
+                .is_empty(),
+            "a self-hosted deployment has no bunyip to read from"
+        );
+    }
+
+    /// Every per-secret declaration names a provider the parser knows, in
+    /// every profile. A name this build cannot parse would refuse boot on the
+    /// deployment that uses that profile and nowhere else, which is the worst
+    /// place to find out.
+    #[test]
+    fn every_per_secret_declaration_names_a_real_provider() {
+        for mode in [DeploymentMode::SelfHosted, DeploymentMode::Saas] {
+            for row in mode.default_secret_providers() {
+                crate::app_secrets::AppSecretProviderKind::parse_name(row.provider)
+                    .unwrap_or_else(|e| panic!("{mode:?} declares {}: {e}", row.secret));
+            }
+        }
     }
 
     #[test]

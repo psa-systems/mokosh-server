@@ -1,3 +1,4 @@
+# SPEC-10.214: none of these paths are ever committed under e2e/.
 # Playwright / Node artifacts - never committed.
 node_modules/
 .auth/

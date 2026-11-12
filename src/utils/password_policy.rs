@@ -175,6 +175,7 @@ pub fn validate(
     context_hints: &[&str],
     policy: PasswordPolicy,
 ) -> Result<(), PasswordPolicyError> {
+    // SPEC-4.25: length floor and ceiling checked first, before blocklist or score.
     // 1. Length checks.
     let len = password.chars().count();
     if len < policy.min_length {
@@ -190,6 +191,7 @@ pub fn validate(
         )));
     }
 
+    // SPEC-4.26: raw lowercase or @/$-normalized form against the common-password list.
     // 2. Blocklist. Compare against the raw + normalized forms so
     // `P@ssword` (raw) fails on the normalized bucket even if not in the
     // literal list.
@@ -205,6 +207,7 @@ pub fn validate(
         ));
     }
 
+    // SPEC-4.27: reject below min_zxcvbn_score, scored with caller context hints.
     // 3. zxcvbn strength score. Context hints let the scorer knock down
     // credentials that quote the user's own email / tenant / name.
     // `zxcvbn::zxcvbn` returns `Result<Entropy, ZxcvbnError>` where the

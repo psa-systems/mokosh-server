@@ -59,6 +59,8 @@ impl FormsService {
     /// predicate below). Drafts are private working state: another user in the
     /// same tenant must not see a half-built form, so ownership is a filter on
     /// every read, not a check applied after fetching.
+    // SPEC-7.298: returns only drafts owned by the calling user, filtered by tenant (RLS)
+    // and user_id in the WHERE predicate, ordered by updated_at DESC.
     pub async fn list_form_drafts(
         &self,
         tenant_id: TenantId,
@@ -97,9 +99,13 @@ impl FormsService {
     ) -> AppResult<FormDraftResponse> {
         // Measured on the serialised form, which is what is stored and what a
         // caller controls, rather than on any in-memory size.
+        // SPEC-7.300: a payload that fails to serialize to JSON is rejected with a
+        // bad-request error naming the failure.
         let size = serde_json::to_vec(&req.payload)
             .map_err(|e| AppError::BadRequest(format!("Draft payload is not storable: {e}")))?
             .len();
+        // SPEC-7.299: a serialized payload over MAX_PAYLOAD_BYTES (262144) is rejected
+        // loudly with the exact size and limit, never silently truncated.
         if size > MAX_PAYLOAD_BYTES {
             return Err(AppError::BadRequest(format!(
                 "That draft is too large to save ({size} bytes; the limit is {MAX_PAYLOAD_BYTES})"
@@ -112,6 +118,8 @@ impl FormsService {
         // draft row, but without this a caller could file a draft against
         // another tenant's definition id and get it back on every list, which
         // leaks that the id exists.
+        // SPEC-7.301: form_definition_id must resolve to a definition in the caller's own
+        // tenant, else NotFound("Form"), so a draft cannot echo back another tenant's id.
         if let Some(definition_id) = req.form_definition_id {
             let exists: Option<Uuid> = sqlx::query_scalar(
                 "SELECT id FROM form_definitions WHERE tenant_id = $1 AND id = $2",
@@ -127,6 +135,8 @@ impl FormsService {
 
         let returning =
             "RETURNING id, form_definition_id, payload ->> 'name' AS name, payload, updated_at";
+        // SPEC-7.302: single atomic INSERT ON CONFLICT DO UPDATE per partial unique index, so
+        // two overlapping autosave writes race into an UPDATE, not a duplicate row or conflict.
         let row = match req.form_definition_id {
             Some(definition_id) => {
                 sqlx::query_as::<_, FormDraftResponse>(&format!(
@@ -165,6 +175,8 @@ impl FormsService {
     /// `user_id` is part of the predicate rather than checked afterwards, so a
     /// draft belonging to someone else is a 404 and not a 403: the caller
     /// should not learn that the id exists.
+    // SPEC-7.303: user_id is part of the DELETE predicate; deleting 0 rows (including someone
+    // else's draft) is a 404 "Draft", not a 403, so the caller cannot learn the id exists.
     pub async fn delete_form_draft(
         &self,
         tenant_id: TenantId,
@@ -229,6 +241,8 @@ impl FormsService {
             tx.commit().await
         }
         .await;
+        // SPEC-7.304: best-effort; a database error here is only logged and never
+        // propagates to fail the caller's create/update request.
         if let Err(e) = result {
             tracing::warn!(error = ?e, "could not clear the form draft after a save");
         }

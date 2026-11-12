@@ -412,8 +412,16 @@ mod tests {
                     // MAPPS-1101: this fake only exercises the Google
                     // pair; Microsoft's writable surface is a separate
                     // follow-up and this test does not drive it.
+                    // MAPPS-1139: the invoice-issuer apps are the host's
+                    // too, and this fake drives none of them.
                     GovernedSecret::MicrosoftContactsClientId
-                    | GovernedSecret::MicrosoftContactsClientSecret => return None,
+                    | GovernedSecret::MicrosoftContactsClientSecret
+                    | GovernedSecret::XeroClientId
+                    | GovernedSecret::XeroClientSecret
+                    | GovernedSecret::XeroWebhookKey
+                    | GovernedSecret::QuickbooksClientId
+                    | GovernedSecret::QuickbooksClientSecret
+                    | GovernedSecret::QuickbooksVerifierToken => return None,
                 })
             }
         }
@@ -510,7 +518,13 @@ mod tests {
                     }
                     GovernedSecret::SmtpPassword
                     | GovernedSecret::MicrosoftContactsClientId
-                    | GovernedSecret::MicrosoftContactsClientSecret => None,
+                    | GovernedSecret::MicrosoftContactsClientSecret
+                    | GovernedSecret::XeroClientId
+                    | GovernedSecret::XeroClientSecret
+                    | GovernedSecret::XeroWebhookKey
+                    | GovernedSecret::QuickbooksClientId
+                    | GovernedSecret::QuickbooksClientSecret
+                    | GovernedSecret::QuickbooksVerifierToken => None,
                 }
             }
             async fn set(&self, secret: GovernedSecret, value: &str) -> AppResult<()> {
@@ -527,7 +541,13 @@ mod tests {
                     }
                     GovernedSecret::SmtpPassword
                     | GovernedSecret::MicrosoftContactsClientId
-                    | GovernedSecret::MicrosoftContactsClientSecret => {}
+                    | GovernedSecret::MicrosoftContactsClientSecret
+                    | GovernedSecret::XeroClientId
+                    | GovernedSecret::XeroClientSecret
+                    | GovernedSecret::XeroWebhookKey
+                    | GovernedSecret::QuickbooksClientId
+                    | GovernedSecret::QuickbooksClientSecret
+                    | GovernedSecret::QuickbooksVerifierToken => {}
                 }
                 Ok(())
             }

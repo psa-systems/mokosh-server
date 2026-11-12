@@ -13,16 +13,30 @@
 #
 # PMS-1252: `cache-warm.yml` fills the shared build cache after merge (push to
 # main writes under forgejo-runner's empty isolation key, which every later
-# pull-request run can read). It compiles what this job compiles and runs
+# pull-request run can read). It compiles what the cargo job compiles and runs
 # nothing, so the "same tree twice" trap the deleted `check-single-build.nu`
 # existed to catch does not fire for the warm run.
 #
-# The steps below are spelled out rather than delegated to `just`, so they drift
-# from the local recipes silently. `just check` covers every step here except
-# the two cargo test ones, and `just pre-push` covers those plus fmt / clippy
-# / compile; running both locally covers this workflow. Keep the three in step
-# and record any deliberate difference in docs/dev-docs/local-vs-ci-checks.md
-# (PMS-851).
+# PMS-1640: the work splits across two parallel jobs. `cargo` runs on the
+# dev-heavy runner for fmt / clippy / unit / doc / machete, because only that
+# image carries `cc` / `gcc` / `ld` + OpenSSL headers (PMS-705, CLAUDE-203).
+# `guards` runs on base-medium for every nu-script check, migrations, env
+# parity, docs and route consumers. The two go green independently; the merge
+# gate waits on both. `secrets` keeps its own base-medium job unchanged.
+#
+# PMS-1652: `classify` calls the shared `classify-diff` composite action from
+# `common` (PC-134, STD-3.1/STD-3.2) instead of a local script or a
+# workflow-level path filter. `cargo`'s clippy/unit/doc-test/machete steps run
+# only when the result is `code`; its fmt step runs on anything but
+# `non-code`. `guards` and `secrets` stay ungated: several guards exist to run
+# on doc changes (see integration.yml's own comment on this).
+#
+# The cargo steps are spelled out rather than delegated to `just`, so they
+# drift from the local recipes silently. `just check` covers every step in
+# both jobs except the two cargo test ones, and `just pre-push` covers those
+# plus fmt / clippy / compile; running both locally covers this workflow.
+# Keep the three in step and record any deliberate difference in
+# docs/dev-docs/local-vs-ci-checks.md (PMS-851).
 name: Check
 
 on:
@@ -41,9 +55,33 @@ on:
     branches:
       - main
 
+# PMS-1633: supersede obsolete PR runs. `github.ref` is unique per PR on
+# pull_request events (refs/pull/<N>/merge), so two open PRs never share a
+# group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  check:
-    name: fmt + clippy + build + tests
+  classify:
+    name: classify diff
+    # PMS-1652: only diffs file paths and comment/whitespace lines, no
+    # compile.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    outputs:
+      result: ${{ steps.classify.outputs.result }}
+    steps:
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v5
+
+      - name: Classify diff
+        id: classify
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/classify-diff@main
+
+  cargo:
+    needs: classify
+    if: needs.classify.outputs.result != 'non-code'
+    name: fmt + clippy + tests + machete
     # Dev label: this job compiles Rust natively on the runner, and only the
     # dev image carries `cc` / `gcc` / `ld` plus the OpenSSL headers openssl-sys
     # probes. Base fails at `linker cc not found` (PMS-705, CLAUDE-203).
@@ -52,9 +90,154 @@ jobs:
     # Backstop, not a target (PMS-829): 38 green runs between 2026-08-22 and
     # 2026-08-24 took 1.9-9.0 minutes, median 3.5. The headroom is for a cold
     # `rust-cache`, which none of those runs exercised and which recompiles the
-    # whole workspace. No step here has a reporting block to protect, so this
-    # is the job bound only, with no inner `timeout` wrapper.
-    timeout-minutes: 30
+    # whole workspace. PR 1276's run 11778 hit 30m with a cold cache on a
+    # loaded HEAVY runner; 45 absorbs a cache-miss full workspace rebuild +
+    # clippy/tests/machete without flapping on runner load, while leaving the
+    # cache-hit path (~3.5m) comfortably ahead of the bound.
+    # No step here has a reporting block to protect, so this is the job bound
+    # only, with no inner `timeout` wrapper.
+    timeout-minutes: 45
+
+    steps:
+      - name: Clone the repository
+        # No fetch-depth: 0 and no submodules here: this job compiles and runs
+        # cargo only. The migration-immutability check (needs origin/main) and
+        # every `just check-*` recipe (needs common/common.just) live in the
+        # guards job below, which checks out deep + submodules on purpose.
+        uses: https://code.forgejo.org/actions/checkout@v5
+
+      - name: Cap build parallelism
+        # nproc/2 cap: never claim more than half the host (see "Concurrency
+        # cap" in CI.md of dev.a8n.run/niceguyit/governance; not a file in
+        # this repository).
+        # PMS-1652: only the compile/test steps below need this; skip it on
+        # comments-only PRs along with them.
+        if: needs.classify.outputs.result == 'code'
+        run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
+
+      - name: Cache Rust build
+        # PMS-1252: `shared-key` MUST match `cache-warm.yml`'s warm-check
+        # job so a pull-request run restores what the post-merge warm
+        # saved. The key lands in rust-cache's key material as the
+        # `-check-` segment.
+        # PMS-1652: only the compile/test steps below read this cache.
+        if: needs.classify.outputs.result == 'code'
+        uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          cache-on-failure: true
+
+      - name: Build target storage
+        # PMS-973: the shared development machines carry a large tmpfs at /tmp
+        # (46 GB on desktop-02) and this workspace's target directory runs to
+        # tens of gigabytes, so a `CARGO_TARGET_DIR` pointed at memory spends the
+        # resource those hosts are actually short of. The variable can be set by
+        # a shell profile, an editor or an agent, none of which travel with the
+        # checkout, which is why this is a check rather than a setting. The
+        # runner is ephemeral, so if a runner image ever puts the workspace on a
+        # tmpfs this step is the notice, and `MOKOSH_ALLOW_TMPFS_TARGET=true`
+        # here is the documented way to accept it. Stays in the cargo job
+        # because the claim it makes only has meaning on the runner that
+        # actually compiles.
+        # PMS-1652: only matters for the compile/test steps below.
+        if: needs.classify.outputs.result == 'code'
+        shell: nu {0}
+        run: |
+          nu scripts/check-build-target-storage.nu
+
+      - name: Check formatting
+        # PMS-1652: runs on `code` and `comments-only` alike (STD-3.2); only
+        # `non-code` skips it, via the job-level `if:` above.
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        # PMS-1635: clippy IS the compile+lint gate; a separate `cargo check`
+        # revalidates fingerprints clippy just computed. `--workspace` matters
+        # per PMS-893: without it, mokosh-types' test target silently stops
+        # compiling (its fixture lost a field in PMS-730 and no gate caught it
+        # until `--workspace` landed on this step).
+        # PMS-1652: STD-3.1 skips compile/test work on `comments-only`.
+        if: needs.classify.outputs.result == 'code'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Unit tests
+        # PMS-893: `--workspace` runs the shared crate's 83 tests, which had
+        # never executed anywhere. mokosh-types is the client/server wire
+        # contract; its tests are the ones that most need to run.
+        if: needs.classify.outputs.result == 'code'
+        run: cargo test --workspace --lib
+
+      - name: Doc tests
+        # Runs the doctests, including the PMS-139 `compile_fail` guard that
+        # pins "a raw Uuid cannot be passed where a TenantId is required".
+        # `--lib` above does not execute doctests.
+        if: needs.classify.outputs.result == 'code'
+        run: cargo test --workspace --doc
+
+      - name: Cache cargo-machete tarball
+        # PMS-1641: version-keyed tarball cache. A hit skips the ~5s
+        # download; a version bump misses the key, downloads once, and
+        # the sha256 check below is the safety net if a wrong-version
+        # file somehow comes back. Bump this key literal in step with
+        # MACHETE_VERSION in the next step.
+        if: needs.classify.outputs.result == 'code'
+        uses: https://github.com/actions/cache@v4
+        with:
+          path: /tmp/machete.tar.gz
+          key: cargo-machete-tarball-0.9.2-linux
+
+      - name: Unused dependencies
+        # PMS-780: `pulldown-cmark` and `minijinja` were declared with no call
+        # site and compiled on every cold build. The manifest is clean now, so
+        # this gate is blocking rather than advisory: a dependency with no use
+        # fails the PR instead of waiting for the next audit.
+        #
+        # PMS-1251: `cargo install --locked cargo-machete` compiled machete and
+        # its dependency tree from source on every cache-miss run. cargo-machete
+        # publishes a linux x86_64 binary (musl, statically linked, so it runs
+        # on this glibc dev image too) with its own published `.sha256` file on
+        # its release page, verified below instead of trusted.
+        #
+        # `ghcr.io/niceguyit/rust-builder-glibc` sets CARGO_HOME=/usr/local/cargo
+        # and puts only that on PATH, not `~/.cargo/bin` (`~` is `/root` in
+        # this image but `/root/.cargo/bin` is never added to PATH, and the
+        # directory does not even exist yet). `${CARGO_HOME:-$HOME/.cargo}/bin`
+        # is where `cargo` actually looks.
+        if: needs.classify.outputs.result == 'code'
+        env:
+          MACHETE_VERSION: "0.9.2"
+          MACHETE_SHA256: "48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9"
+        run: |
+          set -euo pipefail
+          archive="cargo-machete-v${MACHETE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          if [ ! -s /tmp/machete.tar.gz ]; then
+            curl --silent --fail --location --output /tmp/machete.tar.gz \
+              "https://github.com/bnjbvr/cargo-machete/releases/download/v${MACHETE_VERSION}/${archive}"
+          fi
+          echo "${MACHETE_SHA256}  /tmp/machete.tar.gz" | sha256sum --check --strict
+          tar --extract --gzip --file /tmp/machete.tar.gz --directory /tmp
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          mkdir -p "${cargo_bin}"
+          install -m 755 "/tmp/cargo-machete-v${MACHETE_VERSION}-x86_64-unknown-linux-musl/cargo-machete" "${cargo_bin}/cargo-machete"
+          cargo machete
+
+  guards:
+    # PMS-1652: ungated. Several guards exist to run on doc changes (see
+    # integration.yml's own comment on this), so `guards` does not depend on
+    # `classify` at all.
+    name: nu guards + migrations + routes
+    # Base label: nothing in this job invokes `cargo`. Every step is a nu
+    # script, a `just` recipe (just comes from the common submodule), or a
+    # git-based check. The dev image's compile toolchain would sit idle, so
+    # take a base-medium slot and leave dev-heavy for the cargo job above.
+    # `check-runner-labels.nu` below asserts the dev label is reserved for
+    # jobs that compile; this job does not, so the rule is satisfied.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+
+    # Backstop, not a target. The guard set is ~20 shell / nu invocations that
+    # each take seconds; the full job runs in well under a minute on a warm
+    # runner. The budget below absorbs a cold clone + submodule init.
+    timeout-minutes: 15
 
     steps:
       - name: Clone the repository
@@ -72,6 +255,26 @@ jobs:
           # immutability and is unrelated.
           submodules: true
 
+      - name: Detect routing-relevant changes
+        # PMS-1637: the mokosh-apps clone + route-consumers check below
+        # cost 5-15s on every PR but only matter when THIS repo changes
+        # a mounted route or the guard script itself. Gate both on an
+        # explicit git-diff against the base ref (fetch-depth: 0 above
+        # makes origin/<base> reachable). A PR that touches none of
+        # these paths skips both; one that touches any of them runs
+        # them. Grep over --name-only rather than a path-filter action:
+        # no new dependency and the pattern is reviewable in place.
+        id: routes
+        run: |
+          set -euo pipefail
+          base="origin/${{ github.base_ref }}"
+          if git diff --name-only "$base...HEAD" \
+               | grep --quiet -E '^(src/modules/[^/]+/.*\.rs|src/api/router\.rs|scripts/check-route-consumers\.nu)$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Clone the mokosh-apps sibling
         # check-route-consumers.nu compares mounted routes against the SPA
         # source. Without this checkout the guard skips loudly and drift
@@ -79,28 +282,13 @@ jobs:
         # token: the runner's own credentials are scoped to mokosh-server,
         # so a bare checkout stalls at "Determining the default branch"
         # rather than reading anything from psa-systems/mokosh-apps.
+        if: steps.routes.outputs.run == 'true'
         uses: https://code.forgejo.org/actions/checkout@v5
         with:
           repository: psa-systems/mokosh-apps
           path: mokosh-apps
           fetch-depth: 1
           token: ${{ secrets.FORGEJO_PAT }}
-
-      - name: Cap build parallelism
-        # nproc/2 cap: never claim more than half the host (see "Concurrency
-        # cap" in CI.md of dev.a8n.run/niceguyit/governance; not a file in
-        # this repository).
-        run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
-
-      - name: Cache Rust build
-        # PMS-1252: `shared-key` MUST match `cache-warm.yml`'s warm-check
-        # job so a pull-request run restores what the post-merge warm
-        # saved. The key lands in rust-cache's key material as the
-        # `-check-` segment.
-        uses: https://github.com/Swatinem/rust-cache@v2
-        with:
-          shared-key: check
-          cache-on-failure: true
 
       - name: Migration prefix uniqueness
         # PMS-198: fail loud when two migrations share a numeric prefix.
@@ -239,20 +427,6 @@ jobs:
         run: |
           nu scripts/check-env-example.nu
 
-      - name: Build target storage
-        # PMS-973: the shared development machines carry a large tmpfs at /tmp
-        # (46 GB on desktop-02) and this workspace's target directory runs to
-        # tens of gigabytes, so a `CARGO_TARGET_DIR` pointed at memory spends the
-        # resource those hosts are actually short of. The variable can be set by
-        # a shell profile, an editor or an agent, none of which travel with the
-        # checkout, which is why this is a check rather than a setting. The
-        # runner is ephemeral, so if a runner image ever puts the workspace on a
-        # tmpfs this step is the notice, and `MOKOSH_ALLOW_TMPFS_TARGET=true`
-        # here is the documented way to accept it.
-        shell: nu {0}
-        run: |
-          nu scripts/check-build-target-storage.nu
-
       - name: Documented just recipes
         # PMS-843: the docs in `const DOCS` (scripts/check-doc-recipes.nu) are
         # the first commands a newcomer types. Several sites invoked a `dev-down`
@@ -302,72 +476,19 @@ jobs:
           nu scripts/check-claude-md.nu --self-test
           nu scripts/check-claude-md.nu
 
-      - name: Unused dependencies
-        # PMS-780: `pulldown-cmark` and `minijinja` were declared with no call
-        # site and compiled on every cold build. The manifest is clean now, so
-        # this gate is blocking rather than advisory: a dependency with no use
-        # fails the PR instead of waiting for the next audit.
-        #
-        # PMS-1251: `cargo install --locked cargo-machete` compiled machete and
-        # its dependency tree from source on every cache-miss run. cargo-machete
-        # publishes a linux x86_64 binary (musl, statically linked, so it runs
-        # on this glibc dev image too) with its own published `.sha256` file on
-        # its release page, verified below instead of trusted.
-        #
-        # `ghcr.io/niceguyit/rust-builder-glibc` sets CARGO_HOME=/usr/local/cargo
-        # and puts only that on PATH, not `~/.cargo/bin` (`~` is `/root` in
-        # this image but `/root/.cargo/bin` is never added to PATH, and the
-        # directory does not even exist yet). `${CARGO_HOME:-$HOME/.cargo}/bin`
-        # is where `cargo` actually looks.
-        env:
-          MACHETE_VERSION: "0.9.2"
-          MACHETE_SHA256: "48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9"
-        run: |
-          set -euo pipefail
-          archive="cargo-machete-v${MACHETE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
-          curl --silent --fail --location --output /tmp/machete.tar.gz \
-            "https://github.com/bnjbvr/cargo-machete/releases/download/v${MACHETE_VERSION}/${archive}"
-          echo "${MACHETE_SHA256}  /tmp/machete.tar.gz" | sha256sum --check --strict
-          tar --extract --gzip --file /tmp/machete.tar.gz --directory /tmp
-          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
-          mkdir -p "${cargo_bin}"
-          install -m 755 "/tmp/cargo-machete-v${MACHETE_VERSION}-x86_64-unknown-linux-musl/cargo-machete" "${cargo_bin}/cargo-machete"
-          cargo machete
-
       - name: Route consumers
         # Every mounted route needs an SPA caller or a dated parity record.
         # The mokosh-apps sibling checkout above supplies the SPA source;
         # MOKOSH_APPS_DIR points the script at it, and the script itself
-        # fails rather than skips when CI is set.
+        # fails rather than skips when CI is set. PMS-1637: gated on the
+        # same change-detection step that gates the sibling checkout, so
+        # a PR touching nothing route-shaped skips both halves.
+        if: steps.routes.outputs.run == 'true'
         shell: nu {0}
         env:
           MOKOSH_APPS_DIR: mokosh-apps
         run: |
           nu scripts/check-route-consumers.nu
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Compile check
-        # PMS-893: `--workspace`, because without it this checks the root
-        # package only. crates/mokosh-types' test target had not compiled since
-        # PMS-730 added a field its fixture never got, and no gate noticed.
-        run: cargo check --workspace --all-targets
-
-      - name: Unit tests
-        # PMS-893: `--workspace` runs the shared crate's 83 tests, which had
-        # never executed anywhere. mokosh-types is the client/server wire
-        # contract; its tests are the ones that most need to run.
-        run: cargo test --workspace --lib
-
-      - name: Doc tests
-        # Runs the doctests, including the PMS-139 `compile_fail` guard that
-        # pins "a raw Uuid cannot be passed where a TenantId is required".
-        # `--lib` above does not execute doctests.
-        run: cargo test --workspace --doc
 
   secrets:
     name: secrets scan
@@ -428,5 +549,16 @@ jobs:
           # suppresses the specific URL shapes everywhere they appear in
           # git history. The regex is deliberately narrow: each
           # alternative names a specific throwaway credential pair.
-          kingfisher_skip_regex: "postgres://(postgres:postgres|unused:unused|user:(pass|p=ssw=rd)|infisical:\\(\\$infisical_pg_password\\)|[^@:]+:\\(\\$[a-z_]+\\))@"
+          #
+          # MAPPS-1134 adds the second alternative. The first version of
+          # `tests/suites/invoice_issuer_delegation.rs` seeded its Xero and
+          # QuickBooks fixtures as `json!` literals, and an object carrying
+          # `client_id`, `client_secret` and `refresh_token` is the GCP
+          # authorized-user credential shape, which the scan reads as a
+          # Google credential. The fixtures are built from the real structs
+          # now and the working tree is clean, but the first commit's blob
+          # stays reachable through `.git/objects/`, where `--exclude` does
+          # not go. The alternative names those eight throwaway values and
+          # nothing else.
+          kingfisher_skip_regex: "postgres://(postgres:postgres|unused:unused|user:(pass|p=ssw=rd)|infisical:\\(\\$infisical_pg_password\\)|[^@:]+:\\(\\$[a-z_]+\\))@|(client|secret|refresh|access)-(abc|qbo)"
           noseyparker_ignore_file: .noseyparker-ignore.txt

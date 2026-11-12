@@ -33,10 +33,10 @@ use crate::utils::error::{AppError, AppResult};
 const STATE_TTL_MINUTES: i64 = 10;
 
 /// The provider this phase implements.
-const GOOGLE: &str = "google";
+pub(crate) const GOOGLE: &str = "google";
 /// MAPPS-1101: the Microsoft 365 provider discriminator used throughout the
 /// state table, the connections table, and the dispatch factory.
-const MICROSOFT: &str = "microsoft";
+pub(crate) const MICROSOFT: &str = "microsoft";
 
 #[derive(Clone)]
 pub struct ContactSyncService {
@@ -177,6 +177,21 @@ pub struct ContactSyncOverview {
     /// existing client reads `connection` and a tenant holding both is the point:
     /// two cards, two credentials, two selections, one response.
     pub icloud_connection: Option<ConnectionStatus>,
+    /// This deployment's host has an Entra ID client, the Microsoft half of
+    /// `configured` (MAPPS-1101). Without one nobody on the deployment can
+    /// connect, and the card says so rather than offering a button whose only
+    /// outcome is a 500 an admin cannot act on.
+    pub microsoft_configured: bool,
+    /// `integrations/microsoft_contacts_enabled` (PMS-1512), the Microsoft 365
+    /// half of `enabled`.
+    ///
+    /// MAPPS-1124: MAPPS-1101 shipped the Graph client, the Entra OAuth routes
+    /// and the sync dispatch, and this response never grew the pair that lets a
+    /// Settings page draw any of it. A provider the server can sync and the
+    /// client cannot see is a provider nobody can turn on.
+    pub microsoft_enabled: bool,
+    /// The Microsoft 365 connection, `null` when there is none.
+    pub microsoft_connection: Option<ConnectionStatus>,
 }
 
 /// What one connection looks like to the Settings card.
@@ -560,9 +575,18 @@ impl ContactSyncService {
         };
         // Same refusal for consumed, expired and wrong-secret: a caller
         // probing state ids learns nothing from the difference.
-        let usable = consumed_at.is_none()
-            && expires_at > Utc::now()
-            && verify_password(secret, &state_hash).await.unwrap_or(false);
+        let not_consumed_and_fresh = consumed_at.is_none() && expires_at > Utc::now();
+        // PMS-1577: a verification error (corrupt stored hash, Argon2
+        // failure) is not the same answer as a genuine wrong secret, so it
+        // is logged distinctly before falling through to the same refusal.
+        let usable = not_consumed_and_fresh
+            && match verify_password(secret, &state_hash).await {
+                Ok(matches) => matches,
+                Err(e) => {
+                    tracing::warn!(state_id = %state_id, error = %e, "oauth state secret verification failed; treating as not usable");
+                    false
+                }
+            };
         if !usable {
             return Err(AppError::BadRequest(
                 "That connection attempt is no longer valid. Start again from Settings."
@@ -776,9 +800,18 @@ impl ContactSyncService {
                     .to_string(),
             ));
         };
-        let usable = consumed_at.is_none()
-            && expires_at > Utc::now()
-            && verify_password(secret, &state_hash).await.unwrap_or(false);
+        let not_consumed_and_fresh = consumed_at.is_none() && expires_at > Utc::now();
+        // PMS-1577: a verification error (corrupt stored hash, Argon2
+        // failure) is not the same answer as a genuine wrong secret, so it
+        // is logged distinctly before falling through to the same refusal.
+        let usable = not_consumed_and_fresh
+            && match verify_password(secret, &state_hash).await {
+                Ok(matches) => matches,
+                Err(e) => {
+                    tracing::warn!(state_id = %state_id, error = %e, "oauth state secret verification failed; treating as not usable");
+                    false
+                }
+            };
         if !usable {
             return Err(AppError::BadRequest(
                 "That connection attempt is no longer valid. Start again from Settings."
@@ -1074,6 +1107,12 @@ impl ContactSyncService {
             )
             .await?,
             icloud_connection: self.connection(tenant_id, ICLOUD).await?,
+            microsoft_configured: self.microsoft_oauth_client().is_some(),
+            microsoft_enabled: crate::modules::settings::read_microsoft_contacts_enabled(
+                &self.db, tenant_id,
+            )
+            .await?,
+            microsoft_connection: self.connection(tenant_id, MICROSOFT).await?,
         })
     }
 
@@ -1164,12 +1203,13 @@ impl ContactSyncService {
     pub async fn assert_enabled(&self, tenant_id: TenantId, provider: &str) -> AppResult<()> {
         // PMS-1409: each integration has its own switch (PMS-1341), so this asks
         // the one the caller is actually using. Reading Google's flag for an
-        // iCloud request would have made one integration turn the other off.
-        let on = if provider == ICLOUD {
-            crate::modules::settings::read_icloud_contacts_enabled(&self.db, tenant_id).await?
-        } else {
-            crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await?
-        };
+        // iCloud request would have made one integration turn the other off;
+        // PMS-1512 gives Microsoft the same treatment.
+        //
+        // PMS-1524 moved the selection to `switch::contacts_enabled`, because
+        // the same three-way choice is made again before a queued run executes
+        // and that copy had not been given Microsoft's key.
+        let on = super::switch::contacts_enabled(&self.db, tenant_id, provider).await?;
         if on {
             Ok(())
         } else {
@@ -1357,6 +1397,20 @@ impl ContactSyncService {
             );
             return Ok((connection, Box::new(ICloudProvider::new(client))));
         }
+        // PMS-1512: Microsoft's access token is minted against the Entra
+        // OAuth client, not Google's, matching `runs.rs::GoogleSourceFactory::source`.
+        if provider == MICROSOFT {
+            let token = self
+                .microsoft_access_token(tenant_id, connection.id)
+                .await?;
+            return Ok((
+                connection,
+                Box::new(super::microsoft::MicrosoftContactsProvider::new(
+                    self.http.clone(),
+                    token,
+                )),
+            ));
+        }
         let token = self
             .access_token(tenant_id, connection.id, &connection.provider)
             .await?;
@@ -1446,6 +1500,72 @@ impl ContactSyncService {
             Some(serde_json::json!({
                 "event": "contact_sync.selection_changed",
                 "selected_groups": ids,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        self.live_connection(tenant_id, provider).await
+    }
+
+    /// How often this connection is polled (PMS-1315).
+    ///
+    /// `contact_sync_connections.sync_interval_minutes` has decided when the
+    /// worker queues a scheduled run since migration 220, and until now
+    /// nothing could write it: every tenant polled at the column's default
+    /// of 60 minutes whatever their address book looked like. PMS-1315 asked
+    /// for a configurable frequency and this is it, on the connection rather
+    /// than on `integrations.poll_interval_minutes`, because the connection
+    /// these providers poll lives here (`ConnectionHome::Elsewhere`) and the
+    /// interval belongs with the thing it paces.
+    ///
+    /// The floor is the schema's own CHECK, restated here so the refusal is
+    /// a field error naming the minimum rather than a constraint violation:
+    /// a one-minute poll against Google or Microsoft is a rate limit waiting
+    /// to happen. The ceiling is a day, because an interval longer than that
+    /// is a way of saying "stop syncing" and the switch (PMS-1358) says it
+    /// properly, leaving the cadence to mean what it says.
+    pub async fn set_schedule(
+        &self,
+        tenant_id: TenantId,
+        provider: &str,
+        sync_interval_minutes: i32,
+        ctx: &AuditCtx,
+    ) -> AppResult<ConnectionStatus> {
+        const MIN_MINUTES: i32 = 5;
+        const MAX_MINUTES: i32 = 1440;
+        if !(MIN_MINUTES..=MAX_MINUTES).contains(&sync_interval_minutes) {
+            return Err(AppError::validation_field(
+                "sync_interval_minutes",
+                format!(
+                    "must be between {MIN_MINUTES} and {MAX_MINUTES} minutes; turn the \
+                     integration off to stop syncing altogether"
+                ),
+            ));
+        }
+        let connection = self.live_connection(tenant_id, provider).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE contact_sync_connections SET sync_interval_minutes = $3, \
+             updated_at = NOW() WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(connection.id)
+        .bind(sync_interval_minutes)
+        .execute(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contact_sync_connections",
+            Some(connection.id),
+            Some(serde_json::json!({
+                "sync_interval_minutes": connection.sync_interval_minutes
+            })),
+            Some(serde_json::json!({
+                "event": "contact_sync.schedule_changed",
+                "sync_interval_minutes": sync_interval_minutes,
             })),
         )
         .await?;
@@ -2174,6 +2294,12 @@ impl ContactSyncService {
         connection_id: Uuid,
         provider: &str,
     ) -> AppResult<String> {
+        // PMS-1512: Microsoft's refresh token is never sent to Google's token
+        // endpoint, even if a future caller reaches this function directly
+        // with `provider == MICROSOFT` instead of going through `source`.
+        if provider == MICROSOFT {
+            return self.microsoft_access_token(tenant_id, connection_id).await;
+        }
         let client = self.require_oauth_client()?;
         let refresh_token = self
             .secrets

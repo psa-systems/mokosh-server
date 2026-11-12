@@ -12,18 +12,31 @@ just pre-push                # check.yml's cargo checks except doc tests (fmt/cl
 # Dev stack
 just dev [args]             # start the Traefik-routed dev stack (args go to `docker compose up`, e.g. --build --detach)
 just dev-infisical [args]   # start Infisical and its Postgres sidecar (compose profile: infisical)
+just dev-s3 [args]          # start a MinIO object store and point the blank STORAGE_S3_* keys in .env at it (compose profile: s3)
+just dev-seed-portal        # seed the PMS-729 client-portal fixture tenants + contacts into the running dev DB (idempotent, dev-only)
 just down                   # stop the dev stack (volumes preserved)
 just dev-clean              # stop the stack, remove this repo's volumes and target/, delete .env (keeps .env.infisical)
 just dev-clean-all          # everything dev-clean does, plus remove this repo's images and prune its buildx cache
 just infisical-bootstrap    # one-time: drive Infisical first-run setup and fill INFISICAL_* in .env
 
+# Dev (local)
+just dev-local [args]       # start local dev server in Docker (cargo-watch)
+just dev-local-detach       # start local dev server in Docker, detached
+just dev-local-stop         # stop local dev containers
+just dev-logs               # tail logs from the local dev stack
+just ensure-bind-sources    # create each dev_bind_sources directory host-owned, repairing an empty root-owned one
+
 # Checks
 just check                  # umbrella: every check.yml step except its cargo test steps (see below)
 just check-compile          # cargo check --all-targets
+just check-build            # cargo build --all-targets
 just check-clippy           # cargo clippy --all-targets -- -D warnings (same as check.yml)
 just check-fmt              # cargo fmt --all --check
+just check-justfile         # fail if the root justfile redefines a recipe that must come from common/common.just
 just check-docker           # build the OCI image's builder stage only (validation; NOT in `just check`)
 just check-migrations       # fail if two migrations share a numeric prefix
+just check-migration-versions # guard against sqlx migration-version collisions and width mismatches
+just check-migration-versions-against-base <base_ref> # fail if a PR's migrations would collide with origin/main after the merge
 just check-migration-immutability # fail if a migration already on main is modified or deleted
 just check-guarded-content-migrations # fail if a migration after 209 guards a content UPDATE without asserting its row count
 just check-pool-safety      # fail if a serving `.pool()` call lacks its `// SAFETY` note
@@ -48,18 +61,25 @@ just check-claude-md        # fail if CLAUDE.md passes 20,000 bytes, a prose lin
 just ci-log [args]          # print a Forgejo Actions job's log (--list, --workflow, --sha, --run)
 just ci-stalls [days]       # report CI runs that outlived their job's timeout-minutes; needs FORGEJO_TOKEN
 just ci-stalls-self-test    # prove the stall report still reports, on fixtures, with no token
+just job-metrics-report [runs] [job] # aggregate the last `runs` finished runs' JOB-METRICS lines into a per-run table and a per-job min/avg/p95/max summary
 
 # Format, test, build
 just fmt                    # cargo fmt --all
-just test                   # cargo test
+just test                   # cargo test --workspace --lib --bins (unit tests only)
 just ensure-test-db-roles   # create the DB roles the migrations grant to, before the Postgres-backed suite
-just test-integration       # Postgres-backed tests/*.rs suite in the dev `server` container (mirrors CI integration.yml)
+just test-integration       # Postgres-backed tests/suites/*.rs suite in the dev `server` container (mirrors CI integration.yml)
 just test-integration-unsupported # the suites integration.yml skips: functionality nothing currently uses (mirrors CI integration-unsupported.yml)
 just verify-demo            # the demo-critical subset of the integration suite (seed_demo + data_transfer)
 just verify-providers       # boot every provider seam against the running dev stack, report pass/fail per capability
 just test-e2e [args]        # Playwright E2E suite against staging or $E2E_BASE_URL (args go to `playwright test`)
 just build                  # cargo build --release --bins
 just build-docker           # build the production OCI image (oci-build/Dockerfile)
+just build-docker-export    # export the release binary from the `binary` stage to ./dist/{{binary_name}}
+
+# Native
+just lint                   # run clippy with warnings as errors
+just run [args]             # run locally with cargo, forwarding any args (e.g. `just run pr list`)
+just typecheck              # type-check without producing artifacts
 
 # Configuration docs (PMS-1442)
 just config-docs            # regenerate docs/configuration.md's Recently added changelog and Required / Added in columns
@@ -71,6 +91,7 @@ just migrate-create <name>  # create a new migration file
 
 # Release
 just create-release <bump>  # bump version (major|minor|hotfix), push release branch, print PR link [from common]
+just publish-release        # push the release tag the create-release workflow releases from; run after the release PR merges
 just config-release-notes <version> [--ref main] # the configuration-changes block for that release's notes, linking its changelog entry
 ```
 

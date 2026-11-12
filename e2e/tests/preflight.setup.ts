@@ -5,6 +5,7 @@ import { preflightRequiredEnv } from '../lib/env';
 // into a single error so the first failed CI run names every gap, instead
 // of dying at the first missing key and forcing the operator to fix-rerun
 // one var at a time.
+// SPEC-10.216
 setup('verify required env vars are present', async () => {
   preflightRequiredEnv();
 });

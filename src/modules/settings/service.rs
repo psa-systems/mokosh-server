@@ -501,14 +501,12 @@ pub async fn read_icloud_contacts_enabled(db: &Database, tenant_id: TenantId) ->
     Ok(value.and_then(|v| v.as_bool()).unwrap_or(true))
 }
 
-/// MAPPS-1101: whether this tenant allows the Microsoft 365 contact sync.
+/// PMS-1512: whether this tenant allows the Microsoft 365 contact sync.
 ///
-/// Its own key rather than sharing Google's or iCloud's, same reasoning as
-/// `read_icloud_contacts_enabled`: three integrations a tenant decides
-/// about separately. Defaults to allowed; the actual gate for whether
-/// sync fires is still whether a connection exists AND whether the
-/// `contacts` capability is delegated on `integrations.enabled_capabilities`
-/// (that second check lives in `contact_sync::service`).
+/// Its own key rather than sharing Google's, for the same reason the iCloud
+/// key (`read_icloud_contacts_enabled`) has its own: an MSP that disables one
+/// integration should not silently disable another. Defaults to allowed, the
+/// same "unset is enabled" convention as the other two.
 pub async fn read_microsoft_contacts_enabled(
     db: &Database,
     tenant_id: TenantId,

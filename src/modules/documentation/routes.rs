@@ -4,12 +4,6 @@
 //! it (same posture as the asset list and credential summary the
 //! aggregate composes); the audited reveal path is where secret values
 //! come from.
-//!
-//! parity record 2026-10-20: the SPA company-documentation view is on
-//! the mokosh-apps roadmap but has not been built yet, so no caller
-//! exists in `mokosh-apps/src/` for `/companies/{id}/documentation`.
-//! The server ships the endpoint first so the SPA work can wire against
-//! a live aggregate.
 
 use std::sync::Arc;
 

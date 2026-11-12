@@ -6,7 +6,7 @@
 # suites. This workflow runs their complement: the tests for functionality
 # nothing currently uses, whose setup costs the job real time and is the part
 # most likely to break for reasons that have nothing to do with the commit.
-# Today that is `tests/s3_storage.rs` alone.
+# Today that is `tests/suites/s3_storage.rs` alone.
 #
 # The split is NOT written here. `.config/nextest.toml` carries it, as a
 # `default-filter` on the `ci` and `unsupported` profiles, so this workflow
@@ -16,9 +16,9 @@
 # that file.
 #
 # What is deliberately not given up: the code stays and the tests stay, and
-# `integration.yml` still COMPILES every `tests/*.rs` binary on every pull
+# `integration.yml` still COMPILES every suite on every pull
 # request, because `cargo nextest archive` builds them whatever the filter
-# says. A change that stops `tests/s3_storage.rs` compiling still fails the
+# says. A change that stops `tests/suites/s3_storage.rs` compiling still fails the
 # PR. Only the assertions move to a schedule.
 #
 # Weekly rather than per-PR, and Monday morning rather than the weekend, so a
@@ -31,6 +31,7 @@
 # scheduled check, not a merge gate; the gate is `integration.yml`.
 name: Integration (unsupported)
 
+# SPEC-10.22: schedule + workflow_dispatch only, never push or pull_request
 on:
   schedule:
     # 06:00 UTC every Monday.
@@ -44,16 +45,19 @@ jobs:
     # the dev image ships the C toolchain + OpenSSL headers that needs. Base
     # fails at `linker cc not found` (PMS-706), the same reason integration.yml
     # carries this label.
+    # SPEC-10.23
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # The same outer backstop integration.yml carries, and for the same reason:
     # nextest's own slow-timeout reports a stuck case, this only stops a wedge
     # elsewhere in the job from running to the runner's limit. The suite itself
     # is four cases, so the budget is almost entirely the cold compile.
+    # SPEC-10.23
     timeout-minutes: 30
 
     # The S3 suite boots the app, so it needs the same Postgres every other
     # suite does.
+    # SPEC-10.23
     services:
       postgres:
         image: postgres:18.2-alpine3.23
@@ -76,13 +80,32 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v5
 
       - name: Cache Rust build
+        # PMS-1639: share the key with integration.yml's PR job and
+        # cache-warm.yml's warm-integration job. Workspace fingerprints
+        # are identical between the supported and unsupported profiles
+        # (`.config/nextest.toml` partitions which cases RUN, not what
+        # COMPILES), so the weekly run restores what the merge gate
+        # already compiled on main instead of starting cold.
         uses: https://github.com/Swatinem/rust-cache@v2
         with:
+          shared-key: integration
           cache-on-failure: true
 
+      - name: Cache cargo-nextest tarball
+        # PMS-1641: same version-keyed tarball cache as integration.yml.
+        # The weekly cron runs infrequently enough that a fresh download
+        # on key miss is not a hot path, but a key hit (same version
+        # restored from the warm or PR runs on the same runner) still
+        # saves the ~5s this step would otherwise spend on curl.
+        uses: https://github.com/actions/cache@v4
+        with:
+          path: /tmp/nextest.tar.gz
+          key: cargo-nextest-tarball-0.9.145-linux
+
       - name: Install cargo-nextest
+        # SPEC-10.24: pinned nextest 0.9.145 / SHA-256 32aa...867, same pin as integration.yml
         # PMS-1177: nextest schedules test CASES from every archived binary
-        # concurrently instead of running one `tests/*.rs` binary to
+        # concurrently instead of running one suite to
         # completion before starting the next, which is where most of the
         # previous wall clock went.
         #
@@ -107,8 +130,10 @@ jobs:
           NEXTEST_SHA256: "32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867"
         run: |
           set -euo pipefail
-          curl --silent --fail --location --output /tmp/nextest.tar.gz \
-            "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          if [ ! -s /tmp/nextest.tar.gz ]; then
+            curl --silent --fail --location --output /tmp/nextest.tar.gz \
+              "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          fi
           echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum --check --strict
           cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
           mkdir -p "${cargo_bin}"
@@ -121,7 +146,7 @@ jobs:
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
       - name: Start MinIO for the S3 storage suite
-        # PMS-958. `tests/s3_storage.rs` round-trips the S3 backend against a
+        # PMS-958. `tests/suites/s3_storage.rs` round-trips the S3 backend against a
         # real object store and skips (loudly) when STORAGE_S3_ENDPOINT is unset, so
         # this step is what makes it run here. A `services:` entry cannot do
         # it: the MinIO image carries no command, `server /data` has to be
@@ -160,11 +185,13 @@ jobs:
         # Only this suite sets STORAGE_PROVIDER=s3, in its own process; the
         # variables below are read by nothing else, so every other suite
         # keeps exercising the local backend.
+        # SPEC-10.24: digest-pinned bitnamilegacy/minio, SHA-256-verified binary
         env:
           MINIO_IMAGE: docker.io/bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c
           MINIO_SHA256: 0586fed6e33767430230d2f5bafd0d2f4ea2b844ce17025593dd7ab07f5f33c2
         run: |
           set -euo pipefail
+          # SPEC-10.25: MinIO pin is amd64-only
           if [ "$(uname -m)" != "x86_64" ]; then
             echo "::error::MinIO pin is for linux-amd64; runner is $(uname -m)"
             exit 1
@@ -192,6 +219,7 @@ jobs:
             cat /tmp/minio.log
             exit 1
           }
+          # SPEC-10.26
           {
             echo "STORAGE_S3_ENDPOINT=http://127.0.0.1:9000"
             echo "STORAGE_S3_BUCKET=mokosh-ci"
@@ -202,6 +230,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Disable Postgres durability
+        # SPEC-10.27: disable durability and create DB roles identically to integration.yml
         # PMS-1251: this `postgres` service is thrown away with the job, so
         # fsync/synchronous_commit/full_page_writes buy crash safety this
         # database never needs to survive into. Measured locally against
@@ -241,6 +270,7 @@ jobs:
         run: psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 --file scripts/test-db-roles.sql
 
       - name: Unsupported integration tests
+        # SPEC-10.27: no archive step, unlike integration.yml
         # `--profile unsupported` is the whole selection: its `default-filter`
         # in `.config/nextest.toml` is the complement of the `ci` profile's, so
         # this step runs exactly what the merge gate skips and no suite can

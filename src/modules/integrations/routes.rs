@@ -8,33 +8,51 @@
 //! to a real caller.
 //!
 //! Mounted at `/api/v1/integrations` by `create_api_router`, so the paths here
-//! are relative to that prefix. The literal `/{provider}` segment is parsed
-//! against the integration enum; a bare string that is not a provider gets a
-//! 404 at [`parse_provider`].
+//! are relative to that prefix.
 //!
-//! Every handler takes `RequireAdmin`. Deciding that Xero issues this MSP's
-//! invoices is not a technician's call, and `connect` accepts a credential, so
-//! the gate is the same one the rest of Settings carries. There is no module
-//! gate on top: integrations are how a tenant turns capabilities ON, so gating
-//! the page behind a module a tenant has not enabled would hide the switch
-//! behind itself.
+//! # One route, because the per-provider four served nobody (PMS-1571)
+//!
+//! This module used to mount `GET`/`PUT /integrations/{provider}` and
+//! `POST /integrations/{provider}/connect` and `/disconnect` beside the list.
+//! They were reachable by URL and answered 404 for every provider in the
+//! registry, because the only credential home this surface can connect is
+//! [`CredentialHome::Integration`](super::registry::CredentialHome::Integration),
+//! the one whose credential arrives in the connect request, and no entry
+//! carries it. Each provider's credential belongs to another surface for its
+//! own documented reason: the payment gateways to their credential form, the
+//! two invoice issuers to their OAuth consent round trips, the three contact
+//! sources to contact sync.
+//!
+//! MAPPS-1153 left them mounted on the argument that the registry is the one
+//! place that decides, so a provider that did take its credential here would
+//! be served again without a route being rebuilt. What that produced instead
+//! was four routes nobody could reach and three call sites in the SPA that
+//! never rendered, since `settings_integrations.rs` reads the same
+//! `configurable_here` flag to decide whether to draw the controls at all.
+//!
+//! The registry still decides, and
+//! [`tests::an_integration_home_provider_needs_the_per_provider_routes_back`](super::registry)
+//! is what makes that mean something: it fails the day an entry takes the
+//! `Integration` home with these routes absent, and it fails today if they
+//! come back while no entry does. Restoring them is adding the four
+//! `.route(...)` lines back with their handlers, which the service methods
+//! and request DTOs are still here for.
+//!
+//! The one remaining handler takes `RequireAdmin`: what an organization has
+//! delegated to a third party is not a technician's read. There is no module
+//! gate on top - integrations are how a tenant turns capabilities ON, so
+//! gating the page behind a module a tenant has not enabled would hide the
+//! switch behind itself.
 
 use std::sync::Arc;
 
-use axum::{
-    extract::{Path, State},
-    routing::{get, post, put},
-    Router,
-};
-use validator::Validate;
+use axum::{extract::State, routing::get, Router};
 
-use crate::modules::audit::AuditCtx;
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
-use crate::utils::error::{AppError, AppResult};
+use crate::utils::error::AppResult;
 use crate::utils::json::Json;
 
 use super::models::*;
-use super::registry;
 use super::service::IntegrationsService;
 
 #[derive(Clone)]
@@ -48,49 +66,7 @@ pub fn integration_routes(service: IntegrationsService) -> Router {
     };
     Router::new()
         .route("/integrations", get(list_integrations))
-        .route("/integrations/{provider}", get(get_integration))
-        .route("/integrations/{provider}", put(update_integration))
-        .route(
-            "/integrations/{provider}/connect",
-            post(connect_integration),
-        )
-        .route(
-            "/integrations/{provider}/disconnect",
-            post(disconnect_integration),
-        )
         .with_state(state)
-}
-
-/// The provider path segment, parsed against the enum rather than passed
-/// through as a string.
-///
-/// A 404 for an unknown one, because the path names a resource that does not
-/// exist. Parsing here rather than in the service means the service only ever
-/// sees a provider the registry has an entry for, which is what lets
-/// `registry::descriptor` be infallible.
-///
-/// MAPPS-1098: also 404 for a provider whose integrations surface is hidden
-/// (payment providers). The row still exists and billing still writes to it
-/// via `set_payment_connection`; the HTTP surface here does not expose it so
-/// `Settings > Payment Gateways` is the single surface for the lifecycle.
-fn parse_provider(raw: &str) -> AppResult<IntegrationProvider> {
-    let provider = IntegrationProvider::from_str(raw).ok_or_else(|| {
-        AppError::NotFound(format!(
-            "{raw} is not an integration provider. The providers are: {}",
-            IntegrationProvider::ALL
-                .iter()
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))
-    })?;
-    if !registry::descriptor(provider).is_exposed_on_integrations_page() {
-        return Err(AppError::NotFound(format!(
-            "{} is configured under Settings > Payment Gateways",
-            provider.as_str()
-        )));
-    }
-    Ok(provider)
 }
 
 async fn list_integrations(
@@ -99,66 +75,4 @@ async fn list_integrations(
     RequireAuth(user): RequireAuth,
 ) -> AppResult<Json<Vec<IntegrationResponse>>> {
     Ok(Json(state.service.list(user.tenant()).await?))
-}
-
-async fn get_integration(
-    State(state): State<IntegrationsRouterState>,
-    _admin: RequireAdmin,
-    RequireAuth(user): RequireAuth,
-    Path(provider): Path<String>,
-) -> AppResult<Json<IntegrationResponse>> {
-    let provider = parse_provider(&provider)?;
-    Ok(Json(state.service.get(user.tenant(), provider).await?))
-}
-
-async fn update_integration(
-    State(state): State<IntegrationsRouterState>,
-    _admin: RequireAdmin,
-    RequireAuth(user): RequireAuth,
-    ctx: AuditCtx,
-    Path(provider): Path<String>,
-    Json(request): Json<UpdateIntegrationRequest>,
-) -> AppResult<Json<IntegrationResponse>> {
-    let provider = parse_provider(&provider)?;
-    request.validate()?;
-    Ok(Json(
-        state
-            .service
-            .update(user.tenant(), provider, request, &ctx)
-            .await?,
-    ))
-}
-
-async fn connect_integration(
-    State(state): State<IntegrationsRouterState>,
-    _admin: RequireAdmin,
-    RequireAuth(user): RequireAuth,
-    ctx: AuditCtx,
-    Path(provider): Path<String>,
-    Json(request): Json<ConnectIntegrationRequest>,
-) -> AppResult<Json<IntegrationResponse>> {
-    let provider = parse_provider(&provider)?;
-    request.validate()?;
-    Ok(Json(
-        state
-            .service
-            .connect(user.tenant(), provider, request, &ctx)
-            .await?,
-    ))
-}
-
-async fn disconnect_integration(
-    State(state): State<IntegrationsRouterState>,
-    _admin: RequireAdmin,
-    RequireAuth(user): RequireAuth,
-    ctx: AuditCtx,
-    Path(provider): Path<String>,
-) -> AppResult<Json<IntegrationResponse>> {
-    let provider = parse_provider(&provider)?;
-    Ok(Json(
-        state
-            .service
-            .disconnect(user.tenant(), provider, &ctx)
-            .await?,
-    ))
 }

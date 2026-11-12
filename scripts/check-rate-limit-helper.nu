@@ -16,6 +16,7 @@
 #     `AppError::rate_limited(retry_after_seconds)`, the one constructor, is the
 #     only bypass-proof way to build one.
 
+# SPEC-10.174: let _ = retry_after is banned even inside this helper file.
 const HELPER_FILE = 'src/utils/error.rs'
 
 def main [] {
@@ -37,6 +38,7 @@ def main [] {
                 let bypasses_constructor = (
                     ($row.item | str contains 'AppError::RateLimited')
                     and (not $is_helper)
+                    and (not ($trimmed | str starts-with '//'))
                 )
                 let reason = if $inline_429 {
                     'builds a 429 outside the shared helper'

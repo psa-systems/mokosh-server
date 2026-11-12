@@ -32,6 +32,7 @@
 
 import { execFileSync } from 'node:child_process';
 
+// SPEC-10.213: kept in lock-step with build-oci-image.yml's own path filter (10.39).
 // Keep in lock-step with `on.push.paths` in .forgejo/workflows/build-oci-image.yml.
 // A path here that the build workflow does not list will make the gate poll
 // for a SHA staging never serves; a path the build lists that this misses
@@ -116,6 +117,8 @@ function buildShaQuery(headSha) {
 // filters that strip the trees `git log -- <path>` needs, so self-heal in
 // two stages: unshallow first if the clone is shallow, then refetch
 // without filter if the path query still finds nothing.
+// SPEC-10.213: resolves the expected SHA by walking git log for the most recent
+// build-trigger-path commit, self-healing with unshallow/refetch if that finds nothing.
 function resolveBuildSha(headSha) {
   let sha = buildShaQuery(headSha);
   if (sha) return sha;
@@ -179,6 +182,8 @@ try {
   // informational, not a merge gate, so skip the gate entirely with a
   // loud warning and let the suite run against whatever staging is
   // currently serving.
+  // SPEC-10.213: on total SHA-resolution failure, warn and exit 0 rather than
+  // fail the job.
   console.warn('============================================================');
   console.warn(`SKIPPING deploy-sync gate: ${String(err)}`);
   console.warn('Tests will run against whatever commit staging is currently serving.');
@@ -208,6 +213,7 @@ async function fetchGitHash() {
   }
 }
 
+// SPEC-10.213: polls every 15000ms for up to 600000ms until git_hash prefix-matches.
 const deadline = Date.now() + TIMEOUT_MS;
 console.log(`Waiting for ${versionUrl} to report ${expectedSha} (timeout 10m)...`);
 

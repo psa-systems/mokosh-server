@@ -214,7 +214,7 @@ be the code's.
   iCloud absolute-path quirk, a 507 truncation, a 404 deletion, and a
   `valid-sync-token` refusal.
 - **Integration:** a Radicale server in CI (a Python package, pinned and
-  checksum-verified, started in the job the way `tests/s3_storage.rs` starts
+  checksum-verified, started in the job the way `tests/suites/s3_storage.rs` starts
   MinIO) with a seeded collection. That covers a full read, a delta, a
   deletion, a group-card edit forcing a full read, a revoked password, and a
   redirect to a private address being refused.

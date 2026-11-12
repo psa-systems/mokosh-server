@@ -1,0 +1,164 @@
+//! Round-trip integration test for tenant data export -> import (PMS-647 / PMS-648).
+//!
+//! Seeds a uniquely-named company + an FK-referencing contact into the default
+//! tenant (which is also pre-populated with sample data), exports the whole
+//! tenant via `GET /api/v1/data/export`, imports the envelope back
+//! (wipe-and-replace) via `POST /api/v1/data/import`, and asserts the data is
+//! restored with REMAPPED ids - the contact's FK follows the company's new id,
+//! proving cross-table FK remap (over deferrable constraints, migration 088)
+//! over the full tenant dataset - and that no secret column leaked into the
+//! export. Runs against
+//! Postgres in CI (`integration.yml`); the local `--lib` pre-push only
+//! compiles it. Uses unique names so it is robust to the tenant's pre-seeded
+//! sample rows (no exact-count assertions).
+
+use crate::common;
+
+use common::DEFAULT_TENANT_ID;
+use mokosh_test::mokosh_test;
+use serde_json::{json, Value};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+/// Column-name substrings that must never appear as a key in any exported row.
+const SECRET_SUBSTRINGS: &[&str] = &[
+    "encrypted",
+    "password_hash",
+    "_secret",
+    "mfa_secret",
+    "api_key",
+    "api_secret",
+    "private_key",
+];
+
+#[mokosh_test]
+async fn export_import_round_trip_remaps_ids_and_leaks_no_secrets(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+
+    // Uniquely-named company + a contact that FK-references it, so the round-trip
+    // exercises cross-table FK remapping (over deferred constraints) and the rows
+    // are findable amid the tenant's pre-seeded sample data.
+    let marker = Uuid::new_v4().simple().to_string();
+    let company_name = format!("rt-company-{marker}");
+    let contact_first = format!("rt-{marker}");
+    let company_id = Uuid::new_v4();
+    let contact_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(company_id)
+        .bind(DEFAULT_TENANT_ID)
+        .bind(&company_name)
+        .execute(&pool)
+        .await
+        .expect("seed company");
+    sqlx::query(
+        "INSERT INTO contacts (id, tenant_id, company_id, first_name, last_name)
+         VALUES ($1, $2, $3, $4, 'Doe')",
+    )
+    .bind(contact_id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .bind(&contact_first)
+    .execute(&pool)
+    .await
+    .expect("seed contact");
+
+    let tenant_name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("read tenant name");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // --- export ---
+    let export_res = app
+        .client
+        .get(app.url("/api/v1/data/export"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send export");
+    assert!(
+        export_res.status().is_success(),
+        "export status {}",
+        export_res.status()
+    );
+    let envelope: Value = export_res.json().await.expect("export json");
+
+    // The envelope carries the tenant name so an orchestrator can echo it back
+    // as the import `confirm` guard without a second round-trip.
+    assert_eq!(
+        envelope["tenant_name"],
+        json!(tenant_name),
+        "export envelope must include the tenant name"
+    );
+
+    let entities = envelope["entities"].as_object().expect("entities object");
+    // The seeded company + contact are present in the export.
+    let has_company = entities["companies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["name"] == json!(company_name));
+    assert!(has_company, "seeded company missing from export");
+    let has_contact = entities["contacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["first_name"] == json!(contact_first));
+    assert!(has_contact, "seeded contact missing from export");
+    // No secret column leaked into ANY entity row.
+    for (table, rows) in entities {
+        if let Some(arr) = rows.as_array() {
+            for row in arr {
+                if let Some(obj) = row.as_object() {
+                    for key in obj.keys() {
+                        for s in SECRET_SUBSTRINGS {
+                            assert!(!key.contains(s), "secret column {key} leaked in {table}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- import (wipe-and-replace back into the same tenant) ---
+    let import_res = app
+        .client
+        .post(app.url("/api/v1/data/import"))
+        .bearer_auth(&token)
+        .json(&json!({ "confirm": tenant_name, "export": envelope }))
+        .send()
+        .await
+        .expect("send import");
+    let import_status = import_res.status();
+    let import_body = import_res.text().await.unwrap_or_default();
+    assert!(
+        import_status.is_success(),
+        "import status {import_status}: {import_body}"
+    );
+
+    // --- restored with remapped ids ---
+    let new_company_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM companies WHERE tenant_id = $1 AND name = $2")
+            .bind(DEFAULT_TENANT_ID)
+            .bind(&company_name)
+            .fetch_one(&pool)
+            .await
+            .expect("company after import");
+    assert_ne!(new_company_id, company_id, "company id must be remapped");
+
+    let contact_company_fk: Uuid = sqlx::query_scalar(
+        "SELECT company_id FROM contacts WHERE tenant_id = $1 AND first_name = $2",
+    )
+    .bind(DEFAULT_TENANT_ID)
+    .bind(&contact_first)
+    .fetch_one(&pool)
+    .await
+    .expect("contact after import");
+    assert_eq!(
+        contact_company_fk, new_company_id,
+        "contact FK must follow the remapped company id"
+    );
+}

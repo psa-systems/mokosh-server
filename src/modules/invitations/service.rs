@@ -268,7 +268,7 @@ impl InvitationsService {
     /// into a general API handler, where it would leak which tenants have
     /// outstanding invites for an arbitrary address. The
     /// `routes_do_not_reach_global_login_helpers` regression test
-    /// (`tests/auth.rs`) pins that no `routes.rs` references it.
+    /// (`tests/suites/auth.rs`) pins that no `routes.rs` references it.
     pub async fn newest_pending_for(&self, email: &str) -> AppResult<Option<PendingInvite>> {
         let email = email.trim().to_ascii_lowercase();
         // SAFETY (PMS-285, step 9 decision (a)): kept as a deliberate pre-auth

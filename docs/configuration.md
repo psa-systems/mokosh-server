@@ -12,12 +12,36 @@ In development, `.env` is generated once per clone from the committed `.env.exam
 
 Configuration changes in the last 5 releases, newest first, rendered by `just config-docs` from `src/config/registry.rs` and `src/config/variables.toml` (edit those, not this section). **Breaking: won't start** marks a change after which the restart fails until the operator acts; apply it before restarting. **Breaking: feature off** marks a change after which the server runs but the named feature stops working or changes until the operator acts; review it before restarting. Both name the operator action and the issue that introduced them. An unmarked entry needs no action unless you relied on the old behavior. Upgrading across more releases than this? Run `just config-since <running version>`.
 
+<a id="release-v0-19-0"></a>
+
+### Unreleased (v0.19.0)
+
+#### Added
+
+- [`PORTAL_COOKIE_DOMAIN`](#var-portal-cookie-domain) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-18-0"></a>
+
+### Unreleased (v0.18.0)
+
+#### Added
+
+- [`BUNYIP_SECRETS_CLIENT_ID`](#var-bunyip-secrets-client-id) (Required: no) - Optional, and set together or not at all. A hosted deployment points these at bunyip's host-secrets route and the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is then read from there instead of from this deployment's own provider: an operator sets it once in bunyip under Admin > Mokosh. A URL with only one half of the credential refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says. (PMS-1537)
+- [`BUNYIP_SECRETS_CLIENT_SECRET`](#var-bunyip-secrets-client-secret) (Required: no) - Optional, and set together or not at all. A hosted deployment points these at bunyip's host-secrets route and the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is then read from there instead of from this deployment's own provider: an operator sets it once in bunyip under Admin > Mokosh. A URL with only one half of the credential refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says. (PMS-1537)
+- [`BUNYIP_SECRETS_URL`](#var-bunyip-secrets-url) (Required: no) - Optional, and set together or not at all. A hosted deployment points these at bunyip's host-secrets route and the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is then read from there instead of from this deployment's own provider: an operator sets it once in bunyip under Admin > Mokosh. A URL with only one half of the credential refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says. (PMS-1537)
+
 <a id="release-v0-17-0"></a>
 
 ### v0.17.0
 
 #### Added
 
+- **Breaking: feature off:** [`QUICKBOOKS_CLIENT_ID`](#var-quickbooks-client-id) (Required: no) - Feature: delegated invoice issuing through Xero and QuickBooks. Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh. (MAPPS-1139)
+- **Breaking: feature off:** [`QUICKBOOKS_CLIENT_SECRET`](#var-quickbooks-client-secret) (Required: no) - Feature: delegated invoice issuing through Xero and QuickBooks. Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh. (MAPPS-1139)
+- **Breaking: feature off:** [`QUICKBOOKS_VERIFIER_TOKEN`](#var-quickbooks-verifier-token) (Required: no) - Feature: delegated invoice issuing through Xero and QuickBooks. Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh. (MAPPS-1139)
+- **Breaking: feature off:** [`XERO_CLIENT_ID`](#var-xero-client-id) (Required: no) - Feature: delegated invoice issuing through Xero and QuickBooks. Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh. (MAPPS-1139)
+- **Breaking: feature off:** [`XERO_CLIENT_SECRET`](#var-xero-client-secret) (Required: no) - Feature: delegated invoice issuing through Xero and QuickBooks. Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh. (MAPPS-1139)
+- **Breaking: feature off:** [`XERO_WEBHOOK_KEY`](#var-xero-webhook-key) (Required: no) - Feature: delegated invoice issuing through Xero and QuickBooks. Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh. (MAPPS-1139)
 - [`MICROSOFT_CONTACTS_CLIENT_ID`](#var-microsoft-contacts-client-id) (Required: no) - Optional. Leave it unset to keep the default.
 - [`MICROSOFT_CONTACTS_CLIENT_SECRET`](#var-microsoft-contacts-client-secret) (Required: no) - Optional. Leave it unset to keep the default.
 
@@ -49,25 +73,25 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 #### Added
 
 - [`OIDC_BACKCHANNEL_CLIENT_ID`](#var-oidc-backchannel-client-id) (Required: no) - Optional. Set it to the OIDC client id Bunyip addresses back-channel logout tokens to; unset refuses every logout token. (PMS-998)
-- [`STORAGE_PROVIDER`](#var-storage-provider) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_ROOT`](#var-storage-root) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_ACCESS_KEY_ID`](#var-storage-s3-access-key-id) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_BUCKET`](#var-storage-s3-bucket) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_ENDPOINT`](#var-storage-s3-endpoint) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_PATH_STYLE`](#var-storage-s3-path-style) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_REGION`](#var-storage-s3-region) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_SECRET_ACCESS_KEY`](#var-storage-s3-secret-access-key) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
+- [`STORAGE_PROVIDER`](#var-storage-provider) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_ROOT`](#var-storage-root) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_S3_ACCESS_KEY_ID`](#var-storage-s3-access-key-id) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_S3_BUCKET`](#var-storage-s3-bucket) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_S3_ENDPOINT`](#var-storage-s3-endpoint) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_S3_PATH_STYLE`](#var-storage-s3-path-style) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_S3_REGION`](#var-storage-s3-region) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_S3_SECRET_ACCESS_KEY`](#var-storage-s3-secret-access-key) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
 
 #### Deprecated
 
-- [`ATTACHMENT_DIR`](#var-attachment-dir) (Required: no) - Renamed to `STORAGE_ROOT`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_ACCESS_KEY_ID`](#var-s3-access-key-id) (Required: no) - Renamed to `STORAGE_S3_ACCESS_KEY_ID`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_BUCKET`](#var-s3-bucket) (Required: no) - Renamed to `STORAGE_S3_BUCKET`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_ENDPOINT`](#var-s3-endpoint) (Required: no) - Renamed to `STORAGE_S3_ENDPOINT`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_PATH_STYLE`](#var-s3-path-style) (Required: no) - Renamed to `STORAGE_S3_PATH_STYLE`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_REGION`](#var-s3-region) (Required: no) - Renamed to `STORAGE_S3_REGION`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_SECRET_ACCESS_KEY`](#var-s3-secret-access-key) (Required: no) - Renamed to `STORAGE_S3_SECRET_ACCESS_KEY`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`STORAGE_BACKEND`](#var-storage-backend) (Required: no) - Renamed to `STORAGE_PROVIDER`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
+- [`ATTACHMENT_DIR`](#var-attachment-dir) (Required: no) - Renamed to `STORAGE_ROOT`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`S3_ACCESS_KEY_ID`](#var-s3-access-key-id) (Required: no) - Renamed to `STORAGE_S3_ACCESS_KEY_ID`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`S3_BUCKET`](#var-s3-bucket) (Required: no) - Renamed to `STORAGE_S3_BUCKET`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`S3_ENDPOINT`](#var-s3-endpoint) (Required: no) - Renamed to `STORAGE_S3_ENDPOINT`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`S3_PATH_STYLE`](#var-s3-path-style) (Required: no) - Renamed to `STORAGE_S3_PATH_STYLE`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`S3_REGION`](#var-s3-region) (Required: no) - Renamed to `STORAGE_S3_REGION`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`S3_SECRET_ACCESS_KEY`](#var-s3-secret-access-key) (Required: no) - Renamed to `STORAGE_S3_SECRET_ACCESS_KEY`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`STORAGE_BACKEND`](#var-storage-backend) (Required: no) - Renamed to `STORAGE_PROVIDER`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
 
 <a id="release-v0-14-0"></a>
 
@@ -142,12 +166,12 @@ No configuration changes.
 | --- | --- | --- | --- | --- |
 | <a id="var-mokosh-deployment-mode"></a>`MOKOSH_DEPLOYMENT_MODE` | yes | v0.14.0 | `.env` | `self-hosted` or `saas`. Selects the hosting profile, which supplies the default provider for every capability (configuration, secrets, authentication, email, storage). An unrecognized value fails startup naming both legal values (PMS-1011, PMS-1160). |
 | <a id="var-environment"></a>`ENVIRONMENT` | no, default `development` | v0.1.0 | `.env` | `development`, `dev` and `test` accept the built-in development secrets and skip the required-variable gate; every other value enforces both. A deployment sets `production` or `staging`. |
-| <a id="var-database-url"></a>`DATABASE_URL` | yes | v0.1.0 | `.env` for host-side tools, `compose.dev.yml` for the container | Privileged `mokosh_migrator` connection string (`BYPASSRLS`), used for migrations, bootstrap and cross-tenant workers. The built-in fallback is a localhost Postgres, so a deployment without it cannot start. |
+| <a id="var-database-url"></a>`DATABASE_URL` | yes | v0.1.0 | `.env` for host-side tools, `compose.dev.yml` for the container | Privileged `mokosh_migrator` connection string (`BYPASSRLS`), used for migrations, bootstrap and cross-tenant workers. Unset outside development/test now refuses to start naming the variable, instead of falling back to a localhost Postgres that likely does not exist on a deployed host (PMS-1577). |
 | <a id="var-mokosh-app-database-url"></a>`MOKOSH_APP_DATABASE_URL` | yes | v0.3.0; required since v0.14.0 | `.env` | Request-serving `mokosh_app` connection string (`NOBYPASSRLS`, PMS-285). Unset in development falls back to `DATABASE_URL`, single-role, and row-level security goes inert, which is why every other environment refuses to start without it (PMS-1160). |
 | <a id="var-mokosh-admin-database-url"></a>`MOKOSH_ADMIN_DATABASE_URL` | no, needed only on the first boot against an unprovisioned database | v0.4.0 | `.env` | Superuser connection the server uses once to create the `mokosh_migrator` and `mokosh_app` roles (PMS-489). Unused once both roles exist. |
 | <a id="var-mokosh-migrator-password"></a>`MOKOSH_MIGRATOR_PASSWORD` | no, needed only when the roles are provisioned | v0.3.0 | `.env` | Password given to the `mokosh_migrator` role when it is created. Generated per clone in development. |
 | <a id="var-mokosh-app-password"></a>`MOKOSH_APP_PASSWORD` | no, needed only when the roles are provisioned | v0.3.0 | `.env` | Password given to `mokosh_app`; boot reconciles the role's password from it. Generated per clone in development. |
-| <a id="var-run-migrations"></a>`RUN_MIGRATIONS` | no, default `true` | v0.1.0 | `.env` | Whether the server applies pending migrations on start. |
+| <a id="var-run-migrations"></a>`RUN_MIGRATIONS` | no, default `true` | v0.1.0 | `.env` | Whether the server applies pending migrations on start. Unset or blank keeps the default; set to a value other than a boolean fails startup naming the variable and the value (PMS-1577). |
 | <a id="var-rust-log"></a>`RUST_LOG` | no, default `info` | v0.1.0 | `.env` | Tracing filter (the dev stack sets `info,mokosh_server=debug`). |
 
 ### Secrets and encryption
@@ -176,22 +200,22 @@ No configuration changes.
 | <a id="var-config-providers"></a>`CONFIG_PROVIDERS` | no, default the hosting profile's provider | v0.14.0 | `.env` | Comma-separated priority list of configuration providers, e.g. `file,database,environment`. Today it powers the `provider-status`, `provider-migrate` and `provider-purge` subcommands (PMS-1012); request-serving reads still go through `CONFIG_BACKEND`. |
 | <a id="var-config-file-dir"></a>`CONFIG_FILE_DIR` | no, unset disables the file provider | v0.14.0 | `.env` | Directory the file configuration provider reads, one file per key. |
 | <a id="var-bunyip-config-url"></a>`BUNYIP_CONFIG_URL` | no, unset disables the Bunyip provider | v0.14.0 | `.env` | Base URL of the Bunyip API the Bunyip configuration provider reads. |
-| <a id="var-bunyip-config-client-id"></a>`BUNYIP_CONFIG_CLIENT_ID` | no, needed only with `BUNYIP_CONFIG_URL` | v0.14.0 | `.env` | Machine-credential client id for Bunyip's `POST /v1/oauth2/token`. |
-| <a id="var-bunyip-config-client-secret"></a>`BUNYIP_CONFIG_CLIENT_SECRET` | no, needed only with `BUNYIP_CONFIG_URL` | v0.14.0 | `.env` | Machine-credential client secret for the same token call. |
+| <a id="var-bunyip-config-client-id"></a>`BUNYIP_CONFIG_CLIENT_ID` | no, needed only with `BUNYIP_CONFIG_URL` | v0.14.0 | `.env` | Machine-credential client id this deployment presents to Bunyip's `GET /v1/host/config/{KEY}`, as HTTP Basic. |
+| <a id="var-bunyip-config-client-secret"></a>`BUNYIP_CONFIG_CLIENT_SECRET` | no, needed only with `BUNYIP_CONFIG_URL` | v0.14.0 | `.env` | Machine-credential client secret for the same HTTP Basic credential. |
 
 ### Server and public URLs
 
 | Variable | Required | Added in | Where set | Purpose |
 | --- | --- | --- | --- | --- |
 | <a id="var-host"></a>`HOST` | no, default `0.0.0.0` | v0.1.0 | `.env` | Listen address. |
-| <a id="var-port"></a>`PORT` | no, default `8080` | v0.1.0 | `MOKOSH_PORT` in `.env` | Listen port inside the container, and the port Traefik forwards to. |
+| <a id="var-port"></a>`PORT` | no, default `8080` | v0.1.0 | `MOKOSH_PORT` in `.env` | Listen port inside the container, and the port Traefik forwards to. Unset or blank keeps the default; set to a non-numeric value fails startup naming the variable and the value (PMS-1577). |
 | <a id="var-base-url"></a>`BASE_URL` | yes | v0.1.0; required since v0.14.0 | `.env` | Base of platform-owned email links (password reset, portal grant, invoice pay). The development fallback is localhost, which outside development would send every link nowhere (PMS-1160). |
 | <a id="var-client-origin"></a>`CLIENT_ORIGIN` | yes | v0.2.0; required since v0.14.0 | `.env` | Browser-visible origin of the client that talks to this API: the `CORS_ORIGIN` default and the OAuth popup `postMessage` origin (PMS-1160). |
 | <a id="var-spa-base-url"></a>`SPA_BASE_URL` | yes | v0.12.0; required since v0.14.0 | `.env` | Base for emailed links to pages only mokosh-apps serves (request forms, portal set-password, invoice Pay Now). On a deployment `CLIENT_ORIGIN` is the apex, so falling back to it lands every such link on Bunyip's 404 (MAPPS-425, PMS-1160). |
 | <a id="var-cors-origin"></a>`CORS_ORIGIN` | no, default `CLIENT_ORIGIN` | v0.2.0 | `.env` | Comma-separated CORS allow-list. Every entry must be a valid header value or the server panics at startup. |
 | <a id="var-public-api-base-url"></a>`PUBLIC_API_BASE_URL` | no, unset sends request-form email without the logo | v0.12.0 | `.env` | This deployment's public API base, used to make the tenant logo absolute in request-form email (PMS-748, MAPPS-429). |
 | <a id="var-abuse-contact-email"></a>`ABUSE_CONTACT_EMAIL` | no, unset drops the report-abuse line | v0.12.0 | `.env` | Address a client can report an unwanted request-form email to (PMS-748). |
-| <a id="var-mokosh-max-tenants"></a>`MOKOSH_MAX_TENANTS` | no, unset leaves tenant creation uncapped | v0.14.0 | `.env` | Ceiling on tenants the super-admin can create; the create endpoint answers 409 at the cap (MAPPS-457). |
+| <a id="var-mokosh-max-tenants"></a>`MOKOSH_MAX_TENANTS` | no, unset leaves tenant creation uncapped | v0.14.0 | `.env` | Ceiling on tenants the super-admin can create; the create endpoint answers 409 at the cap (MAPPS-457). Set to a non-numeric or non-positive value fails startup naming the variable and the value, instead of silently reading as uncapped (PMS-1577). |
 | <a id="var-mokosh-update-check-url"></a>`MOKOSH_UPDATE_CHECK_URL` | no, unset disables the update probe | v0.3.0 | `.env` | Upstream version probe for the self-hosted update check (PMS-238). |
 
 ### Mail
@@ -200,7 +224,7 @@ No configuration changes.
 | --- | --- | --- | --- | --- |
 | <a id="var-mail-provider"></a>`MAIL_PROVIDER` | no, default the hosting profile's (`log` self-hosted, `smtp` saas) | v0.14.0 | `.env` | `log` (`LogMailer`, no bytes leave the box) or `smtp` (`SmtpMailer` against `SMTP_HOST`). Unset with `SMTP_HOST` set means `smtp`. An unrecognized value, or `smtp` without `SMTP_HOST`, fails startup (PMS-1013). |
 | <a id="var-smtp-host"></a>`SMTP_HOST` | no, unset selects `LogMailer` | v0.2.0 | `.env` | SMTP relay host; the dev stack points it at mailpit. The admin email settings override every `SMTP_*` value per field (PMS-638). |
-| <a id="var-smtp-port"></a>`SMTP_PORT` | no, default `587` | v0.2.0 | `.env` | SMTP relay port. |
+| <a id="var-smtp-port"></a>`SMTP_PORT` | no, default `587` | v0.2.0 | `.env` | SMTP relay port. Unset or blank keeps the default; set to a non-numeric value fails startup naming the variable and the value (PMS-1577). |
 | <a id="var-smtp-username"></a>`SMTP_USERNAME` | no, unset sends unauthenticated | v0.2.0 | `.env` | SMTP login; set without `SMTP_PASSWORD` it fails startup. |
 | <a id="var-smtp-password"></a>`SMTP_PASSWORD` | no, needed with `SMTP_USERNAME` | v0.2.0 | governed application-tier secret | SMTP relay password, served by the `APP_SECRET_BACKEND` provider. |
 | <a id="var-smtp-from"></a>`SMTP_FROM` | no, needed when `SMTP_HOST` is set | v0.2.0 | `.env` | Sender mailbox (RFC 5322). Its domain must be one the relay may send for. |
@@ -213,16 +237,16 @@ No configuration changes.
 | <a id="var-auth-providers"></a>`AUTH_PROVIDERS` | no, default the hosting profile's (`bunyip,local` saas, `local` self-hosted) | v0.14.0 | `.env` | Comma-separated authentication-provider priority list. `AuthService::login` refuses the local password path without `local`, and the middleware skips Bunyip verification without `bunyip` (PMS-981). |
 | <a id="var-oidc-issuer"></a>`OIDC_ISSUER` | no, unset turns Bunyip sign-in off | v0.3.0 | `compose.dev.yml`, derived from `${USER}` | Bunyip issuer; must equal the token `iss` and Bunyip's discovery issuer. |
 | <a id="var-oidc-audience"></a>`OIDC_AUDIENCE` | no, unset turns Bunyip sign-in off | v0.3.0 | `compose.dev.yml`, derived from `${USER}` | Audience on the mokosh-apps `oauth_clients` row in bunyip-api. |
-| <a id="var-oidc-jwks-cache-ttl-secs"></a>`OIDC_JWKS_CACHE_TTL_SECS` | no, default `600` | v0.3.0 | `.env` | How long Bunyip's JWKS is cached, in seconds. |
-| <a id="var-oidc-leeway-seconds"></a>`OIDC_LEEWAY_SECONDS` | no, default `30` | v0.3.0 | `.env` | Clock leeway for token validation, in seconds. |
-| <a id="var-oidc-default-tenant-id"></a>`OIDC_DEFAULT_TENANT_ID` | no, default the migration-023 seed tenant | v0.3.0 | `.env` | Shared landing tenant a Bunyip user is provisioned into (PMS-239). |
+| <a id="var-oidc-jwks-cache-ttl-secs"></a>`OIDC_JWKS_CACHE_TTL_SECS` | no, default `600` | v0.3.0 | `.env` | How long Bunyip's JWKS is cached, in seconds. Unset or blank keeps the default; set to a non-numeric value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-oidc-leeway-seconds"></a>`OIDC_LEEWAY_SECONDS` | no, default `30` | v0.3.0 | `.env` | Clock leeway for token validation, in seconds. Unset or blank keeps the default; set to a non-numeric value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-oidc-default-tenant-id"></a>`OIDC_DEFAULT_TENANT_ID` | no, default the migration-023 seed tenant | v0.3.0 | `.env` | Shared landing tenant a Bunyip user is provisioned into (PMS-239). Unset or blank keeps the default; set to a value that does not parse as a UUID fails startup naming the variable and the value (PMS-1577). |
 | <a id="var-oidc-backchannel-client-id"></a>`OIDC_BACKCHANNEL_CLIENT_ID` | no, unset refuses every back-channel logout token | v0.15.0 | `.env` | Client id Bunyip addresses a back-channel logout token to: the mokosh-apps row's `client_id`, not its audience (PMS-998). |
 | <a id="var-allow-uninvited-bunyip-signup"></a>`ALLOW_UNINVITED_BUNYIP_SIGNUP` | no, default off | v0.16.0 | `.env` | Lets a Bunyip identity with a verified email provision a personal tenant on first sight. Production stays invitation-only; staging turns it on (PMS-1457). |
 | <a id="var-bunyip-status-client-id"></a>`BUNYIP_STATUS_CLIENT_ID` | no, unset gates provider status on `RequireAdmin` alone | v0.14.0 | `.env` | Machine credential Bunyip's provider-status aggregator presents as HTTP Basic (PMS-1193). Set together with the secret below. |
 | <a id="var-bunyip-status-client-secret"></a>`BUNYIP_STATUS_CLIENT_SECRET` | no, unset gates provider status on `RequireAdmin` alone | v0.14.0 | `.env` | The secret half, compared in constant time. |
 | <a id="var-admin-email"></a>`ADMIN_EMAIL` | no, unset skips the first-run admin | v0.1.0 | `.env` | Optional first-run super-admin, development only; see [`first-run-onboarding.md`](first-run-onboarding.md). |
 | <a id="var-admin-password"></a>`ADMIN_PASSWORD` | no, unset skips the first-run admin | v0.1.0 | `.env` | Password for the first-run admin above. |
-| <a id="var-login-approval-enabled"></a>`LOGIN_APPROVAL_ENABLED` | no, default off | v0.8.0 | `.env` | The suspicious-login notify-and-approve gate (PMS-658), off by default because it can withhold a login. |
+| <a id="var-login-approval-enabled"></a>`LOGIN_APPROVAL_ENABLED` | no, default off | v0.8.0 | `.env` | The suspicious-login notify-and-approve gate (PMS-658), off by default because it can withhold a login. Unset or blank keeps the default; set to a value that is not a recognized boolean spelling fails startup naming the flag and the value (PMS-1577). |
 
 ### Features, network and payments
 
@@ -258,14 +282,14 @@ No configuration changes.
 | <a id="var-s3-path-style"></a>`S3_PATH_STYLE` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_PATH_STYLE` | `compose.dev.yml` | Deprecated alias, as above. |
 | <a id="var-s3-access-key-id"></a>`S3_ACCESS_KEY_ID` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ACCESS_KEY_ID` | `compose.dev.yml` | Deprecated alias, as above. |
 | <a id="var-s3-secret-access-key"></a>`S3_SECRET_ACCESS_KEY` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_SECRET_ACCESS_KEY` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-attachment-max-bytes"></a>`ATTACHMENT_MAX_BYTES` | no, default 25 MiB | v0.4.0 | `.env` | Per-attachment size cap in bytes. |
-| <a id="var-kb-attachment-max-bytes"></a>`KB_ATTACHMENT_MAX_BYTES` | no, default 5 MiB | v0.14.0 | `.env` | Cap on an image embedded in a knowledge base article (PMS-923). |
-| <a id="var-tenant-logo-max-bytes"></a>`TENANT_LOGO_MAX_BYTES` | no, default 1 MiB | v0.12.0 | `.env` | Cap on an uploaded tenant logo. |
-| <a id="var-branding-tenant-favicon-max-bytes"></a>`BRANDING_TENANT_FAVICON_MAX_BYTES` | no, default 512 KiB | v0.14.0 | `.env` | Cap on a tenant favicon (MAPPS-622). |
-| <a id="var-branding-tenant-background-max-bytes"></a>`BRANDING_TENANT_BACKGROUND_MAX_BYTES` | no, default 2 MiB | v0.14.0 | `.env` | Cap on a tenant sign-in background. |
-| <a id="var-branding-company-logo-max-bytes"></a>`BRANDING_COMPANY_LOGO_MAX_BYTES` | no, default 1 MiB | v0.14.0 | `.env` | Cap on a client company logo. |
-| <a id="var-branding-company-favicon-max-bytes"></a>`BRANDING_COMPANY_FAVICON_MAX_BYTES` | no, default 512 KiB | v0.14.0 | `.env` | Cap on a client company favicon. |
-| <a id="var-branding-company-background-max-bytes"></a>`BRANDING_COMPANY_BACKGROUND_MAX_BYTES` | no, default 2 MiB | v0.14.0 | `.env` | Cap on a client company sign-in background. |
+| <a id="var-attachment-max-bytes"></a>`ATTACHMENT_MAX_BYTES` | no, default 25 MiB | v0.4.0 | `.env` | Per-attachment size cap in bytes. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-kb-attachment-max-bytes"></a>`KB_ATTACHMENT_MAX_BYTES` | no, default 5 MiB | v0.14.0 | `.env` | Cap on an image embedded in a knowledge base article (PMS-923). Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-tenant-logo-max-bytes"></a>`TENANT_LOGO_MAX_BYTES` | no, default 1 MiB | v0.12.0 | `.env` | Cap on an uploaded tenant logo. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-branding-tenant-favicon-max-bytes"></a>`BRANDING_TENANT_FAVICON_MAX_BYTES` | no, default 512 KiB | v0.14.0 | `.env` | Cap on a tenant favicon (MAPPS-622). Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-branding-tenant-background-max-bytes"></a>`BRANDING_TENANT_BACKGROUND_MAX_BYTES` | no, default 2 MiB | v0.14.0 | `.env` | Cap on a tenant sign-in background. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-branding-company-logo-max-bytes"></a>`BRANDING_COMPANY_LOGO_MAX_BYTES` | no, default 1 MiB | v0.14.0 | `.env` | Cap on a client company logo. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-branding-company-favicon-max-bytes"></a>`BRANDING_COMPANY_FAVICON_MAX_BYTES` | no, default 512 KiB | v0.14.0 | `.env` | Cap on a client company favicon. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
+| <a id="var-branding-company-background-max-bytes"></a>`BRANDING_COMPANY_BACKGROUND_MAX_BYTES` | no, default 2 MiB | v0.14.0 | `.env` | Cap on a client company sign-in background. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
 
 ### Removed
 
@@ -283,8 +307,18 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-bunyip-mailer-url"></a>`BUNYIP_MAILER_URL` | no, unset makes `MAIL_PROVIDER=bunyip` refuse to boot | v0.16.0 | `.env` | Base URL of Bunyip's mailer relay that `MAIL_PROVIDER=bunyip` sends through (`POST /v1/mailer/send`, BUNYIP-602). |
 | <a id="var-bunyip-mailer-client-id"></a>`BUNYIP_MAILER_CLIENT_ID` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client id presented as HTTP Basic to the mailer relay. |
 | <a id="var-bunyip-mailer-client-secret"></a>`BUNYIP_MAILER_CLIENT_SECRET` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client secret presented as HTTP Basic to the mailer relay. |
-| <a id="var-microsoft-contacts-client-id"></a>`MICROSOFT_CONTACTS_CLIENT_ID` | no | v0.17.0 | `.env` | Not described yet: say what it does. |
-| <a id="var-microsoft-contacts-client-secret"></a>`MICROSOFT_CONTACTS_CLIENT_SECRET` | no | v0.17.0 | `.env` | Not described yet: say what it does. |
+| <a id="var-microsoft-contacts-client-id"></a>`MICROSOFT_CONTACTS_CLIENT_ID` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The host's Microsoft 365 OAuth client id for the Microsoft Contacts import (MAPPS-1101). Served by the `APP_SECRET_BACKEND` provider: Infisical under `/app`, a `{NAME}_FILE` compose secret, an `APP_SECRETS_DIR` file or an `app_secrets` row. Setting only one half of the pair is a boot error naming the missing half. |
+| <a id="var-microsoft-contacts-client-secret"></a>`MICROSOFT_CONTACTS_CLIENT_SECRET` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The secret half of the pair above, served by the same provider so both come from one Entra ID app registration. |
+| <a id="var-portal-cookie-domain"></a>`PORTAL_COOKIE_DOMAIN` | no | v0.19.0 | `.env` | Optional `Domain=` attribute for the contact-portal refresh cookie (`mokosh:contact_token`). Set to the shared apex (e.g. `.a8n.run`) when the SPA runs on `tenant-*.<apex>` and the API host is a different subdomain of the same apex, so the cookie reaches `/api/v1/contact/auth/refresh` across subdomains. Unset leaves the cookie host-scoped. |
+| <a id="var-quickbooks-client-id"></a>`QUICKBOOKS_CLIENT_ID` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The host's QuickBooks Online OAuth client id for delegated invoice issuing (MAPPS-1139). Served by the `APP_SECRET_BACKEND` provider; setting only one half of the pair is a boot error naming the missing half. Unset leaves no tenant on this deployment able to connect a QuickBooks company. |
+| <a id="var-quickbooks-client-secret"></a>`QUICKBOOKS_CLIENT_SECRET` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The secret half of the pair above, served by the same provider so both come from one QuickBooks Online app registration (MAPPS-1139). |
+| <a id="var-quickbooks-verifier-token"></a>`QUICKBOOKS_VERIFIER_TOKEN` | no | v0.17.0 | governed application-tier secret, NOT `.env` | Verifier token QuickBooks signs webhook deliveries with. Served by the `APP_SECRET_BACKEND` provider; unset refuses deliveries, so an invoice QuickBooks marks paid stays outstanding in Mokosh until recorded by hand (MAPPS-1139). |
+| <a id="var-xero-client-id"></a>`XERO_CLIENT_ID` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The host's Xero OAuth client id for delegated invoice issuing (MAPPS-1139). Served by the `APP_SECRET_BACKEND` provider; setting only one half of the pair is a boot error naming the missing half. Unset leaves no tenant on this deployment able to connect a Xero organisation. |
+| <a id="var-xero-client-secret"></a>`XERO_CLIENT_SECRET` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The secret half of the pair above, served by the same provider so both come from one Xero app registration (MAPPS-1139). |
+| <a id="var-xero-webhook-key"></a>`XERO_WEBHOOK_KEY` | no | v0.17.0 | governed application-tier secret, NOT `.env` | Signing key Xero webhook deliveries are verified against. Served by the `APP_SECRET_BACKEND` provider; unset refuses deliveries, so an invoice Xero marks paid stays outstanding in Mokosh until recorded by hand (MAPPS-1139). |
+| <a id="var-bunyip-secrets-url"></a>`BUNYIP_SECRETS_URL` | no | v0.18.0 | `.env` | Base URL of bunyip's host-secrets route. On a hosted deployment, set together with the client id/secret below, the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is read from there instead of from this deployment's own `APP_SECRET_BACKEND` provider; an operator sets it once in bunyip under Admin > Mokosh. Setting only one of the three refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says. (PMS-1537) |
+| <a id="var-bunyip-secrets-client-id"></a>`BUNYIP_SECRETS_CLIENT_ID` | no | v0.18.0 | `.env` | Machine-credential client id this deployment presents to bunyip's host-secrets route, as HTTP Basic, alongside `BUNYIP_SECRETS_URL`. All three must be set together or left unset. (PMS-1537) |
+| <a id="var-bunyip-secrets-client-secret"></a>`BUNYIP_SECRETS_CLIENT_SECRET` | no | v0.18.0 | `.env` | Machine-credential client secret this deployment presents to bunyip's host-secrets route, as HTTP Basic, alongside `BUNYIP_SECRETS_URL`. All three must be set together or left unset. (PMS-1537) |
 
 ## Development stack variables
 

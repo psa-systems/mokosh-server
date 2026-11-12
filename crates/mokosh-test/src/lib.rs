@@ -61,6 +61,8 @@ pub fn runtime() -> tokio::runtime::Runtime {
 /// Close the pool the body was handed, naming the test if it held on. The
 /// ten-second bound and the wording are `#[sqlx::test]`'s, because a suite
 /// that leaked a pool should report it the same way it did before.
+// SPEC-1 and 2.170: pool.close() is bounded to 10 seconds; a timeout logs the
+// test path rather than blocking the process indefinitely on a leaked pool.
 pub async fn close_pool(pool: &PgPool, test_path: &str) {
     if tokio::time::timeout(Duration::from_secs(10), pool.close())
         .await
@@ -79,6 +81,8 @@ pub async fn close_pool(pool: &PgPool, test_path: &str) {
 /// Postgres refuses to drop a database anything is connected to. Nothing of
 /// the test survives into here, so this needs its own runtime to run the drop
 /// on.
+// SPEC-1 and 2.168: a failing (panicked) test's database is kept, not dropped;
+// a passing test's database is always dropped.
 pub fn finish(db: TestDatabase, passed: bool) {
     if !passed {
         // KEPT when the body panicked, which is what `#[sqlx::test]` does and
@@ -92,6 +96,8 @@ pub fn finish(db: TestDatabase, passed: bool) {
 /// The advisory-lock key the template build serialises on. Arbitrary but
 /// fixed, and namespaced to this repository so it cannot collide with a lock
 /// the application takes (`pg_advisory_lock` shares one space per cluster).
+// SPEC-1 and 2.163: the template build is serialized across processes by a
+// Postgres session-level advisory lock on this fixed key.
 const BUILD_LOCK_KEY: i64 = 0x6d6f6b6f_73685f31;
 
 /// How long a test database may take to appear before we give up. A clone is
@@ -104,6 +110,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// for why it waits rather than forces.
 const DROP_ATTEMPTS: u32 = 60;
 const DROP_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+// A peer's clone briefly holds the template, so Postgres returns 55006 ("source
+// database is being accessed by other users") under concurrent shards; wait and
+// retry rather than failing the test outright.
+const CLONE_RETRY_ATTEMPTS: u32 = 3;
+const CLONE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// A database cloned from the template, owned by one test.
 pub struct TestDatabase {
@@ -135,6 +147,8 @@ impl TestDatabase {
     /// standing with its occupants named, because that is a connection the
     /// body really did leave open and the name printed here is the thread to
     /// pull on.
+    // SPEC-1 and 2.169: waits for pg_stat_activity to show zero sessions (up to 60 polls at 50ms) before a
+    // non-FORCE DROP DATABASE; a database still occupied after the wait is left in place with its sessions logged.
     pub async fn drop_database(&self) {
         let Ok(mut admin) = PgConnection::connect(&self.admin_url).await else {
             eprintln!("could not connect to drop test database {}", self.name);
@@ -198,6 +212,8 @@ impl TestDatabase {
 /// captured output. [`acquire`] calls the same thing, so a run that skips the
 /// step still works; it just does the build under the lock with the rest of
 /// the suite waiting.
+// SPEC-1 and 2.165: idempotent with the build-if-absent logic `acquire` runs,
+// so calling this ahead of the suite is optional, not required.
 pub async fn ensure_template_built() -> String {
     let base = database_url();
     let template = template_name();
@@ -214,16 +230,26 @@ pub async fn acquire(test_path: &str) -> TestDatabase {
 
     ensure_template(&admin_url, &template).await;
 
-    // Unique per test and per run, so it collides with nothing: not with a
-    // peer running now, and not with a database a failed run left behind.
+    // SPEC-1 and 2.159: the per-test database is `CREATE DATABASE ... TEMPLATE` cloned from the migrated template rather than migrated from scratch.
+    // Unique per test and per run, so it collides with nothing: not with a peer running now, and not with a database a failed run left behind.
     let name = test_database_name(test_path);
     let mut admin = PgConnection::connect(&admin_url)
         .await
         .expect("connect to the maintenance database");
-    admin
-        .execute(format!(r#"CREATE DATABASE "{name}" TEMPLATE "{template}""#).as_str())
-        .await
-        .unwrap_or_else(|e| panic!("clone {name} from template {template}: {e}"));
+    let stmt = format!(r#"CREATE DATABASE "{name}" TEMPLATE "{template}""#);
+    let mut attempt: u32 = 0;
+    loop {
+        match admin.execute(stmt.as_str()).await {
+            Ok(_) => break,
+            Err(sqlx::Error::Database(e))
+                if e.code().as_deref() == Some("55006") && attempt + 1 < CLONE_RETRY_ATTEMPTS =>
+            {
+                tokio::time::sleep(CLONE_RETRY_DELAY * (1u32 << attempt)).await;
+                attempt += 1;
+            }
+            Err(e) => panic!("clone {name} from template {template}: {e}"),
+        }
+    }
     drop(admin);
 
     let pool = PgPoolOptions::new()
@@ -250,8 +276,8 @@ async fn ensure_template(admin_url: &str, template: &str) {
         return;
     }
 
-    // Session-level, so it is held across the statements below and released
-    // when this connection closes, including if the process dies.
+    // SPEC-1 and 2.163: the first process to arrive takes the advisory lock and builds; every other process blocks here until it is released.
+    // Session-level, so it is held across the statements below and released when this connection closes, including if the process dies.
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(BUILD_LOCK_KEY)
         .execute(&mut admin)
@@ -272,6 +298,8 @@ async fn ensure_template(admin_url: &str, template: &str) {
     // process that made it is gone. A refusal here therefore means something
     // this code does not know about is holding the name, which is worth the
     // hard failure rather than a FORCE that would paper over it.
+    // SPEC-1 and 2.164: the template is built under a "_building" name and only renamed to its real name once every
+    // migration has applied, so a process killed mid-build leaves a carcass rather than a template that looks done.
     let building = format!("{template}_building");
     admin
         .execute(format!(r#"DROP DATABASE IF EXISTS "{building}""#).as_str())
@@ -314,6 +342,8 @@ async fn ensure_template(admin_url: &str, template: &str) {
 /// Drop templates from older migration sets. The CI cluster is thrown away
 /// after the run; a developer's is not, and one template per migration change
 /// would accumulate. Only ones nobody is connected to, and never this one.
+// SPEC-1 and 2.171: after a build, every other "mokosh_tpl_%" database with no active
+// session is dropped, so only the current and any still-in-use stale template persist.
 async fn drop_stale_templates(admin: &mut PgConnection, keep: &str) {
     let stale: Vec<String> = sqlx::query_scalar(
         "SELECT datname FROM pg_database d \
@@ -380,6 +410,8 @@ fn template_name() -> String {
 /// migration's bytes without hashing the SQL a second time; `description`
 /// carries the rest of the file name. Each variable-length field is
 /// length-prefixed so no two different sets can serialise to the same stream.
+// SPEC-1 and 2.160: the template name is "mokosh_tpl_" followed by the first 8 bytes (16 hex chars) of a SHA-256 digest over each migration's length-prefixed version/description/checksum, in order.
+// SPEC-1 and 2.161: the digest runs over sqlx::migrate!'s compile-time-embedded migration set, not a runtime directory walk, so the name and the schema that fills it always come from the same source.
 fn template_digest<'a>(migrations: impl IntoIterator<Item = &'a Migration>) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -402,6 +434,8 @@ fn template_digest<'a>(migrations: impl IntoIterator<Item = &'a Migration>) -> S
 /// A database name unique to this test and this run: the test path, so a
 /// kept failure says which test it belongs to, plus a random tail so two runs
 /// never collide.
+// SPEC-1 and 2.166: the per-test database name is a v4 UUID prefix (so truncation at Postgres's 63-byte
+// identifier limit never collides two test names) followed by as much of the test path's tail as fits.
 fn test_database_name(test_path: &str) -> String {
     // Postgres truncates an identifier at 63 bytes and says so in a NOTICE.
     // The UUID therefore goes FIRST: with the readable part in front, a long

@@ -14,10 +14,12 @@
 //! `tenant_isolation` policy as a backstop. A caller that hands one of
 //! these functions the bare NOBYPASSRLS `db().pool()` now reads zero
 //! membership rows. `identities` has no `tenant_id` to scope to and stays
-//! exempt, named in `TENANTLESS_WITHOUT_RLS` (`tests/rls_coverage.rs`).
+//! exempt, named in `TENANTLESS_WITHOUT_RLS` (`tests/suites/rls_coverage.rs`).
 //! Migration `157_identities_and_memberships.sql` created both tables; its
 //! header's "neither table is RLS-enabled" predates 191.
 
+// SPEC-1 and 2.116: every read in this file must run on the migrator (BYPASSRLS) pool; identities carries no tenant_id and no
+// RLS, and tenant_memberships' fail-closed tenant_isolation policy is the backstop if a caller passes the app pool instead.
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -266,6 +268,8 @@ impl MembershipRepo {
         // decode either case; the switcher's bunyip-mint path hides
         // the "Switch" affordance when the id is None, consistent with
         // how it reads a revoked grant.
+        // SPEC-1 and 2.118: grant-arm rows are collected before owner-arm rows, and an owner-arm row whose
+        // tenant_id already appeared from a grant is skipped, so a grantee's seat keeps its grant designation.
         let grant_rows: Vec<GrantArmRow> = sqlx::query_as(
             r#"
             SELECT g.id, g.bunyip_grant_id, t.id AS tenant_id, t.name, t.slug, t.kind, g.role
@@ -377,6 +381,8 @@ impl IdentityRepo {
     /// on replay (0 rows affected). Called from
     /// `authenticate_identity_first` on TOTP success; the caller must
     /// fail closed on `false`.
+    // SPEC-1 and 2.117: compare-and-set on mfa_last_totp_step; zero rows affected
+    // means replay.
     pub async fn record_identity_mfa_success(
         pool: &PgPool,
         identity_id: Uuid,

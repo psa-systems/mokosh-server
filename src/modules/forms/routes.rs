@@ -49,9 +49,13 @@ pub fn forms_routes(service: FormsService, app_url: String) -> Router {
     };
     Router::new()
         .route("/forms", get(list).post(create))
+        // SPEC-7.297: registered before `/forms/{id}` so the literal path segment
+        // `drafts` is never captured as a form id by the `{id}` route.
         // PMS-759: before `/forms/{id}`, so `drafts` is not parsed as a form id.
         .route("/forms/drafts", get(list_drafts).put(upsert_draft))
         .route("/forms/drafts/{id}", axum::routing::delete(delete_draft))
+        // SPEC-7.209: no DELETE /forms/{id} and no POST /forms/{id}/submissions route;
+        // both stay unmounted and 405 rather than being routed.
         // PMS-840: no `delete`. A definition is retired with `is_active`, and a
         // hard delete is refused anyway once `form_submissions` points at it.
         .route("/forms/{id}", get(get_one).patch(update))
@@ -85,7 +89,7 @@ pub fn forms_routes(service: FormsService, app_url: String) -> Router {
 //
 // Backend-only, no SPA caller wanted: `GET /forms/{id}`. The SPA lists every
 // definition and edits from that list, so a by-id read is redundant there; it
-// stays for API clients and is the shape `tests/forms.rs` reads back with.
+// stays for API clients and is the shape `tests/suites/forms.rs` reads back with.
 //
 // No SPA caller yet, and that is the gap: `GET /forms/{id}/submissions`. A
 // client's answers are otherwise unreadable once rendered into the ticket
@@ -98,6 +102,8 @@ pub fn forms_routes(service: FormsService, app_url: String) -> Router {
 // operator's delete, and a hard delete was refused anyway once a submission
 // pointed at the definition. `retired_routes_stay_unmounted` is the guard.
 
+// SPEC-7.205: GET /forms requires only authentication and lists every definition for the
+// caller's tenant, including retired ones, unless active_only=true narrows the result.
 async fn list(
     State(s): State<FormsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -109,6 +115,8 @@ async fn list(
 /// PMS-840: backend-only. Nothing in `mokosh-apps/src/` fetches a definition
 /// by id (the editor works from the `GET /forms` list), so this serves API
 /// clients and the integration suite, not a screen.
+// SPEC-7.206: GET /forms/{id} requires authentication; a missing definition for the
+// caller's tenant is a 404, not any other status.
 async fn get_one(
     State(s): State<FormsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -117,13 +125,19 @@ async fn get_one(
     Ok(Json(s.service.get(u.tenant(), id).await?))
 }
 
+// SPEC-7.207: POST /forms (create a definition) requires an admin user, not merely
+// authentication.
 async fn create(
     State(s): State<FormsRouterState>,
     RequireAdminUser(u): RequireAdminUser,
     Json(body): Json<CreateFormDefinitionRequest>,
 ) -> AppResult<Json<FormDefinitionResponse>> {
+    // SPEC-7.213,7.215,7.224,7.225,7.226: DTO-layer checks on name/slug/fields and, per
+    // field, CreateFormFieldRequest's name/label/min_length/max_length, before the service runs.
     body.validate()?;
     let created = s.service.create(u.tenant(), u.id, body).await?;
+    // SPEC-7.212: after a successful create, the caller's "new form" draft (keyed by
+    // form_definition_id = None) is deleted best-effort; a failure here only logs a warning.
     // PMS-759: the work is on the server now, so the "new form" draft has
     // nothing left to protect. Cleared here rather than left to the SPA: a
     // draft exists to survive the browser going away, so it cannot depend on
@@ -134,14 +148,19 @@ async fn create(
     Ok(Json(created))
 }
 
+// SPEC-7.208: PATCH /forms/{id} (update a definition) requires an admin user.
 async fn update(
     State(s): State<FormsRouterState>,
     RequireAdminUser(u): RequireAdminUser,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateFormDefinitionRequest>,
 ) -> AppResult<Json<FormDefinitionResponse>> {
+    // SPEC-7.214, SPEC-7.215: UpdateFormDefinitionRequest.contact_info keeps the
+    // same 200-char cap via double_option, and fields (when present) must have >= 1 entry.
     body.validate()?;
     let updated = s.service.update(u.tenant(), id, body).await?;
+    // SPEC-7.212: after a successful update, the caller's draft for this specific
+    // form_definition_id is deleted best-effort.
     s.service
         .clear_form_draft_after_save(u.tenant(), u.id, Some(id))
         .await;
@@ -151,6 +170,8 @@ async fn update(
 /// PMS-759: the caller's own drafts. Admin-gated to match `create` / `update`:
 /// a draft is a half-written definition, and the people who can author one are
 /// the people who can hold one.
+// SPEC-7.296: all draft routes (list, upsert, delete) require an admin user, matching the
+// create/update gating on definitions.
 async fn list_drafts(
     State(s): State<FormsRouterState>,
     RequireAdminUser(u): RequireAdminUser,
@@ -179,6 +200,8 @@ async fn delete_draft(
 
 /// PMS-869: the reader for a form's answers. No SPA caller yet; see the
 /// parity record above.
+// SPEC-7.210: GET /forms/{id}/submissions requires only authentication (any authenticated
+// agent, not admin-only).
 async fn list_submissions(
     State(s): State<FormsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -191,12 +214,17 @@ async fn list_submissions(
 // handling the account emails the form), so it is RequireAuth rather than
 // admin-gated. Authoring the definition it points at stays admin-only above.
 
+// SPEC-7.258: issuing a request link requires only authentication, not admin.
 async fn issue_request_link(
     State(s): State<FormsRouterState>,
     RequireAuth(u): RequireAuth,
     Json(body): Json<IssueRequestLinkRequest>,
 ) -> AppResult<Json<RequestLinkResponse>> {
+    // SPEC-7.260: IssueRequestLinkRequest is DTO-validated before the service call:
+    // recipient_email (if present) must be a valid email, people (if present) in 1..=50.
     body.validate()?;
+    // SPEC-7.259: issuing is rate-limited per issuing user; exceeding it fails the
+    // request with a rate-limited error rather than sending another link.
     s.mail_limiter
         .check(u.id)
         .map_err(|retry_after| AppError::rate_limited(Some(retry_after)))?;
@@ -214,6 +242,8 @@ struct RequestLinkQuery {
     company_id: Option<Uuid>,
 }
 
+// SPEC-7.275: GET /form-request-links requires only authentication and lists links for
+// the caller's tenant, optionally filtered to one company_id.
 async fn list_request_links(
     State(s): State<FormsRouterState>,
     RequireAuth(u): RequireAuth,

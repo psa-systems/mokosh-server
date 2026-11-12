@@ -35,6 +35,7 @@ use crate::config::{self, registry as keys, ConfigKey};
 /// without a real client IP does not register as a country change. The website
 /// probe refuses to connect to them at all, so an authenticated user cannot
 /// point the server at `127.0.0.1` or `10.0.0.5` and read back a status code.
+// SPEC-4.8: the crate's one definition of "not a public internet peer".
 pub fn is_non_public_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -137,6 +138,7 @@ pub struct PrivateTargetAllowlist {
 impl PrivateTargetAllowlist {
     /// Parse a comma-separated list. An empty list allows nothing, which is the
     /// fail-closed default: the guard behaves exactly as PMS-805 wrote it.
+    // SPEC-4.11: address/CIDR entries exempt networks, others exempt a hostname; blank input exempts nothing.
     pub fn parse(raw: &str) -> Self {
         let mut hosts = Vec::new();
         let mut networks = Vec::new();
@@ -205,6 +207,8 @@ pub fn private_target_allowlist() -> &'static PrivateTargetAllowlist {
 /// The residual is the same one PMS-805 stated: a DNS rebinding attack that
 /// changes the answer between this check and the connect is not covered without
 /// an IP-pinned connector.
+// SPEC-4.9, SPEC-4.10: scheme/host/port screened before DNS; resolved
+// addresses screened against SPEC-4.8 and the allowlist.
 pub async fn guard_outbound_url<R: HostResolver + ?Sized>(
     resolver: &R,
     url: &Url,
@@ -227,8 +231,8 @@ pub async fn guard_outbound_url<R: HostResolver + ?Sized>(
         }
     }
 
-    // An operator naming the host itself exempts whatever it resolves to,
-    // because that is the case where they do not control the answer.
+    // SPEC-4.11: an operator naming the host itself exempts whatever it
+    // resolves to, because that is the case where they do not control the answer.
     if allowlist.allows_host(host) {
         return Ok(());
     }
@@ -262,6 +266,7 @@ pub async fn guard_outbound_url<R: HostResolver + ?Sized>(
 /// log even when the input does not parse as a URL at all: an unparsable
 /// string can still carry `user:password@`, a secret path, a query or a
 /// fragment, and this works on the raw text rather than a successful parse.
+// SPEC-4.12: authority only, never scheme/userinfo/path/query/fragment, even on unparsable input.
 pub fn loggable_url_authority(raw: &str) -> String {
     let after_scheme = raw.split_once("://").map_or(raw, |(_, rest)| rest);
     let end = after_scheme

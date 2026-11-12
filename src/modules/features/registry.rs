@@ -62,6 +62,28 @@ pub enum Feature {
     /// banner. The existing single-asset `POST /api/v1/assets` is unaffected
     /// either way.
     AssetsCatalog,
+    /// Delegated invoice issuer (MAPPS-1099 Phase 2). Gates the dispatch
+    /// that reads a tenant's `integrations.enabled_capabilities` and picks
+    /// an external invoice issuer (Xero or QuickBooks) when one is
+    /// configured. Off: `create_invoice` runs the current local path for
+    /// every tenant, every time; the dispatch helper
+    /// (`crate::modules::billing::invoice_issuer::select_issuer`) still
+    /// returns `IssuerSelection::Local`, so no provider HTTP is ever
+    /// reached. On: a tenant with a connected Xero or QuickBooks row
+    /// carrying `Capability::Invoicing` has the row persisted with the
+    /// external provider's identifiers; a tenant without one still runs
+    /// the local path. The flag defaults OFF on every deployment so the
+    /// Phase 2 merge is a no-op until operations flips it on in staging.
+    DelegatedInvoiceIssuer,
+    /// Delegated BILLS (MAPPS-1155). Its own switch and not
+    /// [`Feature::DelegatedInvoiceIssuer`]'s, although both ride the same
+    /// Xero and QuickBooks connection: that flag is named for, and
+    /// documented as, the invoice issuer, and a second capability riding
+    /// it is how an operator turns on something they did not read about.
+    /// Off: `expenses::create_bill` is byte-identical to the local path.
+    /// On: a tenant that delegated `BillsAndExpenses` has its bills raised
+    /// in the provider, which is where that MSP's accounting lives.
+    DelegatedBills,
 }
 
 impl Feature {
@@ -70,6 +92,8 @@ impl Feature {
         Feature::IntegrationsOverview,
         Feature::AssetsSearchV2,
         Feature::AssetsCatalog,
+        Feature::DelegatedInvoiceIssuer,
+        Feature::DelegatedBills,
     ];
 
     /// The stable key: the `feature_toggles.key` value and the wire name. Never
@@ -79,6 +103,8 @@ impl Feature {
             Feature::IntegrationsOverview => "integrations_overview",
             Feature::AssetsSearchV2 => "assets_search_v2",
             Feature::AssetsCatalog => "assets_catalog",
+            Feature::DelegatedInvoiceIssuer => "delegated_invoice_issuer",
+            Feature::DelegatedBills => "delegated_bills",
         }
     }
 
@@ -88,6 +114,8 @@ impl Feature {
             Feature::IntegrationsOverview => "Integrations overview",
             Feature::AssetsSearchV2 => "Asset search v2",
             Feature::AssetsCatalog => "Asset catalog + bulk order",
+            Feature::DelegatedInvoiceIssuer => "Delegated invoice issuer",
+            Feature::DelegatedBills => "Delegated bills",
         }
     }
 
@@ -115,6 +143,20 @@ impl Feature {
                  up to 500 serials per call, and the signature detector surfaces hot patterns. \
                  The single-asset POST /api/v1/assets is unaffected either way."
             }
+            Feature::DelegatedInvoiceIssuer => {
+                "The dispatch that lets a tenant hand invoice issuing to Xero or QuickBooks \
+                 when the integration is connected with the Invoicing capability. Off: every \
+                 invoice is issued locally by Mokosh (the current behaviour) regardless of \
+                 which capabilities a tenant has turned on; the external-provider HTTP clients \
+                 are compiled in but never reached. On: a tenant whose Xero or QuickBooks row \
+                 enables Invoicing has new invoices issued through that provider and the \
+                 external numbers persisted on the local row; a tenant without one still \
+                 issues locally. Leave off until the external-provider credential mapping \
+                 lands in a follow-up PR."
+            }
+            Feature::DelegatedBills => {
+                "Whether a tenant that has delegated Bills and expenses to Xero or QuickBooks                  has its bills raised there. Off: every bill is Mokosh's, which is what it is                  today. On: a bill for a vendor mapped to that provider is created over there                  and Mokosh keeps the reference. Separate from the invoice switch because it                  moves a different ledger, in the other direction."
+            }
         }
     }
 
@@ -125,6 +167,8 @@ impl Feature {
             Feature::IntegrationsOverview => "MAPPS-971",
             Feature::AssetsSearchV2 => "PMS-1486",
             Feature::AssetsCatalog => "PMS-1492",
+            Feature::DelegatedInvoiceIssuer => "MAPPS-1099",
+            Feature::DelegatedBills => "MAPPS-1155",
         }
     }
 

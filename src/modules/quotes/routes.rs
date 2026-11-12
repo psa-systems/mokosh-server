@@ -5,7 +5,7 @@
 //! the same pair `invoices`, `contracts`, and `rate-cards` use. PMS-350
 //! established that every financial surface is finance-gated on reads as
 //! well as writes, and a quote is a priced commercial document, so it
-//! belongs in that set. `tests/rbac_route_coverage.rs` pins it.
+//! belongs in that set. `tests/suites/rbac_route_coverage.rs` pins it.
 //!
 //! URLs are absolute (`/quotes`, ...) so the call site `merge`s rather
 //! than `nest`s, matching `billing_routes`. That also keeps

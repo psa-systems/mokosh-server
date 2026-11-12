@@ -27,6 +27,7 @@ pub fn generate_secret() -> [u8; TOTP_SECRET_BYTES] {
 /// RFC 4648 base32, uppercase, no padding. We hand-roll because the only
 /// callers are this module and the recovery-code module; pulling another
 /// crate for two functions is not worth it.
+// SPEC-4.30: RFC 4648 base32, uppercase alphabet, no padding on encode.
 pub fn base32_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut out = String::with_capacity((bytes.len() * 8).div_ceil(5));
@@ -48,6 +49,7 @@ pub fn base32_encode(bytes: &[u8]) -> String {
     out
 }
 
+// SPEC-4.30: decode ignores whitespace and "=" padding, accepts either case.
 pub fn base32_decode(s: &str) -> Result<Vec<u8>, TotpError> {
     let mut out = Vec::with_capacity(s.len() * 5 / 8);
     let mut buf: u32 = 0;
@@ -99,6 +101,7 @@ fn urlencode(s: &str) -> String {
 
 /// RFC 4226 HOTP / RFC 6238 TOTP step function. `t` is the step number
 /// (i.e. unix_seconds / 30).
+// SPEC-4.31: RFC 4226/6238 HMAC-SHA1 dynamic truncation for step number t.
 fn step(secret: &[u8], t: i64) -> u32 {
     let mut mac = Hmac::<Sha1>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(&t.to_be_bytes());
@@ -122,6 +125,7 @@ fn format_code(value: u32) -> String {
 /// Verify `code` against `secret` allowing `+-window` steps of clock
 /// skew. Returns the matched step on success so the caller can use it
 /// for anti-replay.
+// SPEC-4.31: exactly TOTP_DIGITS ascii digits, +-window steps, constant-time compare.
 pub fn verify(secret: &[u8], code: &str, now: DateTime<Utc>, window: i64) -> Option<i64> {
     let code = code.trim();
     if code.len() != TOTP_DIGITS as usize || !code.chars().all(|c| c.is_ascii_digit()) {

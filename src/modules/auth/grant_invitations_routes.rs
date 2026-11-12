@@ -433,7 +433,7 @@ async fn create_invitation(
             );
             let context = serde_json::json!({
                 "recipient_email": invitation.invitee_email,
-                "invitee_display_name": local_part(&invitation.invitee_email),
+                "salutation": crate::utils::email::salutation(&local_part(&invitation.invitee_email)),
                 "inviter_display_name": display_name_for(&caller),
                 "mokosh_account_name": lookup_tenant_name(&state, caller.tenant_id)
                     .await
@@ -492,6 +492,30 @@ fn local_part(email: &str) -> String {
         .map(|(local, _)| local)
         .unwrap_or(email)
         .to_string()
+}
+
+#[cfg(test)]
+mod salutation_greeting {
+    //! PMS-1507: the grant-invite greeting is `{{salutation}},` filled
+    //! from `salutation(&local_part(email))`. An empty or whitespace-only
+    //! local part (e.g. `"@example.com"` or `" @example.com"`) must still
+    //! resolve to the bare "Hello" fallback, not an empty string that
+    //! would leave the template's `{{salutation}},` as a stray leading
+    //! comma.
+
+    use super::local_part;
+    use crate::utils::email::salutation;
+
+    #[test]
+    fn blank_local_part_falls_back_to_bare_hello() {
+        assert_eq!(salutation(&local_part("@example.com")), "Hello");
+        assert_eq!(salutation(&local_part(" @example.com")), "Hello");
+    }
+
+    #[test]
+    fn non_blank_local_part_greets_by_name() {
+        assert_eq!(salutation(&local_part("alice@example.com")), "Hello alice");
+    }
 }
 
 /// Best-effort display name for the inviter, matching the shape

@@ -181,6 +181,27 @@ pub struct InvoiceResponse {
     pub updated_at: DateTime<Utc>,
     /// `Some` on `GET /:id`, `None` on list rollups.
     pub lines: Option<Vec<InvoiceLineResponse>>,
+    /// MAPPS-1099: the external provider (`xero`, `quickbooks`) that issued
+    /// this invoice, when the tenant delegated the Invoicing capability.
+    /// `None` is "Mokosh issued this invoice", which is every row on a
+    /// deployment that has not turned `DelegatedInvoiceIssuer` on.
+    ///
+    /// Set by `create_invoice` since MAPPS-1134. Before that the column was
+    /// schema-ready and unwritten, and this comment said so for three
+    /// phases after it stopped being true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_provider: Option<String>,
+    /// The external provider's own id for this invoice (Xero's guid,
+    /// QuickBooks's numeric id), used by the webhook receiver to reconcile
+    /// provider events back to the local row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_invoice_id: Option<String>,
+    /// The human-readable number as the external provider rendered it, kept
+    /// because that is what the customer sees and what admins reconcile
+    /// against. `None` for a Mokosh-issued invoice, which prints
+    /// `invoice_number` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_number: Option<String>,
 }
 
 /// MAPPS-984: server-side aggregate for the dashboard "open invoices"
@@ -454,6 +475,20 @@ pub struct PaymentResponse {
     pub gateway_transaction_id: Option<String>,
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+/// The columns a webhook receiver needs about an invoice its provider holds
+/// (MAPPS-1136).
+///
+/// Three fields rather than the whole `InvoiceResponse`: the receiver is
+/// about to record what the provider collected, and the amount and the
+/// currency are what that record takes. Reading the rest would be reading
+/// it to throw away.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DelegatedInvoiceRow {
+    pub id: uuid::Uuid,
+    pub balance_due: Decimal,
+    pub currency: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -916,6 +951,7 @@ mod tests {
 pub struct CreditNoteLineResponse {
     pub id: Uuid,
     pub line_type: InvoiceLineType,
+    pub product_id: Option<Uuid>,
     pub description: String,
     pub quantity: Decimal,
     pub unit_price: Decimal,
@@ -950,11 +986,23 @@ pub struct CreditNoteResponse {
     pub updated_at: DateTime<Utc>,
     /// `Some` on `GET /:id`, `None` on list rollups, like `InvoiceResponse`.
     pub lines: Option<Vec<CreditNoteLineResponse>>,
+    /// PMS-1546: `xero` or `quickbooks` when that provider holds a copy of
+    /// this credit note, with its own id and the number it rendered. All
+    /// three are `None` for a credit note only Mokosh holds, which is
+    /// every one against a locally-issued invoice.
+    pub external_provider: Option<String>,
+    pub external_credit_note_id: Option<String>,
+    pub external_number: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct CreateCreditNoteLineRequest {
     pub line_type: InvoiceLineType,
+    /// The catalogue product this line credits, when it names one.
+    /// Required only on the QuickBooks-delegated path, which resolves it
+    /// to an `ItemRef` the provider refuses the call without (PMS-1546).
+    #[serde(default)]
+    pub product_id: Option<Uuid>,
     #[validate(length(min = 1, max = 1000))]
     pub description: String,
     /// Required to be positive by `create_credit_note`, unlike

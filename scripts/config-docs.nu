@@ -49,6 +49,12 @@ def is-version [v: any] {
 }
 
 def release-tags [] {
+    # Best-effort: an offline clone or one with no `origin` keeps whatever
+    # tags it already has rather than failing the whole run (PMS-1675).
+    # check.yml's "nu guards + migrations + routes" job, which runs this,
+    # already clones with fetch-depth: 0 and no fetch-tags override, so it
+    # already has every tag; this fetch is for a developer's local clone.
+    do -i { ^git fetch --tags --quiet }
     ^git tag --list "v*" | lines | where {|t| is-version $t }
 }
 
@@ -152,7 +158,7 @@ def build-entries [catalog: list, meta: record] {
         }
         if $v.deprecated != null {
             let d = $v.deprecated
-            $auto = ($auto | append { release: $d.release, group: "Deprecated", var: $v.name, required: false, level: "", feature: "", issue: ($d.issue? | default ""), action: $"Renamed to `($d.replacement)`. The old name still works and logs a warning naming the new one; rename it at your next compose edit." })
+            $auto = ($auto | append { release: $d.release, group: "Deprecated", var: $v.name, required: false, level: "", feature: "", issue: ($d.issue? | default ""), action: $"Renamed to `($d.replacement)`. The old name no longer works: the server refuses to boot when it is set \(PMS-1443); rename it in your compose file." })
         }
         if $v.removed != null {
             let r = $v.removed
@@ -203,6 +209,8 @@ def build-entries [catalog: list, meta: record] {
     let all = ($auto | append $explicit | each {|e|
         if ($e.action | is-empty) { $e | update action (default-action $e) } else { $e }
     })
+    # SPEC-10.188: a required-at-add entry (other than v0.1.0) needs a [[change]]
+    # naming an issue and action; feature-off needs a non-empty feature.
     for e in $all {
         if ($e.level | is-not-empty) and (($e.action | is-empty) or not ($e.issue =~ '^[A-Z]+-\d+$')) {
             $errors = ($errors | append $"($LEVELS | get $e.level) ($e.group) ($e.var) in ($e.release) needs a [[change]] record in ($VARIABLES_FILE) with the operator action and the issue that introduced it")
@@ -347,11 +355,15 @@ def check-recent [lines: list, entries: list, tags: list] {
     let anchors = ($lines | str join "\n" | parse --regex '<a id="(?<id>[^"]+)"></a>' | get id)
     mut errors = []
     mut found = []
+    mut headings = []
     mut release: any = null
     mut group: any = null
     for line in ($lines | skip ($bounds.start + 1) | first ($bounds.stop - $bounds.start - 1)) {
         if ($line starts-with "### ") {
             $release = ($line | parse --regex '(?<v>v\d+\.\d+\.\d+)' | get 0?.v)
+            if $release != null {
+                $headings = ($headings | append { v: $release, unreleased: ($line | str contains "Unreleased") })
+            }
             $group = null
             continue
         }
@@ -392,6 +404,14 @@ def check-recent [lines: list, entries: list, tags: list] {
         }
     }
     let w = (window $entries $tags)
+    for h in $headings {
+        let want = ($h.v in $w.unreleased)
+        if $h.unreleased != $want {
+            let got = if $h.unreleased { "Unreleased" } else { "released" }
+            let expect = if $want { "Unreleased" } else { "released" }
+            $errors = ($errors | append $"($DOC_FILE): ($h.v) heading is labeled '($got)', a fresh `window` call says it is '($expect)'; run `just config-docs`")
+        }
+    }
     let covered = ($w.unreleased | append $w.released)
     for e in ($entries | where {|e| $e.release in $covered }) {
         if not ($"($e.release)|($e.group)|($e.var)" in $found) {
@@ -518,6 +538,9 @@ def main [] {
     print "usage: nu scripts/config-docs.nu <generate|check|since <version>|release-notes <version>|self-test>"
 }
 
+# SPEC-10.186: rewrites only the Recently-added block and the All-variables
+# table rows; a second run is idempotent.
+
 def "main generate" [] {
     let repo = (load-repo)
     fail-on $repo.errors "the configuration facts are inconsistent"
@@ -527,6 +550,9 @@ def "main generate" [] {
     $next | save --force $DOC_FILE
     print $"rewrote the generated parts of ($DOC_FILE)"
 }
+
+# SPEC-10.185: fails on a catalog defect (duplicate name, malformed field, or a
+# code-read var missing from the registry) or a docs/configuration.md mismatch.
 
 def "main check" [] {
     let repo = (load-repo)
@@ -540,6 +566,9 @@ def "main check" [] {
     fail-on $errors "docs/configuration.md disagrees with the configuration facts (PMS-1442)"
     print $"config docs OK: ($repo.catalog | length) variables, ($repo.entries | length) changelog entries"
 }
+
+# SPEC-10.187: one row per catalog change after `version`, sorted by release,
+# breaking-level, required-first, name.
 
 def "main since" [
     version: string   # the release you run now, e.g. v0.13.0
@@ -683,6 +712,7 @@ def "main self-test" [] {
         ["a Breaking change without an issue and action fails", (build-entries (build-catalog (parse-registry $new_req) $f.meta) $f.meta | get errors), 1]
         ["a wrong Required flag in the changelog fails", (all-errors $f.registry_text $f.meta $f.tags ($good | str replace '[`OPT_KEY`](#var-opt-key) (Required: no)' '[`OPT_KEY`](#var-opt-key) (Required: yes)')), 1]
         ["an entry linking to a missing anchor fails", (all-errors $f.registry_text $f.meta $f.tags ($good | str replace '[`OPT_KEY`](#var-opt-key)' '[`OPT_KEY`](#var-nope)')), 1]
+        ["a stale 'Unreleased' heading on an already-tagged release fails", (all-errors $f.registry_text $f.meta $f.tags ($good | str replace '### v9.1.0' '### Unreleased (v9.1.0)')), 1]
         ["a read outside the registry that is not listed fails", (guard-errors ["BOOT_KEY" "SURPRISE_KEY"] (build-catalog (parse-registry $f.registry_text) $f.meta)), 1]
         ["a listed variable nothing reads fails", (guard-errors [] (build-catalog (parse-registry $f.registry_text) $f.meta)), 1]
         ["discover finds env::var, helpers, consts and EnvFilter", (do {

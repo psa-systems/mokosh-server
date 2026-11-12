@@ -46,6 +46,7 @@
 
 use std::collections::BTreeMap;
 
+use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
@@ -115,8 +116,10 @@ fn local_name(raw: &[u8]) -> String {
 /// being a parse failure. A CardDAV server is free to return more than was asked
 /// for, and iCloud does.
 pub fn parse_multistatus(xml: &str) -> SourceResult<MultiStatus> {
+    // No `trim_text`: entity references split text into several events (see the
+    // `GeneralRef` arm), and trimming each one would eat the spaces and line
+    // breaks between them. Every value is trimmed whole at its closing tag.
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
     let mut out = MultiStatus::default();
     let mut current: Option<DavResource> = None;
     // The element whose text we are collecting, and the text so far.
@@ -157,8 +160,27 @@ pub fn parse_multistatus(xml: &str) -> SourceResult<MultiStatus> {
                     }
                 }
             }
+            // quick-xml 0.38 stopped resolving entities inside `Text`: `a &amp; b`
+            // arrives as `Text("a ")`, `GeneralRef("amp")`, `Text(" b")`. Reading
+            // only `Text` would silently drop every `&`, `<` and `>` from a card.
             Ok(Event::Text(e)) => {
-                text.push_str(&e.unescape().unwrap_or_default());
+                text.push_str(&e.decode().unwrap_or_default());
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if let Ok(Some(ch)) = e.resolve_char_ref() {
+                    text.push(ch);
+                } else if let Ok(name) = e.decode() {
+                    match resolve_predefined_entity(&name) {
+                        Some(resolved) => text.push_str(resolved),
+                        // A DTD-declared entity this parser cannot resolve is kept
+                        // as written rather than dropped, so the card stays whole.
+                        None => {
+                            text.push('&');
+                            text.push_str(&name);
+                            text.push(';');
+                        }
+                    }
+                }
             }
             Ok(Event::CData(e)) => {
                 text.push_str(&String::from_utf8_lossy(e.as_ref()));
@@ -215,7 +237,7 @@ pub fn parse_multistatus(xml: &str) -> SourceResult<MultiStatus> {
                     }
                     "address-data" => {
                         if let Some(resource) = current.as_mut() {
-                            resource.card = Some(value);
+                            resource.card = Some(value.trim().to_string());
                         }
                     }
                     "status" => {
@@ -659,6 +681,31 @@ mod tests {
         // another card; the provider is what tells them apart.
         let group = parsed.resources[2].card.as_deref().expect("group card");
         assert!(group.contains("X-ADDRESSBOOKSERVER-KIND:group"), "{group}");
+    }
+
+    /// Entity and character references inside a card come back as the characters
+    /// they stand for. quick-xml 0.38+ reports them as their own events, so a
+    /// parser that read only `Text` lost them (`AT&T` became `ATT`).
+    #[test]
+    fn escaped_characters_in_a_card_survive_the_parse() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:response>
+    <d:href>/card/att.vcf</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getetag>"e1"</d:getetag>
+        <card:address-data>BEGIN:VCARD
+ORG:AT&amp;T &lt;Labs&gt; &#x41;&#66;
+END:VCARD</card:address-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#;
+        let parsed = parse_multistatus(xml).expect("parses");
+        let card = parsed.resources[0].card.as_deref().expect("a card body");
+        assert!(card.contains("ORG:AT&T <Labs> AB\n"), "{card:?}");
     }
 
     /// A sync report carries the token to use next time, and reports a deletion

@@ -240,7 +240,7 @@ pub const ALL_CAPABILITIES: &[&str] = &[
 /// binds these for a new tenant, so a tenant created today holds what
 /// one that predates the migrations holds; `builtin_roles_match_the_seed_migrations`
 /// fails the build when a migration appends a capability without adding
-/// it here, and `tests/tenants.rs` pins a freshly created tenant against
+/// it here, and `tests/suites/tenants.rs` pins a freshly created tenant against
 /// the default tenant's rows. A new built-in capability is added in a NEW
 /// migration (the 179 shape) AND here, in the same change.
 pub const BUILTIN_BILLING_CONTACT: &[&str] = &[

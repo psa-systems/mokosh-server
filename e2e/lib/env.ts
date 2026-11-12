@@ -6,12 +6,14 @@ import { config as loadEnv } from 'dotenv';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// SPEC-10.196: override:false keeps a real env var winning over .env.
 // Load e2e/.env BEFORE reading process.env so dotenv-only values are visible
 // to every consumer. CI injects the same vars from Forgejo secrets, so a
 // missing file is fine (override:false keeps real env winning).
 const here = dirname(fileURLToPath(import.meta.url));
 loadEnv({ path: resolve(here, '..', '.env'), override: false });
 
+// SPEC-10.196: required() throws on unset or blank-after-trim.
 function required(name: string): string {
   const value = process.env[name];
   if (value === undefined || value.trim() === '') {
@@ -46,6 +48,8 @@ function deriveApiBase(spaUrl: string): string | null {
 // Required: no domain is ever hardcoded as a fallback. The SPA host differs
 // per environment (staging `https://msp.a8n.systems`, prod
 // `https://msp.psa.systems`), so the operator must inject it explicitly.
+// SPEC-10.197: E2E_BASE_URL is required with no hardcoded fallback; apiBaseURL
+// resolves E2E_API_BASE_URL, else api.<host>, else the base URL itself.
 const spaBaseURL = required('E2E_BASE_URL');
 const derivedApi = deriveApiBase(spaBaseURL);
 const apiBaseURL = optional('E2E_API_BASE_URL') ?? derivedApi ?? spaBaseURL;
@@ -53,6 +57,7 @@ const apiBaseURL = optional('E2E_API_BASE_URL') ?? derivedApi ?? spaBaseURL;
 // SPA + mokosh PSA live under `msp.<tld>`, but the OP runs under the apex
 // `api.<tld>` (no `msp.` prefix). When unset, fall back to apiBaseURL - a
 // legacy default that points at mokosh, which serves no `/oauth2/*`.
+// SPEC-10.197: opBaseURL resolves E2E_OP_BASE_URL, else falls back to apiBaseURL.
 const opBaseURL = optional('E2E_OP_BASE_URL') ?? apiBaseURL;
 
 export const env = {
@@ -105,6 +110,8 @@ export const env = {
 // would reasonably fill them in. Each entry pairs the var name with a
 // one-line purpose so the aggregated error message names what each
 // missing value is for, not just which key is empty.
+// SPEC-10.198: each of these is required; E2E_ENVIRONMENT is read directly
+// via process.env by test specs, not through this module, defaulting to 'unknown'.
 const REQUIRED: Array<{ name: string; purpose: string }> = [
   {
     name: 'E2E_BASE_URL',
@@ -130,6 +137,7 @@ const REQUIRED: Array<{ name: string; purpose: string }> = [
 /// configuration gap in one round trip instead of fixing-and-rerunning
 /// once per missing key. Called from the `preflight` setup project so it
 /// runs before any other project's tests.
+// SPEC-10.198: collects every missing required var into one thrown error.
 export function preflightRequiredEnv(): void {
   const missing = REQUIRED.filter(({ name }) => {
     const value = process.env[name];

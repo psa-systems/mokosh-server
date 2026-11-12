@@ -46,6 +46,7 @@ pub struct PaginationParams {
 /// values are still allowed through and get [`PaginationParams::per_page`]'s
 /// clamp to 1: zero rows is not the same class of mistake as an
 /// unbounded page.
+// SPEC-4.49: reject per_page over MAX_PER_PAGE at parse time, not a silent clamp.
 fn deserialize_per_page<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
     D: Deserializer<'de>,
@@ -92,6 +93,7 @@ fn unknown_sort(requested: &str, allowed: &[&str]) -> AppError {
 impl PaginationParams {
     /// PMS-1238: `sort_dir` other than asc/desc is a 422, not a silent DESC.
     /// An empty value (the `Default` shape) stays the descending default.
+    // SPEC-4.50: asc->ASC, ""/desc->DESC, else 422 naming sort_dir.
     fn direction(&self) -> AppResult<&'static str> {
         match self.sort_dir.to_lowercase().as_str() {
             "asc" => Ok("ASC"),
@@ -112,6 +114,7 @@ impl PaginationParams {
     }
 
     /// Get the per_page value, clamped to MAX_PER_PAGE
+    // SPEC-4.49: clamp to [1, MAX_PER_PAGE].
     pub fn per_page(&self) -> u32 {
         self.per_page.clamp(1, Self::MAX_PER_PAGE)
     }
@@ -146,6 +149,7 @@ impl PaginationParams {
     ///
     /// MAPPS-533: rejects an unknown key exactly as [`Self::order_by`] does.
     /// The 422 names the public keys, never the SQL they map to.
+    // SPEC-4.51: reject an unlisted sort key; resolve a listed key to its SQL expression.
     pub fn order_by_mapped(
         &self,
         default_sql: &str,
@@ -199,6 +203,7 @@ impl PaginationParams {
     /// Rejecting is about telling the caller, not about what is safe to splice.
     /// A `sort` that is absent is unchanged - it uses `default_field` - so a
     /// caller that never asks to sort can never see a 422.
+    // SPEC-4.51: reject an unlisted sort field; None sort keeps the default field.
     pub fn order_by(&self, default_field: &str, allowed_fields: &[&str]) -> AppResult<String> {
         self.reject_over_cap_per_page()?;
         let default_field = default_field
@@ -228,6 +233,7 @@ impl PaginationParams {
     /// naming `sort` instead of a 200 in the default order. A `sort` that is
     /// absent is unchanged, exactly as with the two helpers above: a caller
     /// that never asks to sort never sees this.
+    // SPEC-4.51: any non-None sort on an unsorted endpoint is a 422.
     pub fn reject_unsupported_sort(&self) -> AppResult<()> {
         self.reject_over_cap_per_page()?;
         match self.sort.as_deref() {
@@ -268,6 +274,7 @@ pub struct PaginationMeta {
 
 impl<T> PaginatedResponse<T> {
     /// Create a new paginated response
+    // SPEC-4.52: total_pages = ceil(total / per_page.max(1)); has_next/has_prev from page.
     pub fn new(data: Vec<T>, page: u32, per_page: u32, total: u64) -> Self {
         // Guard against per_page == 0: division by zero yields NaN/inf,
         // which casts to a nonsensical total_pages (0 or u32::MAX). Clamp
@@ -729,6 +736,7 @@ mod pms1194_sort_guard {
             "email_intake",
             include_str!("../modules/email_intake/routes.rs"),
         ),
+        ("expenses", include_str!("../modules/expenses/routes.rs")),
         ("features", include_str!("../modules/features/routes.rs")),
         ("forms", include_str!("../modules/forms/routes.rs")),
         (

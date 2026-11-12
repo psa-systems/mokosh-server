@@ -37,6 +37,7 @@ pub mod provider;
 pub mod routes;
 pub mod runs;
 pub mod service;
+pub mod switch;
 pub mod sync;
 pub mod vcard;
 

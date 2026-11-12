@@ -39,6 +39,7 @@ static APP_NAME: RwLock<Option<Arc<str>>> = RwLock::new(None);
 /// The name every consumer renders. Never empty: an unset (or unusable)
 /// setting yields [`DEFAULT_APP_NAME`], because a blank product name in an
 /// email subject is a worse outcome than an unchanged one.
+// SPEC-4.22: unset reads as DEFAULT_APP_NAME; otherwise the most recently set name.
 pub fn app_name() -> Arc<str> {
     APP_NAME
         .read()
@@ -61,6 +62,7 @@ pub fn set_app_name(name: Option<&str>) {
 /// Rejects control characters because the name lands in email `Subject`
 /// headers: a `\r\n` in a header value is header injection, and lettre would
 /// otherwise carry whatever an admin typed.
+// SPEC-4.22: blank, over MAX_APP_NAME_LEN chars, or any control char is refused.
 pub fn sanitize(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {

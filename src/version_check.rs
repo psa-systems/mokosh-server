@@ -77,6 +77,7 @@ struct UpdateCheckProbe {
 static UPDATE_CHECK_PROBE: std::sync::OnceLock<Option<UpdateCheckProbe>> =
     std::sync::OnceLock::new();
 
+// SPEC-1 and 2.153: the update check makes no outbound request, and the probe is never built, when MOKOSH_UPDATE_CHECK_URL is unset or blank.
 fn update_check_probe() -> Option<&'static UpdateCheckProbe> {
     UPDATE_CHECK_PROBE
         .get_or_init(|| {
@@ -85,9 +86,8 @@ fn update_check_probe() -> Option<&'static UpdateCheckProbe> {
             if trimmed.is_empty() {
                 return None;
             }
-            // Best-effort credential scrub for error strings, identical to the
-            // Infisical probe. A value that does not parse as a URL has no
-            // leak path, but stay defensive and fall back to the literal.
+            // SPEC-1 and 2.154: the display URL strips userinfo, query and fragment so a credential embedded in the configured URL never reaches an error message. Best-effort credential
+            // scrub for error strings, identical to the Infisical probe. A value that does not parse as a URL has no leak path, but stay defensive and fall back to the literal.
             let display = match url::Url::parse(&trimmed) {
                 Ok(mut u) => {
                     let _ = u.set_username("");
@@ -126,6 +126,7 @@ static RESULT_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedResult>>>
 /// Reuse window for a successful check. Update info changes rarely, so a
 /// generous window collapses dashboard polling (and abuse) to one upstream
 /// request per window.
+// SPEC-1 and 2.155: a successful result is cached and reused for 15 minutes; a failed one for 60 seconds.
 const SUCCESS_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// Shorter reuse window for a failed check, so a transient upstream outage
 /// recovers on the next poll instead of being pinned for the success window.

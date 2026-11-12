@@ -52,6 +52,7 @@ use std::fmt;
 ///
 /// The line is bootstrap ORDER, not how secret a value is: bootstrap is what a
 /// provider is made from, so it cannot be served by one.
+// SPEC-1 and 2.123: the two-tier split a provider read is built on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
     /// Resolved exactly once per process, and carried across a
@@ -188,6 +189,8 @@ pub fn tier_of(name: &str) -> Option<Tier> {
 /// name what will not work if no provider holds the key. Keys without a
 /// feature attribute are legitimately-unset by design; see the module-level
 /// note for why silence is the default.
+// SPEC-1 and 2.122: the one declaration site a ConfigKey and its Tier/since/required
+// facts come from; a flag or a read naming a key it does not emit cannot compile.
 macro_rules! declare_keys {
     ($(
         $(#[doc = $doc:literal])*
@@ -253,9 +256,10 @@ declare_keys! {
     Bootstrap CONFIG_PROVIDERS = "CONFIG_PROVIDERS", since "v0.14.0", optional;
     /// Base URL of the Bunyip API the Bunyip configuration provider reads.
     Bootstrap BUNYIP_CONFIG_URL = "BUNYIP_CONFIG_URL", since "v0.14.0", optional;
-    /// Machine-credential client id for `POST /v1/oauth2/token`.
+    /// Machine-credential client id this deployment presents to Bunyip's
+    /// `GET /v1/host/config/{KEY}`, as HTTP Basic.
     Bootstrap BUNYIP_CONFIG_CLIENT_ID = "BUNYIP_CONFIG_CLIENT_ID", since "v0.14.0", optional;
-    /// Machine-credential client secret for `POST /v1/oauth2/token`.
+    /// Machine-credential client secret for the same HTTP Basic credential.
     Bootstrap BUNYIP_CONFIG_CLIENT_SECRET = "BUNYIP_CONFIG_CLIENT_SECRET", since "v0.14.0", optional;
     /// PMS-981: authentication provider enablement, a comma-separated priority
     /// list (`bunyip,local` by default in `saas`; `local` in `self-hosted`).
@@ -276,6 +280,12 @@ declare_keys! {
     Application BUNYIP_WEBHOOK_SECRET = "BUNYIP_WEBHOOK_SECRET", since "v0.6.0", required;
     Application CLIENT_ORIGIN = "CLIENT_ORIGIN", since "v0.2.0", required "v0.14.0";
     Application CORS_ORIGIN = "CORS_ORIGIN", since "v0.2.0", optional;
+    /// Optional `Domain=` attribute for the contact-portal refresh cookie
+    /// (`mokosh:contact_token`). Set to the shared apex (e.g. `.a8n.run`) when
+    /// the SPA runs on tenant-*.<apex> and reaches the API host at a different
+    /// subdomain, so the cookie reaches `/api/v1/contact/auth/refresh` from
+    /// that origin; unset leaves the cookie host-scoped as before.
+    Application PORTAL_COOKIE_DOMAIN = "PORTAL_COOKIE_DOMAIN", since "v0.19.0", optional;
     Application SPA_BASE_URL = "SPA_BASE_URL", since "v0.12.0", required "v0.14.0";
     Application PUBLIC_API_BASE_URL = "PUBLIC_API_BASE_URL", since "v0.12.0", optional;
     Application ABUSE_CONTACT_EMAIL = "ABUSE_CONTACT_EMAIL", since "v0.12.0", optional;

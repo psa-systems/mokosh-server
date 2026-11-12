@@ -1252,7 +1252,7 @@ impl AuthService {
         // "pre-auth / cross-tenant entitlement lookup path" reason for the
         // second table's exemption, and 038's ENABLE-RLS loop runs at
         // migration time only. Both tables are named in `ALLOWED_WITHOUT_RLS`
-        // (`tests/rls_coverage.rs`), so a migration that gives either a
+        // (`tests/suites/rls_coverage.rs`), so a migration that gives either a
         // policy fails the guard instead of silently fail-closing this read.
         //
         // The `LEFT JOIN` preserves the "no entitlement row passes through"
@@ -1542,9 +1542,16 @@ impl AuthService {
             Some((tenant_id, token_hash)) => (Some(*tenant_id), Some(token_hash.as_str())),
             None => (None, None),
         };
-        let verified = verify_password_or_dummy(secret, row_hash)
-            .await
-            .unwrap_or(false);
+        // PMS-1577: a verification error is not the same answer as a
+        // genuine wrong/missing token, so it is logged distinctly before
+        // falling through to the same `NotFound` refusal below.
+        let verified = match verify_password_or_dummy(secret, row_hash).await {
+            Ok(matches) => matches,
+            Err(e) => {
+                tracing::warn!(user_id = %user_id, error = %e, "password reset token verification failed; treating as invalid");
+                false
+            }
+        };
         let tenant_id = match (verified, candidate_tenant) {
             (true, Some(tenant_id)) => tenant_id,
             _ => return Err(AppError::NotFound("token".to_string())),
@@ -2749,7 +2756,7 @@ impl AuthService {
     /// before any `AuthState`/tenant context exists. It must NEVER be wired into
     /// a request handler, where it would let an authenticated caller probe other
     /// tenants' placement. The `routes_do_not_reach_global_login_helpers`
-    /// regression test (`tests/auth.rs`) pins that no `routes.rs` references it.
+    /// regression test (`tests/suites/auth.rs`) pins that no `routes.rs` references it.
     pub async fn find_user_placement(&self, user_id: Uuid) -> AppResult<Option<(Uuid, String)>> {
         // SAFETY (PMS-285/PMS-260): resolving which tenant a `sub` belongs to is
         // this helper's whole job, so it reads `users` across tenants. It runs
@@ -2790,7 +2797,7 @@ impl AuthService {
     /// PMS-260: like [`Self::find_user_placement`], this is deliberately NOT
     /// tenant-scoped, so it must NEVER be wired into a request handler; the
     /// `routes_do_not_reach_global_login_helpers` regression test
-    /// (`tests/auth.rs`) pins that no `routes.rs` references it.
+    /// (`tests/suites/auth.rs`) pins that no `routes.rs` references it.
     pub async fn find_bunyip_principal(&self, user_id: Uuid) -> AppResult<Option<BunyipPrincipal>> {
         // SAFETY (PMS-285/PMS-260/PMS-777): both tables this reads are already
         // read on the migrator (BYPASSRLS) pool on this exact path
@@ -3986,7 +3993,20 @@ impl AuthService {
                             any_verified_user = Some(user);
                         }
                     }
-                    _ => continue,
+                    Ok(false) => continue,
+                    // PMS-1577: a verification error (corrupt stored hash)
+                    // is not the same answer as a genuine wrong password,
+                    // so it is logged distinctly before moving on to the
+                    // next membership.
+                    Err(e) => {
+                        tracing::warn!(
+                            user_id = %user.id,
+                            tenant_id = %m.tenant_id,
+                            error = %e,
+                            "password verification failed; treating as not matched",
+                        );
+                        continue;
+                    }
                 }
             }
             if matched_memberships.is_empty() {
@@ -4588,7 +4608,7 @@ pub fn mfa_lockout_until(
 /// evaluated inside its `UPDATE` so the window is derived from the counter
 /// value the database just produced, never from a stale read. Keeping it in
 /// one place lets `mfa_lock_seconds_sql_matches_rust_schedule`
-/// (`tests/auth.rs`) pin it against the Rust helper.
+/// (`tests/suites/auth.rs`) pin it against the Rust helper.
 ///
 /// `count_expr` is a caller-supplied SQL fragment (a column expression or a
 /// bind placeholder), never user input.

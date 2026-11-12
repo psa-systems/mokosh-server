@@ -79,6 +79,7 @@ pub mod env;
 pub mod file;
 pub mod flags;
 pub mod guard;
+pub mod parse;
 pub mod registry;
 
 pub use bunyip::{BunyipConfig, BunyipProvider};
@@ -556,6 +557,8 @@ impl ConfigSelection {
     /// `environment` is reachable through it until the migrate CLI
     /// (PMS-1012) rewires this. An operator asking for one of the other
     /// three here is a wiring error pointing them at `CONFIG_PROVIDERS`.
+    // SPEC-1 and 2.128: CONFIG_BACKEND is a single-provider slot that can only resolve to Environment today;
+    // any other legal provider name is a wiring error directing the operator to CONFIG_PROVIDERS (PMS-987).
     pub fn resolve(profile_default: &str, raw: &str) -> AppResult<Self> {
         let raw = raw.trim();
         let (provider, source) = if raw.is_empty() {
@@ -716,6 +719,8 @@ pub fn snapshot() -> Arc<Generation> {
     current()
 }
 
+// SPEC-1 and 2.124: get/has/served_by are the one read path every caller outside
+// the ENTRY_POINTS allowlist must use; guard.rs::every_env_read_goes_through_the_provider enforces it.
 /// The value for a declared key, or `None` when no provider holds it.
 ///
 /// This is the one read path. Trimming, emptiness and defaults stay with the
@@ -746,6 +751,8 @@ pub fn served_by(key: &ConfigKey) -> Option<&'static str> {
 /// PMS-986: this is a thin wrapper around
 /// `try_refresh(RefreshRequest::system())`. A rejected outcome hands back the
 /// PREVIOUS generation (still live), matching current best-effort semantics.
+// SPEC-1 and 2.125: refresh re-resolves every application-tier key atomically and
+// falls back to the previous generation on a rejected outcome.
 pub fn refresh() -> Arc<Generation> {
     match try_refresh(RefreshRequest::system()) {
         RefreshOutcome::Applied { generation, .. } => generation,
@@ -775,6 +782,8 @@ pub fn refresh() -> Arc<Generation> {
 /// The `providers_consulted` field is shaped for the PMS-987 chain: today it
 /// lists the single installed provider, but the shape survives without a
 /// second API change.
+// SPEC-1 and 2.126: a bootstrap-tier required key is refused before any I/O, and a
+// rejected outcome leaves the live generation and its counter untouched.
 pub fn try_refresh(request: RefreshRequest) -> RefreshOutcome {
     let previous = current();
 
@@ -888,6 +897,8 @@ impl std::fmt::Debug for EnumerationStatus {
 /// The four variants stay OPEN even where today's single-provider slot
 /// cannot itself produce a given transition, so wiring the PMS-987 provider
 /// chain later lights up a variant instead of adding one.
+// SPEC-1 and 2.129: the staleness report compares a recorded generation to a live
+// provider probe without ever exposing a value, only key/provider identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StalenessState {
     /// Recorded and live agree: either both say the same provider serves it,
@@ -1116,6 +1127,7 @@ fn derive_staleness_state(
 /// No such endpoint exists yet (PMS-1012 owns the CLI half; the admin
 /// endpoint lands in its own PR), so this is the seam for that future
 /// caller.
+// SPEC-1 and 2.126: the per-key form of the same bootstrap-refresh refusal rule.
 pub fn refuse_refresh_of_bootstrap(key: &'static ConfigKey) -> AppResult<()> {
     match key.tier() {
         Tier::Bootstrap => Err(AppError::Configuration(format!(
@@ -1137,6 +1149,8 @@ pub fn refuse_refresh_of_bootstrap(key: &'static ConfigKey) -> AppResult<()> {
 /// shape, for the reason PMS-904 states: only the auth service and the startup
 /// wiring know which mode this is, and a capability module cares which
 /// provider it got rather than which profile chose it.
+// SPEC-1 and 2.127: the boot entry point that installs a provider from
+// CONFIG_BACKEND (or the hosting profile's default) before any other read.
 pub fn init_from_env(profile_default: &str) -> AppResult<ConfigSelection> {
     let selection = ConfigSelection::from_env(profile_default)?;
     let chosen = build(selection.provider);
@@ -1269,6 +1283,8 @@ pub enum ConfigClassification {
 /// The FIRST element is the highest priority. Sorting is the caller's:
 /// the chain builder respects the order `CONFIG_PROVIDERS` was written in
 /// (that is the operator declaration the boot report echoes).
+// SPEC-1 and 2.130: the PMS-987 priority-list chain and its classification are wired but dormant; no boot
+// path installs one, so CONFIG_PROVIDERS still only feeds the single-provider slot via ConfigSelection.
 pub struct ConfigProviderChain {
     providers: Vec<(ConfigProviderKind, Arc<dyn ConfigProvider>)>,
 }

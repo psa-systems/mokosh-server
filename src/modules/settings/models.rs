@@ -104,9 +104,13 @@ pub fn validate_setting_value(
         // rather than one shared switch, because an MSP that syncs its Google
         // Workspace directory and wants nobody's personal iCloud contacts in
         // the CRM is the ordinary case.
+        //
+        // PMS-1512: `integrations/microsoft_contacts_enabled` is the same
+        // switch for the Microsoft 365 contact sync, for the same reason.
         ("timesheets", "track_breaks")
         | ("integrations", "google_contacts_enabled")
         | ("integrations", "icloud_contacts_enabled")
+        | ("integrations", "microsoft_contacts_enabled")
         | ("notifications", "channel_email_enabled")
         | ("notifications", "channel_in_app_enabled") => match value {
             Value::Bool(_) => Ok(()),

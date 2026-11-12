@@ -38,12 +38,15 @@ use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::dashboards::{dashboard_routes, DashboardsService};
 use crate::modules::email_intake::{email_intake_routes, EmailIntakeService};
+use crate::modules::expenses::{expenses_routes, ExpensesService};
 use crate::modules::forms::{forms_routes, public_form_routes, FormsService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::attachments::{
     kb_attachment_routes, public_kb_attachment_routes, KbAttachmentConfig, KbAttachmentService,
 };
-use crate::modules::knowledge_base::{kb_routes, KbService};
+use crate::modules::knowledge_base::{
+    kb_execution_routes, kb_routes, KbExecutionService, KbService,
+};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::platform::{platform_routes, PlatformAdminService};
@@ -153,6 +156,11 @@ pub fn create_api_router(
     // against a database of its own, and the provider it would find is
     // whichever one initialised the global first.
     app_secrets: Arc<crate::app_secrets::AppSecrets>,
+    // MAPPS-1139: the deployment's Xero and Intuit applications, resolved in
+    // `main` so a half-configured pair fails the boot rather than a customer's
+    // first click. Empty is a deployment that has neither, which refuses at
+    // the point a tenant tries to use one.
+    issuer_apps: Arc<crate::modules::billing::invoice_issuer_app::IssuerApps>,
     // PMS-1414: the process's feature-toggle snapshot. Passed rather than built
     // here so `main` can hand the SAME handle to the refresh job: a router with
     // its own copy would never see a flip made by the interval tick.
@@ -276,8 +284,16 @@ pub fn create_api_router(
         notifications_service.clone(),
     )
     .with_payment_methods(payment_methods_service.clone());
+    // SLA service shares the notifications dispatcher so the
+    // `sla_sweep` worker (spawned from main.rs with this same service)
+    // can enqueue at-risk / breach alerts. The CRUD + evaluate routes
+    // do not use the dispatcher; only the worker does. Built ahead of
+    // `ticket_service` (PMS-1564) so the ticket service can hold a
+    // clone and call `evaluate_for_ticket` on create / status change.
+    let sla_service = SlaService::with_dispatcher(db.clone(), notifications_service.clone());
     let ticket_service =
-        TicketService::with_dispatcher(db.clone(), mailer.clone(), notifications_service.clone());
+        TicketService::with_dispatcher(db.clone(), mailer.clone(), notifications_service.clone())
+            .with_sla(Arc::new(sla_service.clone()));
     // PMS-711: the agent-facing billing service also sends the outbound invoice
     // "Pay Now" email on the send transition, so it takes the mailer + the SPA
     // origin the pay link is built from.
@@ -337,8 +353,17 @@ pub fn create_api_router(
         spa_base_url.clone(),
     );
     let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
+    // MAPPS-1100 Phase A: Bills and Expenses leaf lookups. Vendors +
+    // expense categories only; the bills/expenses headers themselves
+    // land in Phase B.
+    let expenses_service = ExpensesService::new(db.clone());
     // PMS-1129: an @mention in a KB comment notifies through the queue.
     let kb_service = KbService::new(db.clone()).with_notifications(notifications_service.clone());
+    // KB article executions: the "I followed this article" record on a
+    // ticket. Reuses the KB render path, so a template change in the
+    // Phase 1a service propagates automatically.
+    let kb_execution_service =
+        KbExecutionService::new(db.clone(), std::sync::Arc::new(kb_service.clone()));
     // PMS-246: the SPA origin is the invite accept-link base (login-driven
     // acceptance), so created invites email the invitee. PMS-1378 routed
     // the invite mail through `NotificationsService::dispatch`
@@ -354,6 +379,71 @@ pub fn create_api_router(
     // deployment on Infisical keeps its integration credentials there too.
     let integrations_service =
         crate::modules::integrations::IntegrationsService::new(db.clone(), secrets.clone());
+    // MAPPS-1099 / MAPPS-1134: wire the feature-flagged invoice-issuer
+    // dispatch onto the serving `BillingService`. The flag defaults OFF
+    // (`Feature::DelegatedInvoiceIssuer`), so this is a no-op on every
+    // environment until an admin flips it; even flipped on, only a tenant
+    // with Xero or QuickBooks connected and the `Invoicing` capability
+    // enabled sees the delegated path.
+    //
+    // The two clients are built here with their real hosts. They are the
+    // only place those hosts are named, and a test builds the same
+    // dispatcher with `with_api_base` / `with_identity_base` pointing at a
+    // stub, which is what lets the delegated path be exercised end to end
+    // without reaching Xero or Intuit.
+    let issuer_dispatcher = Arc::new(
+        crate::modules::billing::invoice_issuer_dispatch::IssuerDispatcher::new(
+            features.clone(),
+            Arc::new(integrations_service.clone()),
+            Arc::new(
+                crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService::new(
+                    db.clone(),
+                ),
+            ),
+            secrets.clone(),
+            // MAPPS-1139: the deployment's own Xero and Intuit applications,
+            // read through the application-tier secret seam exactly as the
+            // Google and Microsoft 365 clients are. A deployment with neither
+            // configured still builds the dispatcher; it refuses at the point
+            // a tenant tries to use one, naming the deployment rather than
+            // failing somewhere inside a provider call.
+            issuer_apps.clone(),
+            Arc::new(crate::modules::billing::provider_invoice::XeroClient::new()),
+            Arc::new(crate::modules::billing::provider_invoice::QuickBooksClient::new()),
+        ),
+    );
+    let billing_service = billing_service.with_invoice_dispatch(issuer_dispatcher.clone());
+    // MAPPS-1155: the bill half of the same dispatch, on its own flag
+    // (`Feature::DelegatedBills`, also OFF by default). Assigned here
+    // rather than at construction because the dispatcher is built after
+    // the services it serves, and a bill push needs the same clients,
+    // the same credential blob and the same near-expiry refresh an
+    // invoice push does.
+    let expenses_service = expenses_service.with_bill_dispatch(issuer_dispatcher.clone());
+    // MAPPS-1142: the OAuth round trip that writes the credential blob the
+    // dispatcher and the receivers read. Its own service rather than another
+    // method on `IntegrationsService`, because what it does is a browser round
+    // trip with a single-use state, which is contact sync's shape and not the
+    // integrations catalog's.
+    let issuer_connect = Arc::new(
+        crate::modules::billing::invoice_issuer_connect::InvoiceIssuerConnectService::new(
+            db.clone(),
+            secrets.clone(),
+            issuer_apps.clone(),
+            // MAPPS-1154: so the settings card can say whether delegated
+            // issuing is switched on for this deployment. The connect flow
+            // does not gate on it; the card just stops claiming an
+            // arrangement the toggle has switched off.
+            features.clone(),
+            Arc::new(crate::modules::billing::provider_invoice::XeroClient::new()),
+            Arc::new(crate::modules::billing::provider_invoice::QuickBooksClient::new()),
+            public_api_base_url.clone(),
+            // PMS-1580: the settings page the admin lands on exists only in
+            // mokosh-apps, the contact-sync shape (`router.rs` above), not on
+            // the apex `client_origin` serves.
+            spa_base_url.clone(),
+        ),
+    );
     let reports_service = ReportsService::new(db.clone());
     // PMS-457: saved-report definitions (Phase 1).
     let saved_reports_service = SavedReportsService::new(db.clone());
@@ -390,7 +480,10 @@ pub fn create_api_router(
     let email_intake_service = EmailIntakeService::new(
         db.clone(),
         ticket_service.clone(),
-        AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
+        AttachmentService::new(
+            db.clone(),
+            AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
+        ),
     );
     // PMS-451: per-ticket approval requests.
     let approvals_service = ApprovalsService::new(db.clone());
@@ -401,11 +494,6 @@ pub fn create_api_router(
     // the auth logic.
     let rmm_service_shared = std::sync::Arc::new(rmm_service.clone());
     let status_service = crate::modules::status::StatusService::new(db.clone());
-    // SLA service shares the notifications dispatcher so the
-    // `sla_sweep` worker (spawned from main.rs with this same service)
-    // can enqueue at-risk / breach alerts. The CRUD + evaluate routes
-    // do not use the dispatcher; only the worker does.
-    let sla_service = SlaService::with_dispatcher(db.clone(), notifications_service.clone());
     // PMS-157 / PMS-710: first-visit demo seeding. Holds its own clones of the
     // contacts, tickets, projects, and SLA services so it can drive the real
     // create paths for the connected demo dataset; wired below as a middleware
@@ -466,6 +554,7 @@ pub fn create_api_router(
             }),
         )
         // Build / version info (public, used for diagnostics)
+        // SPEC-1 and 2.150: GET /api/v1/version serves VersionInfo::current() with no auth extractor on the handler, confirming version.rs's doc-comment claim of endpoint consumption.
         .route("/version", get(version_info))
         // Self-hosted update check (PMS-238). Opt-in via
         // `MOKOSH_UPDATE_CHECK_URL`; compares the running build against the
@@ -542,6 +631,8 @@ pub fn create_api_router(
         // api_v1 build (alongside `settings_service`) so every route
         // (including the MAPPS-518 platform-admin-gated tenant
         // endpoints) can resolve it.
+        // SPEC-1 and 2.66: builds its own `PlatformAdminService` instance, separate from the one the outer
+        // Extension layer injects near the end of this chain (around line 971); both target the same table.
         .nest(
             "/platform",
             platform_routes(
@@ -553,6 +644,8 @@ pub fn create_api_router(
         // single-tenant deployment there is exactly one tenant and the
         // CRUD endpoints would be a foot-gun. PMS-24.
         ;
+    // SPEC-1 and 2.67: `/tenants`, `/teams` and `/me` (teams) are only mounted when the `multi-tenant` cargo feature
+    // is on; a build without it has no tenant CRUD and no teams surface at all, not merely a gated handler.
     #[cfg(feature = "multi-tenant")]
     let api_v1 = api_v1.nest(
         "/tenants",
@@ -619,7 +712,10 @@ pub fn create_api_router(
             "/tickets",
             ticket_routes(
                 ticket_service.clone(),
-                AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
+                AttachmentService::new(
+                    db.clone(),
+                    AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
+                ),
                 // PMS-937: the tickets router now also owns
                 // `POST /tickets/{id}/approvals/request`, which needs
                 // the shared ApprovalsService instance (used for both
@@ -632,7 +728,7 @@ pub fn create_api_router(
         // path nests cleanly under the existing ticket tree.
         .merge(agent_attachment_routes(AttachmentService::new(
             db.clone(),
-            AttachmentConfig::from_env(),
+            AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
         )))
         // PMS-468: agent "all comments from this contact" feed. The
         // route lives on the tickets module (TicketService owns the
@@ -666,10 +762,26 @@ pub fn create_api_router(
         // `billing_routes` defines the full paths so the URL structure
         // stays flat. PMS-34.
         .merge(billing_routes(billing_service, public_api_base_url.clone()))
+        // MAPPS-1099 Phase 2c: admin surfaces that populate the
+        // invoice-issuer mapping tables (Mokosh company -> external
+        // customer, Mokosh product -> external item). Behind the same
+        // `Feature::DelegatedInvoiceIssuer` flag the dispatch reads;
+        // every route answers 404 while the flag is off.
+        .merge(crate::modules::billing::invoice_issuer_mapping_routes::invoice_issuer_mapping_routes(
+            crate::modules::billing::invoice_issuer_mapping_routes::InvoiceIssuerMappingRouterState {
+                service: Arc::new(crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService::new(db.clone())),
+                features: features.clone(),
+            },
+        ))
         // Quotes: the sales document that precedes a Project, plus its
         // line items. Shares the billing module gate + finance role with
         // invoices. PMS-672.
         .merge(quotes_routes(quotes_service))
+        // MAPPS-1100: the inbound-money plane (vendors + expense
+        // categories so far; bills + expenses themselves land next). Same
+        // RequireBilling + RequireFinance gates as the customer-facing
+        // billing plane.
+        .merge(expenses_routes(expenses_service))
         // Assets / CMDB: types, assets, relationships, config items,
         // credential vault, audit log. PMS-72.
         //
@@ -705,12 +817,16 @@ pub fn create_api_router(
         )
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
+        // KB article executions on tickets. Staff-only in this phase;
+        // the per-ticket surface and the per-execution step toggles
+        // share one service wired through the Phase 1a render path.
+        .merge(kb_execution_routes(kb_execution_service))
         // PMS-923: images an article embeds. Upload / list / delete are
         // manager-gated here; the READ is public (see the public tree below),
         // because an `<img>` cannot carry an Authorization header.
         .merge(kb_attachment_routes(KbAttachmentService::new(
             db.clone(),
-            KbAttachmentConfig::from_env(),
+            KbAttachmentConfig::from_env().expect("KB_ATTACHMENT_MAX_BYTES invalid"),
         )))
         // Org membership invitations (PMS-244): admin-only, tenant-scoped.
         .merge(invitations_routes(invitations_service))
@@ -722,6 +838,13 @@ pub fn create_api_router(
         .merge(crate::modules::integrations::integration_routes(
             integrations_service,
         ))
+        // MAPPS-1142: starting a Xero or QuickBooks connection. Admin-gated
+        // inside, beside the catalog it ends up writing a row in.
+        .merge(
+            crate::modules::billing::invoice_issuer_connect::invoice_issuer_connect_routes(
+                issuer_connect.clone(),
+            ),
+        )
         // RMM: connections, device mappings, alert rules, alert ingest. PMS-101.
         .merge(rmm_routes(rmm_service))
         // Client service status: monitored systems and observed check
@@ -814,15 +937,29 @@ pub fn create_api_router(
         // "unknown". The in-transaction `audit_write` path (PMS-117) is the
         // sole audit writer and records the entity type, record id, and
         // before/after snapshots that the audit trail needs.
-        // First-visit demo seeding (PMS-157). Added before the auth layer
-        // so it runs *inner* of it: auth populates AuthState, then this
-        // reads the resolved tenant/user and seeds a new account's demo
-        // data once (detached, best-effort). No-op for already-seen tenants.
+        // SPEC-1 and 2.65: api_v1's middleware stack, innermost to outermost: seed_middleware (next), then auth_middleware (below), then the contact-plane middleware, then Extension<Database>, Extension<SettingsService>, Extension<PlatformAdminService>, and finally normalize_error_envelope as the outermost layer (end of this
+        // chain). Each later `.layer()` call wraps the ones before it. First-visit demo seeding (PMS-157). Added before the auth layer so it runs *inner* of it: auth populates AuthState, then this reads the resolved tenant/user and seeds a new account's demo data once (detached, best-effort). No-op for already-seen tenants.
         .layer(middleware::from_fn_with_state(
             crate::modules::seed::SeedMiddlewareState {
                 service: seed_service,
             },
             crate::modules::seed::seed_middleware,
+        ))
+        // MAPPS-877: refuse a `ReadOnly` caller on any non-safe HTTP
+        // method. Runs AFTER `auth_middleware` (auth_middleware is
+        // added below, so it wraps this one; request flow is:
+        // auth_middleware -> require_write_for_mutations -> seed ->
+        // route) so the `AuthState` this layer reads has already been
+        // written. GET / HEAD / OPTIONS pass through unchanged; every
+        // POST / PUT / PATCH / DELETE by a caller whose role is
+        // `ReadOnly` is refused here with 403, before the handler
+        // runs. Handlers that already gate on `RequireAdmin` /
+        // `RequireManager` / `RequireFinance` refuse `ReadOnly` by
+        // construction (their allowlists do not include it); this
+        // layer catches the mutating handlers whose only auth gate
+        // was `RequireAuth`.
+        .layer(middleware::from_fn(
+            crate::modules::auth::middleware::require_write_for_mutations,
         ))
         // Apply auth middleware
         .layer(middleware::from_fn_with_state(
@@ -863,6 +1000,8 @@ pub fn create_api_router(
         // /api/v1 route (including the platform-admin-gated tenant
         // endpoints from MAPPS-518) can resolve it, not just the
         // /platform sub-tree.
+        // SPEC-1 and 2.66: this `PlatformAdminService` instance (built fresh here for the Extension layer) is distinct from the one `/platform`
+        // builds for itself above (around line 627); both read the same `db` and `jwt_secret` but are separate objects serving separate call sites.
         .layer(axum::Extension(Arc::new(PlatformAdminService::new(
             db.clone(),
             jwt_secret.clone(),
@@ -872,6 +1011,8 @@ pub fn create_api_router(
         // returned as the standard `{error:{code,message}}` envelope instead
         // of raw axum/serde plaintext. JSON responses (every `AppError`) pass
         // through untouched.
+        // SPEC-1 and 2.62: this is one of seven independent normalize_error_envelope instances: api_v1 (here), bunyip_nest, stripe_webhooks,
+        // paypal_webhooks, invoice_issuer_webhooks (one per provider closure call), public_api, and contact_api each layer their own.
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
         ));
@@ -952,6 +1093,8 @@ pub fn create_api_router(
     // not the verifier exists; with no verifier there is nothing to verify
     // against, and the route answering 404 in that deployment would be
     // indistinguishable from a typo in bunyip's registered URI.
+    // SPEC-1 and 2.64 DEFECT: the comment above claims the receiver is "Mounted whether or not the verifier exists", but `logout_verifier.map(...)` below only builds `Some(router)` when `bunyip_verifier` was `Some`; the `match`
+    // further down (around line 1127) merges it into `bunyip_nest` only in that case, so with no verifier the route is NOT mounted and a request to it 404s exactly as the comment says it would not. Not fixed here; see Defects found.
     let backchannel_logout = logout_verifier.map(|verifier| {
         let state = Arc::new(
             crate::modules::auth::backchannel_logout::BackchannelLogoutState {
@@ -987,6 +1130,8 @@ pub fn create_api_router(
         .with_state(bunyip_webhook_state)
         // PMS-298: shared JSON error envelope so a bad request here matches
         // the rest of the API surface.
+        // SPEC-1 and 2.62: bunyip_nest's own independent normalize_error_envelope instance (one of seven; see the api_v1 one near line 992). SPEC-1 and 2.69: both routes on this nest authenticate via an
+        // HMAC signature over the raw body rather than a session; `account_deleted` runs on the migrator/BYPASSRLS pool because it is pre-auth and resolves its own tenant from the `users` row it reads.
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
         ));
@@ -996,6 +1141,8 @@ pub fn create_api_router(
     // the OP's own status codes rather than this API's error envelope: a 400
     // it wraps would still be a delivery failure to bunyip, but the body
     // would claim to be a Mokosh error for a caller that is not a client.
+    // SPEC-1 and 2.64 DEFECT: this `match` is the actual mount decision for the back-channel logout route; it merges `logout` only when `backchannel_logout` is `Some`,
+    // contradicting the "mounted whether or not the verifier exists" comment above `logout_verifier.map(...)` (around line 1072). Not fixed here; see Defects found.
     let bunyip_nest = match backchannel_logout {
         Some(logout) => bunyip_nest.merge(logout),
         None => bunyip_nest,
@@ -1018,9 +1165,13 @@ pub fn create_api_router(
         payment_methods: payment_methods_service.clone(),
         provider_id: "stripe",
     });
+    // SPEC-1 and 2.70: Stripe and PayPal share `provider_webhook_handler` and the per-tenant `/webhooks/{tenant_id}`
+    // path shape; only `provider_id` and the state's `billing`/`payment_methods` differ between them.
     let stripe_webhooks = Router::new()
         .route("/webhooks/{tenant_id}", post(provider_webhook_handler))
         .with_state(stripe_webhook_state)
+        // SPEC-1 and 2.62: stripe_webhooks' own independent normalize_error_envelope
+        // instance (one of seven; see the api_v1 one near line 992).
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
         ));
@@ -1043,9 +1194,62 @@ pub fn create_api_router(
     let paypal_webhooks = Router::new()
         .route("/webhooks/{tenant_id}", post(provider_webhook_handler))
         .with_state(paypal_webhook_state)
+        // SPEC-1 and 2.62: paypal_webhooks' own independent normalize_error_envelope
+        // instance (one of seven; see the api_v1 one near line 992).
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
         ));
+
+    // MAPPS-1136 / MAPPS-1141: the invoice-issuer webhook receivers, under
+    // `/api/v1/webhooks/{provider}` OUTSIDE the auth chain for the same reason
+    // the payment ones are: the provider authenticates itself with an HMAC
+    // over the raw body.
+    //
+    // ONE URL per provider, not one per tenant, because there is one
+    // application per provider and therefore one webhook subscription for the
+    // host to configure. The delivery says which organisation it is about and
+    // `integrations.external_organisation_id` says whose that is. The payment
+    // receivers keep their per-tenant path, which is still right there: a
+    // gateway's webhook secret IS the tenant's.
+    //
+    // The prefix is in `RAW_BODY_PATHS`, because a byte the JSON sanitizer
+    // rewrote is a signature that does not verify.
+    //
+    // They share the dispatcher the serving `BillingService` was given, rather
+    // than building a second one: it owns the credential load, the near-expiry
+    // refresh and the two clients, and a receiver needs all three.
+    let invoice_issuer_webhooks = |path: &'static str, provider| {
+        Router::new()
+            .route(
+                path,
+                post(
+                    crate::modules::billing::webhook_invoice_issuer::invoice_issuer_webhook_handler,
+                ),
+            )
+            .with_state(Arc::new(
+                crate::modules::billing::webhook_invoice_issuer::InvoiceIssuerWebhookState {
+                    billing: Arc::new(BillingService::with_secrets(
+                        db.clone(),
+                        encryption_key,
+                        secrets.clone(),
+                    )),
+                    // PMS-1543: its own instance rather than the serving
+                    // one, which `expenses_routes` has taken by value. It
+                    // carries no bill dispatch on purpose: this path
+                    // RECORDS what the provider already did, and a push
+                    // back out from here would be the loop PMS-1545 has to
+                    // avoid.
+                    expenses: Arc::new(crate::modules::expenses::ExpensesService::new(db.clone())),
+                    dispatcher: issuer_dispatcher.clone(),
+                    provider,
+                },
+            ))
+            // SPEC-1 and 2.62: each call of this closure (one per provider, Xero and QuickBooks) builds its own
+            // independent normalize_error_envelope instance (two of the seven; see the api_v1 one near line 992).
+            .layer(middleware::from_fn(
+                crate::utils::error::normalize_error_envelope,
+            ))
+    };
 
     // Combine everything. The `.fallback` swallows any non-/api/v1/* request
     // (including hitting `/` directly in a browser) with a small placeholder
@@ -1064,6 +1268,16 @@ pub fn create_api_router(
         .merge(crate::modules::features::routes::public_config_routes(
             features.clone(),
         ))
+        // MAPPS-1142: the OAuth redirect Xero and Intuit send an admin's
+        // browser to. Unauthenticated by construction, the same reasoning as
+        // the contact-sync callbacks below: a redirect carries no session, and
+        // the single-use state is the only identity it has. Every outcome is a
+        // redirect back to the SPA.
+        .merge(
+            crate::modules::billing::invoice_issuer_connect::invoice_issuer_public_routes(
+                issuer_connect.clone(),
+            ),
+        )
         // PMS-1212 (PSA-70): the OAuth redirect Google sends an admin's
         // browser to. Unauthenticated by construction - a redirect carries no
         // session - and its credential is the single-use `state` parameter,
@@ -1089,7 +1303,7 @@ pub fn create_api_router(
         // `internal` article. Same bargain as the logo above.
         .merge(public_kb_attachment_routes(KbAttachmentService::new(
             db.clone(),
-            KbAttachmentConfig::from_env(),
+            KbAttachmentConfig::from_env().expect("KB_ATTACHMENT_MAX_BYTES invalid"),
         )))
         // PMS-941: an image embedded in a ticket description or note, for the
         // same reason as the KB image above and with one extra guard: this
@@ -1098,7 +1312,7 @@ pub fn create_api_router(
         // `is_inline`. Anything else 404s here exactly as an unknown id does.
         .merge(public_ticket_attachment_routes(AttachmentService::new(
             db.clone(),
-            AttachmentConfig::from_env(),
+            AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
         )))
         .merge(public_form_routes(
             FormsService::with_request_links(
@@ -1109,13 +1323,16 @@ pub fn create_api_router(
             .with_abuse_contact(abuse_contact_email)
             .with_public_api_base(public_api_base_url),
         ))
-        // PMS-1299 (F7b): per-IP budget over the whole unauthenticated nest.
+        // SPEC-1 and 2.63: triggers on every request to this nest, keyed by the caller's extracted client IP (trusted-proxy-aware); quota is `PUBLIC_API_PER_MIN` (60/minute) via `PublicIpLimiter::new`. A caller past the
+        // quota gets a 429 with `Retry-After` and body "Too many requests, please try again shortly" (`crate::utils::error::rate_limited_response`). PMS-1299 (F7b): per-IP budget over the whole unauthenticated nest.
         .layer(middleware::from_fn_with_state(
             crate::modules::auth::rate_limit::PublicIpLimiter::new(
                 crate::modules::auth::rate_limit::PUBLIC_API_PER_MIN,
             ),
             crate::modules::auth::rate_limit::public_ip_limit,
         ))
+        // SPEC-1 and 2.62: public_api's own independent normalize_error_envelope
+        // instance (one of seven; see the api_v1 one near line 992).
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
         ));
@@ -1134,6 +1351,8 @@ pub fn create_api_router(
     // `settings:manage_company_branding` gate without a duplicate
     // instance.
     let contact_service_arc = std::sync::Arc::new(contact_service.clone());
+    // SPEC-1 and 2.68: contact_api composes contact_portal::contact_routes with the branding module's contact-scoped routes, sharing one
+    // ContactAuthService instance (`contact_service_arc`) between the two merged routers so a single `load_capabilities` implementation backs both.
     let contact_api = crate::modules::contact_portal::contact_routes(
         contact_service,
         payment_methods_service.clone(),
@@ -1142,10 +1361,14 @@ pub fn create_api_router(
         db.clone(),
         contact_service_arc,
     ))
+    // SPEC-1 and 2.62: contact_api's own independent normalize_error_envelope
+    // instance (one of seven; see the api_v1 one near line 992).
     .layer(middleware::from_fn(
         crate::utils::error::normalize_error_envelope,
     ));
 
+    // SPEC-1 and 2.60: the seven top-level mounts and their auth models (session /api/v1, no-auth-by-design /api/v1/public, contact Bearer /api/v1/contact, and the four signed
+    // receivers) match CLAUDE.md's "Routing model" claim; the invoice-issuer webhooks mount below is the fourth signed receiver the CLAUDE.md prose does not name individually.
     Router::new()
         .nest("/api/v1", api_v1)
         .nest("/api/v1/public", public_api)
@@ -1153,6 +1376,21 @@ pub fn create_api_router(
         .nest("/api/v1/bunyip", bunyip_nest)
         .nest("/api/v1/stripe", stripe_webhooks)
         .nest("/api/v1/paypal", paypal_webhooks)
+        // SPEC-1 and 2.71: one URL per provider (Xero, QuickBooks), not one per tenant: there is one application per provider
+        // so one webhook subscription for the host to configure, unlike the per-tenant stripe/paypal `{tenant_id}` path above.
+        .nest(
+            "/api/v1/webhooks",
+            invoice_issuer_webhooks(
+                "/xero",
+                crate::modules::billing::invoice_issuer::InvoiceProviderKind::Xero,
+            )
+            .merge(invoice_issuer_webhooks(
+                "/quickbooks",
+                crate::modules::billing::invoice_issuer::InvoiceProviderKind::Quickbooks,
+            )),
+        )
+        // SPEC-1 and 2.1: catches every request matching none of the seven nests above (including a bare GET to
+        // `/`), answering a 404 HTML page rather than letting axum's default 404 leak internal route info.
         .fallback(get(move |headers| {
             not_a_frontend(headers, client_origin.clone())
         }))
@@ -1164,8 +1402,11 @@ pub fn create_api_router(
         // three signature-verified receivers by path. One layer rather than a
         // `SanitizedJson<T>` extractor on 157 `Json<T>` handlers, so a route
         // added later cannot forget to opt in.
+        // SPEC-1 and 2.61: layered once on the combined Router, outside every nest, so it runs on every path including the signed receivers; the
+        // RAW_BODY_PATHS exemption is a prefix check inside the function itself (src/utils/text.rs), not a difference in which nests this layer wraps.
         .layer(middleware::from_fn(crate::utils::text::sanitize_json_body))
-        // Apply global middleware
+        // SPEC-1 and 2.72: global stack order on the combined Router, each `.layer()` wrapping the previous outward: sanitize_json_body (just
+        // above), then tracing, then compression, then CORS, then security headers (outermost, below) see every response from every nest.
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
         .layer(cors)
@@ -1218,7 +1459,7 @@ fn not_a_frontend_body(hub_link: &str) -> String {
          <title>API endpoint</title>\n\
          <meta name=\"robots\" content=\"noindex\">\n\
          {viewport}\n\
-         <style>{shell_css}a{{color:#0066cc}}</style>\n\
+         <style>{shell_css}a{{color:light-dark(#0066cc,#6cb4ff)}}</style>\n\
          </head>\n\
          <body>\n\
          <h1>This is an API endpoint.</h1>\n\
@@ -1229,6 +1470,8 @@ fn not_a_frontend_body(hub_link: &str) -> String {
     )
 }
 
+// SPEC-1 and 2.73: GET /api/v1/health answers the static string "OK" with no
+// downstream dependency check at all (contrast /ready below).
 /// Health check endpoint
 async fn health_check() -> &'static str {
     "OK"
@@ -1263,6 +1506,8 @@ async fn health_check() -> &'static str {
 /// shows the root cause without a separate metrics scrape. The
 /// response sets `Cache-Control: no-store` so an intermediate
 /// proxy / CDN does not pin the failing state past the next probe.
+// SPEC-1 and 2.74: GET /api/v1/ready answers 200 with {"status":"ready","checks":{"db":...,"infisical":...}} when both checks pass, else 503
+// with "status":"not_ready" and the failing check's value replaced by an "error: ..." string; every response carries `Cache-Control: no-store`.
 async fn ready_check(
     db: crate::db::Database,
 ) -> (
@@ -1314,6 +1559,8 @@ async fn ready_check(
 /// orchestrator drain or restart a healthy instance. The ping was
 /// previously unbounded, so a wedged connection could hold the probe
 /// open indefinitely.
+// SPEC-1 and 2.75: the readiness DB ping is bounded to 3 seconds; a ping that neither answers nor errors within
+// that bound is treated as a failure ("db ping exceeded 3s") rather than hanging the /ready response open.
 const READY_DB_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Run the readiness DB ping under [`READY_DB_PING_TIMEOUT`]. Takes the
@@ -1340,6 +1587,8 @@ async fn bounded_db_ping(
 /// pool. The lock is initialised on the first /ready request, not at
 /// `create_api_router` time, because the env var is process-global
 /// and reading it lazily keeps the router signature unchanged.
+// SPEC-1 and 2.76: built lazily in a `OnceLock` on the first /ready request (not at `create_api_router` time), caching the parsed URL, a credential-scrubbed
+// display string, and a reused `reqwest::Client`; a blank or unset `INFISICAL_ADDRESS` at that first call means no probe runs for the lifetime of the process.
 struct InfisicalProbe {
     /// `<base>/api/status` URL with trailing-slash stripped from
     /// `<base>`. Pre-built so the probe path is a const lookup.
@@ -1415,6 +1664,8 @@ fn build_infisical_probe(raw: Option<String>) -> Option<InfisicalProbe> {
 ///   response, or 1s timeout). Error messages reference only the
 ///   sanitised display URL so credentials in the env var stay out
 ///   of the response body / access log.
+// SPEC-1 and 2.77: three-way result read by `ready_check`: `Ok(true)` (probe ran, 2xx response) renders "infisical":"ok"; `Ok(false)` (unconfigured) renders
+// "skipped" and never fails readiness; `Err(_)` (configured but DNS/TCP/non-2xx/timeout failure) renders "error: ..." and fails readiness with a 503.
 async fn probe_infisical() -> Result<bool, String> {
     let Some(probe) = infisical_probe() else {
         return Ok(false);
@@ -1519,6 +1770,20 @@ mod tests {
         assert!(body.contains("max-width:36rem"));
     }
 
+    /// PMS-1629: the body's `color-scheme: light dark` makes a dark browser
+    /// paint a near-black canvas, so the shell's `color`/`background-color`
+    /// pair and the page's own link color must both carry a dark-mode value
+    /// instead of a fixed light-mode one.
+    #[test]
+    fn not_a_frontend_pairs_colors_for_dark_mode() {
+        let body = not_a_frontend_body("https://example.com");
+        assert!(body.contains("background-color:light-dark(#fff,#121212)"));
+        assert!(body.contains("color:light-dark(#1a1a1a,#e8e8e8)"));
+        assert!(body.contains("a{color:light-dark(#0066cc,#6cb4ff)}"));
+    }
+
+    // SPEC-1 and 2.78: this test is itself the enforcement site. It textually scans tickets/routes.rs (mounted at `/tickets`) and tickets/attachments.rs (merged at the top level) for `.route(...)` calls, computes
+    // each one's effective `(method, prefix+path)`, and fails on any pair both sources register; it also fails if the scan finds 20 or fewer routes total, guarding against the parser silently matching nothing.
     /// The mokosh-contact-login <- main merge (chore/merge-main-into-contact-
     /// login) panicked axum at Router construction because two builders
     /// registered the same `(method, path)` after nesting:
@@ -1686,6 +1951,8 @@ mod tests {
         );
     }
 
+    // SPEC-1 and 2.79: the two tests below (brotli_is_negotiated_when_the_ client_advertises_it, gzip_only_client_still_gets_gzip) confirm the global `CompressionLayer::new()` (see line 1341/the global stack comment above
+    // `Router::new()`'s outer layers) offers brotli when the client advertises it alongside gzip, and falls back to gzip for a gzip-only client, without the layer's offered algorithm set itself being visible from its construction call.
     /// Drive the same `CompressionLayer::new()` the router applies globally and
     /// report the `content-encoding` it negotiated for `accept_encoding`.
     async fn negotiated_encoding(accept_encoding: &str) -> String {

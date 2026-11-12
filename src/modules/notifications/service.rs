@@ -37,6 +37,7 @@ use super::models::*;
 ///
 /// Two forms, because the two bodies differ: the HTML one makes the address a
 /// `mailto:` link. Both are always complete sentences.
+// SPEC-7.602: msp_footer_line composition rule (and its HTML twin below), including the escaping of both msp_name and the support email in the HTML variant.
 fn footer_line(msp_name: &str, support_email: &str) -> String {
     let support_email = support_email.trim();
     if support_email.is_empty() {
@@ -83,6 +84,7 @@ const DEFAULT_PRIMARY_COLOR: &str = "#111827";
 ///
 /// A value that is already absolute is passed through: a tenant whose branding
 /// points at an externally hosted mark is not this function's business.
+// SPEC-7.600: msp_logo_url is always an absolute http(s) URL or the empty string, never a relative path.
 fn absolute_logo_url(public_api_base: Option<&str>, stored: &str) -> String {
     let stored = stored.trim();
     if stored.is_empty() {
@@ -120,6 +122,7 @@ impl NotificationsService {
     /// the at-rest encryption a no-op for any caller that forgot to
     /// pass the key (see PMS-92). Forcing the key through this
     /// constructor makes that mistake impossible.
+    // SPEC-7.589: no zero-key constructor exists, so a caller cannot silently make config_encrypted a no-op.
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
         Self {
             db,
@@ -167,6 +170,7 @@ impl NotificationsService {
             .map(|r| {
                 let plain =
                     crate::utils::crypto::decrypt(&r.config_encrypted, &self.encryption_key)?;
+                // SPEC-7.590: a config that fails to parse as JSON becomes Null rather than failing the whole list call.
                 let config: serde_json::Value =
                     serde_json::from_str(&plain).unwrap_or(serde_json::Value::Null);
                 Ok(NotificationChannelResponse {
@@ -215,6 +219,7 @@ impl NotificationsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-7.593: create_channel/update_channel/create_template/update_template/create_rule/update_rule each write exactly one audit_write row in the mutation's transaction; the matching delete_* methods write none.
         audit_write(
             &mut *tx,
             tenant_id,
@@ -276,6 +281,7 @@ impl NotificationsService {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        // SPEC-7.592: channel/template/rule update and delete are tenant-scoped (WHERE tenant_id = $1 AND id = $2); a missing or other-tenant row is AppError::NotFound (404), never 403.
         if n == 0 {
             return Err(AppError::NotFound("Notification channel".to_string()));
         }
@@ -490,6 +496,7 @@ impl NotificationsService {
 
     // PMS-89 user preferences -------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.588: lists only the authenticated caller's own rows (tenant_id + user_id), ordered by event_type, paginated.
     pub async fn list_user_preferences(
         &self,
         tenant_id: TenantId,
@@ -522,6 +529,7 @@ impl NotificationsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.586: upserts on the unique (user_id, event_type) constraint; the caller can only ever write their own preferences.
     pub async fn upsert_user_preference(
         &self,
         tenant_id: TenantId,
@@ -587,6 +595,8 @@ impl NotificationsService {
         owner: InboxOwner,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<NotificationInboxItemResponse>, u64)> {
+        // SPEC-7.609: only channel_type = 'in_app' rows, scoped to tenant_id plus either user_id or contact_id, never both in one query.
+        // SPEC-7.613: ordered created_at DESC and paginated via the standard envelope.
         // Two statements per owner kind rather than one with a CASE, so
         // each stays on its own partial index (migrations 013 and 142).
         let (count_sql, list_sql, owner_id) = match owner {
@@ -675,6 +685,7 @@ impl NotificationsService {
             .execute(&mut *tx)
             .await?
             .rows_affected();
+        // SPEC-7.612: zero rows affected returns AppError::NotFound("Notification") (404); a row owned by a different user/contact/tenant is never a 403/401.
         if n == 0 {
             return Err(AppError::NotFound("Notification".to_string()));
         }
@@ -899,6 +910,7 @@ impl NotificationsService {
         // a caller passed a non-object (empty array, null, primitive),
         // wrap it in an object so the branding keys can be attached
         // rather than silently dropped.
+        // SPEC-7.598: a non-object context is replaced with {} before branding keys are attached, so those keys are never silently dropped.
         if !context.is_object() {
             context = serde_json::json!({});
         }
@@ -916,6 +928,7 @@ impl NotificationsService {
 
         let obj = context.as_object_mut().expect("guarded above");
 
+        // SPEC-7.599: msp_name defaults to the literal "Mokosh Platform" when the tenant's name is empty or the tenant row is not found.
         let msp_name = if name.is_empty() {
             "Mokosh Platform".to_string()
         } else {
@@ -931,6 +944,7 @@ impl NotificationsService {
             .map(str::to_string)
             .unwrap_or_else(|| msp_name.clone());
 
+        // SPEC-7.596: a caller-supplied msp_name/msp_logo_url/msp_primary_color/msp_support_email always wins over the tenant's stored branding, since ensure_key only inserts when the key is absent.
         // helper: only set the key if the caller did not.
         let mut ensure_key = |k: &str, v: serde_json::Value| {
             if !obj.contains_key(k) {
@@ -959,6 +973,7 @@ impl NotificationsService {
         );
         // PMS-1172: always a real colour. This one lands inside CSS, where an
         // empty value leaves `background:;` and the button disappears.
+        // SPEC-7.601: msp_primary_color is always a non-empty color value, defaulting to "#111827" (DEFAULT_PRIMARY_COLOR) when blank or absent.
         let color = branding_str("primary_color");
         ensure_key(
             "msp_primary_color",
@@ -1029,15 +1044,17 @@ impl NotificationsService {
     /// out of that transaction into two of their own, so the reads that decided
     /// WHAT to queue could not see the transaction that queued it. Both now run
     /// on the caller's connection, and
-    /// `tests/notification_dispatch_query_budget.rs` counts the `set_config`
+    /// `tests/suites/notification_dispatch_query_budget.rs` counts the `set_config`
     /// and the `COMMIT` so a third cannot come back unnoticed.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.562: every caller awaits dispatch inline for the row write only; the queued rows are delivered asynchronously later by DispatcherWorker.
     pub async fn dispatch(
         &self,
         tenant_id: TenantId,
         event_type: &str,
         context: &serde_json::Value,
     ) -> AppResult<u64> {
+        // SPEC-7.559: dispatch opens exactly one begin_with_tenant transaction per call, covering rule lookup, template load, preference reads and every insert, and commits it before returning.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let messages = self
             .render_event(&mut tx, tenant_id, event_type, context)
@@ -1049,6 +1066,7 @@ impl NotificationsService {
             // ship as literal braces to the recipient (PMS-702). Only
             // dispatch warns: `preview` renders the same unresolved keys
             // on purpose and returns them to the caller (PMS-808).
+            // SPEC-7.574: dispatch (unlike preview) logs one warn per message with a non-empty unresolved list; the placeholders still ship as literal {{key}} text.
             if !message.unresolved.is_empty() {
                 tracing::warn!(
                     %tenant_id,
@@ -1061,6 +1079,7 @@ impl NotificationsService {
             }
 
             // One statement per recipient kind, whatever the recipient count.
+            // SPEC-7.575: one row per user_id via a single INSERT ... SELECT ... FROM UNNEST, status = 'pending', contact_id/recipient left NULL.
             if !message.user_ids.is_empty() {
                 fanout += sqlx::query(
                     r#"INSERT INTO notifications
@@ -1082,6 +1101,7 @@ impl NotificationsService {
                 .await?
                 .rows_affected();
             }
+            // SPEC-7.576: one row per address via a single UNNEST statement, status = 'pending', user_id/contact_id left NULL.
             if !message.emails.is_empty() {
                 fanout += sqlx::query(
                     r#"INSERT INTO notifications
@@ -1106,6 +1126,7 @@ impl NotificationsService {
             // PMS-1083: the contact's inbox row, against `contact_id`
             // (migration 142). `contact_ids` is empty off the `in_app`
             // channel by construction.
+            // SPEC-7.577: one row per contact_id via a single UNNEST statement, status = 'pending'; this branch only fires for in-app rows since contact_ids is empty for any other channel.
             if !message.contact_ids.is_empty() {
                 fanout += sqlx::query(
                     r#"INSERT INTO notifications
@@ -1128,6 +1149,7 @@ impl NotificationsService {
                 .rows_affected();
             }
         }
+        // SPEC-7.561: returns the total notifications rows actually inserted and propagates any database error to the caller rather than swallowing it.
         tx.commit().await?;
         Ok(fanout)
     }
@@ -1149,6 +1171,7 @@ impl NotificationsService {
         event_type: &str,
         context: &serde_json::Value,
     ) -> AppResult<Vec<NotificationPreviewResponse>> {
+        // SPEC-7.579: preview renders through the identical render_event function dispatch uses, issues only read-only SELECTs, and commits its own begin_with_tenant transaction despite writing nothing.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let messages = self
             .render_event(&mut tx, tenant_id, event_type, context)
@@ -1166,9 +1189,11 @@ impl NotificationsService {
         let addresses = self.load_user_emails(&mut tx, tenant_id, &user_ids).await?;
         tx.commit().await?;
 
+        // SPEC-7.580: one NotificationPreviewResponse per (rule, channel) pair in the same order dispatch iterates them.
         Ok(messages
             .into_iter()
             .map(|m| NotificationPreviewResponse {
+                // SPEC-7.581: user_id recipients render as their resolved email with a fallback to the bare UUID; contact_ids are left out of the response entirely.
                 recipients: m
                     .user_ids
                     .iter()
@@ -1202,6 +1227,7 @@ impl NotificationsService {
     ///
     /// Reads run on the caller's connection (PMS-782) so the whole
     /// dispatch, rule lookup through insert, is one transaction.
+    // SPEC-7.560: render_event (and enrich_with_branding it calls) never opens a second transaction; both run their reads on the connection the caller's transaction already set the tenant GUC on.
     async fn render_event(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -1217,6 +1243,7 @@ impl NotificationsService {
         // over the branding defaults so a specific dispatch site can
         // override. Applied here (not in dispatch) so `preview` renders the
         // same context and neither can drift.
+        // SPEC-7.595: every dispatch and preview call enriches context with msp_name, msp_logo_url, msp_primary_color, msp_support_email, msp_footer_line, msp_footer_line_html and app_name before rendering.
         let enriched_context = self
             .enrich_with_branding(&mut *conn, tenant_id, context.clone())
             .await?;
@@ -1225,6 +1252,7 @@ impl NotificationsService {
         // find `{{app_name}}` unresolved because one caller forgot it.
         let merged = with_app_name(&enriched_context);
         let context = &merged;
+        // SPEC-7.563: only active rules for this tenant and event_type are considered; inactive or other-tenant rules are never looked up.
         let rules = sqlx::query_as::<_, RuleRow>(
             r#"SELECT id, name, event_type, conditions, channels, recipients, template_id, is_active
                FROM notification_rules
@@ -1264,6 +1292,7 @@ impl NotificationsService {
         // is no single entity to deep-link). Stamped on every row of
         // every recipient kind since PMS-1083 (MAPPS-656 recorded the
         // pair as parsed and never written).
+        // SPEC-7.570: entity_type/entity_id are taken from context; entity_type must be non-empty and at most 50 chars, entity_id must parse as a UUID, otherwise the column stays NULL with no rejection error.
         let ctx_entity_type: Option<String> = context
             .get("entity_type")
             .and_then(|v| v.as_str())
@@ -1301,6 +1330,7 @@ impl NotificationsService {
         for rule in rules {
             // PMS-1237 finding 2: a rule scoped by `conditions` only fires
             // for a matching dispatch context.
+            // SPEC-7.564: a rule whose conditions do not match the dispatch context is skipped entirely (see rule_conditions_match for the match semantics).
             if !rule_conditions_match(&rule.conditions, context) {
                 continue;
             }
@@ -1319,6 +1349,7 @@ impl NotificationsService {
             // addresses, user ids, ticket text) mailed to a real
             // recipient. Skip the rule and log the misconfiguration.
             // PMS-1238: a deactivated template does not send, whatever its rule says.
+            // SPEC-7.565: a rule with no template_id, a missing template, or an inactive template is skipped, logged via warn!, and contributes zero to the fanout count; dispatch never falls back to a synthetic subject/body.
             let template = template.filter(|t| t.is_active.unwrap_or(true));
             let Some(template) = template else {
                 tracing::warn!(
@@ -1332,6 +1363,7 @@ impl NotificationsService {
                 continue;
             };
 
+            // SPEC-7.567: recipients are the union of rule.recipients.user_ids with an optional context.recipient_user_id, of rule.recipients.emails with an optional context.recipient_email, and of rule.recipients.contacts with an optional context.recipient_contact_id, each deduplicated.
             // Merge rule.recipients with caller-supplied context recipients.
             let mut user_ids: Vec<Uuid> = rule
                 .recipients
@@ -1372,6 +1404,7 @@ impl NotificationsService {
             // standalone row queued for `emails`, for the same channel. Drop
             // an email address that already resolves to one of this rule's
             // user_ids, the same lookup the worker uses at delivery.
+            // SPEC-7.568: an email address that case-insensitively matches one of this rule's user_ids' own email is dropped from the emails list before fan-out, so the same person is never queued twice.
             if !user_ids.is_empty() && !emails.is_empty() {
                 let user_addresses = self
                     .load_user_emails(&mut *conn, tenant_id, &user_ids)
@@ -1405,6 +1438,7 @@ impl NotificationsService {
             // PMS-195: batch-load every recipient's preference row up front
             // instead of querying once per (channel, user) pair inside the
             // nested loop below (was N+1).
+            // SPEC-7.585: user and contact preference rows are each batch-loaded in exactly one query per dispatch call, never once per (recipient, channel) pair in a nested loop.
             let prefs = self
                 .load_user_preferences(&mut *conn, tenant_id, &user_ids, event_type)
                 .await?;
@@ -1423,6 +1457,8 @@ impl NotificationsService {
             //
             // A template with no subject (in_app rows need none) leaves the
             // column NULL rather than inventing one.
+            // SPEC-7.571: the template is rendered exactly once per rule, reused unchanged across every channel that rule fans out on.
+            // SPEC-7.572: a template with no subject leaves notifications.subject NULL rather than synthesizing one.
             let (subject, subject_unresolved) = match template.subject.as_deref() {
                 Some(raw) => {
                     let (rendered, unresolved) = render_template(raw, context);
@@ -1435,6 +1471,7 @@ impl NotificationsService {
             // text and persist it on the row, so the worker sends one
             // multipart message instead of re-resolving the template
             // (which could have been edited after the row was queued).
+            // SPEC-7.573: body_html is rendered with Escape::Html while subject/body_text use Escape::Text; the rendered body_html is persisted on the row at dispatch time and never re-rendered by the worker.
             let (body_html, html_unresolved) = match template.body_html.as_deref() {
                 Some(raw) => {
                     let (rendered, unresolved) = render_template_as(raw, context, Escape::Html);
@@ -1464,6 +1501,7 @@ impl NotificationsService {
                     // Standalone email-style recipients have no user row
                     // and no preferences to consult. in_app rows must
                     // always belong to a user, so they carry none.
+                    // SPEC-7.569: for in_app, contact_ids are the only recipients filtered by contact preferences and emails is forced empty; every other channel forces contact_ids empty.
                     emails: if channel == "in_app" {
                         Vec::new()
                     } else {
@@ -1628,6 +1666,7 @@ struct RenderedNotification {
 /// equality, and a context missing the key fails the rule rather than
 /// matching it, since a rule cannot be scoped by a field the event never
 /// carries.
+// SPEC-7.564: a missing context key never matches, an array expected value matches by containment ("in"), a scalar expected value requires exact equality; absent conditions or {} match unconditionally.
 fn rule_conditions_match(conditions: &serde_json::Value, context: &serde_json::Value) -> bool {
     let Some(map) = conditions.as_object() else {
         return true;
@@ -1643,6 +1682,7 @@ fn rule_conditions_match(conditions: &serde_json::Value, context: &serde_json::V
     })
 }
 
+// SPEC-7.584: opt-out by default: no row accepts every channel; is_enabled = false rejects every channel; is_enabled = true (or NULL) accepts only a channel in channel_types. The same function governs both user and contact (contact_notification_preferences) acceptance.
 fn accepts_channel(pref: Option<&(Option<bool>, Vec<String>)>, channel: &str) -> bool {
     match pref {
         None => true,
@@ -1668,6 +1708,7 @@ pub const RENDER_TRACE_TARGET: &str = "mokosh::notifications::render";
 /// product in an outbound email. A context that is not an object carries no
 /// top-level keys for `render_template` to resolve anyway, so replacing it
 /// loses nothing.
+// SPEC-7.597: with_app_name always overwrites any caller-supplied app_name with the deployment's configured product name, so context data can never rename the product in an outbound email.
 fn with_app_name(context: &serde_json::Value) -> serde_json::Value {
     let name = serde_json::Value::String(crate::utils::app_name::app_name().to_string());
     let mut merged = context.clone();
@@ -1697,6 +1738,7 @@ fn with_app_name(context: &serde_json::Value) -> serde_json::Value {
 /// reject it at write time instead of letting `dispatch` skip it later.
 /// The route-level `#[validate(required)]` catches the HTTP path; this
 /// covers every other caller of the service.
+// SPEC-7.566: template_id is required at both the HTTP validation layer and independently here, so non-HTTP callers of create_rule/update_rule are also gated.
 fn require_template_id(request: &UpsertNotificationRuleRequest) -> AppResult<Uuid> {
     request
         .template_id
@@ -1720,11 +1762,13 @@ pub fn render_template(input: &str, context: &serde_json::Value) -> (String, Vec
     render_template_as(input, context, Escape::Text)
 }
 
+// SPEC-7.603: flat, non-recursive, non-conditional {{key}} substitution against the top-level fields of context only; no dotted-path or nested-object lookup.
 pub fn render_template_as(
     input: &str,
     context: &serde_json::Value,
     escape: Escape,
 ) -> (String, Vec<String>) {
+    // SPEC-7.607: under Escape::Html every value is HTML-escaped unless its key is in MARKUP_KEYS (raw markup built in Rust); under Escape::Text nothing is ever escaped.
     let emit = |out: &mut String, key: &str, value: &str| {
         if escape == Escape::Html && !MARKUP_KEYS.contains(&key) {
             out.push_str(&crate::utils::html::html_escape(value));
@@ -1735,6 +1779,7 @@ pub fn render_template_as(
     // PMS-782: one trace event per substitution pass, so the render count of a
     // dispatch is observable (it used to be one pass per channel of the same
     // rule, rendering byte-identical output N times).
+    // SPEC-7.608: exactly one tracing::trace! event at RENDER_TRACE_TARGET per render pass (subject/body_text/body_html are three separate passes, one per rule, not one per channel).
     tracing::trace!(target: RENDER_TRACE_TARGET, bytes = input.len(), "rendering notification template");
     let mut out = String::with_capacity(input.len());
     let mut unresolved: Vec<String> = Vec::new();
@@ -1742,6 +1787,7 @@ pub fn render_template_as(
     while let Some(open) = rest.find("{{") {
         out.push_str(&rest[..open]);
         rest = &rest[open + 2..];
+        // SPEC-7.606: an unterminated {{ with no matching }} emits the literal {{ plus the remaining input verbatim and returns immediately, adding nothing to unresolved.
         let Some(close) = rest.find("}}") else {
             out.push_str("{{");
             out.push_str(rest);
@@ -1749,8 +1795,10 @@ pub fn render_template_as(
         };
         let key = rest[..close].trim();
         match context.get(key) {
+            // SPEC-7.604: a string value is emitted verbatim; any other JSON value type is emitted via its Display/to_string representation.
             Some(serde_json::Value::String(s)) => emit(&mut out, key, s),
             Some(v) => emit(&mut out, key, &v.to_string()),
+            // SPEC-7.605: a {{key}} absent from context keeps its original internal whitespace in the output while the trimmed key is appended once (deduplicated) to the unresolved list.
             None => {
                 if !unresolved.iter().any(|k| k == key) {
                     unresolved.push(key.to_string());
@@ -2037,6 +2085,7 @@ impl From<InboxRow> for NotificationInboxItemResponse {
             channel_type: r.channel_type,
             subject: r.subject,
             body: r.body,
+            // SPEC-7.614: status defaults to the literal "pending" if the DB column is unexpectedly NULL, rather than erroring.
             status: r.status.unwrap_or_else(|| "pending".into()),
             sent_at: r.sent_at,
             read_at: r.read_at,
@@ -2103,7 +2152,7 @@ impl From<RuleRow> for NotificationRuleResponse {
 /// `contacts::service::mirror_writers` shape, under `cargo test --lib`, with
 /// no script, recipe or CI step to add.
 ///
-/// `tests/notification_dispatch_query_budget.rs` is the behavioural half: this
+/// `tests/suites/notification_dispatch_query_budget.rs` is the behavioural half: this
 /// scan proves no transaction is opened in the render path, that test counts
 /// the `set_config` and the `COMMIT` a real dispatch actually issues.
 #[cfg(test)]

@@ -55,11 +55,13 @@
 # Required-but-empty values use the `${VAR:?...}` form so compose fails
 # loudly with a helpful message instead of starting a misconfigured stack.
 
+# SPEC-10.133
 name: dev-mokosh-${USER:?USER missing - run via just dev}
 
 services:
 
   # PostgreSQL database for Infisical (internal only).
+  # SPEC-10.134
   infisical-postgres:
     profiles: ["infisical"]
     container_name: dev-mokosh-infisical-postgres-${USER:?USER missing - run via just dev}
@@ -149,6 +151,7 @@ services:
   # named volume mounted at `/data`). CI extracts the binary from the same
   # image and runs it directly in `integration.yml`, bypassing the entrypoint
   # so dev and CI take MinIO from one place.
+  # SPEC-10.143
   minio:
     profiles: ["s3"]
     container_name: dev-mokosh-minio-${USER:?USER missing - run via just dev}
@@ -161,6 +164,7 @@ services:
     networks:
       - private
     ports:
+      # SPEC-10.135
       # PMS-900: host side from .env, so a second checkout running
       # `just dev-s3` does not collide. The server reaches MinIO in-network
       # at `minio:9000`, so these two are host-side tooling only (the console,
@@ -197,10 +201,12 @@ services:
       # of the upstream image's default. Using a `pgdata` subdir of the
       # mount point sidesteps the postgres-entrypoint quirk that refuses
       # to initdb into a non-empty directory.
+      # SPEC-10.136
       PGDATA: /var/lib/postgresql/data/pgdata
     networks:
       - private
     ports:
+      # SPEC-10.135
       # PMS-496: published on LOOPBACK ONLY. host-side sqlx-cli (just
       # migrate-run) connects via localhost:${MOKOSH_PG_HOST_PORT}; sibling
       # containers reach this DB by in-network DNS `postgres:5432` and need no
@@ -249,6 +255,7 @@ services:
 
   # Mokosh API server. Built from the dev Dockerfile; source mounted for
   # live reload via `cargo run`.
+  # SPEC-10.137
   server:
     container_name: dev-mokosh-server-${USER:?USER missing - run via just dev}
     build:
@@ -268,6 +275,7 @@ services:
       # dev box (earlyoom SIGTERMs the container at ~1.5 GB free), paired with the
       # profile.dev tuning in Cargo.toml (debug=0, codegen-units=256). A box with
       # headroom can set CARGO_BUILD_JOBS in .env to a higher value or `default`.
+      # SPEC-10.138
       CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-1}
 
       # Reach the in-stack postgres by service-DNS name. PMS-285: the split
@@ -338,6 +346,14 @@ services:
       # Empty means the file provider is not built; the `:-` default reproduces
       # the code's own behaviour when APP_SECRETS_DIR is unset.
       APP_SECRETS_DIR: ${APP_SECRETS_DIR:-}
+      # PMS-1537: bunyip's host-secrets route and the machine credential that
+      # reads it. Empty in dev, which is what every self-hosted deployment
+      # reads: no URL means the bunyip provider is not built, and the Google
+      # client pair comes from whatever APP_SECRET_BACKEND names. A dev box
+      # pointing at a real bunyip sets all three.
+      BUNYIP_SECRETS_URL: ${BUNYIP_SECRETS_URL:-}
+      BUNYIP_SECRETS_CLIENT_ID: ${BUNYIP_SECRETS_CLIENT_ID:-}
+      BUNYIP_SECRETS_CLIENT_SECRET: ${BUNYIP_SECRETS_CLIENT_SECRET:-}
       # PMS-982: `environment`, the only kind reachable via the SINGLE-provider
       # slot today. The `:-` default reproduces the code's own fallback in
       # ConfigSelection::from_env.
@@ -448,6 +464,10 @@ services:
       # for the predicate.
       CORS_ORIGIN: ${CORS_ORIGIN:-}
 
+      # MAPPS-920: Domain= attribute for the contact-portal refresh cookie,
+      # set when the SPA runs on a different subdomain of the API's apex.
+      PORTAL_COOKIE_DOMAIN: ${PORTAL_COOKIE_DOMAIN:-}
+
       # MAPPS-425 / PMS-748 / MAPPS-429: the emailed-link and email-branding
       # trio. SPA_BASE_URL falls back to CLIENT_ORIGIN, so it only needs setting
       # on a stack where the SPA is not the login origin; PUBLIC_API_BASE_URL is
@@ -498,6 +518,7 @@ services:
       # EMPTY default on purpose: the resolver takes the first non-blank of the
       # two, so a default here would shadow STORAGE_ROOT and every dev stack
       # would silently keep running on the deprecated name.
+      # SPEC-10.140
       STORAGE_ROOT: ${STORAGE_ROOT:-/data/attachments}
       ATTACHMENT_DIR: ${ATTACHMENT_DIR:-}
       ATTACHMENT_MAX_BYTES: ${ATTACHMENT_MAX_BYTES:-}
@@ -579,6 +600,7 @@ services:
     # router name, Traefik rejects it, and the host never routes (default
     # cert + 404). In list form the whole "key=value" is one string value,
     # so ${USER} in the router name interpolates correctly.
+    # SPEC-10.142
     labels:
       - traefik.enable=true
       - traefik.docker.network=network-traefik-public
@@ -593,8 +615,10 @@ services:
     # network, which serves the OP with a valid Let's Encrypt cert. Override
     # BUNYIP_OP_TRAEFIK_IP in .env on a box whose Traefik publishes
     # nebula-secure on a different IP.
+    # SPEC-10.141
     extra_hosts:
       - "${USER}-bunyip-api.a8n.run:${BUNYIP_OP_TRAEFIK_IP:-172.30.0.11}"
+    # SPEC-10.139
     volumes:
       - ./src:/app/src
       - ./crates:/app/crates

@@ -11,7 +11,8 @@ use super::mokosh_bunyip_grants::map_grant_role;
 use super::oidc_rs::{Verifier as BunyipVerifier, VerifyError};
 use super::service::{is_unresolved_placeholder_email, BunyipPrincipal, UNRESOLVED_EMAIL_DOMAIN};
 use super::{AuthService, AuthState, CurrentUser, UserRole};
-use crate::utils::error::AppError;
+use crate::utils::error::{AppError, AppResult};
+use uuid::Uuid;
 
 /// PMS-769: what happened to the `Authorization: Bearer` credential on this
 /// request. Recorded on the request extensions by [`auth_middleware`] (and by
@@ -500,10 +501,8 @@ pub async fn auth_middleware(
     // paths and for tenant-mismatched tokens.
     let auth_state = if !auth_state.is_authenticated {
         if let Some(sub) = candidate_sub {
-            match auth_middleware.auth_service.is_user_tombstoned(sub).await {
-                Ok(true) => AuthState::deleted(),
-                _ => auth_state,
-            }
+            let probe = auth_middleware.auth_service.is_user_tombstoned(sub).await;
+            resolve_tombstone_probe(auth_state, sub, probe)
         } else {
             auth_state
         }
@@ -539,6 +538,70 @@ pub async fn auth_middleware(
     request.extensions_mut().insert(outcome);
 
     next.run(request).await
+}
+
+/// MAPPS-877: refuse a `ReadOnly` caller on any request whose method
+/// changes state. Runs after [`auth_middleware`] so it can read the
+/// `AuthState` the auth pass wrote to the request extensions; a
+/// caller who is not authenticated at all skips this check (their
+/// request will be refused by the extractors downstream with an
+/// ordinary 401, which is the right shape). Non-mutating methods
+/// (GET / HEAD / OPTIONS) pass through unchanged, so a read-only
+/// grantee can still browse the workspace.
+///
+/// Reasoning for the middleware shape rather than per-handler
+/// extractor swaps: mokosh has ~60 mutating endpoints across ~30
+/// files, and touching each of them individually would leave the
+/// enforcement scattered and hard to audit. One layer at the router
+/// root, tested in one place, is both smaller and easier to reason
+/// about. Handlers that gate on a specific role (RequireAdmin /
+/// RequireManager / RequireFinance) already refuse `ReadOnly`
+/// because their allowlist does not include it; this middleware is
+/// what catches the mutating handlers that only asked for
+/// `RequireAuth`.
+pub async fn require_write_for_mutations(request: Request, next: Next) -> Response {
+    use axum::http::Method;
+    let method = request.method().clone();
+    // Safe methods only ever read; let them through with no lookup.
+    if matches!(&method, &Method::GET | &Method::HEAD | &Method::OPTIONS) {
+        return next.run(request).await;
+    }
+    // Look up the caller's role from the AuthState the auth pass
+    // wrote. Nothing here = no bearer or a bearer the auth pass did
+    // not accept; the downstream extractor answers 401 with the
+    // proper `WWW-Authenticate` challenge, so passing through is
+    // correct.
+    let is_read_only = request
+        .extensions()
+        .get::<AuthState>()
+        .and_then(|s| s.user.as_ref())
+        .map(|u| !u.role.can_write())
+        .unwrap_or(false);
+    if is_read_only {
+        return AppError::Forbidden(
+            "This account is read-only and cannot make changes here.".to_string(),
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
+/// PMS-1577: the tombstone probe's result folded into the next `AuthState`,
+/// pulled out of `auth_middleware` so the error branch is unit-testable
+/// without a database. `Ok(true)` upgrades to `deleted` (unchanged MAPPS-348
+/// behaviour); `Ok(false)` and `Err` both keep `auth_state` as it was, but a
+/// database error is logged with the user id first, because reading it as
+/// "definitely not tombstoned" the same way a real negative answer is read
+/// would hide a database outage behind an identical response.
+fn resolve_tombstone_probe(auth_state: AuthState, sub: Uuid, probe: AppResult<bool>) -> AuthState {
+    match probe {
+        Ok(true) => AuthState::deleted(),
+        Ok(false) => auth_state,
+        Err(e) => {
+            tracing::warn!(user_id = %sub, error = %e, "tombstone probe failed; treating as not tombstoned");
+            auth_state
+        }
+    }
 }
 
 fn bearer(req: &Request) -> Option<&str> {
@@ -603,10 +666,48 @@ where
     }
 }
 
+/// MAPPS-877: extractor that requires an authenticated caller AND
+/// refuses any role whose `can_write()` returns false. Wraps
+/// `RequireAuth` so a signed-out request still 401s and a signed-in
+/// `ReadOnly` request 403s at the router boundary, before the
+/// handler runs and before any database write. Handlers that used
+/// `RequireAuth` to gate a mutation (POST / PUT / PATCH / DELETE)
+/// switch to `RequireWriteAccess` with no other change; role-gated
+/// mutations (`RequireAdmin`, `RequireManager`, etc.) already refuse
+/// `ReadOnly` by construction because their allowlist does not
+/// include it, so no change is needed there.
+///
+/// The rejection is `AppError::Forbidden` with a message that names
+/// the role, so a SPA that renders the button anyway can surface a
+/// specific reason rather than a generic 403.
+#[derive(Clone)]
+pub struct RequireWriteAccess(pub CurrentUser);
+
+impl<S> axum::extract::FromRequestParts<S> for RequireWriteAccess
+where
+    S: Send + Sync,
+{
+    type Rejection = AuthRejection;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let RequireAuth(user) = RequireAuth::from_request_parts(parts, state).await?;
+        if !user.role.can_write() {
+            return Err(AppError::Forbidden(
+                "This account is read-only and cannot make changes here.".to_string(),
+            )
+            .into());
+        }
+        Ok(RequireWriteAccess(user))
+    }
+}
+
 /// MAPPS-491 (MAPPS-474 phase 2): extractor that surfaces the FULL
 /// authenticated `AuthState` (identity_id, active_membership_id,
 /// memberships, plus the user + tenant). Handlers that need the
-/// membership set — currently `GET /auth/memberships` — reach for this
+/// membership set - currently `GET /auth/memberships` - reach for this
 /// instead of `RequireAuth`, which only exposes `CurrentUser`.
 #[derive(Clone)]
 pub struct RequireAuthState(pub AuthState);
@@ -1064,7 +1165,7 @@ pub enum LocalPlacement {
 ///
 /// Public because it is the branch production takes for an already-provisioned
 /// caller, and the query-budget regression test
-/// (`tests/bunyip_query_budget.rs`) asserts its cost directly.
+/// (`tests/suites/bunyip_query_budget.rs`) asserts its cost directly.
 pub async fn place_bunyip_user_from_local_state(
     auth_service: &Arc<AuthService>,
     tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
@@ -1718,7 +1819,7 @@ async fn place_bunyip_caller(
     // Bunyip-backed login"). They bootstrap the first tenant, so they
     // must be able to sign in on a fresh instance without a
     // pre-existing invitation - matches the `bootstrap_admin_*`
-    // regression pins in `tests/bunyip_login.rs`.
+    // regression pins in `tests/suites/bunyip_login.rs`.
     let is_platform_admin = claims.bunyip_role.as_deref() == Some("admin");
     // The flag opens the door for a first-sight bunyip identity; the
     // verified-email conjunction stays here so an unverified address can
@@ -1802,8 +1903,8 @@ async fn place_bunyip_caller(
     // invited user is seeded with the invite's role; otherwise the user owns
     // their own single-tenant Mokosh world (PMS-447) so the JIT default is
     // `Admin`, not `Technician`. The Bunyip-role reconciliation below still
-    // runs and promotes to `SuperAdmin` if the at+jwt carries the platform
-    // admin claim.
+    // runs, but since MAPPS-519 a platform admin claim floors at `Admin`, not
+    // `SuperAdmin` (see `effective_role_from_bunyip`).
     let initial_role = invite
         .as_ref()
         .and_then(|i| UserRole::from_str(&i.role))
@@ -1969,7 +2070,9 @@ async fn place_bunyip_caller(
     // MAPPS-330: every Mokosh user is an admin of their own instance. The
     // PMS-458 invite-respect branch (preserving least-privilege grants into
     // SHARED org tenants) is removed: even invited joiners floor at `admin`,
-    // and a platform-level Bunyip `admin` claim still rises to `super_admin`.
+    // and since MAPPS-519 a platform-level Bunyip `admin` claim no longer
+    // rises to `super_admin` (platform privilege comes only from
+    // `platform_admins`; see `effective_role_from_bunyip` below).
     let effective = effective_role_from_bunyip(claims.bunyip_role.as_deref(), user.role);
     if effective != user.role {
         // Role transitions are security-relevant; log every one (fires only on
@@ -2053,9 +2156,23 @@ fn effective_role_from_bunyip(bunyip_role: Option<&str>, local: UserRole) -> Use
 }
 
 fn default_bunyip_tenant_id() -> uuid::Uuid {
-    crate::config::get(&crate::config::registry::OIDC_DEFAULT_TENANT_ID)
-        .and_then(|s| uuid::Uuid::parse_str(&s).ok())
-        .unwrap_or_else(|| uuid::Uuid::from_u128(1))
+    let raw = crate::config::get(&crate::config::registry::OIDC_DEFAULT_TENANT_ID);
+    match crate::config::parse::parse_optional::<uuid::Uuid>(
+        &crate::config::registry::OIDC_DEFAULT_TENANT_ID,
+        raw,
+    ) {
+        Ok(Some(id)) => id,
+        Ok(None) => uuid::Uuid::from_u128(1),
+        Err(e) => {
+            // PMS-1577: the boot-time check (`main.rs`) is supposed to have
+            // already refused a set-but-unparseable OIDC_DEFAULT_TENANT_ID,
+            // but a refresh after boot can still land one; warn so a JIT
+            // placement that silently reverted to the hardcoded default is
+            // visible.
+            tracing::warn!(error = %e, "OIDC_DEFAULT_TENANT_ID failed to parse; serving the hardcoded default tenant");
+            uuid::Uuid::from_u128(1)
+        }
+    }
 }
 
 /// PMS-245: whether an already-placed user should be backfilled off the shared
@@ -2083,8 +2200,8 @@ fn is_stuck_in_default(
 mod tests {
     use super::{
         default_bunyip_tenant_id, effective_role_from_bunyip, is_stuck_in_default,
-        user_or_auth_error, AuthRejection, AuthState, BearerOutcome, CurrentUser, UserRole,
-        VerifyError,
+        resolve_tombstone_probe, user_or_auth_error, AuthRejection, AuthState, BearerOutcome,
+        CurrentUser, UserRole, VerifyError,
     };
     use crate::utils::error::AppError;
     use axum::response::IntoResponse;
@@ -2151,6 +2268,29 @@ mod tests {
                 other => panic!("expected unchallenged AccountDeleted, got {other:?}"),
             }
         }
+    }
+
+    /// PMS-1577: `Ok(true)` upgrades to `deleted`; `Ok(false)` and `Err`
+    /// both leave `auth_state` exactly as it was, so the response status for
+    /// an unauthenticated request is unchanged by a probe failure.
+    #[test]
+    fn resolve_tombstone_probe_distinguishes_tombstoned_from_not_found_and_error() {
+        let sub = Uuid::from_u128(7);
+        let before = AuthState::default();
+
+        assert!(
+            resolve_tombstone_probe(before.clone(), sub, Ok(true)).deleted,
+            "a confirmed tombstone must upgrade to deleted"
+        );
+        assert!(
+            !resolve_tombstone_probe(before.clone(), sub, Ok(false)).deleted,
+            "a confirmed non-tombstone must not change auth_state"
+        );
+        assert!(
+            !resolve_tombstone_probe(before.clone(), sub, Err(AppError::NotFound("db".into())))
+                .deleted,
+            "a database error must fall back to auth_state, not be read as a positive answer"
+        );
     }
 
     #[test]

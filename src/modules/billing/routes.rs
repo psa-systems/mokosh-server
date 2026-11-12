@@ -957,6 +957,29 @@ async fn get_invoice_pdf(
             return Err(AppError::NotFound("Invoice".to_string()));
         }
     }
+    // MAPPS-1147: a delegated invoice has no Mokosh document, and must not
+    // be given one.
+    //
+    // It is `sent` and therefore frozen (MAPPS-1135), and deliberately has
+    // no stored bytes: the document the customer holds is the provider's
+    // and Mokosh never rendered one. Without this the live-render fallback
+    // below fires and answers a Mokosh-branded PDF carrying Mokosh's
+    // number for an invoice Xero issued, numbered and delivered. Two
+    // documents for one invoice, and an admin who forwards the wrong one
+    // has sent their customer a second invoice.
+    //
+    // A refusal naming where the document is, rather than a redirect into
+    // the provider, which Mokosh cannot authenticate this caller for.
+    if let Some(provider) = invoice.external_provider.as_deref() {
+        return Err(AppError::Conflict(format!(
+            "This invoice was issued by {provider}, so its document is {provider}'s. Open it              there{}.",
+            invoice
+                .external_number
+                .as_deref()
+                .map(|n| format!(" as {n}"))
+                .unwrap_or_default()
+        )));
+    }
     let preview = preview.resolve(
         invoice.status.is_frozen(),
         matches!(caller, CallerContext::Staff(_)),
@@ -1490,13 +1513,13 @@ mod finance_gate {
 
     /// The dual-plane handlers whose staff branch carries the gate in the
     /// body rather than in the argument list (PMS-1041; PMS-1088 added the
-    /// sixth). They take
+    /// seventh). They take
     /// `RequireCallerContext` because they serve the contact plane too, and
     /// stacking `RequireBilling` on top would resolve the caller twice.
     ///
-    /// The list is exhaustive on purpose: adding a sixth is a deliberate act,
-    /// because the inline form is the one that already lost the module gate
-    /// once and the compiler cannot see the omission.
+    /// The list is exhaustive on purpose: adding an eighth is a deliberate
+    /// act, because the inline form is the one that already lost the module
+    /// gate once and the compiler cannot see the omission.
     const INLINE_STAFF_GATE: &[&str] = &[
         "get_invoice",
         // MAPPS-984: the aggregate `/invoices/summary` the dashboard Open
@@ -1510,7 +1533,7 @@ mod finance_gate {
         "get_invoice_pdf",
         "pay_invoice",
         "get_invoice_payment_readiness",
-        // PMS-1088: the invoice ledger, the sixth dual-plane read.
+        // PMS-1088: the invoice ledger, the seventh dual-plane read.
         "list_invoice_payments",
     ];
 

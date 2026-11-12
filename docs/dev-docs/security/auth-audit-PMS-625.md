@@ -73,7 +73,7 @@ if let Some(role) = request.role {
 }
 ```
 
-Regression test: `tests/auth.rs::update_user_enforces_role_ceiling` (admin ->
+Regression test: `tests/suites/auth.rs::update_user_enforces_role_ceiling` (admin ->
 super_admin is 403; admin -> manager is 200).
 
 ### F2 - XSS-safe JSON embedding (`src/modules/auth/google_login.rs`)

@@ -72,6 +72,7 @@ use crate::utils::upload_limits::{body_limit_bytes, oversized_upload_error};
 
 /// Default size cap when `ATTACHMENT_MAX_BYTES` is unset. 25 MiB
 /// matches what the ticket spec cites as the v1 default.
+// SPEC-7.45: the default maximum attachment size is DEFAULT_MAX_BYTES (25 MiB); the inline-image maximum is INLINE_MAX_BYTES (5 MiB), both enforced at upload time.
 const DEFAULT_MAX_BYTES: u64 = 25 * 1024 * 1024;
 /// PMS-783: an attachment blob is addressed by a v4 uuid and is never rewritten
 /// in place (a replacement is a new row under a new uuid, and `delete_one`
@@ -98,6 +99,7 @@ const INLINE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 /// The byte cap an inline image is held to, given the configured attachment
 /// cap. A floor rather than a replacement: lowering `ATTACHMENT_MAX_BYTES`
 /// lowers this too, raising it does not raise this.
+// SPEC-7.46: the inline-image byte cap in effect at any moment is computed as a floor against the tenant's configured max, never exceeding INLINE_MAX_BYTES.
 fn inline_cap(configured_max_bytes: u64) -> u64 {
     configured_max_bytes.min(INLINE_MAX_BYTES)
 }
@@ -114,12 +116,12 @@ pub struct AttachmentConfig {
 }
 
 impl AttachmentConfig {
-    pub fn from_env() -> Self {
-        let max_bytes = crate::config::get(&crate::config::registry::ATTACHMENT_MAX_BYTES)
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|n| *n > 0)
+    pub fn from_env() -> AppResult<Self> {
+        let key = &crate::config::registry::ATTACHMENT_MAX_BYTES;
+        let max_bytes = crate::config::parse::parse_positive(key, crate::config::get(key))
+            .map_err(AppError::Configuration)?
             .unwrap_or(DEFAULT_MAX_BYTES);
-        Self { max_bytes }
+        Ok(Self { max_bytes })
     }
 }
 
@@ -209,6 +211,7 @@ impl AttachmentService {
     /// byte-identical to what this method built before, and on any other it
     /// is whatever that provider calls the object. Nothing reads the column
     /// back, which is why it is a `String` from `location` and not a path.
+    // SPEC-7.53: every stored attachment is addressed by (tenant_id, attachment_id) UUID, never by a filesystem path, when read back through the object storage seam.
     fn storage_path_for(&self, tenant_id: Uuid, attachment_id: Uuid) -> AppResult<String> {
         self.store
             .location(&ObjectKey::ticket_attachment(tenant_id, attachment_id))
@@ -428,6 +431,7 @@ impl AttachmentService {
         self.store.put(&key, &bytes).await?;
         let storage_path = self.storage_path_for(tenant_id, id)?;
 
+        // SPEC-7.55: an attachment filename passes through sanitize_filename before being persisted or echoed back to a client.
         let safe_name = sanitize_filename(&file_name);
         let safe_mime = sanitize_mime_type(&mime_type);
 
@@ -465,6 +469,7 @@ impl AttachmentService {
         // disagree. `uploaded_by_id` is None for a portal upload (the actor is
         // a `contacts` row) and for inbound email (there is no actor), which is
         // why migration 126 drops that column's NOT NULL.
+        // SPEC-7.54: a FileLedger row is recorded for every stored attachment blob, for tenant storage-usage rollups.
         self.ledger
             .record(
                 tenant_id,
@@ -526,6 +531,7 @@ impl AttachmentService {
         bytes: Vec<u8>,
         uploaded_by: Uuid,
     ) -> AppResult<AttachmentResponse> {
+        // SPEC-7.47: inline image upload restricts MIME type to an allowlist (PNG, JPEG, WebP, GIF); SVG is refused.
         let mime = check_inline_image_mime(&mime_type)?;
         if bytes.is_empty() {
             return Err(AppError::BadRequest("The uploaded file is empty".into()));
@@ -565,8 +571,11 @@ impl AttachmentService {
     /// was never meant to be public all return exactly the same 404. That last
     /// case is the one that matters: the answer must not tell a caller holding
     /// a guessed uuid that they found something.
+    // SAFETY (PMS-285 / PMS-941): this runs on the BYPASSRLS migrator pool, tenant-less by construction; see the doc comment above for why.
+    // SPEC-7.49: read_public_inline uses the BYPASSRLS migrator pool (tenant-less lookup), justified by the SAFETY note above per the repo's pool-safety convention.
     async fn read_public_inline(&self, attachment_id: Uuid) -> AppResult<AttachmentRow> {
         let pool: &PgPool = self.db.migrator_pool();
+        // SPEC-7.48: this WHERE clause filters strictly on is_inline = true; an attachment with is_inline = false is never servable through this public route regardless of any other parameter.
         sqlx::query_as(
             "SELECT id, ticket_id, note_id, file_name, file_size, mime_type, \
                     storage_path, tenant_id, uploaded_by_id, created_by_contact_id, created_at, \
@@ -876,6 +885,7 @@ async fn get_public_inline_attachment(
 /// size recorded on the row. Deliberately not a content hash, because hashing
 /// would read the whole file to answer a conditional request, which is the very
 /// cost this change removes.
+// SPEC-7.51: an attachment response carries a strong ETag of the exact form "{uuid}-{filesize}" and honors If-None-Match per RFC 9110 weak-comparison semantics, returning 304 on a match.
 fn attachment_etag(id: Uuid, file_size: i32) -> String {
     format!("\"{id}-{file_size}\"")
 }
@@ -921,10 +931,12 @@ async fn attachment_response(
     }
 
     let attachment_id = row.id;
+    // SPEC-7.52: the private (agent-facing) response returns 500 if the blob is missing from storage despite a DB row existing.
     let file = store
         .open(&ObjectKey::ticket_attachment(row.tenant_id, row.id))
         .await
         .map_err(|e| AppError::Internal(format!("attachment blob missing: {e}")))?;
+    // SPEC-7.50: the attachment download streams the blob via ReaderStream/Body::from_stream, never buffering the whole file into memory.
     // A read that fails mid-body aborts the response (the declared
     // content-length is never reached), which the client sees as a truncated
     // download; log the cause so the failure is diagnosable server-side too.
@@ -983,6 +995,7 @@ async fn inline_image_response(
     // A row whose blob is gone must not become a 500 on a route the whole
     // internet can reach: it is the same "no such image" the caller would get
     // for an unknown id, so answer it the same way.
+    // SPEC-7.52: the public inline-image response returns 404 (not 500) when the blob is missing from storage, and omits Content-Disposition while adding X-Content-Type-Options: nosniff below.
     let file = store
         .open(&ObjectKey::ticket_attachment(row.tenant_id, row.id))
         .await

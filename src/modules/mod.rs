@@ -30,6 +30,9 @@ pub mod data_transfer;
 /// the three owning modules; no new store, no secrets on the wire.
 pub mod documentation;
 pub mod email_intake;
+// MAPPS-1100: the Bills and Expenses subsystem. Phase 0 ships schema +
+// models only; routes/service/worker land in later phases.
+pub mod expenses;
 pub mod features;
 pub mod forms;
 // PMS-1310: installed integrations per tenant, and which capabilities each one

@@ -19,7 +19,7 @@
 //! One read path: [`MokoshBunyipGrantService::is_grant_active`]. Reads
 //! the migrator pool (BYPASSRLS) because the table is deliberately
 //! cross-tenant - a grantee's row names an owner's tenant they do not
-//! otherwise belong to (see `tests/rls_coverage.rs`'s
+//! otherwise belong to (see `tests/suites/rls_coverage.rs`'s
 //! `ALLOWED_WITHOUT_RLS` note). Cached process-wide with a 30-second
 //! TTL: the parent BUNYIP-674 ticket names 30s as the stale window, so
 //! a miss triggers a single query, populates the cache, and the next
@@ -37,23 +37,22 @@ use mokosh_types::auth::UserRole;
 /// value so the middleware refuses to place the caller rather than
 /// silently granting one of the seven mokosh roles by accident.
 ///
-/// `read_only` maps to [`UserRole::Technician`], the least-privilege
-/// mokosh role that already exists. This is deliberately over-
-/// privileged for now: mokosh has no first-class read-only tier, and
-/// a real one is a follow-up (a ticket separately opened once the
-/// grant surface has enough traffic to justify the schema move).
-/// Until then a `read_only` grantee has technician-level WRITE
-/// access on the granted tenant; a grant issuer who needs strict
-/// read-only should not issue this role yet.
+/// MAPPS-877 (2026-09-18): `read_only` now projects onto the
+/// first-class [`UserRole::ReadOnly`] variant that landed alongside
+/// migration 297. Before this it deliberately mapped to
+/// [`UserRole::Technician`] because mokosh had no read-only tier;
+/// that gave every `read_only` grantee technician-level WRITE access
+/// on the granted workspace, so a viewer could create companies,
+/// invoices and tickets. `ReadOnly::can_write` returns false and
+/// every mutating handler that carries the `RequireWriteAccess`
+/// extractor refuses that role at the router boundary.
 pub fn map_grant_role(vocab: &str) -> Option<UserRole> {
     match vocab {
         "admin" => Some(UserRole::Admin),
         "manager" => Some(UserRole::Manager),
         "technician" => Some(UserRole::Technician),
         "finance" => Some(UserRole::Finance),
-        // See the note above: intentionally maps to Technician until
-        // a first-class read-only tier lands.
-        "read_only" => Some(UserRole::Technician),
+        "read_only" => Some(UserRole::ReadOnly),
         _ => None,
     }
 }
@@ -141,7 +140,7 @@ impl MokoshBunyipGrantService {
         }
 
         // SAFETY (PMS-285 / PMS-692 shape): the table is cross-tenant
-        // and RLS-exempt (see `tests/rls_coverage.rs`'s
+        // and RLS-exempt (see `tests/suites/rls_coverage.rs`'s
         // `ALLOWED_WITHOUT_RLS`), so this read runs on the raw
         // NOBYPASSRLS pool without a GUC. `mokosh_app` holds SELECT on
         // it.
@@ -362,7 +361,7 @@ fn invalidate_cache(key: &GrantKey) {
 
 /// Testing hook: drop every cached entry so a test's setup does not
 /// see stale state from an earlier test in the same process. Callable
-/// from the integration-test suite (`tests/mokosh_bunyip_grants.rs`),
+/// from the integration-test suite (`tests/suites/mokosh_bunyip_grants.rs`),
 /// which compiles against this crate's public API. A live process
 /// should never need this - the webhook is the invalidation contract.
 pub fn clear_cache_for_tests() {

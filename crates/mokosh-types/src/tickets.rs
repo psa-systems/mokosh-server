@@ -141,6 +141,7 @@ impl NoteType {
 /// system disagreeing with it is the disagreement an MSP loses. A time-entry
 /// note is edited through its time entry. Internal notes stay in-house so
 /// they can be edited freely subject to the role check.
+// SPEC-4.87: role, author-not-a-contact, and for Public notes not yet sent.
 pub fn note_is_editable(
     note_type: NoteType,
     is_email_sent: bool,
@@ -480,6 +481,13 @@ pub struct CreateTicketRequest {
 }
 
 /// Update ticket request
+///
+/// PMS-1565: every nullable FK/date/number column here follows the
+/// `asset_id` PATCH convention (`Option<Option<T>>` via
+/// `deserialize_double_option`): absent leaves the column unchanged, an
+/// explicit `null` clears it, and a value sets it. `status_id`, `priority_id`
+/// and `queue_id` stay plain `Option<Uuid>` because their columns are
+/// `NOT NULL`, so there is no SQL NULL to clear to.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateTicketRequest {
     #[validate(length(min = 1, max = 500))]
@@ -487,21 +495,29 @@ pub struct UpdateTicketRequest {
     pub description: Option<String>,
     pub status_id: Option<Uuid>,
     pub priority_id: Option<Uuid>,
-    pub type_id: Option<Uuid>,
-    pub category_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
+    pub type_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
+    pub category_id: Option<Option<Uuid>>,
     pub queue_id: Option<Uuid>,
-    pub contact_id: Option<Uuid>,
-    pub site_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
+    pub contact_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
+    pub site_id: Option<Option<Uuid>>,
     pub assigned_to_id: Option<Uuid>,
-    pub team_id: Option<Uuid>,
-    pub contract_id: Option<Uuid>,
-    pub sla_id: Option<Uuid>,
-    pub scheduled_start: Option<DateTime<Utc>>,
-    pub scheduled_end: Option<DateTime<Utc>>,
-    /// See `CreateTicketRequest::estimated_hours`: bound to the
-    /// `DECIMAL(10, 2)` column so an oversized value is a clean 422, not a 500.
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
+    pub team_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
+    pub contract_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
+    pub sla_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
+    pub scheduled_start: Option<Option<DateTime<Utc>>>,
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
+    pub scheduled_end: Option<Option<DateTime<Utc>>>,
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
     #[validate(range(min = 0.0, max = 99_999_999.99))]
-    pub estimated_hours: Option<f64>,
+    pub estimated_hours: Option<Option<f64>>,
     pub is_billable: Option<bool>,
     pub billing_status: Option<BillingStatus>,
     /// PMS-344 follow-up: nullable FK with PATCH-style clearing semantics.
@@ -529,7 +545,11 @@ pub struct TicketResponse {
     pub description: Option<String>,
     pub status: TicketStatusSummary,
     pub priority: TicketPrioritySummary,
+    /// MAPPS-1223: the id beside each name, so a client binds its editor to
+    /// the saved value instead of matching the name against a lookup list.
+    pub type_id: Option<Uuid>,
     pub type_name: Option<String>,
+    pub category_id: Option<Uuid>,
     pub category_name: Option<String>,
     pub queue_name: String,
     pub source: TicketSource,
@@ -537,6 +557,20 @@ pub struct TicketResponse {
     pub company_name: String,
     pub contact_id: Option<Uuid>,
     pub contact_name: Option<String>,
+    /// MAPPS-1223: the four PMS-1565 made writable on `UpdateTicketRequest`
+    /// and the response never carried, so a client could set them and never
+    /// read them back. Id plus display name, the `contact_*` shape.
+    pub site_id: Option<Uuid>,
+    pub site_name: Option<String>,
+    pub team_id: Option<Uuid>,
+    pub team_name: Option<String>,
+    pub contract_id: Option<Uuid>,
+    /// Nullable on the contract, so `contract_name` (never null) is carried
+    /// too for a label that always exists.
+    pub contract_number: Option<String>,
+    pub contract_name: Option<String>,
+    pub sla_id: Option<Uuid>,
+    pub sla_name: Option<String>,
     pub assigned_to_id: Option<Uuid>,
     pub assigned_to_name: Option<String>,
     pub sla_due_date: Option<DateTime<Utc>>,
@@ -608,8 +642,13 @@ pub const SLA_AT_RISK_LEAD_CEIL: chrono::Duration = chrono::Duration::hours(24);
 /// the badge and the alert cannot disagree about when a ticket is in trouble.
 /// The worker's numbers won because they are the ones a human already trusts:
 /// they decide whether somebody gets woken up.
+// SPEC-4.88: 20 percent of the window, clamped to [floor, ceil], floor on a
+// non-positive window.
+// SPEC-7.138: lead = 20% of (due - created_at), floor division, clamped to [5m, 24h].
 pub fn sla_at_risk_lead(created_at: DateTime<Utc>, due: DateTime<Utc>) -> chrono::Duration {
     let window = due - created_at;
+    // SPEC-7.139: returns exactly the 5-minute floor (not a clamped
+    // computed negative/zero lead) when due <= created_at.
     if window <= chrono::Duration::zero() {
         return SLA_AT_RISK_LEAD_FLOOR;
     }
@@ -641,6 +680,8 @@ pub struct SlaClock {
 /// tickets service, so the threshold logic lives in one place - and, since
 /// PMS-893, by the SLA-sweep worker, so the badge on the screen and the alert
 /// in someone's inbox answer the same question the same way.
+// SPEC-4.88: NotApplicable once closed/resolved/status-closed, else Breached
+// past due, Warning inside the at-risk lead, else OnTrack.
 pub fn compute_sla_status(clock: &SlaClock) -> SlaStatus {
     if clock.closed_at.is_some() || clock.resolved_at.is_some() || clock.status_is_closed {
         return SlaStatus::NotApplicable;
@@ -967,6 +1008,7 @@ pub struct TicketSavedView {
 /// `name.trim()` and the column CHECK enforces the trimmed length, so a
 /// whitespace-only name passes `length(min = 1)` here and then fails the
 /// CHECK as an unhandled SQLSTATE 23514 (PMS-1474).
+// SPEC-4.89: rejects a whitespace-only name, not just an empty one.
 fn validate_not_blank(value: &str) -> Result<(), ValidationError> {
     if value.trim().is_empty() {
         Err(ValidationError::new("blank"))

@@ -34,6 +34,25 @@
 //! [`connection::set_payment_connection`], which is the single writer shared with
 //! that surface.
 //!
+//! # What is still reachable, after PMS-1571
+//!
+//! Only [`Self::list`]. The four per-provider routes were removed because the
+//! only credential home this surface can connect is
+//! [`CredentialHome::Integration`] and no registry entry takes it, so
+//! [`Self::get`], [`Self::update`], [`Self::connect`] and [`Self::disconnect`]
+//! have no HTTP caller today.
+//!
+//! They are kept rather than deleted, which is a deliberate trade and not an
+//! oversight. The rules above are the subsystem's, not the route's: they are
+//! what a provider taking the `Integration` home would need on the day it
+//! does, and each is unit-tested here against a fixture descriptor carrying
+//! that home. Deleting them would make that day a redesign instead of four
+//! `.route(...)` lines, and would delete the tests with them.
+//!
+//! `registry::tests::an_integration_home_provider_needs_the_per_provider_routes_back`
+//! is what stops this being dead code nobody revisits: it fails the moment an
+//! entry takes that home, and says to put the routes back.
+//!
 //! Reads and writes go through [`Database::begin_with_tenant`], so the
 //! `tenant_isolation` policy on the table confines them and a missing GUC
 //! yields zero rows rather than another tenant's (PMS-285). Every statement
@@ -41,7 +60,7 @@
 //! superuser bypasses RLS however forced the policy is, and the integration
 //! harness's default `boot` hands the service exactly such a pool, so leaning
 //! on the policy alone would mean the isolation is untested where it is most
-//! likely to be got wrong. `tests/integrations.rs` boots through `boot_rls` so
+//! likely to be got wrong. `tests/suites/integrations.rs` boots through `boot_rls` so
 //! the policy is exercised too.
 
 use std::sync::Arc;
@@ -88,33 +107,116 @@ impl IntegrationsService {
                 .map_err(|e| AppError::Database(e.to_string()))?;
         tx.commit().await?;
 
-        // MAPPS-1098: payment providers are configured on
-        // `Settings > Payment Gateways` end to end, so they are not offered
-        // on this list. The row they persist still exists (billing writes
-        // it via `set_payment_connection`); this surface just does not
-        // expose them.
+        // MAPPS-1122: every provider is listed, payment providers included.
+        // Changing one is still confined to its own surface
+        // (`is_writable_on_integrations_page`); what the panel does here is
+        // say what exists and what state it is in.
+        let contact_sync = self.contact_sync_states(tenant_id).await?;
         Ok(registry::REGISTRY
             .iter()
-            .filter(|descriptor| descriptor.is_exposed_on_integrations_page())
             .map(|descriptor| {
                 let row = rows
                     .iter()
                     .find(|row| row.provider == descriptor.provider.as_str());
-                compose(descriptor, row)
+                compose(
+                    descriptor,
+                    row,
+                    contact_sync.get(descriptor.provider.as_str()),
+                )
             })
             .collect())
     }
 
+    /// The contact-sync connections this tenant holds, by provider
+    /// discriminator (MAPPS-1122).
+    ///
+    /// One query for the whole page rather than one per provider: three of the
+    /// six registry entries are contact-sync sources, and a per-provider read
+    /// would be the N+1 the registry's own `company_name` ticket exists to
+    /// avoid.
+    ///
+    /// Read through `begin_with_tenant` like everything else here, so the
+    /// policy confines it (PMS-285), and projected to the four fields the
+    /// panel renders rather than taking the module's row type across the
+    /// boundary.
+    async fn contact_sync_states(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<std::collections::HashMap<String, ContactSyncState>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<ContactSyncRow> = sqlx::query_as(
+            "SELECT provider, is_active, sync_status, last_error, created_at, disconnected_at \
+                 FROM contact_sync_connections WHERE tenant_id = $1",
+        )
+        .bind(*tenant_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit().await?;
+
+        let mut states = std::collections::HashMap::new();
+        for row in rows {
+            // The registry's providers only. `contact_sync_connections` also
+            // holds a `vcard` row per tenant since PMS-1290, which is an
+            // uploaded file rather than an integration: it has no registry
+            // entry, nothing on this page looks it up, and it has no
+            // tenant-wide switch to read.
+            if IntegrationProvider::from_str(&row.provider).is_none() {
+                continue;
+            }
+            let enabled = crate::modules::contact_sync::switch::contacts_enabled(
+                &self.db,
+                tenant_id,
+                &row.provider,
+            )
+            .await?;
+            let status = contact_sync_status(row.is_active, &row.sync_status, row.disconnected_at);
+            states.insert(
+                row.provider,
+                ContactSyncState {
+                    status,
+                    enabled,
+                    // Only when the state IS the error: a stale message from a
+                    // sync that later succeeded would read as a live failure.
+                    last_error: match status {
+                        IntegrationStatus::Error => row.last_error,
+                        _ => None,
+                    },
+                    connected_at: Some(row.created_at),
+                    disconnected_at: row.disconnected_at,
+                },
+            );
+        }
+        Ok(states)
+    }
+
     /// One provider. Answers for a provider with no row too, for the same
     /// reason the list does.
+    ///
+    /// `capability` is what the caller actually needs: `contact_sync_states`
+    /// loops over all three contact-sync providers, each opening its own
+    /// transaction, and every one of those reads is wasted on a caller that
+    /// only wants invoicing or bills-and-expenses state (PMS-1561 F4). Only a
+    /// caller asking about `Capability::Contacts` pays for it; pass that
+    /// value to keep the old full-response behaviour.
     pub async fn get(
         &self,
         tenant_id: TenantId,
         provider: IntegrationProvider,
+        capability: Capability,
     ) -> AppResult<IntegrationResponse> {
         let descriptor = registry::descriptor(provider);
         let row = self.read_row(tenant_id, provider).await?;
-        Ok(compose(descriptor, row.as_ref()))
+        let contact_sync = if capability == Capability::Contacts {
+            self.contact_sync_states(tenant_id).await?
+        } else {
+            std::collections::HashMap::new()
+        };
+        Ok(compose(
+            descriptor,
+            row.as_ref(),
+            contact_sync.get(provider.as_str()),
+        ))
     }
 
     /// Change what this tenant delegates, and the non-secret settings.
@@ -132,6 +234,12 @@ impl IntegrationsService {
     ) -> AppResult<IntegrationResponse> {
         let descriptor = registry::descriptor(provider);
         assert_managed_here(descriptor)?;
+        // MAPPS-1121: a capability change is the same claim `connect` makes,
+        // in smaller print. `disconnect` is deliberately NOT gated: a tenant
+        // who connected one of these before this landed has a row and a stored
+        // credential, and the way to be rid of both is the button that removes
+        // them.
+        assert_built(descriptor)?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let existing: Option<IntegrationRow> = sqlx::query_as(&format!(
@@ -192,7 +300,7 @@ impl IntegrationsService {
         .await?;
         tx.commit().await?;
 
-        Ok(compose(descriptor, Some(&updated)))
+        Ok(compose(descriptor, Some(&updated), None))
     }
 
     /// Store the credential and mark the integration connected.
@@ -217,6 +325,7 @@ impl IntegrationsService {
     ) -> AppResult<IntegrationResponse> {
         let descriptor = registry::descriptor(provider);
         assert_managed_here(descriptor)?;
+        assert_built(descriptor)?;
 
         if descriptor.credential_home != CredentialHome::Integration {
             return self
@@ -300,7 +409,7 @@ impl IntegrationsService {
         .await?;
         tx.commit().await?;
 
-        Ok(compose(descriptor, Some(&row)))
+        Ok(compose(descriptor, Some(&row), None))
     }
 
     /// Connect a provider whose credential is entered on another surface
@@ -459,7 +568,7 @@ impl IntegrationsService {
         .await?;
         tx.commit().await?;
 
-        Ok(compose(descriptor, Some(&row)))
+        Ok(compose(descriptor, Some(&row), None))
     }
 
     /// Mark the integration disconnected, and delete its credential when this
@@ -558,7 +667,7 @@ impl IntegrationsService {
                 .await?;
         }
 
-        Ok(compose(descriptor, Some(&row)))
+        Ok(compose(descriptor, Some(&row), None))
     }
 
     async fn read_row(
@@ -612,8 +721,49 @@ async fn read_row_in_tx(
 }
 
 /// The registry's half and the tenant's half, joined.
-fn compose(descriptor: &ProviderDescriptor, row: Option<&IntegrationRow>) -> IntegrationResponse {
+fn compose(
+    descriptor: &ProviderDescriptor,
+    row: Option<&IntegrationRow>,
+    contact_sync: Option<&ContactSyncState>,
+) -> IntegrationResponse {
     let mut response = IntegrationResponse::not_installed(descriptor);
+    // MAPPS-1122: a provider whose connection lives in another subsystem has
+    // its status THERE, and this read it from the `integrations` row anyway.
+    // There is no row for Google, so a tenant with Google Contacts connected
+    // and syncing read "Not connected" on a page whose whole job is to say
+    // what is connected. The owning subsystem answers for it.
+    if let Some(state) = contact_sync {
+        response.status = state.status;
+        response.last_error = state.last_error.clone();
+        response.connected_at = state.connected_at;
+        response.disconnected_at = state.disconnected_at;
+        // MAPPS-1131: and the DELEGATION from there too. MAPPS-1122 moved the
+        // status and stopped, so a tenant actively syncing Google Contacts was
+        // listed as connected with nothing delegated to it: these providers
+        // have no `integrations` row at all (`ConnectionHome::Elsewhere`, so
+        // two tables cannot disagree about one fact), which left
+        // `enabled_capabilities` permanently empty.
+        //
+        // Delegated means both halves: a live connection AND the tenant-wide
+        // switch. A disconnected connection is handing nothing over, and
+        // neither is a live one whose switch is off - `assert_enabled` refuses
+        // a sync on the switch alone. `Error` counts as live: the account is
+        // linked and the last attempt to read it failed, which is a failing
+        // delegation, not an absent one.
+        if state.enabled
+            && matches!(
+                state.status,
+                IntegrationStatus::Connected | IntegrationStatus::Error
+            )
+        {
+            response.enabled_capabilities = descriptor
+                .supported_capabilities
+                .iter()
+                .map(|capability| capability.as_str().to_string())
+                .collect();
+        }
+        return response;
+    }
     let Some(row) = row else {
         return response;
     };
@@ -631,8 +781,66 @@ fn compose(descriptor: &ProviderDescriptor, row: Option<&IntegrationRow>) -> Int
     response
 }
 
+/// A contact-sync connection's state, as one of the four statuses this
+/// surface speaks (MAPPS-1122).
+///
+/// `reconnect_required` is an error and not a disconnection: the row is still
+/// there and the tenant still wants the integration, which is why contact sync
+/// gives it its own outcome rather than folding it into `failed` (PSA-70 J).
+/// `throttled` is the provider asking us to wait and must not read as broken.
+fn contact_sync_status(
+    is_active: bool,
+    sync_status: &str,
+    disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> IntegrationStatus {
+    if disconnected_at.is_some() || !is_active {
+        return IntegrationStatus::Disconnected;
+    }
+    match sync_status {
+        "failed" | "reconnect_required" => IntegrationStatus::Error,
+        _ => IntegrationStatus::Connected,
+    }
+}
+
+/// The columns [`IntegrationsService::contact_sync_states`] reads.
+///
+/// A named row type rather than the tuple this was: six columns is past where
+/// a tuple reads (clippy's `type_complexity` says so, and CI is `-D warnings`),
+/// and the positional destructuring was one swapped pair away from reporting
+/// `is_active` as the status.
+#[derive(sqlx::FromRow)]
+struct ContactSyncRow {
+    provider: String,
+    is_active: bool,
+    sync_status: String,
+    last_error: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// One contact-sync connection, reduced to what the panel renders
+/// (MAPPS-1122).
+///
+/// A projection rather than the module's own row type: this is a read across a
+/// subsystem boundary, and taking the whole row would make every column of
+/// `contact_sync_connections` part of what integrations depends on.
+struct ContactSyncState {
+    status: IntegrationStatus,
+    /// Whether the tenant-wide switch for this provider is on (MAPPS-1131).
+    ///
+    /// A second fact from a second table, and both are needed to answer what is
+    /// delegated: the connection says the account is linked, and the switch
+    /// says whether anything is allowed to read it. `assert_enabled` refuses a
+    /// sync request on the switch alone, so a tenant with a live connection and
+    /// the switch off has handed nothing over.
+    enabled: bool,
+    last_error: Option<String>,
+    connected_at: Option<chrono::DateTime<chrono::Utc>>,
+    disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Refuse a provider whose connection is owned by another subsystem, naming
-/// where it is configured and the issue that moves it.
+/// where it is configured instead.
 ///
 /// A 409 rather than a 404: the provider exists and is listed, and what is
 /// wrong is that this is the wrong surface for it.
@@ -642,14 +850,37 @@ fn assert_managed_here(descriptor: &ProviderDescriptor) -> AppResult<()> {
         ConnectionHome::Elsewhere {
             table,
             configured_at,
-            issue,
         } => Err(AppError::Conflict(format!(
             "{} is configured under {configured_at} and not as an integration, so its \
-             connection stays in {table} until {issue} moves it. Changing it here would \
-             give one connection two places to live.",
+             connection stays in {table}. Changing it here would give one connection two \
+             places to live.",
             descriptor.display_name
         ))),
     }
+}
+
+/// Refuse a provider this build has nothing behind (MAPPS-1121).
+///
+/// A 409 rather than a 400, the `assert_managed_here` reading: the request is
+/// well formed and the provider is really listed, and what is wrong is that
+/// there is nothing here to connect it to. Checked before the credential is
+/// read, so nothing is ever written to the secret provider for a provider that
+/// cannot use it, and before the row, so the table never claims a delegation
+/// nothing can act on.
+///
+/// The message does not carry `tracked_by`: it reaches a tenant's screen, and
+/// an MSP admin has no use for our issue keys.
+fn assert_built(descriptor: &ProviderDescriptor) -> AppResult<()> {
+    if descriptor.build.is_built() {
+        return Ok(());
+    }
+    Err(AppError::Conflict(format!(
+        "{} is listed so the capabilities it would take can be named, but this build has \
+         nothing behind it yet: there is no client to hand a credential to and nothing reads \
+         what it would be delegated. Connecting it would report a delegation that cannot \
+         happen.",
+        descriptor.display_name
+    )))
 }
 
 /// The subset rule: every requested capability has to be one the provider
@@ -761,6 +992,77 @@ mod tests {
 
     fn xero() -> &'static ProviderDescriptor {
         registry::descriptor(IntegrationProvider::Xero)
+    }
+
+    /// MAPPS-1121: a provider with nothing behind it is refused before any
+    /// credential is read.
+    ///
+    /// The refusal is the whole fix. Before it, `connect` stored whatever
+    /// string was typed into the page's Credential field under
+    /// `SecretKey::integration`, wrote `status = 'connected'`, and returned
+    /// 200 for a provider with no client, no capability reader and no poll
+    /// job. A tenant was told a delegation had happened that nothing could
+    /// act on, which is worse than the button failing.
+    #[test]
+    fn a_planned_provider_is_refused_and_a_built_one_is_not() {
+        // MAPPS-1153 flipped the last two planned entries, so the refusal
+        // is exercised against a descriptor built for it rather than
+        // against whichever provider happened to be unfinished. The rule
+        // outlives the providers that prompted it, and a test naming Xero
+        // would have been deleted with the flip rather than kept.
+        let planned = ProviderDescriptor {
+            build: registry::ProviderBuild::Planned {
+                tracked_by: "MAPPS-1099",
+            },
+            ..*registry::descriptor(IntegrationProvider::Xero)
+        };
+        let error = assert_built(&planned).expect_err("planned, so refused");
+        let message = format!("{error}");
+        assert!(
+            message.contains(planned.display_name),
+            "the refusal names the provider: {message}"
+        );
+        assert!(
+            !message.contains("MAPPS-"),
+            "an MSP admin reading their own settings has no use for our issue keys: {message}"
+        );
+        for provider in [IntegrationProvider::Quickbooks, IntegrationProvider::Xero] {
+            assert!(
+                assert_built(registry::descriptor(provider)).is_ok(),
+                "{provider:?} has a client, a consent flow and a settings page now"
+            );
+        }
+        for provider in [
+            IntegrationProvider::Stripe,
+            IntegrationProvider::Paypal,
+            IntegrationProvider::Google,
+            IntegrationProvider::Microsoft,
+        ] {
+            assert_built(registry::descriptor(provider)).expect("built, so not refused here");
+        }
+    }
+
+    /// Microsoft 365 is refused on this surface for the OTHER reason, and the
+    /// distinction matters to whoever reads the message.
+    ///
+    /// Its client shipped (MAPPS-1101); what is true is that the connection is
+    /// the Entra consent round trip in `contact_sync`, so this is the wrong
+    /// surface rather than an absent provider. `assert_managed_here` is what
+    /// says so, and it names where the connection does live.
+    #[test]
+    fn microsoft_is_refused_as_managed_elsewhere_not_as_unbuilt() {
+        let descriptor = registry::descriptor(IntegrationProvider::Microsoft);
+        let error = assert_managed_here(descriptor).expect_err("its connection lives elsewhere");
+        let message = format!("{error}");
+        assert!(
+            message.contains("contact_sync_connections"),
+            "names where the connection lives: {message}"
+        );
+        assert!(
+            !message.contains("nothing behind it"),
+            "it is built; saying otherwise sends an admin to wait for work that is done: \
+             {message}"
+        );
     }
 
     /// The rule the whole subsystem exists for: a tenant cannot hand a provider
@@ -884,6 +1186,16 @@ mod tests {
             (IntegrationProvider::Stripe, "Payment Gateways"),
             (IntegrationProvider::Paypal, "Payment Gateways"),
             (IntegrationProvider::Google, "Google Contacts"),
+            // MAPPS-1153: and the ones that made the per-home label a lie.
+            // `ContactSync` answered "Settings > Google Contacts" for all
+            // three contact sources, so iCloud's card named Google's page;
+            // `InvoiceIssuer` has no such string at all, because nothing is
+            // entered and the two providers have different pages. The label
+            // comes from each provider's own setup surface now.
+            (IntegrationProvider::Icloud, "iCloud Contacts"),
+            (IntegrationProvider::Microsoft, "Microsoft 365 Contacts"),
+            (IntegrationProvider::Xero, "Xero"),
+            (IntegrationProvider::Quickbooks, "QuickBooks"),
         ] {
             let response = IntegrationResponse::not_installed(registry::descriptor(provider));
             let elsewhere = response
@@ -896,14 +1208,18 @@ mod tests {
             );
         }
         // And one that takes its credential here, so the absence is asserted
-        // rather than assumed from the loop above.
+        // rather than assumed from the loop above. No provider in the
+        // registry does since MAPPS-1153, so it is a descriptor built for
+        // the case: the rule is about the home, not about who holds it.
+        let arrives_here = registry::ProviderDescriptor {
+            credential_home: registry::CredentialHome::Integration,
+            ..*registry::descriptor(IntegrationProvider::Quickbooks)
+        };
         assert!(
-            IntegrationResponse::not_installed(registry::descriptor(
-                IntegrationProvider::Quickbooks
-            ))
-            .credential_elsewhere
-            .is_none(),
-            "QuickBooks takes its credential in the connect request"
+            IntegrationResponse::not_installed(&arrives_here)
+                .credential_elsewhere
+                .is_none(),
+            "a credential that arrives in the connect request names no other surface"
         );
     }
 
@@ -915,8 +1231,12 @@ mod tests {
         assert!(message.contains("Contact sync"), "{message}");
         assert!(message.contains("contact_sync_connections"), "{message}");
         assert!(
-            message.contains("PMS-1315"),
-            "the refusal names the issue that moves it: {message}"
+            message.contains("Changing it here"),
+            "the refusal says why this surface is not the place: {message}"
+        );
+        assert!(
+            !message.contains("PMS-"),
+            "and names no issue, because the connection stays where it is (PMS-1315): {message}"
         );
 
         assert_managed_here(xero()).expect("Xero is managed here");
@@ -939,12 +1259,22 @@ mod tests {
 
     /// The floor is the one the column enforces, so a value the service accepts
     /// can never be a constraint violation.
+    ///
+    /// PMS-1583 set every real provider's `polling` to `None`, so this test
+    /// builds its own polled descriptor to exercise the floor check that
+    /// `assert_poll_interval` still owns for whichever provider polls next.
     #[test]
     fn a_poll_interval_below_the_floor_is_refused_before_the_database_sees_it() {
-        let error = assert_poll_interval(xero(), Some(1)).expect_err("below the floor");
+        let mut polled = *xero();
+        polled.polling = Some(registry::PollingSpec {
+            default_minutes: registry::DEFAULT_POLL_INTERVAL_MINUTES,
+            min_minutes: registry::MIN_POLL_INTERVAL_MINUTES,
+        });
+
+        let error = assert_poll_interval(&polled, Some(1)).expect_err("below the floor");
         assert!(error.to_string().contains("floor"), "{error}");
         assert_eq!(
-            assert_poll_interval(xero(), Some(registry::MIN_POLL_INTERVAL_MINUTES))
+            assert_poll_interval(&polled, Some(registry::MIN_POLL_INTERVAL_MINUTES))
                 .expect("the floor itself is legal"),
             Some(registry::MIN_POLL_INTERVAL_MINUTES)
         );
