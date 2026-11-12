@@ -245,10 +245,10 @@ impl<T: FlagValue> std::fmt::Debug for Flag<T> {
 /// PMS-983: the organizations feature.
 ///
 /// A SaaS deployment has multi-user organizations enabled by
-/// default, matching the current shipping behaviour on nc-01 and
-/// c-01. A self-hosted deployment starts with organizations off,
-/// matching the single-user default the customer image ships with
-/// today.
+/// default, matching the current shipping behaviour on the hosted
+/// deployments. A self-hosted deployment starts with organizations
+/// off, matching the single-user default the customer image ships
+/// with today.
 pub static ORGANIZATIONS_ENABLED: Flag<bool> = Flag::new(
     &registry::ORGANIZATIONS_ENABLED,
     FlagDefault::PerProfile {
