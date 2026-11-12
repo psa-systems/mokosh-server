@@ -771,7 +771,21 @@ fn compose(
     // have drifted, which is a deployment running a schema this build does not
     // understand. Reading it as `error` is the honest answer: something is
     // wrong with this integration and an operator should look.
-    response.status = IntegrationStatus::from_str(&row.status).unwrap_or(IntegrationStatus::Error);
+    //
+    // PMS-1665: the fallback used to happen silently - the operator saw
+    // `error` with no hint that the stored string was the drift cause,
+    // and the log carried no record of the offending value. Warn with
+    // the provider and the unrecognised string so schema/enum drift is
+    // findable and the operator can file the mismatch against the
+    // right migration or build.
+    response.status = IntegrationStatus::from_str(&row.status).unwrap_or_else(|| {
+        tracing::warn!(
+            provider = %row.provider,
+            stored_status = %row.status,
+            "integrations.status is not one of the statuses this build knows; reporting as `error` until a schema/enum reconciliation lands",
+        );
+        IntegrationStatus::Error
+    });
     response.enabled_capabilities = row.enabled_capabilities.clone();
     response.config = row.config.clone();
     response.poll_interval_minutes = row.poll_interval_minutes;
