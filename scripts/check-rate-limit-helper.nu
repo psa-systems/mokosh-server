@@ -40,6 +40,7 @@ def main [] {
                 let bypasses_constructor = (
                     ($row.item | str contains 'AppError::RateLimited')
                     and (not $is_helper)
+                    and (not ($trimmed | str starts-with '//'))
                 )
                 let reason = if $inline_429 {
                     'builds a 429 outside the shared helper'

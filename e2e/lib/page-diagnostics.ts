@@ -59,9 +59,12 @@ export function mainFrameResponseLog(page: Page): MainFrameResponseLog {
         (text) => {
           entry.body = truncate(text.replace(/\s+/g, ' ').trim(), RESPONSE_BODY_CAP);
         },
-        () => {
-          // Redirects and responses whose context is gone have no body. The
-          // status + URL already carry the signal.
+        (reason: unknown) => {
+          // Redirects and responses whose context is gone have no body. Record
+          // the cause on the entry so a failure that was really a text-read
+          // refusal is not misread as an empty body.
+          const cause = reason instanceof Error ? reason.message : String(reason);
+          entry.body = `(unreadable: ${truncate(cause, RESPONSE_BODY_CAP)})`;
         },
       );
     }

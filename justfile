@@ -521,7 +521,7 @@ check-docker:
     #!/usr/bin/env nu
     let git_hash = (^git rev-parse --short=12 HEAD | str trim)
     let git_describe = (^git describe --tags --always --dirty | str trim)
-    let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
+    let build_date = (date now | date to-timezone utc | format date '%Y-%m-%dT%H:%M:%SZ')
     docker buildx build --target builder --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:check --file oci-build/Dockerfile .
 
 # SPEC-10.390
@@ -741,7 +741,7 @@ build-docker:
     #!/usr/bin/env nu
     let git_hash = (^git rev-parse --short=12 HEAD | str trim)
     let git_describe = (^git describe --tags --always --dirty | str trim)
-    let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
+    let build_date = (date now | date to-timezone utc | format date '%Y-%m-%dT%H:%M:%SZ')
     docker buildx build --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:local --file oci-build/Dockerfile .
 
 # SPEC-10.104
