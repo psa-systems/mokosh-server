@@ -1016,10 +1016,12 @@ impl TicketService {
         // SPEC-7.10: run_ticket_status_changed/run_ticket_priority_changed fire inside the same transaction as the field UPDATE, only when the value actually changes.
         // PMS-448 phase 2: fire transition triggers. Each runs in
         // this same transaction so a logged rule firing commits
-        // atomically with the underlying transition. Both
-        // executors only LOG the matching rules to
-        // `workflow_rule_runs`; mutating actions on transitions are
-        // Phase 3.
+        // atomically with the underlying transition. The executors
+        // record the matching rules to `workflow_rule_runs` AND
+        // apply their mutating actions (`set_status_id`,
+        // `set_priority_id`, `assign_to_*`, `add_tag`,
+        // `add_internal_note`), so a post-update cascade happens in
+        // the same transaction.
         if let Some(new_status_id) = request.status_id {
             if new_status_id != old_status_id {
                 crate::modules::workflows::WorkflowExecutor::run_ticket_status_changed(
