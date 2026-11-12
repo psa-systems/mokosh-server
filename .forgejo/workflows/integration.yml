@@ -380,7 +380,10 @@ jobs:
           echo "--- candidate dir sizes ---"
           echo "HOME=$HOME"
           echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
-          du -sh /tmp "$HOME" "$GITHUB_WORKSPACE" 2>/dev/null || true
+          # Diagnostic only; don't fail the shard over a missing path, but let
+          # du's own error reach the log so a missing path is visible instead
+          # of swallowed.
+          du -sh /tmp "$HOME" "$GITHUB_WORKSPACE" || true
 
       - name: Build the template every test clones
         # PMS-1254: the 243 migrations are applied ONCE per Postgres
