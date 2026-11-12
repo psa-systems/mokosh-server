@@ -149,7 +149,7 @@ impl OpportunitiesService {
         .execute(&mut *tx)
         .await?;
 
-        let row = self.load_row(&mut tx, id).await?;
+        let row = self.load_row(&mut tx, tenant_id, id).await?;
         tx.commit().await?;
         Ok(row)
     }
@@ -157,7 +157,7 @@ impl OpportunitiesService {
     // SPEC-14.86: 404 for an unknown or deleted id.
     pub async fn get(&self, tenant_id: TenantId, id: Uuid) -> AppResult<Opportunity> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        self.load_row(&mut tx, id).await
+        self.load_row(&mut tx, tenant_id, id).await
     }
 
     // SPEC-14.86: non-deleted rows, newest update first, no pagination.
@@ -219,7 +219,7 @@ impl OpportunitiesService {
             }
         }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let existing = self.load_row(&mut tx, id).await?;
+        let existing = self.load_row(&mut tx, tenant_id, id).await?;
         if existing.closed_at.is_some() {
             return Err(AppError::BadRequest(
                 "A closed opportunity is immutable. Open a new one to record follow-up work."
@@ -305,7 +305,7 @@ impl OpportunitiesService {
             ));
         }
 
-        let row = self.load_row(&mut tx, id).await?;
+        let row = self.load_row(&mut tx, tenant_id, id).await?;
         tx.commit().await?;
         Ok(row)
     }
@@ -322,7 +322,7 @@ impl OpportunitiesService {
     ) -> AppResult<Opportunity> {
         Self::ensure_outcome(&request.outcome)?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let existing = self.load_row(&mut tx, id).await?;
+        let existing = self.load_row(&mut tx, tenant_id, id).await?;
         if existing.closed_at.is_some() {
             return Err(AppError::BadRequest(
                 "This opportunity is already closed.".into(),
@@ -369,7 +369,7 @@ impl OpportunitiesService {
             ));
         }
 
-        let row = self.load_row(&mut tx, id).await?;
+        let row = self.load_row(&mut tx, tenant_id, id).await?;
         tx.commit().await?;
         Ok(row)
     }
@@ -395,13 +395,28 @@ impl OpportunitiesService {
         Ok(())
     }
 
-    // SPEC-14.86, SPEC-14.91: soft-deleted rows read as absent.
-    async fn load_row(&self, tx: &mut sqlx::PgConnection, id: Uuid) -> AppResult<Opportunity> {
-        let row = sqlx::query("SELECT * FROM opportunities WHERE id = $1 AND deleted_at IS NULL")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Opportunity".to_string()))?;
+    /// PMS-1662: filter by `tenant_id` explicitly rather than relying on
+    /// the `app.current_tenant` GUC + the RLS USING policy. Every other
+    /// query in this module is explicit; the one read that rested on RLS
+    /// alone was a single flipped flag away from silently reading a row
+    /// from the wrong tenant. Adding the predicate here is a belt-and-
+    /// -braces defence matching the sibling queries' shape.
+    ///
+    /// SPEC-14.86, SPEC-14.91: soft-deleted rows read as absent.
+    async fn load_row(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<Opportunity> {
+        let row = sqlx::query(
+            "SELECT * FROM opportunities WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+        )
+        .bind(*tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Opportunity".to_string()))?;
         Ok(row_to_opportunity(row))
     }
 }
