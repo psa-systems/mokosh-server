@@ -104,4 +104,3 @@ async fn leave_grant(
         GranteeLeaveOutcome::NotFound => Ok(StatusCode::NOT_FOUND),
     }
 }
-
