@@ -310,9 +310,7 @@ mod tests {
         assert!(!looks_like_guid("12345678-1234-1234-1234-123456789abcd"));
         assert!(!looks_like_guid("not-a-guid-at-all"));
         assert!(!looks_like_guid(""));
-        assert!(!looks_like_guid(
-            "12345678g1234h1234i1234j123456789abc"
-        ));
+        assert!(!looks_like_guid("12345678g1234h1234i1234j123456789abc"));
     }
 
     #[test]
