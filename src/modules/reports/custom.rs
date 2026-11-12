@@ -377,36 +377,36 @@ pub async fn run(
         ));
     }
 
-    // PMS-1665: an out-of-range `limit` used to be silently clamped to
-    // 1..=1000, so a caller asking for 2000 rows got 1000 back with no
-    // signal that the cap moved. Refuse up front naming the bound.
+    // Out-of-range `limit` used to be silently clamped to 1..=1000, so
+    // a caller asking for 2000 rows got 1000 back with no signal that
+    // the cap moved. Refuse up front naming the bound.
     if let Some(n) = spec.limit {
         if !(1..=1000).contains(&n) {
             return Err(AppError::BadRequest(format!(
-                "limit must be between 1 and 1000; got {n}"
+                "Limit must be between 1 and 1000; got {n}"
             )));
         }
     }
 
-    // PMS-1665: an unknown `format` used to silently render JSON (the
-    // route only routes CSV; anything else fell through). A caller that
-    // asked for "pdf" got JSON and was left to wonder why their export
-    // tool refused to open it.
+    // Unknown `format` used to silently render JSON (the route only
+    // routes CSV; anything else fell through). A caller that asked for
+    // "pdf" got JSON and was left to wonder why their export tool
+    // refused to open it.
     if let Some(ref f) = spec.format {
         if !matches!(f.as_str(), "json" | "csv") {
             return Err(AppError::BadRequest(format!(
-                "format must be \"json\" or \"csv\"; got {f:?}"
+                "Format must be \"json\" or \"csv\"; got \"{f}\""
             )));
         }
     }
 
-    // PMS-1665: `from`/`to` on a source that has no date column (today:
-    // `assets`) used to be silently dropped. The caller then got the
-    // whole table and thought their filter had applied. Refuse up front
-    // naming the source that does not take a date range.
+    // `from`/`to` on a source that has no date column (today: `assets`)
+    // used to be silently dropped. The caller then got the whole table
+    // and thought their filter had applied. Refuse up front naming the
+    // source that does not take a date range.
     if src.date_col.is_none() && (spec.from.is_some() || spec.to.is_some()) {
         return Err(AppError::BadRequest(format!(
-            "source {} does not support a date range",
+            "Source {} does not support a date range",
             src.key
         )));
     }
