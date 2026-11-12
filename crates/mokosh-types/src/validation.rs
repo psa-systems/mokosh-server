@@ -58,9 +58,6 @@ fn validate_nonneg(
     Ok(())
 }
 
-/// Validate a money rate stored in a `DECIMAL(10, 2)` column (`default_rate`,
-/// `hourly_rate`): non-negative, at most 2 decimal places, magnitude `< 1e8`.
-/// A zero rate is allowed (free / non-billable work).
 /// A URL slug: lowercase alphanumerics in hyphen-separated groups, with no
 /// leading, trailing or doubled hyphen. Grammar `^[a-z0-9]+(-[a-z0-9]+)*$`.
 ///
@@ -87,6 +84,9 @@ pub fn validate_slug(slug: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Validate a money rate stored in a `DECIMAL(10, 2)` column (`default_rate`,
+/// `hourly_rate`): non-negative, at most 2 decimal places, magnitude `< 1e8`.
+/// A zero rate is allowed (free / non-billable work).
 // SPEC-4.80: DECIMAL(10,2), zero allowed.
 pub fn validate_rate(value: &Decimal) -> Result<(), ValidationError> {
     validate_nonneg(
