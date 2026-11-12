@@ -2504,10 +2504,13 @@ impl ContactService {
         };
 
         let Some(notify) = self.notifications.as_ref() else {
+            // PMS-1663: the setup link carries the live single-use secret;
+            // CLAUDE.md invariant "a log line must not carry a usable
+            // credential". Record the contact id only and let an operator
+            // who needs the link re-mint one via the normal flow.
             tracing::warn!(
                 contact_id = %contact.id,
-                password_setup_link = %password_setup_link,
-                "no notifications dispatcher wired; portal setup token persisted but no message queued (setup_link logged for manual relay)",
+                "no notifications dispatcher wired; portal setup token persisted but no message queued",
             );
             return;
         };
@@ -2543,8 +2546,10 @@ impl ContactService {
         {
             Ok(_) => tracing::info!(
                 contact_id = %contact.id,
-                magic_link_url = ?magic_link_url,
-                password_setup_link = %password_setup_link,
+                // PMS-1663: the two URLs each carry a live single-use
+                // secret; log only whether a magic-link accompanied the
+                // setup link, not the links themselves.
+                magic_link_included = magic_link_url.is_some(),
                 "portal grant email queued"
             ),
             Err(e) => tracing::warn!(

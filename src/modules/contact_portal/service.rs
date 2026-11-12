@@ -1206,9 +1206,12 @@ impl ContactAuthService {
                     )
                     .await;
             } else {
+                // PMS-1663: the magic-link URL carries the live single-use
+                // secret; CLAUDE.md invariant "a log line must not carry a
+                // usable credential". Record the intent id only.
                 tracing::warn!(
-                    magic_link_url = %magic_link_url,
-                    "no notifications dispatcher wired; login-link intent persisted but no message queued (link logged for manual relay)"
+                    intent_id = %intent_id,
+                    "no notifications dispatcher wired; login-link intent persisted but no message queued"
                 );
             }
         }
