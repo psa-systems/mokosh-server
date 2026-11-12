@@ -285,7 +285,7 @@ async fn create_without_a_notifier_omits_mail_sent(pool: PgPool) {
     let svc = svc(&pool);
     let req = CreateInvitationRequest {
         email: "pms1659-no-notifier@example.com".to_string(),
-        role: "user".to_string(),
+        role: "technician".to_string(),
         team_id: None,
     };
 
