@@ -1140,3 +1140,73 @@ async fn retiring_lifecycle_stage_flips_status_to_retired_on_put_and_patch(pool:
         "PATCH: non-retired lifecycle must leave status untouched (default 'active')"
     );
 }
+
+/// PMS-1664: `POST /assets/{parent}/relationships` used to accept any
+/// `child_asset_id`, including an id naming a foreign-tenant row (silent
+/// cross-tenant link via FK) or a missing one (23503 500); and would
+/// write `relationship_type` free-text, outside the closed set the DTO
+/// doc names; and allowed `parent == child` self-edges. Now all three
+/// refuse with a named 400/404 before the INSERT runs.
+#[mokosh_test]
+async fn create_asset_relationship_rejects_bad_inputs(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Rel Validation Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let type_id = create_asset_type(&app, &token, "Server").await;
+    let parent = create_asset(&app, &token, "parent-host", &type_id, company).await;
+    let child = create_asset(&app, &token, "child-host", &type_id, company).await;
+
+    // 1) Self-edge refused as 400 before any FK/tenant work runs.
+    let r = app
+        .client
+        .post(app.url(&format!("/api/v1/assets/{parent}/relationships")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "child_asset_id": parent,
+            "relationship_type": "hosts",
+        }))
+        .send()
+        .await
+        .expect("self-edge POST");
+    assert_eq!(r.status().as_u16(), 400, "self-edge must refuse as 400");
+
+    // 2) Unknown relationship_type refused as 400.
+    let r = app
+        .client
+        .post(app.url(&format!("/api/v1/assets/{parent}/relationships")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "child_asset_id": child,
+            "relationship_type": "bogus",
+        }))
+        .send()
+        .await
+        .expect("bogus type POST");
+    assert_eq!(
+        r.status().as_u16(),
+        400,
+        "unknown relationship_type must refuse as 400"
+    );
+
+    // 3) Ghost child asset id refuses as 404 (no silent cross-tenant link,
+    //    no 500 from the FK).
+    let ghost = uuid::Uuid::new_v4();
+    let r = app
+        .client
+        .post(app.url(&format!("/api/v1/assets/{parent}/relationships")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "child_asset_id": ghost,
+            "relationship_type": "hosts",
+        }))
+        .send()
+        .await
+        .expect("ghost child POST");
+    assert_eq!(
+        r.status().as_u16(),
+        404,
+        "unknown child asset must refuse as 404"
+    );
+}
