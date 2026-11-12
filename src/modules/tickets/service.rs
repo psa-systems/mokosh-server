@@ -2958,6 +2958,13 @@ impl TicketService {
 
         // Append a public audit-trail note so the agent side sees the
         // reopen (and any reason) in the same thread the SPA renders.
+        // PMS-1667: `.unwrap_or_else(Uuid::nil)` used to substitute the nil
+        // UUID when the tenant had no admin/manager user to attribute the
+        // note to, so the INSERT below would then raise 23503 on the
+        // created_by_id FK after the status flip had already written into
+        // the same open transaction. Match the sibling portal-note paths
+        // and refuse with the named Configuration error BEFORE writing,
+        // and only when a human is there to see it.
         let fallback_creator: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM users WHERE tenant_id = $1 AND status = 'active' \
              AND role IN ('super_admin', 'admin', 'manager') \
@@ -2966,12 +2973,24 @@ impl TicketService {
         .bind(tenant_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let creator_id = fallback_creator.unwrap_or_else(Uuid::nil);
+        let creator_id = fallback_creator.ok_or(AppError::Configuration(
+            "Cannot reopen ticket: tenant has no admin/manager user to attribute the audit note to"
+                .into(),
+        ))?;
+        // PMS-1667: the appended note always said "reopened by customer"
+        // even when a staff caller drove the reopen (contact_id None). Pick
+        // the actor from whose seat the call came so the thread reads
+        // truthfully for a reader.
+        let actor = if contact_id.is_some() {
+            "customer"
+        } else {
+            "staff"
+        };
         let content = match reason {
             Some(r) if !r.trim().is_empty() => {
-                format!("Ticket reopened by customer. Reason: {}", r.trim())
+                format!("Ticket reopened by {actor}. Reason: {}", r.trim())
             }
-            _ => "Ticket reopened by customer.".to_string(),
+            _ => format!("Ticket reopened by {actor}."),
         };
         sqlx::query(
             "INSERT INTO ticket_notes (id, tenant_id, ticket_id, note_type,
