@@ -1905,7 +1905,12 @@ impl ContactAuthService {
         let Some(notifications) = self.notifications.as_ref() else {
             return;
         };
-        let row: Option<(String, Option<String>, String, Option<Uuid>)> = sqlx::query_as(
+        // PMS-1659 finding: the old `.unwrap_or(None)` discarded the
+        // database error, so the warn log below said "the contact or
+        // company could not be read" with no indication of what failed.
+        // Match on the Result so a real database fault is logged with
+        // the cause, distinct from a legitimately-absent row.
+        let row: Option<(String, Option<String>, String, Option<Uuid>)> = match sqlx::query_as(
             "SELECT TRIM(c.first_name || ' ' || c.last_name), c.email, co.name, \
                     co.account_manager_id \
              FROM contacts c INNER JOIN companies co ON co.id = $3 \
@@ -1916,11 +1921,21 @@ impl ContactAuthService {
         .bind(session.company_id)
         .fetch_optional(self.db.migrator_pool())
         .await
-        .unwrap_or(None);
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    contact_id = %session.id,
+                    error = %e,
+                    "portal access request notified nobody: the contact/company lookup failed"
+                );
+                return;
+            }
+        };
         let Some((contact_name, contact_email, company_name, account_manager_id)) = row else {
             tracing::warn!(
                 contact_id = %session.id,
-                "portal access request notified nobody: the contact or company could not be read"
+                "portal access request notified nobody: the contact or company row is absent"
             );
             return;
         };
