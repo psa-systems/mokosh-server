@@ -2540,6 +2540,16 @@ impl KbService {
             from.unwrap_or_else(|| today - chrono::Duration::days(ARTICLE_DURATION_WINDOW_DAYS)),
             to.unwrap_or(today),
         );
+        // PMS-1664 finding: an inverted range used to be accepted and
+        // return null figures silently. A caller typing "2026-10-01"
+        // for `from` and "2026-09-01" for `to` learns the mistake only
+        // by reading an empty response. Refuse with 422 at the entry.
+        if from > to {
+            return Err(AppError::validation_field(
+                "to",
+                "to must be on or after from",
+            ));
+        }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let exists: bool = sqlx::query_scalar(

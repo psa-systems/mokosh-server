@@ -21,11 +21,19 @@ use crate::utils::pagination::PaginationParams;
 
 /// The one aggregate response. Three parallel lists, each already
 /// scoped to the one company at the service level.
+///
+/// PMS-1664 finding: the totals used to be discarded (`_total_assets`,
+/// `_total_articles`), so a company with more than `PER_LIST_LIMIT`
+/// assets or articles was silently truncated. Surface each total
+/// alongside its list so the SPA can show a "showing N of M; see the
+/// full list" affordance.
 #[derive(Debug, Serialize)]
 pub struct CompanyDocumentation {
     pub assets: Vec<AssetResponse>,
+    pub total_assets: u64,
     pub credentials: Vec<CredentialSummary>,
     pub articles: Vec<KbArticleResponse>,
+    pub total_articles: u64,
 }
 
 /// How many of each list the aggregate returns per request. The intent is
@@ -71,7 +79,7 @@ impl DocumentationService {
         // query with no ordering dependency between the three, so they run
         // concurrently.
         #[rustfmt::skip]
-        let ((assets, _total_assets), credentials, (articles, _total_articles)) = tokio::try_join!(
+        let ((assets, total_assets), credentials, (articles, total_articles)) = tokio::try_join!(
             self.assets.list_assets(tenant_id, &asset_filter, &page),
             self.assets.list_credentials_for_company(tenant_id, company_id),
             self.kb.list_articles(tenant_id, &kb_filter, &page)
@@ -79,8 +87,10 @@ impl DocumentationService {
 
         Ok(CompanyDocumentation {
             assets,
+            total_assets,
             credentials,
             articles,
+            total_articles,
         })
     }
 }
