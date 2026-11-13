@@ -38,6 +38,13 @@ use crate::utils::net::{
 /// this instead of the URL itself.
 fn loggable_url(url: &Url) -> Url {
     let mut cleaned = url.clone();
+    // PMS-1663 finding: `set_username`/`set_password` return `Result`
+    // only to signal "cannot set userinfo on a cannot-be-a-base URL".
+    // The probe flow restricts `url` to http(s) (see `attempt_scheme`
+    // + `MAX_HOPS` + the Url::parse call sites), both of which ARE
+    // base URLs, so the mutation is infallible here. The `let _ =`
+    // is deliberate; swallow for the reason the url crate's own docs
+    // name, not because we are shrugging at a credential leak.
     let _ = cleaned.set_username("");
     let _ = cleaned.set_password(None);
     cleaned
