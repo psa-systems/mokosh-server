@@ -525,9 +525,24 @@ impl TimeTrackingService {
     /// cannot be written through `PUT /settings`, which validates it, but can
     /// exist from a hand-written row - and reading it as the default is the
     /// same fallback `NoteEditPolicy` takes for the same reason.
+    ///
+    /// PMS-1662 F10: a stored value outside the closed set used to fall
+    /// through silently. Keep the fallback (a wire-type never reaches
+    /// out-of-set, so this is strictly a hand-written-row cushion) but
+    /// log the offending value so a drift is findable in the operator's
+    /// logs.
     async fn segment_edit_policy(&self, tenant_id: TenantId) -> AppResult<SegmentEditPolicy> {
-        Ok(read_segment_editing(&self.db, tenant_id)
-            .await?
+        let stored = read_segment_editing(&self.db, tenant_id).await?;
+        if let Some(ref raw) = stored {
+            if SegmentEditPolicy::parse(raw).is_none() {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    stored = %raw,
+                    "segment_edit_policy: stored value is not one of the known policies; falling back to default",
+                );
+            }
+        }
+        Ok(stored
             .and_then(|stored| SegmentEditPolicy::parse(&stored))
             .unwrap_or_default())
     }
