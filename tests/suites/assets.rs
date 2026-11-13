@@ -1140,3 +1140,64 @@ async fn retiring_lifecycle_stage_flips_status_to_retired_on_put_and_patch(pool:
         "PATCH: non-retired lifecycle must leave status untouched (default 'active')"
     );
 }
+
+/// PMS-1664: `POST /assets/{id}/credentials` with an unknown asset id used to
+/// fall through to a 23503 (500) at INSERT time, or (if the FK happened to
+/// resolve against a foreign-tenant row) silently link the credential to an
+/// asset that the caller cannot see. The service now refuses with 404 after
+/// a tenant-scoped existence check.
+#[mokosh_test]
+async fn create_credential_against_an_unknown_asset_returns_404(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let ghost = Uuid::new_v4();
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/assets/{ghost}/credentials")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "ghost-cred",
+            "credential_type": "domain",
+            "username": "administrator",
+            "password": "x",
+        }))
+        .send()
+        .await
+        .expect("create credential against ghost asset");
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "ghost asset id must not surface as 500; body: {}",
+        resp.text().await.unwrap_or_default()
+    );
+}
+
+/// PMS-1664: same for configuration items.
+#[mokosh_test]
+async fn upsert_configuration_item_against_an_unknown_asset_returns_404(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let ghost = Uuid::new_v4();
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/assets/{ghost}/configuration-items")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "ghost-config",
+            "category": "network",
+            "value": "x",
+        }))
+        .send()
+        .await
+        .expect("create config item against ghost asset");
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "ghost asset id must not surface as 500; body: {}",
+        resp.text().await.unwrap_or_default()
+    );
+}
