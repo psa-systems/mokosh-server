@@ -1455,6 +1455,14 @@ impl ContactService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // PMS-1663: an id that names no row answered 200 and wrote an audit
+        // row with a null before-snapshot, so the stale caller saw a successful
+        // delete and the audit stream grew a bogus entry. Refuse before the
+        // unlink + DELETE + audit sequence runs.
+        if before.is_none() {
+            return Err(AppError::NotFound("Company".to_string()));
+        }
+
         // PMS-812: unlink this company's contacts, never delete them. Runs
         // BEFORE the company DELETE so `recompute_contact_mirrors` - the single
         // writer of `contacts.company_id` (PMS-806) - leaves no mirror pointing
@@ -4627,6 +4635,12 @@ impl ContactService {
                 .bind(site_id)
                 .fetch_optional(&mut *tx)
                 .await?;
+
+        // PMS-1663: an id that names no row answered 200 and wrote a bogus
+        // delete audit row. Refuse before the DELETE + audit runs.
+        if before.is_none() {
+            return Err(AppError::NotFound("Site".to_string()));
+        }
 
         sqlx::query("DELETE FROM sites WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
