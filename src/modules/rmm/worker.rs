@@ -53,6 +53,7 @@ impl RmmSyncWorker {
         Self { db, encryption_key }
     }
 
+    // SPEC-15.1567, SPEC-15.1568
     /// Pick up every active connection past its `sync_interval_minutes`
     /// window and sync each via its `RmmProvider`. Returns the number
     /// of connections processed.
@@ -130,6 +131,7 @@ impl RmmSyncWorker {
         Ok(count)
     }
 
+    // SPEC-15.1569, SPEC-15.1570, SPEC-15.1571, SPEC-15.1575
     /// Sync a single connection against the given provider. Public so
     /// the integration test can inject a mock provider directly,
     /// bypassing the `build_provider` factory.
@@ -184,6 +186,7 @@ impl RmmSyncWorker {
         Ok(stats)
     }
 
+    // SPEC-15.1569: atomic claim
     /// Atomically claim the connection: flips it to `in_progress` only if it
     /// was not already there, so two replicas racing on the same due row
     /// cannot both proceed. Returns `true` when this call won the claim.
@@ -202,6 +205,7 @@ impl RmmSyncWorker {
         Ok(result.rows_affected() == 1)
     }
 
+    // SPEC-15.1568
     async fn mark_failed(&self, connection_id: Uuid, err: String) -> AppResult<()> {
         sqlx::query(
             r#"UPDATE rmm_connections
@@ -219,6 +223,7 @@ impl RmmSyncWorker {
         Ok(())
     }
 
+    // SPEC-15.1570, SPEC-15.1575
     async fn upsert_mapping(
         &self,
         tenant_id: Uuid,
@@ -253,6 +258,7 @@ impl RmmSyncWorker {
         Ok(())
     }
 
+    // SPEC-15.1572, SPEC-15.1573, SPEC-15.1574
     /// Match-or-create the `assets` row for this mapping. The mapping
     /// must already carry a `company_id` (admin-curated) before sync
     /// will spawn an asset; otherwise return `Ok(None)` and leave the
@@ -434,6 +440,7 @@ impl RmmSyncWorker {
         }))
     }
 
+    // SPEC-15.1572, SPEC-15.1573, SPEC-15.1574: asset audit entry
     async fn write_audit(
         &self,
         tenant_id: Uuid,
@@ -481,6 +488,7 @@ impl RmmSyncWorker {
 
 #[async_trait]
 impl Job for RmmSyncWorker {
+    // SPEC-15.1567: job name
     fn name(&self) -> &'static str {
         "rmm_sync"
     }

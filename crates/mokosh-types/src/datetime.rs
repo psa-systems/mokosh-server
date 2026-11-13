@@ -35,6 +35,7 @@ pub fn resolve_tz(user_tz: &str) -> Tz {
 /// [`resolve_tz`] first means an invalid stored value degrades to `"UTC"`
 /// rather than raising a Postgres `invalid value for parameter TimeZone`
 /// error mid-query.
+// SPEC-4.1040: IANA name of the resolved zone (UTC on fallback); user_today is user_local_date.
 pub fn canonical_tz_name(user_tz: &str) -> &'static str {
     resolve_tz(user_tz).name()
 }

@@ -529,6 +529,7 @@ async fn apply_transition_actions(
                     .bind(ticket_id)
                     .execute(&mut *tx)
                     .await;
+            // SPEC-7.1052: the nested context reuses the triggering context's other dimensions.
             if let Err(e) = r {
                 first_error.get_or_insert_with(|| format!("set_priority_id failed: {e}"));
             } else {
@@ -808,6 +809,7 @@ async fn apply_add_internal_note(
 
 // SPEC-7.204: this INSERT and the rule-listing SELECTs use `.await?`, so a SQL failure here
 // propagates up the recursive call chain and can abort the outer transaction, unlike action errors.
+// SPEC-7.1050: run rows use entity_type 'tickets' inside the ticket's transaction.
 async fn insert_run_row(
     tx: &mut sqlx::PgConnection,
     tenant_id: Uuid,

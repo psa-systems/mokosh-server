@@ -31,6 +31,7 @@ pub struct AssetModelResponse {
 /// cannot forge `seeded` (which belongs to the DEFAULT-tenant seed
 /// migration) or `auto_derived` (which belongs to the signature
 /// detector's write path, MR3).
+// SPEC-15.1007, SPEC-15.1009: create-model bounds and defaults
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateAssetModelRequest {
     #[validate(length(min = 1, max = 100))]
@@ -60,6 +61,7 @@ fn default_specs() -> serde_json::Value {
 /// `PUT /api/v1/asset-models/{id}`. Every field is Option; absent fields
 /// leave the column untouched. (MR1 ships CREATE only; this type is
 /// filed for MR2 so the models stay colocated.)
+// SPEC-15.1011: update-model bounds
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateAssetModelRequest {
@@ -84,6 +86,7 @@ pub struct UpdateAssetModelRequest {
 /// `GET /api/v1/asset-models?q=&limit=` query shape. The typeahead
 /// matches the trimmed, lowercased `q` against the trigram GIN on
 /// `lower(manufacturer || ' ' || model)`.
+// SPEC-15.1004, SPEC-15.1005: query bounds
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct AssetModelsQuery {
     #[serde(default)]
@@ -150,6 +153,7 @@ pub struct TemplateSuggestion {
 }
 
 /// `POST /api/v1/asset-templates` body.
+// SPEC-15.1015: create-template bounds
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateAssetTemplateRequest {
     #[validate(length(min = 1, max = 150))]
@@ -171,6 +175,7 @@ pub struct CreateAssetTemplateRequest {
 /// fields leave the column untouched. (`company_id` and friends are
 /// Option<Option<T>> so the SPA can clear them explicitly; the service
 /// treats a bare `None` as "do not touch".)
+// SPEC-15.1016: update-template bounds
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateAssetTemplateRequest {
     #[validate(length(min = 1, max = 150))]

@@ -68,6 +68,7 @@ pub struct CompanyBlocker {
 /// `active_timers`, `rmm_device_mappings`, `parent_company_id`, and `contacts`
 /// via PMS-812) or cascades (`sites`, `contact_companies`,
 /// `form_request_tokens`). See migration 113.
+// SPEC-15.40: the one blocker list; refusal and preview both read it
 pub const COMPANY_BLOCKERS: &[CompanyBlocker] = &[
     CompanyBlocker {
         constraint: "invoices_company_id_fkey",
@@ -135,6 +136,7 @@ pub use mokosh_types::contacts::{CompanyDeletionPreview, DeletionRecords as Bloc
 
 /// What a delete would unlink rather than destroy. Mirrors migration 113 plus
 /// PMS-812's `contacts` rule.
+// SPEC-15.44: preview "unlinked" kinds
 const COMPANY_UNLINKED: &[(&str, &str)] = &[
     ("contacts", "contacts"),
     ("projects", "projects"),
@@ -144,6 +146,7 @@ const COMPANY_UNLINKED: &[(&str, &str)] = &[
 ];
 
 /// What a delete destroys outright.
+// SPEC-15.44: preview "removed" kinds
 const COMPANY_REMOVED: &[(&str, &str)] = &[
     ("sites", "sites"),
     ("form_request_tokens", "request form links"),
@@ -153,6 +156,7 @@ const COMPANY_REMOVED: &[(&str, &str)] = &[
     ("portal_roles", "company-scoped portal roles"),
 ];
 
+// SPEC-15.38, SPEC-15.39: 23503 becomes a 400 naming the blocker
 fn company_delete_blocked(constraint: Option<&str>) -> AppError {
     let named = constraint.and_then(|c| {
         COMPANY_BLOCKERS
@@ -184,6 +188,7 @@ fn company_delete_blocked(constraint: Option<&str>) -> AppError {
 
 /// How long a portal setup link remains redeemable. Mirrors the
 /// password-reset redemption window (PMS-136).
+// SPEC-15.57: setup token lifetime
 const PORTAL_SETUP_TOKEN_TTL_HOURS: i64 = 72;
 
 /// Contact management service
@@ -291,6 +296,7 @@ impl ContactService {
     /// same `"Referenced {table} not found in this tenant"` error the
     /// per-key checks did, for the first table (in `checks` order) whose id
     /// was not found.
+    // SPEC-15.21: one query, one transaction; 400 on first missing id
     async fn validate_fks(
         &self,
         tenant_id: TenantId,
@@ -339,6 +345,7 @@ impl ContactService {
     /// Membership accepts either carrier, because both are live: the legacy
     /// `contacts.company_id` scalar (PMS-806 keeps it as the mirror of the
     /// primary link) and a `contact_companies` row for a multi-company contact.
+    // SPEC-15.26: billing contact must belong to the company
     async fn assert_contact_of_company(
         &self,
         tenant_id: TenantId,
@@ -375,6 +382,7 @@ impl ContactService {
     // ========================================================================
 
     /// Create a new company
+    // SPEC-15.20: foreign ids checked before any write
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_company(
         &self,
@@ -383,6 +391,7 @@ impl ContactService {
         ctx: &AuditCtx,
     ) -> AppResult<Company> {
         let company_id = Uuid::new_v4();
+        // SPEC-15.24: absent addresses become empty parts
         let address = request.address.clone().unwrap_or_default();
         let billing_address = request.billing_address.clone().unwrap_or_default();
 
@@ -407,6 +416,7 @@ impl ContactService {
         // (case-insensitive, trimmed) before the INSERT so the common path
         // returns a friendly 409. The unique index added in migration 054
         // closes the TOCTOU race between two concurrent creates.
+        // SPEC-15.22: trimmed, case-insensitive name check; internal excluded
         let name_taken: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM companies \
              WHERE tenant_id = $1 AND company_type <> 'internal' \
@@ -477,6 +487,7 @@ impl ContactService {
             // Race backstop: another concurrent create won the unique index
             // (migration 054). Map 23505 to the same friendly 409 the
             // pre-flight check returns instead of a 500.
+            // SPEC-15.23: lost race on the name index is a 409
             if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23505") {
                 return Err(AppError::Conflict(
                     "A company with this name already exists".to_string(),
@@ -493,6 +504,7 @@ impl ContactService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // SPEC-15.24: create audit row in the same transaction
         audit_write(
             &mut *tx,
             tenant_id,
@@ -517,6 +529,7 @@ impl ContactService {
     /// row keep working; this method runs ONE follow-up query per page
     /// of results, regardless of page size, to fill in the counts the
     /// list page renders.
+    // SPEC-15.30: rollup fields, one query per page
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn enrich_companies(
         &self,
@@ -573,6 +586,7 @@ impl ContactService {
         // both when there is no account manager (`u.id IS NULL`, legitimate)
         // and when `u.first_name`/`u.last_name` themselves are NULL (a failed
         // lookup); `account_manager_id` distinguishes the two.
+        // SPEC-15.31: unresolved manager names are logged with ids
         let unresolved: Vec<Uuid> = responses
             .iter()
             .filter(|r| r.account_manager_id.is_some() && r.account_manager_name.is_none())
@@ -585,6 +599,7 @@ impl ContactService {
         Ok(responses)
     }
 
+    // SPEC-15.4: 404 outside the tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company(&self, tenant_id: TenantId, company_id: Uuid) -> AppResult<Company> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -616,6 +631,7 @@ impl ContactService {
     }
 
     /// List companies with filters
+    // SPEC-15.32: AND-combined filters with total
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_companies(
         &self,
@@ -653,6 +669,7 @@ impl ContactService {
             // own-company so it never appears as a fake client in pickers. An
             // explicit `company_type=internal` filter (above branch) still
             // surfaces it, and lookup-by-id (`get_company`) is unaffected.
+            // SPEC-15.33: default list hides the internal company
             data_conds.push("company_type <> 'internal'".to_string());
             count_conds.push("company_type <> 'internal'".to_string());
         }
@@ -669,6 +686,7 @@ impl ContactService {
 
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
+        // SPEC-15.34: unknown sort is 422
         let order_by = pagination.order_by("name", mokosh_types::sort::COMPANIES)?;
 
         let query = format!(
@@ -732,6 +750,7 @@ impl ContactService {
     // conditional bind so additional fields can be appended without
     // reflowing the chain. The final `+= 1` looks dead today but keeps
     // the next added field one diff away.
+    // SPEC-15.25, SPEC-15.29: partial update; audit in one transaction
     #[allow(unused_assignments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_company(
@@ -890,6 +909,7 @@ impl ContactService {
         // (PMS-758). A caller sends only the subset they own; an
         // explicit `null` clears that key so the resolver falls back
         // to the tenant default on the next fetch.
+        // SPEC-15.28: validated patch, merged with ||
         if let Some(branding) = request.branding.as_ref() {
             // PMS-1197: the same table `TenantService::update_tenant`
             // already calls, minus the two tenant-only keys. The object
@@ -1020,6 +1040,7 @@ impl ContactService {
         // company in the tenant (case-insensitive, trimmed). Excluding this
         // company's own id lets a re-save with the name unchanged succeed.
         if let Some(ref name) = request.name {
+            // SPEC-15.27: rename conflict ignores itself and internal
             let name_taken: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM companies \
                  WHERE tenant_id = $1 AND id <> $2 AND company_type <> 'internal' \
@@ -1047,6 +1068,7 @@ impl ContactService {
 
         if let Err(e) = q.execute(&mut *tx).await {
             // Race backstop against the unique index (migration 054).
+            // SPEC-15.23: lost race on the name index is a 409
             if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23505") {
                 return Err(AppError::Conflict(
                     "A company with this name already exists".to_string(),
@@ -1077,6 +1099,7 @@ impl ContactService {
         // PMS-1186: naming somebody the billing contact is what makes them one,
         // so it is also what lets them read the invoices they will be sent.
         // Inside this transaction, so a rolled-back update grants nothing.
+        // SPEC-15.29: invoice read grant inside the update transaction
         if let Some(billing_id) = request.default_billing_contact_id {
             crate::modules::contacts::portal_access::ensure_can_read_invoices(
                 &mut tx, tenant_id, billing_id, ctx,
@@ -1095,6 +1118,7 @@ impl ContactService {
     /// Resolved ones are kept and returned too: an MSP looking at a contact
     /// wants to see that they asked for invoices last month and it was
     /// granted, not just what is outstanding today.
+    // SPEC-15.108: newest first, resolved included
     pub async fn list_access_requests(
         &self,
         tenant_id: TenantId,
@@ -1125,6 +1149,7 @@ impl ContactService {
     ///
     /// Declining closes it without granting. Both record who answered, so a
     /// request cannot be quietly disposed of.
+    // SPEC-15.109: row lock serializes concurrent resolutions
     pub async fn resolve_access_request(
         &self,
         tenant_id: TenantId,
@@ -1159,6 +1184,7 @@ impl ContactService {
         }
 
         if grant {
+            // SPEC-15.110: unknown area or missing role is a 500, never another role
             let Some(area) = crate::modules::contact_portal::capabilities::access_area(&area_key)
             else {
                 // A row whose area left the closed set, which only a code
@@ -1198,6 +1224,7 @@ impl ContactService {
             .await?;
         }
 
+        // SPEC-15.111: status, resolver and time recorded
         let row = sqlx::query_as::<_, PortalAccessRequestRow>(
             "UPDATE portal_access_requests \
              SET status = $3, resolved_by_id = $4, resolved_at = NOW() \
@@ -1248,6 +1275,7 @@ impl ContactService {
     /// counts only OPEN tickets, so a company with five closed tickets and none
     /// open reports zero there and is still refused. A preview built on that
     /// number would promise a delete that then fails.
+    // SPEC-15.43: 404 for unknown company; can_delete rule
     pub async fn deletion_preview(
         &self,
         tenant_id: TenantId,
@@ -1295,6 +1323,7 @@ impl ContactService {
         }
 
         let mut blocking = Vec::new();
+        // SPEC-15.44: only non-zero kinds, tickets counted closed or open
         for b in COMPANY_BLOCKERS {
             let count = count_in(&mut tx, b.table, tenant_id, company_id).await?;
             if count > 0 {
@@ -1357,6 +1386,7 @@ impl ContactService {
         })
     }
 
+    // SPEC-15.41, SPEC-15.42: audit in one transaction; unknown id must be 404
     pub async fn delete_company(
         &self,
         tenant_id: TenantId,
@@ -1388,6 +1418,7 @@ impl ContactService {
         .fetch_one(&mut *tx)
         .await?;
 
+        // SPEC-15.35: own company refused first
         if is_own_company {
             return Err(AppError::BadRequest(
                 "This is your organisation's own company record, which general and \
@@ -1405,6 +1436,7 @@ impl ContactService {
         .fetch_one(&mut *tx)
         .await?;
 
+        // SPEC-15.36: any ticket blocks, open or closed
         if ticket_count > 0 {
             // PMS-920: tickets are removable, so "delete them first" is advice
             // the operator can actually take, but it is rarely the one they
@@ -1428,6 +1460,7 @@ impl ContactService {
         // writer of `contacts.company_id` (PMS-806) - leaves no mirror pointing
         // at the row that is about to go. The `ON DELETE SET NULL` action added
         // in migration 110 is only the backstop for a direct SQL delete.
+        // SPEC-15.37: contacts are unlinked, never deleted
         let unlinked: Vec<Uuid> = sqlx::query_scalar(
             "DELETE FROM contact_companies WHERE tenant_id = $1 AND company_id = $2 \
              RETURNING contact_id",
@@ -1485,6 +1518,7 @@ impl ContactService {
         // is not a valid state, plus `credential_vault`, which is nullable but
         // keeps blocking on purpose: nulling it would leave encrypted secrets
         // owned by nothing and cascading would destroy them silently.
+        // SPEC-15.38: FK violation becomes a 400, not a 500
         if let Err(e) = sqlx::query("DELETE FROM companies WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(company_id)
@@ -1524,6 +1558,7 @@ impl ContactService {
     /// stored (mirrors the password-reset token shape in
     /// `auth::service`). Returns the full token to email after the
     /// transaction commits. PMS-136.
+    // SPEC-15.57: token format, hashes and expiry
     async fn insert_setup_token(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -1565,6 +1600,7 @@ impl ContactService {
     /// implementation dispatched `auth.welcome` with a slug-less
     /// `/portal/set-password?token=...` URL that the SPA router 404'd on,
     /// stranding every fresh contact.
+    // SPEC-15.58: skipped with a warn when it cannot be sent
     async fn send_setup_email(&self, contact: &Contact, token: &str) {
         if contact.email.is_none() {
             tracing::warn!(
@@ -1614,6 +1650,7 @@ impl ContactService {
     /// runs its own inline slug-mint inside the grant tx so the assignment is
     /// atomic with the role writes; this helper covers the create + update
     /// paths where the enclosing tx is not the grant tx.
+    // SPEC-15.98: reuse or mint a slug, bounded retries
     async fn ensure_portal_slug(&self, company_id: Uuid, tenant_id: Uuid) -> AppResult<String> {
         let existing: Option<String> = sqlx::query_scalar(
             "SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2",
@@ -1680,6 +1717,7 @@ impl ContactService {
     /// built-in first, then tenant-wide customs, then Company-scoped,
     /// name-alphabetical inside each band. Same-name across scopes is
     /// intentionally allowed so both rows appear in the list.
+    // SPEC-15.91, SPEC-15.92: role summaries with holder counts
     pub async fn list_portal_roles(
         &self,
         tenant_id: TenantId,
@@ -1745,6 +1783,7 @@ impl ContactService {
     /// mokosh-contact-login prompt 003: return the role ids currently
     /// assigned to a contact. Used by the SPA to pre-check boxes in the
     /// grant modal when opened on an already-portal-user contact.
+    // SPEC-15.93: 404 for a contact outside the tenant
     pub async fn list_contact_portal_role_ids(
         &self,
         tenant_id: TenantId,
@@ -1790,6 +1829,7 @@ impl ContactService {
     /// - Every `role_ids[i]` must belong to the same tenant.
     /// - `role_ids` must be non-empty (a contact needs at least one
     ///   role to hold any capability).
+    // SPEC-15.94, SPEC-15.95: preconditions before any write
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
     pub async fn grant_portal_access(
         &self,
@@ -1864,6 +1904,7 @@ impl ContactService {
         .bind(role_ids)
         .fetch_all(self.db.migrator_pool())
         .await?;
+        // SPEC-15.96: missing and foreign-scope roles share one 400
         let role_map: std::collections::HashMap<Uuid, Option<Uuid>> =
             role_rows.into_iter().collect();
         for role_id in role_ids {
@@ -1908,6 +1949,7 @@ impl ContactService {
         .fetch_optional(&mut *tx)
         .await?
         .flatten();
+        // SPEC-15.98: slug minted inside the grant transaction
         let portal_slug: String = match existing_slug {
             Some(s) => s,
             None => {
@@ -1966,6 +2008,7 @@ impl ContactService {
             }
         };
 
+        // SPEC-15.99: roles replaced and flag set in one transaction
         // Rewrite the role assignments: delete anything not in the new
         // set, upsert the new set. Atomic + idempotent so re-invoking
         // with the same set is a no-op and re-invoking with a smaller
@@ -2014,6 +2057,7 @@ impl ContactService {
         // Detect the "already granted, has a password" state and
         // skip the token/email work; a role edit becomes just the
         // role-assignment rewrite above + the audit line.
+        // SPEC-15.100: role-only edit sends no token or email
         let already_credentialled: bool = sqlx::query_scalar(
             "SELECT is_portal_user AND portal_password_hash IS NOT NULL \
              FROM contacts WHERE id = $1 AND tenant_id = $2",
@@ -2046,6 +2090,7 @@ impl ContactService {
             tx.commit().await?;
             None
         } else {
+            // SPEC-15.101: fresh grant replaces unused tokens and emails
             // Fresh grant OR re-grant of a previously revoked account
             // whose password was cleared: mint a token + queue the
             // setup email. Invalidate any prior unredeemed setup
@@ -2121,6 +2166,7 @@ impl ContactService {
     /// Company belongs to this tenant, but the `AND tenant_id = $3`
     /// keeps a stray cross-tenant call from silently touching another
     /// tenant's row.
+    // SPEC-15.97: nine-digit Portal ID, bounded retries
     async fn ensure_portal_id(&self, company_id: Uuid, tenant_id: Uuid) -> AppResult<i64> {
         // Fast path: already assigned.
         let existing: Option<i64> =
@@ -2193,6 +2239,7 @@ impl ContactService {
     /// token, mints a fresh one, dispatches the email. 400 when the
     /// contact is not `is_portal_user = TRUE` (grant first) or has no
     /// email on file.
+    // SPEC-15.104, SPEC-15.105: 409 preconditions; new token and email
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
     pub async fn resend_portal_invite(
         &self,
@@ -2272,6 +2319,7 @@ impl ContactService {
     /// Does NOT clear `portal_password_hash` so a re-grant preserves
     /// the customer's chosen password (they can log in again without
     /// re-setting).
+    // SPEC-15.106: roles, flag, tokens and sessions revoked together
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
     pub async fn revoke_portal_access(
         &self,
@@ -2345,6 +2393,7 @@ impl ContactService {
     /// portal user with zero roles has no capabilities and can log in
     /// but see nothing gated; the operator either re-adds a role or
     /// revokes access outright).
+    // SPEC-15.107: replace without token, flag or email changes
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
     pub async fn replace_portal_role_assignments(
         &self,
@@ -2383,6 +2432,7 @@ impl ContactService {
         .bind(&unique)
         .fetch_all(self.db.migrator_pool())
         .await?;
+        // SPEC-15.96: same scope rule as the grant
         let role_map: std::collections::HashMap<Uuid, Option<Uuid>> =
             role_rows.into_iter().collect();
         for role_id in &unique {
@@ -2461,6 +2511,7 @@ impl ContactService {
     ///
     /// Best-effort dispatch: a failed send never rolls back the grant
     /// transaction (both tokens are already persisted).
+    // SPEC-15.102, SPEC-15.103: template, links, best-effort dispatch
     async fn send_grant_email(
         &self,
         contact: &Contact,
@@ -2566,6 +2617,7 @@ impl ContactService {
     /// `ContactService`; the insert shape is small and any future
     /// drift is caught by the shared test that asserts the emitted
     /// URL redeems.
+    // SPEC-15.102, SPEC-15.103: 15-minute login intent
     async fn mint_grant_magic_link_url(
         &self,
         tenant_id: uuid::Uuid,
@@ -2635,6 +2687,7 @@ impl ContactService {
     /// wholesale and `contact_phones.id` is not stable across writes. The
     /// partial unique index allows one primary row per contact; deleting the
     /// old rows first is what keeps a primary swap from colliding with it.
+    // SPEC-15.48, SPEC-15.61: phone rows rewritten wholesale
     async fn write_contact_phones(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -2689,6 +2742,7 @@ impl ContactService {
     /// `created_at` and only `sort_order` separates them (PMS-815). It is set
     /// on INSERT and left alone on conflict, so a surviving link keeps its
     /// original position.
+    // SPEC-15.50: upsert links, delete the rest, one primary
     async fn write_contact_companies(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -2717,6 +2771,7 @@ impl ContactService {
         .execute(&mut *conn)
         .await?;
 
+        // SPEC-15.51: a dropped link clears the billing-contact pointer
         // PMS-993: the DELETE above rewrites the whole link set, and
         // `PUT /contacts/{id}` synthesizes a single-element set from the legacy
         // scalar `company_id`, so an unrelated edit can unlink this contact from
@@ -2797,6 +2852,7 @@ impl ContactService {
     /// `company_name` (the freeform label) is cleared whenever a primary link
     /// exists: the two are mutually exclusive (PMS-402), and the read side
     /// resolves `COALESCE(co.name, c.company_name)` anyway.
+    // SPEC-15.52: mirrors derived from the child rows
     async fn recompute_contact_mirrors(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -2846,6 +2902,7 @@ impl ContactService {
     /// Load `phones` and `companies` for a page of contacts with ONE query per
     /// child table, then attach them. No per-row query: `list_contacts` and
     /// `get_company_contacts` both hydrate a whole page this way.
+    // SPEC-15.63: one query per child kind for the page
     async fn hydrate_contacts(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -2987,6 +3044,7 @@ impl ContactService {
     }
 
     /// Create a new contact
+    // SPEC-15.59: one transaction; hydrated result
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contact(
         &self,
@@ -3008,10 +3066,12 @@ impl ContactService {
             .filter(|e| !e.is_empty())
             .is_none()
         {
+            // SPEC-15.45: email is required on create
             return Err(AppError::validation_required("email"));
         }
         // PMS-402: only verify a CRM company exists when one is linked. A
         // freeform or company-less contact skips the existence check.
+        // SPEC-15.46: linked company must exist in the tenant
         if let Some(company_id) = request.company_id {
             self.get_company(tenant_id, company_id).await?;
         }
@@ -3025,6 +3085,7 @@ impl ContactService {
         // in the same request are ignored; an absent list is materialized from
         // those scalars, which is what keeps a pre-PMS-806 request creating
         // exactly the same contact.
+        // SPEC-15.47: explicit list wins over the scalars
         let phones = match request.phones.as_deref() {
             Some(entries) => resolve_phone_list(entries)?,
             None => phones_from_scalars(
@@ -3033,6 +3094,7 @@ impl ContactService {
                 request.fax.as_deref(),
             ),
         };
+        // SPEC-15.49: explicit list wins over company_id
         let links = match request.companies.as_deref() {
             Some(entries) => resolve_company_list(entries),
             None => request
@@ -3093,6 +3155,7 @@ impl ContactService {
         // label. An empty freeform string normalizes to NULL. PMS-806: a
         // non-empty `companies` list makes a CRM name authoritative the same
         // way (the request layer already rejects both at once).
+        // SPEC-15.53: freeform name only without a link
         let stored_company_name: Option<&str> = if request.company_id.is_some() || !links.is_empty()
         {
             None
@@ -3134,6 +3197,7 @@ impl ContactService {
     /// (PMS-1213, [`Self::import_contact_in`]). The caller has already
     /// resolved and validated `phones` and `links` against the tenant, which
     /// `create_contact` does before it opens the transaction.
+    // SPEC-15.54, SPEC-15.59: defaults; rows written on the caller transaction
     #[allow(clippy::too_many_arguments)]
     async fn insert_contact_in(
         &self,
@@ -3160,6 +3224,7 @@ impl ContactService {
         // when every field the index cares about is set (email +
         // company_id + will-be-portal-user). Non-portal freeform /
         // stub contacts stay unaffected.
+        // SPEC-15.55: duplicate portal email per company is a 422
         if request.create_portal_access {
             if let (Some(cid), Some(email)) = (
                 request.company_id,
@@ -3237,6 +3302,7 @@ impl ContactService {
         // customer, who redeems the emailed `/portal/set-password` link. The
         // token row is written inside this transaction so a rollback drops it
         // with the contact; the email is sent only after commit.
+        // SPEC-15.56: token stored in the transaction, email after commit
         let setup_token = if request.create_portal_access {
             sqlx::query(
                 "UPDATE contacts SET is_portal_user = TRUE, updated_at = NOW() WHERE id = $1",
@@ -3281,6 +3347,7 @@ impl ContactService {
     /// the next sync. It links no company (PSA-70 G: an organisation name from
     /// the source is free text, never a `companies` row) and grants no portal
     /// access, so both are refused here rather than trusted to be absent.
+    // SPEC-15.60: imports link no company and grant no access
     pub(crate) async fn import_contact_in(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -3315,6 +3382,7 @@ impl ContactService {
 
     /// Replace a contact's phone list on the caller's transaction and
     /// recompute the mirrors from it (PMS-1213).
+    // SPEC-15.61: phones replaced, mirrors recomputed
     pub(crate) async fn replace_contact_phones_in(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -3330,6 +3398,7 @@ impl ContactService {
     }
 
     /// Get contact by ID
+    // SPEC-15.62: 404 outside the tenant; company name resolved
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_contact(&self, tenant_id: TenantId, contact_id: Uuid) -> AppResult<Contact> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -3360,6 +3429,7 @@ impl ContactService {
     }
 
     /// List contacts with filters
+    // SPEC-15.64: AND-combined filters with total
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_contacts(
         &self,
@@ -3435,6 +3505,7 @@ impl ContactService {
         }
         // Comma-separated; a contact carrying ANY of them matches. Blank
         // entries are dropped, and a filter of only blanks filters nothing.
+        // SPEC-15.65: any-of tags; blanks dropped
         let tags: Vec<String> = filter
             .tags
             .as_deref()
@@ -3450,6 +3521,7 @@ impl ContactService {
         }
         // PMS-1260: origin takes no bind - the provider is a closed enum, so
         // its literal is written from a match, never from the request.
+        // SPEC-15.66: manual, google and vcard origins
         match filter.origin {
             Some(ContactOriginFilter::Manual) => {
                 data_conds.push(
@@ -3497,6 +3569,7 @@ impl ContactService {
 
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
+        // SPEC-15.67: unknown sort is 422
         let order_by = pagination.order_by("last_name", mokosh_types::sort::CONTACTS)?;
 
         let query = format!(
@@ -3567,6 +3640,7 @@ impl ContactService {
     /// capped at 20. `q`, when present, is a case-insensitive substring
     /// filter. The column comes from a closed enum (`ContactSuggestField`),
     /// so it is safe to interpolate; the user-supplied `q` is always bound.
+    // SPEC-15.68: ranked suggestions, capped at 20
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn distinct_contact_field_values(
         &self,
@@ -3613,6 +3687,7 @@ impl ContactService {
     // ========================================================================
 
     /// List this tenant's industry lookup rows (paginated, alphabetical).
+    // SPEC-15.87: alphabetical, paginated
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_company_industries(
         &self,
@@ -3640,6 +3715,7 @@ impl ContactService {
     }
 
     /// Create an industry. A duplicate name (case-insensitive) returns 409.
+    // SPEC-15.88: trimmed name; duplicate is 409; audited
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_company_industry(
         &self,
@@ -3676,6 +3752,7 @@ impl ContactService {
 
     /// Update an industry's name / active flag. 404 if not in this tenant; a
     /// duplicate name returns 409.
+    // SPEC-15.89: 404 unknown; duplicate is 409
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_company_industry(
         &self,
@@ -3700,6 +3777,7 @@ impl ContactService {
     }
 
     /// Delete an industry. 404 if not in this tenant.
+    // SPEC-15.90: 404 unknown
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_company_industry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -3716,6 +3794,7 @@ impl ContactService {
     }
 
     /// Get contacts for a company
+    // SPEC-15.69: any link counts, once each
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company_contacts(
         &self,
@@ -3772,6 +3851,7 @@ impl ContactService {
     }
 
     /// Update contact
+    // SPEC-15.70, SPEC-15.77: partial update; audit in one transaction
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_contact(
         &self,
@@ -3823,6 +3903,7 @@ impl ContactService {
         // stored freeform name in the same statement (no bind needed, it is a
         // literal NULL). Otherwise, an explicit company_name is persisted
         // (empty string normalizes to NULL via `stored_company_name` below).
+        // SPEC-15.71: company_id clears the freeform name
         let stored_company_name: Option<Option<&str>> = if request.company_id.is_some() {
             None
         } else {
@@ -3996,6 +4077,7 @@ impl ContactService {
         // existing row, and only an absent field falls back to it - a clear
         // must not be re-read as "unchanged" the way a single-level `Option`
         // made it look.
+        // SPEC-15.72: an explicit null clears, an absent scalar keeps
         let phones = match request.phones.as_deref() {
             Some(entries) => Some(resolve_phone_list(entries)?),
             None if request.phone.is_some()
@@ -4022,6 +4104,7 @@ impl ContactService {
             }
             None => None,
         };
+        // SPEC-15.73: list, company_id or neither
         let links = match request.companies.as_deref() {
             Some(entries) => Some(resolve_company_list(entries)),
             None => request.company_id.map(|company_id| {
@@ -4055,6 +4138,7 @@ impl ContactService {
         self.recompute_contact_mirrors(&mut tx, tenant_id, contact_id)
             .await?;
 
+        // SPEC-15.74: scoped roles follow the contact's company
         // PMS-1236: a company-scoped portal role assignment must be dropped
         // when the contact's company changes, or the contact keeps a role
         // (and the capabilities it grants) scoped to a Company they no
@@ -4088,6 +4172,7 @@ impl ContactService {
             .and_then(|v| v.get("is_portal_user"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // SPEC-15.75: only a false-to-true flip mints a token
         let setup_token = if request.is_portal_user == Some(true) && !was_portal_user {
             Some(
                 self.insert_setup_token(&mut tx, tenant_id, contact_id)
@@ -4097,6 +4182,7 @@ impl ContactService {
             None
         };
 
+        // SPEC-15.76: edited fields stop following the sync source
         if let Some(sync_before) = sync_before {
             crate::modules::contact_sync::locks::lock_edited_fields(
                 &mut tx,
@@ -4138,6 +4224,7 @@ impl ContactService {
     }
 
     /// Delete contact
+    // SPEC-15.78: 404 unknown; delete and audit in one transaction
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_contact(
         &self,
@@ -4166,6 +4253,7 @@ impl ContactService {
         // card stays attached to the provider Customer. A detach failure
         // returns the error here, leaving the transaction unwound and the
         // contact (and its payment method rows) in place.
+        // SPEC-15.79: detach failure or missing service aborts the delete
         match &self.payment_methods {
             Some(payment_methods) => {
                 payment_methods
@@ -4218,6 +4306,7 @@ impl ContactService {
     // ========================================================================
 
     /// Create a new site
+    // SPEC-15.81: company must exist; defaults; audited
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_site(
         &self,
@@ -4240,6 +4329,7 @@ impl ContactService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // If this is marked as primary, unmark other sites
+        // SPEC-15.82: one primary site per company
         if request.is_primary {
             sqlx::query(
                 "UPDATE sites SET is_primary = FALSE WHERE tenant_id = $1 AND company_id = $2",
@@ -4305,6 +4395,7 @@ impl ContactService {
 
     /// Update a site. Audit F4: previously the route handler called
     /// `get_site` and silently returned the unchanged record.
+    // SPEC-15.83: 404 unknown; partial update; audited
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_site(
         &self,
@@ -4329,6 +4420,7 @@ impl ContactService {
 
         // If this is being marked primary, demote the other sites under
         // the same company first (mirrors create_site).
+        // SPEC-15.82: demote the other sites first
         if matches!(request.is_primary, Some(true)) {
             sqlx::query(
                 "UPDATE sites SET is_primary = FALSE \
@@ -4454,6 +4546,7 @@ impl ContactService {
     }
 
     /// Get site by ID
+    // SPEC-15.84: 404 outside the tenant
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_site(&self, tenant_id: TenantId, site_id: Uuid) -> AppResult<Site> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -4477,6 +4570,7 @@ impl ContactService {
     }
 
     /// Get sites for a company
+    // SPEC-15.85: primary first, then name
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_company_sites(
         &self,
@@ -4516,6 +4610,7 @@ impl ContactService {
     }
 
     /// Delete site
+    // SPEC-15.86: audited delete; unknown id must be 404
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_site(
         &self,
@@ -4810,6 +4905,7 @@ struct ResolvedLink {
 /// normalization (a blank number deserializes to `None`); the request-layer
 /// `required` rule rejects `None`, and this is the fail-loud backstop for a
 /// caller that reaches the service without validating.
+// SPEC-15.48: list order is sort order; first promoted if none primary
 fn resolve_phone_list(entries: &[ContactPhoneInput]) -> AppResult<Vec<ResolvedPhone>> {
     let mut resolved = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
@@ -4840,6 +4936,7 @@ fn resolve_phone_list(entries: &[ContactPhoneInput]) -> AppResult<Vec<ResolvedPh
 /// contact carries a mobile but no `phone`, promoting the mobile would make the
 /// mirror rule write that number back into `contacts.phone`, changing what an
 /// unchanged request stores today. The migration backfill uses the same rule.
+// SPEC-15.47: only phone becomes primary
 fn phones_from_scalars(
     phone: Option<&str>,
     mobile: Option<&str>,
@@ -4881,6 +4978,7 @@ fn phones_from_scalars(
 /// [`ContactService::write_contact_companies`], because it depends on which
 /// links already existed. Duplicate ids and two primaries are 422s at the
 /// request layer.
+// SPEC-15.49: caller flags preserved for write_contact_companies
 fn resolve_company_list(entries: &[ContactCompanyLinkInput]) -> Vec<ResolvedLink> {
     entries
         .iter()
@@ -4914,6 +5012,7 @@ fn resolve_company_list(entries: &[ContactCompanyLinkInput]) -> Vec<ResolvedLink
 /// list written by [`ContactService::write_contact_companies`] (including the
 /// empty list that legitimately unlinks a contact). `title` is copied from the
 /// contact the way migration 108's backfill copied it.
+// SPEC-15.80: repairs a mirror with no link row
 pub(crate) async fn ensure_primary_company_link(
     conn: &mut sqlx::PgConnection,
     tenant_id: Uuid,
@@ -5002,6 +5101,7 @@ impl From<SiteRow> for Site {
             is_primary: row.is_primary,
             timezone: row.timezone,
             notes: row.notes,
+            // SPEC-15.84: coordinates returned as numbers
             latitude: row.latitude.map(|d| d.to_string().parse().unwrap_or(0.0)),
             longitude: row.longitude.map(|d| d.to_string().parse().unwrap_or(0.0)),
             created_at: row.created_at,

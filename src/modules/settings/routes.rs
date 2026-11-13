@@ -59,12 +59,14 @@ pub fn settings_routes(
         // dropped because axum's matchit treats `{id}` and `{category}`
         // as the same path shape and refused to register both. Delete
         // now lives at `DELETE /settings/{category}/{key}` per AC1.
+        // SPEC-15.2006, SPEC-15.2007
         .route("/settings", get(list_settings).put(upsert_setting))
         // PMS-116 module configs. PMS-113 AC2: the tenants-API
         // `/api/v1/tenants/:tenant_id/modules/:module` surface
         // delegates to the same SettingsService instance, so this is
         // the single canonical write path even though both URL shapes
         // exist.
+        // SPEC-15.2013, SPEC-15.2014
         .route("/settings/modules", get(list_module_configs))
         .route(
             "/settings/modules/{module}",
@@ -123,6 +125,7 @@ pub fn settings_routes(
 /// deployment-wide handlers below; `RequireAdmin` let any organisation's admin
 /// read and repoint the relay every organisation sends through. The SMTP
 /// password is never returned, only whether one is set.
+// SPEC-15.2005, SPEC-15.2037
 async fn get_email(
     State(s): State<SettingsRouterState>,
     _operator: DeploymentOperator,
@@ -132,6 +135,7 @@ async fn get_email(
 
 /// PMS-638: write the deployment-wide email settings (admin only), then rebuild
 /// and hot-swap the live mailer so the change takes effect without a restart.
+// SPEC-15.2005, SPEC-15.2038, SPEC-15.2041
 async fn put_email(
     State(s): State<SettingsRouterState>,
     _operator: DeploymentOperator,
@@ -144,6 +148,7 @@ async fn put_email(
 
 /// PMS-1444: whether this deployment's Google client is set, and where it
 /// lives. Never either half of it, not even the id.
+// SPEC-15.2005, SPEC-15.2045
 async fn get_google_client(
     State(s): State<SettingsRouterState>,
     _operator: DeploymentOperator,
@@ -155,6 +160,7 @@ async fn get_google_client(
 
 /// PMS-1444: set the host's Google client, then swap the one the process is
 /// using so a Connect that happens a second later uses it.
+// SPEC-15.2005
 async fn put_google_client(
     State(s): State<SettingsRouterState>,
     _operator: DeploymentOperator,
@@ -176,6 +182,7 @@ async fn put_google_client(
 /// operator can confirm outbound email without triggering a password reset.
 /// A malformed address or an SMTP failure surfaces as the mailer's error
 /// rather than being swallowed.
+// SPEC-15.2005, SPEC-15.2043
 async fn post_email_test_send(
     State(s): State<SettingsRouterState>,
     _operator: DeploymentOperator,
@@ -199,6 +206,7 @@ async fn post_email_test_send(
 /// SmtpMailer's `verify` issues a NOOP against the relay so an unreachable
 /// host or a rejected credential surfaces without asking an operator to
 /// receive a test message; LogMailer's `verify` is trivially Ok.
+// SPEC-15.2005, SPEC-15.2044
 async fn post_email_verify(
     State(s): State<SettingsRouterState>,
     _operator: DeploymentOperator,
@@ -209,6 +217,7 @@ async fn post_email_verify(
 }
 
 /// PMS-789: read the deployment-wide product name (admin only).
+// SPEC-15.2005
 async fn get_app_name(
     State(s): State<SettingsRouterState>,
     _operator: DeploymentOperator,
@@ -219,6 +228,7 @@ async fn get_app_name(
 /// PMS-789: write the deployment-wide product name (admin only). The write
 /// refreshes the process cache, so the next mail sent and the next 404 page
 /// rendered carry the new name with no restart.
+// SPEC-15.2005
 async fn put_app_name(
     State(s): State<SettingsRouterState>,
     _operator: DeploymentOperator,
@@ -229,6 +239,7 @@ async fn put_app_name(
     ))
 }
 
+// SPEC-15.2006
 async fn list_settings(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -246,6 +257,7 @@ async fn list_settings(
     )))
 }
 
+// SPEC-15.2007, SPEC-15.2008
 async fn upsert_setting(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -274,6 +286,7 @@ async fn upsert_setting(
     ))
 }
 
+// SPEC-15.2014
 async fn list_module_configs(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -291,6 +304,7 @@ async fn list_module_configs(
     )))
 }
 
+// SPEC-15.2015
 async fn get_module_config(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -301,6 +315,7 @@ async fn get_module_config(
     ))
 }
 
+// SPEC-15.2016
 async fn upsert_module_config(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -318,6 +333,7 @@ async fn upsert_module_config(
 
 // PMS-113 AC1: category + per-key tenant_settings ---------------------------
 
+// SPEC-15.2009
 async fn get_settings_by_category(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -330,6 +346,7 @@ async fn get_settings_by_category(
     ))
 }
 
+// SPEC-15.2010
 async fn get_setting(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -340,6 +357,7 @@ async fn get_setting(
     ))
 }
 
+// SPEC-15.2011, SPEC-15.2008
 async fn put_setting(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -367,6 +385,7 @@ async fn put_setting(
     ))
 }
 
+// SPEC-15.2012
 async fn delete_setting_by_key(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,

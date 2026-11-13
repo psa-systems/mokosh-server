@@ -50,26 +50,33 @@ pub(crate) struct CorsOriginMatcher {
 impl CorsOriginMatcher {
     /// Parse the raw CORS_ORIGIN entry list. Panics with a clear
     /// message on a malformed entry so a bad env fails the boot.
-    // SPEC-1 and 2.80, SPEC-1 and 2.81: called exactly once, at router construction (boot), not
+    // called exactly once, at router construction (boot), not
     // per request; a parse failure here panics the boot instead of being deferred to request time.
+    // SPEC-12.14: entries are trimmed and parsed here, once.
     pub(crate) fn from_entries(entries: &[String]) -> Self {
+        // SPEC-2.103
         let rules = entries.iter().map(|raw| parse_entry(raw)).collect();
         Self { rules }
     }
 
     /// Return `true` if `origin_bytes` (the raw `Origin` header value)
     /// matches any configured entry.
-    // SPEC-1 and 2.80: runs on every CORS-checked request; does no parsing, only
+    // runs on every CORS-checked request; does no parsing, only
     // byte comparisons against the rules parsed once at boot.
+    // SPEC-2.104
     pub(crate) fn matches(&self, origin_bytes: &[u8]) -> bool {
         self.rules.iter().any(|rule| match rule {
-            // SPEC-1 and 2.88, SPEC-1 and 2.92: byte-for-byte, case-sensitive; no
+            // byte-for-byte, case-sensitive; no
             // normalization of the incoming Origin header.
+            // SPEC-12.15
+            // SPEC-2.111
             Rule::Exact(v) => v.as_bytes() == origin_bytes,
+            // SPEC-12.16: scheme prefix, strictly longer host, tail match on `.suffix`.
             Rule::Wildcard { scheme, suffix } => {
-                // SPEC-1 and 2.89: scheme is matched as a literal prefix, so a
+                // scheme is matched as a literal prefix, so a
                 // wildcard entry never matches the other scheme.
                 let scheme_bytes = scheme.as_bytes();
+                // SPEC-2.112
                 let Some(host) = origin_bytes.strip_prefix(scheme_bytes) else {
                     return false;
                 };
@@ -77,12 +84,14 @@ impl CorsOriginMatcher {
                 // with `evilclient.a8n.systems`: the suffix must sit
                 // exactly at the tail of the host, and the label to the
                 // left of the leading dot must be non-empty.
-                // SPEC-1 and 2.91: rejects the bare apex and the empty-label host.
+                // rejects the bare apex and the empty-label host.
+                // SPEC-2.114
                 if host.len() <= suffix.len() {
                     return false;
                 }
-                // SPEC-1 and 2.90, SPEC-1 and 2.93: a tail (suffix) comparison, not leftmost-label-only, so any number of leading
+                // a tail (suffix) comparison, not leftmost-label-only, so any number of leading
                 // host labels match; suffix is the literal config text and includes a port if one was written into the entry.
+                // SPEC-2.113
                 host.ends_with(suffix.as_bytes())
             }
         })
@@ -98,49 +107,57 @@ impl CorsOriginMatcher {
 /// interior `*`) so the operator sees the misconfiguration at boot.
 fn parse_entry(raw: &str) -> Rule {
     let raw = raw.trim();
+    // SPEC-12.17: every malformed shape below panics with a CORS_ORIGIN message.
     if raw.is_empty() {
-        // SPEC-1 and 2.82: panics at boot rather than being skipped or allow-listing nothing.
+        // panics at boot rather than being skipped or allow-listing nothing.
+        // SPEC-2.105
         panic!("CORS_ORIGIN entry is empty");
     }
 
     for scheme in ["https://", "http://"] {
         let wildcard_prefix = format!("{scheme}*.");
         if let Some(suffix) = raw.strip_prefix(&wildcard_prefix) {
+            // SPEC-2.106
             if suffix.is_empty() {
-                // SPEC-1 and 2.83: panics at boot on a wildcard with no suffix.
+                // panics at boot on a wildcard with no suffix.
                 panic!(
                     "CORS_ORIGIN wildcard {raw:?} is missing a suffix after {wildcard_prefix:?}"
                 );
             }
+            // SPEC-2.107
             if suffix.contains('*') {
-                // SPEC-1 and 2.84: panics at boot; only the leftmost label may be a wildcard.
+                // panics at boot; only the leftmost label may be a wildcard.
                 panic!(
                     "CORS_ORIGIN wildcard {raw:?} must not contain another `*` after the leftmost label"
                 );
             }
+            // SPEC-2.108
             if !suffix.contains('.') {
-                // SPEC-1 and 2.85: panics at boot; a wildcard suffix must have a TLD.
+                // panics at boot; a wildcard suffix must have a TLD.
                 panic!(
                     "CORS_ORIGIN wildcard {raw:?} suffix must include at least one dot (host must have a TLD)"
                 );
             }
             return Rule::Wildcard {
                 scheme,
+                // SPEC-2.115 SPEC-2.116
                 suffix: format!(".{suffix}"),
             };
         }
     }
 
+    // SPEC-2.109
     if raw.contains('*') {
-        // SPEC-1 and 2.86: panics at boot; `*` is only legal in the `<scheme>://*.` position.
+        // panics at boot; `*` is only legal in the `<scheme>://*.` position.
         panic!(
             "CORS_ORIGIN entry {raw:?} contains `*` outside the leading `<scheme>://*.` position"
         );
     }
 
-    // SPEC-1 and 2.87: panics at boot if an exact entry is not a valid header value.
+    // panics at boot if an exact entry is not a valid header value.
     let value = raw
         .parse::<HeaderValue>()
+        // SPEC-2.110
         .unwrap_or_else(|e| panic!("CORS_ORIGIN entry {raw:?} is not a valid header value: {e}"));
     Rule::Exact(value)
 }

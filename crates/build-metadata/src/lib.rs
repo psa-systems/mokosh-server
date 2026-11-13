@@ -16,6 +16,7 @@
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// SPEC-2.257
 /// Emit the `cargo:rustc-env` + `cargo:rerun-if-*` directives that expose
 /// `MOKOSH_GIT_HASH`, `MOKOSH_GIT_DESCRIBE`, and `MOKOSH_BUILD_DATE` to the
 /// crate being built.
@@ -41,7 +42,7 @@ pub fn emit(git_dir: &str) {
     println!("cargo:rerun-if-changed={git_dir}/index");
 }
 
-// SPEC-1 and 2.152: resolution order is the pre-set env var first, a `git` shell-out second, a hardcoded fallback last.
+// SPEC-2.254
 fn resolve_git_hash() -> String {
     if let Ok(value) = std::env::var("MOKOSH_GIT_HASH") {
         if !value.trim().is_empty() {
@@ -51,6 +52,7 @@ fn resolve_git_hash() -> String {
     run_git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string())
 }
 
+// SPEC-2.255
 fn resolve_git_describe() -> String {
     if let Ok(value) = std::env::var("MOKOSH_GIT_DESCRIBE") {
         if !value.trim().is_empty() {
@@ -66,6 +68,7 @@ fn resolve_git_describe() -> String {
     })
 }
 
+// SPEC-2.256
 fn resolve_build_date() -> String {
     if let Ok(value) = std::env::var("MOKOSH_BUILD_DATE") {
         if !value.trim().is_empty() {

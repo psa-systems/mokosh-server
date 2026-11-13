@@ -550,6 +550,8 @@ struct StatusReport {
     orphans: Vec<OrphanRow>,
 }
 
+// SPEC-3.1039: report shape: secrets rows, config chain rows, orphans; text omits unheld config
+// keys.
 fn build_status_report(
     secret_providers: &[Option<Arc<dyn AppSecretProvider>>],
     secret_selection: AppSecretsSelection,
@@ -885,6 +887,7 @@ async fn move_one_secret(
     }
 }
 
+// SPEC-3.1040: config tier: same outcomes as secrets; bootstrap-tier keys skipped.
 async fn migrate_config(
     source_kind: ConfigProviderKind,
     target_kind: ConfigProviderKind,
@@ -1014,6 +1017,7 @@ pub async fn run_provider_set(args: &[String]) -> AppResult<()> {
 /// `read_back` reads the target LIVE and is the caller's business, because what
 /// "live" means differs by provider and the production caller has to defeat a
 /// cache to get it.
+// SPEC-3.1042: refuses an unbuilt or read-only declared provider; reports restart_required: true.
 async fn set_one_secret<ReadBack, Fut>(
     secret: GovernedSecret,
     plain: &str,
@@ -1359,6 +1363,8 @@ async fn purge_secrets(
     }
 }
 
+// SPEC-3.1041: refuses a key the target serves, with no other holder, or not live in its serving
+// provider.
 async fn purge_config(
     kind: ConfigProviderKind,
     chain: &ConfigProviderChain,

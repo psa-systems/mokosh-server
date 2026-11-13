@@ -22,6 +22,7 @@ pub struct InvitationsRouterState {
     pub service: Arc<InvitationsService>,
 }
 
+// SPEC-5.539: every invitation route is admin-only.
 pub fn invitations_routes(service: Arc<InvitationsService>) -> Router {
     let state = InvitationsRouterState { service };
     Router::new()
@@ -33,6 +34,7 @@ pub fn invitations_routes(service: Arc<InvitationsService>) -> Router {
         .with_state(state)
 }
 
+// SPEC-5.547: pending invitations only; 422 on sort.
 async fn list_invitations(
     State(s): State<InvitationsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -48,6 +50,7 @@ async fn list_invitations(
     )))
 }
 
+// SPEC-5.540: email format is validated before the service runs (422).
 async fn create_invitation(
     State(s): State<InvitationsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -59,6 +62,7 @@ async fn create_invitation(
     Ok(Json(s.service.create(u.tenant(), u.id, &req, &ctx).await?))
 }
 
+// SPEC-5.551: success is 200 with an empty body.
 async fn revoke_invitation(
     State(s): State<InvitationsRouterState>,
     RequireAuth(u): RequireAuth,

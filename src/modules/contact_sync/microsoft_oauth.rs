@@ -81,6 +81,7 @@ pub const CONTACTS_READ: &str = "Contacts.Read";
 /// is that no code path writes (the trait at
 /// [`super::provider::ContactSyncProvider`] has no write method), not that
 /// the grant is narrow.
+// SPEC-15.652
 pub fn grants_contacts_read(granted: &str) -> bool {
     granted
         .split_whitespace()
@@ -104,6 +105,7 @@ impl OauthClient {
     /// would connect as half an application, so it is an error naming the
     /// key that is missing, raised at boot where an operator is present
     /// to read it.
+    // SPEC-15.657
     pub fn from_app_secrets(secrets: &AppSecrets) -> AppResult<Option<Self>> {
         let read = |secret: GovernedSecret| {
             secrets
@@ -132,6 +134,7 @@ impl OauthClient {
 /// Mirrors [`super::oauth::SharedGoogleClient`]: the operator surface
 /// (follow-up PR) writes the pair through the same `swap` mechanism so
 /// the setting takes effect without a restart.
+// SPEC-15.658
 pub struct SharedMicrosoftClient {
     inner: std::sync::RwLock<Option<OauthClient>>,
     write_lock: tokio::sync::Mutex<()>,
@@ -181,6 +184,7 @@ impl Default for SharedMicrosoftClient {
     }
 }
 
+// SPEC-15.657
 fn half_configured(missing: GovernedSecret) -> AppError {
     AppError::Configuration(format!(
         "Microsoft 365 Contacts is half configured: {} is set and {} is not. A client id and its \
@@ -204,6 +208,7 @@ fn half_configured(missing: GovernedSecret) -> AppError {
 /// would get an access token that expires in an hour and the integration
 /// would die overnight; the failure mode is identical to Google's and the
 /// mitigation is the same shape.
+// SPEC-15.650
 pub fn authorization_url(
     client: &OauthClient,
     redirect_uri: &str,
@@ -253,6 +258,7 @@ pub struct TokenResponse {
 /// (`invalid_grant`, `invalid_request`, `interaction_required`) plus the
 /// `AADSTS<N>` numeric codes in the `error_description`; the standard code
 /// alone decides the TokenError variant.
+// SPEC-15.654
 pub fn classify_token_error(status: u16, body: &str) -> TokenError {
     let error_code = serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -270,6 +276,7 @@ pub fn classify_token_error(status: u16, body: &str) -> TokenError {
 }
 
 /// Exchange an authorization code for tokens.
+// SPEC-15.653
 pub async fn exchange_code(
     http: &reqwest::Client,
     client: &OauthClient,
@@ -292,6 +299,7 @@ pub async fn exchange_code(
 /// Trade a refresh token for a fresh access token. Microsoft requires the
 /// same scope set to be re-sent on refresh, else the issued access token
 /// comes back narrower than the stored grant claims.
+// SPEC-15.653
 pub async fn refresh_access_token(
     http: &reqwest::Client,
     client: &OauthClient,
@@ -307,6 +315,7 @@ pub async fn refresh_access_token(
     post_token(http, &form).await
 }
 
+// SPEC-15.654
 async fn post_token(
     http: &reqwest::Client,
     form: &[(&str, &str)],
@@ -336,6 +345,7 @@ async fn post_token(
 /// Microsoft Graph's OIDC userinfo endpoint returns `email`; if a tenant
 /// has disabled it, we fall back to `/v1.0/me`'s `mail` or
 /// `userPrincipalName`. One call per Connect.
+// SPEC-15.656
 pub async fn account_email(http: &reqwest::Client, access_token: &str) -> AppResult<String> {
     #[derive(Deserialize)]
     struct UserInfo {

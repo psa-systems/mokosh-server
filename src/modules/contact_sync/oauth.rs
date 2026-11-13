@@ -67,6 +67,7 @@ pub const CONTACTS_READONLY: &str = "https://www.googleapis.com/auth/contacts.re
 /// no code path writes (`google::tests::this_module_never_writes_to_google`),
 /// not that the grant is narrow. Refusing a superset here would reject a
 /// working connection over a permission nothing uses.
+// SPEC-15.652
 pub fn grants_contacts_read(granted: &str) -> bool {
     granted.split_whitespace().any(|scope| {
         scope == CONTACTS_READONLY || scope == "https://www.googleapis.com/auth/contacts"
@@ -99,6 +100,7 @@ impl OauthClient {
     /// other is neither: it is a host that would connect as half an application,
     /// so it is an error naming the key that is missing, raised at boot where an
     /// operator is present to read it rather than at a customer's first click.
+    // SPEC-15.657
     pub fn from_app_secrets(secrets: &AppSecrets) -> AppResult<Option<Self>> {
         let read = |secret: GovernedSecret| {
             secrets
@@ -139,6 +141,7 @@ impl OauthClient {
 ///
 /// `None` is a configured state, not an uninitialised one: it is a deployment
 /// with no Google client, which the Settings card renders as unavailable.
+// SPEC-15.658
 pub struct SharedGoogleClient {
     inner: std::sync::RwLock<Option<OauthClient>>,
     /// PMS-1473: held for the full id-then-secret write in
@@ -211,6 +214,7 @@ impl Default for SharedGoogleClient {
 /// next action is to add it, and says where it goes without naming a provider:
 /// which provider serves it is `SECRET_BACKEND`'s answer and the app-secret
 /// survey already logs it one line above this.
+// SPEC-15.657
 fn half_configured(missing: GovernedSecret) -> AppError {
     AppError::Configuration(format!(
         "Google Contacts is half configured: {} is set and {} is not. A client id and its secret \
@@ -237,6 +241,7 @@ pub struct Pkce {
 }
 
 impl Pkce {
+    // SPEC-15.651
     pub fn generate() -> Self {
         // 64 characters from the crate's own CSPRNG helper, inside RFC 7636's
         // 43..128 range.
@@ -263,6 +268,7 @@ impl Pkce {
 /// consent, so a tenant that reconnects after a disconnect would get an access
 /// token that expires in an hour and an integration that dies quietly
 /// overnight.
+// SPEC-15.649
 pub fn authorization_url(
     client: &OauthClient,
     redirect_uri: &str,
@@ -317,6 +323,7 @@ pub enum TokenError {
     Transport(String),
 }
 
+// SPEC-15.655
 impl From<TokenError> for AppError {
     fn from(value: TokenError) -> Self {
         match value {
@@ -337,6 +344,7 @@ impl From<TokenError> for AppError {
 
 /// Classify a token-endpoint error body. Pure, so the mapping is testable
 /// without a network.
+// SPEC-15.654
 pub fn classify_token_error(status: u16, body: &str) -> TokenError {
     let error_code = serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -354,6 +362,7 @@ pub fn classify_token_error(status: u16, body: &str) -> TokenError {
 }
 
 /// Exchange an authorization code for tokens.
+// SPEC-15.653
 pub async fn exchange_code(
     http: &reqwest::Client,
     client: &OauthClient,
@@ -373,6 +382,7 @@ pub async fn exchange_code(
 }
 
 /// Trade a refresh token for a fresh access token.
+// SPEC-15.653
 pub async fn refresh_access_token(
     http: &reqwest::Client,
     client: &OauthClient,
@@ -387,6 +397,7 @@ pub async fn refresh_access_token(
     post_token(http, &form).await
 }
 
+// SPEC-15.654
 async fn post_token(
     http: &reqwest::Client,
     form: &[(&str, &str)],
@@ -412,6 +423,7 @@ async fn post_token(
 /// on every render: it is the answer to "whose address book is this", and it
 /// has to keep being answerable after the grant is revoked, which is exactly
 /// when the card most needs to name it.
+// SPEC-15.656
 pub async fn account_email(http: &reqwest::Client, access_token: &str) -> AppResult<String> {
     #[derive(Deserialize)]
     struct UserInfo {

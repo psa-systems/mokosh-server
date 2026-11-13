@@ -154,6 +154,7 @@ pub fn contact_sync_public_routes(service: Arc<ContactSyncService>) -> Router {
 /// What the Settings card reads (PMS-1241): whether the integration is
 /// allowed, whether this deployment can connect, and the connection or `null`.
 /// Never connected is an offer, not an error.
+// SPEC-15.500
 async fn get_connection(
     State(state): State<ContactSyncRouterState>,
     RequireAuth(user): RequireAuth,
@@ -174,6 +175,7 @@ struct AuthorizeResponse {
 
 /// POST, not GET: it writes a state row. A GET that mutates is a GET a browser
 /// can be made to perform.
+// SPEC-15.501
 async fn begin_connect(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -183,6 +185,7 @@ async fn begin_connect(
     Ok(Json(AuthorizeResponse { authorize_url }))
 }
 
+// SPEC-15.503
 async fn disconnect(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -211,6 +214,7 @@ struct ProviderQuery {
 }
 
 impl ProviderQuery {
+    // SPEC-15.504
     fn resolve(&self) -> AppResult<&str> {
         match self
             .provider
@@ -247,6 +251,7 @@ struct IcloudConnectRequest {
 /// in `SECRET_FIELD_NAMES`' company by name, so the PMS-924 body sanitizer leaves
 /// it byte-identical: an app-specific password is compared elsewhere and a
 /// rewritten one is a refusal nobody can place.
+// SPEC-15.505
 async fn connect_icloud(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -271,6 +276,7 @@ async fn connect_icloud(
     })))
 }
 
+// SPEC-15.503
 async fn disconnect_icloud(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -287,6 +293,7 @@ async fn disconnect_icloud(
 /// POST because it reads the tenant's whole Google account on the grant,
 /// which a GET that a link or a prefetch could fire must not do. Admin, like
 /// the label list. Writes nothing.
+// SPEC-15.506
 async fn preview(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -311,6 +318,7 @@ struct SelectionRequest {
     group_ids: Vec<String>,
 }
 
+// SPEC-15.507
 async fn set_selection(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -335,6 +343,7 @@ struct ScheduleRequest {
 /// How often this connection is polled (PMS-1315). `RequireAdmin` like the
 /// selection it sits beside: how hard an MSP leans on a customer's address
 /// book is the same kind of decision as which labels it reads.
+// SPEC-15.508
 async fn set_schedule(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -362,6 +371,7 @@ struct RunsQuery {
     limit: Option<i64>,
 }
 
+// SPEC-15.509
 async fn list_runs(
     State(state): State<ContactSyncRouterState>,
     RequireAuth(user): RequireAuth,
@@ -377,6 +387,7 @@ async fn list_runs(
 
 /// 202: the run is queued, and the worker does the import. The response is
 /// the row to poll, never the import's result.
+// SPEC-15.510
 async fn queue_run(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -391,6 +402,7 @@ async fn queue_run(
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
 
+// SPEC-15.511
 async fn get_run(
     State(state): State<ContactSyncRouterState>,
     RequireAuth(user): RequireAuth,
@@ -399,6 +411,7 @@ async fn get_run(
     Ok(Json(state.service.run(user.tenant(), run_id).await?))
 }
 
+// SPEC-15.511
 async fn cancel_run(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -416,6 +429,7 @@ async fn cancel_run(
 
 /// Take the `file` part of a multipart upload. 201 with the stored upload and
 /// what importing it would do; nothing is imported yet.
+// SPEC-15.512
 async fn upload_vcard(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -449,6 +463,7 @@ async fn upload_vcard(
     Ok((StatusCode::CREATED, Json(uploaded)))
 }
 
+// SPEC-15.513
 async fn list_vcard_uploads(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -465,6 +480,7 @@ async fn list_vcard_uploads(
 
 /// POST for the same reason as Google's preview: it reads a whole address
 /// book. Writes nothing.
+// SPEC-15.514
 async fn preview_vcard(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -481,6 +497,7 @@ async fn preview_vcard(
 }
 
 /// 202, like a Google import: the answer is the run to poll.
+// SPEC-15.514
 async fn import_vcard(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -498,6 +515,7 @@ async fn import_vcard(
 
 /// Reading and answering the queue carry `RequireAuth`, the gate on reading
 /// and editing a contact: each answer is a link, a create or a skip of one.
+// SPEC-15.515
 async fn review_queue(
     State(state): State<ContactSyncRouterState>,
     RequireAuth(user): RequireAuth,
@@ -505,6 +523,7 @@ async fn review_queue(
     Ok(Json(state.service.review_queue(user.tenant()).await?))
 }
 
+// SPEC-15.515
 async fn resolve(
     State(state): State<ContactSyncRouterState>,
     RequireAuth(user): RequireAuth,
@@ -519,6 +538,7 @@ async fn resolve(
     ))
 }
 
+// SPEC-15.516
 async fn get_provenance(
     State(state): State<ContactSyncRouterState>,
     RequireAuth(user): RequireAuth,
@@ -529,6 +549,7 @@ async fn get_provenance(
     ))
 }
 
+// SPEC-15.516
 async fn release_lock(
     State(state): State<ContactSyncRouterState>,
     _manager: RequireManager,
@@ -543,6 +564,7 @@ async fn release_lock(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// SPEC-15.516
 async fn unlink(
     State(state): State<ContactSyncRouterState>,
     RequireAuth(user): RequireAuth,
@@ -566,6 +588,7 @@ struct RemoveImportedDataRequest {
 
 /// POST with a body rather than DELETE: it takes a reason, and it is not a
 /// delete of the resource at this path.
+// SPEC-15.516
 async fn remove_imported_data(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -600,6 +623,7 @@ struct CallbackQuery {
 /// at this, and the outcome belongs on the Settings page they started from.
 /// The reason is a flag in the query, never the provider's text, because this
 /// URL ends up in a browser history.
+// SPEC-15.517
 async fn callback(
     State(state): State<ContactSyncRouterState>,
     Query(query): Query<CallbackQuery>,
@@ -627,6 +651,7 @@ async fn callback(
 /// MAPPS-1101: POST, not GET, same reasoning as `begin_connect` (writes a
 /// state row; a GET that mutates is a GET a browser can be made to
 /// perform). Admin-gated.
+// SPEC-15.502
 async fn begin_microsoft_connect(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -641,6 +666,7 @@ async fn begin_microsoft_connect(
 
 /// MAPPS-1101: thin wrapper around the shared disconnect path with
 /// provider = "microsoft". Admin-gated.
+// SPEC-15.503
 async fn disconnect_microsoft(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
@@ -658,6 +684,7 @@ async fn disconnect_microsoft(
 /// shape as `callback` for Google: always a redirect back to the SPA, the
 /// reason is a flag in the query (never Microsoft's text, because the URL
 /// ends up in a browser history).
+// SPEC-15.517
 async fn microsoft_callback(
     State(state): State<ContactSyncRouterState>,
     Query(query): Query<CallbackQuery>,

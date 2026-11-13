@@ -62,6 +62,7 @@ use crate::utils::error::AppError;
 /// `vcard` is an uploaded file (PMS-1290): one tenant-level source row whose
 /// reads are the file a run imports, so it is never scheduled and has no
 /// credential.
+// SPEC-15.670
 pub const SUPPORTED: &[&str] = &["google", "vcard", "icloud", "microsoft"];
 
 /// A group a source may offer for the records that carry no group at all, so
@@ -71,6 +72,7 @@ pub const SUPPORTED: &[&str] = &["google", "vcard", "icloud", "microsoft"];
 pub const UNGROUPED_ID: &str = "mokosh:ungrouped";
 
 /// Whether [`build`] can produce a provider for this discriminator.
+// SPEC-15.670
 pub fn is_supported(provider: &str) -> bool {
     SUPPORTED.contains(&provider)
 }
@@ -111,6 +113,7 @@ pub struct Words {
 /// this does not know is one no build serves ([`is_supported`] refuses it before
 /// any of these strings can be shown), and a wrong-but-generic noun is a better
 /// failure than a panic on the Settings card.
+// SPEC-15.671
 pub fn words(provider: &str) -> Words {
     match provider {
         "google" => Words {
@@ -310,6 +313,7 @@ pub enum SourceError {
     Failed(String),
 }
 
+// SPEC-15.672
 impl std::fmt::Display for SourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -324,6 +328,7 @@ impl std::fmt::Display for SourceError {
     }
 }
 
+// SPEC-15.672
 impl From<SourceError> for AppError {
     fn from(error: SourceError) -> Self {
         AppError::Integration(error.to_string())
@@ -354,6 +359,7 @@ pub trait ContactSyncProvider: Send + Sync {
     /// read as deletion in the source, so an implementation that returns the
     /// pages it managed to fetch before an error would tombstone every contact
     /// on the pages it did not.
+    // SPEC-15.673
     async fn changes_since(&self, sync_token: Option<&str>) -> SourceResult<SourceChanges>;
 
     /// Whether a full read is the WHOLE source, so a linked record absent from
@@ -361,6 +367,7 @@ pub trait ContactSyncProvider: Send + Sync {
     /// file (PMS-1290), which holds whatever someone exported: a contact
     /// missing from today's file is not a contact deleted anywhere, and
     /// reading it as one would flag every contact the last file imported.
+    // SPEC-15.673
     fn lists_everything(&self) -> bool {
         true
     }

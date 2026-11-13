@@ -47,6 +47,7 @@ use uuid::Uuid;
 use crate::modules::auth::tenant::TenantId;
 use crate::utils::error::{AppError, AppResult};
 
+// SPEC-13.432: alphabet and length of a company prefix.
 /// Unambiguous when read aloud or written by hand: no I, L, O, 0 or 1.
 pub const PREFIX_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
@@ -81,6 +82,7 @@ impl NumberScheme {
     /// value on the way in (`validate_setting_value`), so a value outside the
     /// set can only be a hand-edited row, and refusing every invoice would be
     /// a worse answer to it than numbering one the old way.
+    // SPEC-13.433: only the exact value `company_prefix` opts in.
     pub fn from_setting(value: Option<&str>) -> Self {
         match value {
             Some("company_prefix") => Self::CompanyPrefix,
@@ -90,6 +92,7 @@ impl NumberScheme {
 }
 
 /// One random prefix. Uniqueness is the index's job, not this function's.
+// SPEC-13.432: a random draw, never derived from the company name.
 pub fn generate_prefix() -> String {
     use rand::Rng;
     let mut rng = rand::rng();
@@ -108,6 +111,7 @@ pub fn generate_prefix() -> String {
 /// invoices for one company cannot overwrite each other: the loser reads back
 /// what the winner installed. A unique violation means two DIFFERENT companies
 /// drew the same prefix, which retries with a fresh draw.
+// SPEC-13.435, SPEC-13.436, SPEC-13.437: existing prefix, null-guarded assign, bounded retry.
 pub async fn ensure_company_prefix(
     tx: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -168,6 +172,7 @@ pub async fn ensure_company_prefix(
 /// Gap-free by construction: the row is updated inside the caller's
 /// transaction, so a create that rolls back gives the number back, and a
 /// concurrent create blocks on the row rather than reading a stale counter.
+// SPEC-13.438, SPEC-13.439: row-based counter on the caller's transaction, gap-free.
 pub async fn next_company_number(
     tx: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -211,12 +216,14 @@ pub async fn next_company_number(
 }
 
 /// Format a number under the per-customer scheme.
+// SPEC-13.440: six-digit zero padding, wider numbers grow.
 pub fn format_company_number(prefix: &str, sequence: i32) -> String {
     format!("{prefix}-{sequence:06}")
 }
 
 /// Read the tenant's chosen scheme. Runs on the caller's tenant-GUC
 /// connection because `tenant_settings` is RLS-covered.
+// SPEC-13.434: tenant setting billing_prefs/invoice_numbering.
 pub async fn read_scheme(
     tx: &mut sqlx::PgConnection,
     tenant_id: TenantId,

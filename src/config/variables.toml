@@ -1,33 +1,40 @@
-# SPEC-1 and 2.148: documentation data for scripts/config-docs.nu, not read by declare_keys! or any
+# documentation data for scripts/config-docs.nu, not read by declare_keys! or any
 # Rust code; it carries since/required/changelog facts for variables read outside the registry.
 # Release facts `declare_keys!` cannot carry (PMS-1442); `just config-docs` renders them.
 # [[variable]]: read outside crate::config::get; `required` = boot refuses it outside dev/test.
 
+# SPEC-6.34, SPEC-6.4: the since/required facts of every variable read outside the registry.
 [[variable]]
+# SPEC-6.65
+# SPEC-2.225
 name = "MOKOSH_DEPLOYMENT_MODE"
 since = "v0.14.0"
 required = true
 reader = "src/utils/deployment.rs"
 
 [[variable]]
+# SPEC-6.15
 name = "CONFIG_BACKEND"
 since = "v0.14.0"
 required = false
 reader = "src/config/mod.rs"
 
 [[variable]]
+# SPEC-6.70
 name = "SECRET_BACKEND"
 since = "v0.14.0"
 required = false
 reader = "src/secrets/mod.rs"
 
 [[variable]]
+# SPEC-6.72
 name = "APP_SECRET_BACKEND"
 since = "v0.16.0"
 required = false
 reader = "src/app_secrets/mod.rs"
 
 [[variable]]
+# SPEC-6.74
 name = "BUNYIP_SECRETS_URL"
 since = "v0.18.0"
 required = false
@@ -46,6 +53,7 @@ required = false
 reader = "src/app_secrets/bunyip.rs"
 
 [[variable]]
+# SPEC-6.76
 name = "GOOGLE_CONTACTS_CLIENT_ID"
 since = "v0.14.0"
 required = false
@@ -106,6 +114,7 @@ required = false
 reader = "src/app_secrets/mod.rs"
 
 [[variable]]
+# SPEC-6.67
 name = "MOKOSH_ADMIN_DATABASE_URL"
 since = "v0.4.0"
 required = false
@@ -124,6 +133,7 @@ required = false
 reader = "src/db/provision.rs"
 
 [[variable]]
+# SPEC-6.71
 name = "INFISICAL_PROJECT_ID"
 since = "v0.1.0"
 required = false
@@ -148,18 +158,21 @@ required = false
 reader = "src/secrets/infisical.rs"
 
 [[variable]]
+# SPEC-6.93
 name = "STORAGE_PROVIDER"
 since = "v0.15.0"
 required = false
 reader = "src/storage/env.rs"
 
 [[variable]]
+# SPEC-6.94
 name = "STORAGE_ROOT"
 since = "v0.15.0"
 required = false
 reader = "src/storage/env.rs"
 
 [[variable]]
+# SPEC-6.95
 name = "STORAGE_S3_ENDPOINT"
 since = "v0.15.0"
 required = false
@@ -196,6 +209,7 @@ required = false
 reader = "src/storage/env.rs"
 
 [[variable]]
+# SPEC-6.38: a retired name refuses boot, with its replacement named.
 name = "STORAGE_BACKEND"
 since = "v0.14.0"
 required = false
@@ -252,6 +266,7 @@ reader = "src/storage/env.rs"
 deprecated = { release = "v0.15.0", replacement = "STORAGE_S3_SECRET_ACCESS_KEY", issue = "PMS-1317" }
 
 [[variable]]
+# SPEC-6.64
 name = "RUST_LOG"
 since = "v0.1.0"
 required = false

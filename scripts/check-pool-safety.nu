@@ -17,6 +17,8 @@
 # SPEC-10.171: 8-line lookback window; migrator_pool() calls are exempt.
 const LOOKBACK = 8
 
+# SPEC-10.356: lookback includes comments
+
 def main [] {
     let files = (glob src/**/*.rs | where {|f| not ($f | str contains 'src/db/pool.rs') })
     let violations = (

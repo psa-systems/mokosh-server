@@ -271,6 +271,7 @@ impl SlaService {
         policy_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<SlaTargetResponse>, u64)> {
+        // SPEC-7.1033: unknown policy yields an empty page and no ORDER BY.
         // SPEC-7.81: tenant-scopes via the policy join (p.tenant_id = $1 AND p.id = $2),
         // so a caller cannot enumerate another tenant's targets by guessing a policy id.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -320,6 +321,7 @@ impl SlaService {
         .bind(tenant_id)
         .fetch_one(&mut *tx)
         .await?;
+        // SPEC-7.1032: foreign or unknown policy is 404 "SLA policy"; delete_target 404s "SLA target".
         if !exists {
             return Err(AppError::NotFound("SLA policy".to_string()));
         }
@@ -436,6 +438,7 @@ impl SlaService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-7.1030: only the three create paths write an audit record.
         audit_write(
             &mut *tx,
             tenant_id,
@@ -665,6 +668,7 @@ impl SlaService {
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn evaluate_for_ticket(&self, tenant_id: TenantId, ticket_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.1038: created_at is the clock start for both due times.
         let row: Option<(Option<Uuid>, Uuid, DateTime<Utc>)> = sqlx::query_as(
             r#"SELECT sla_id, priority_id, created_at FROM tickets
                WHERE tenant_id = $1 AND id = $2"#,
@@ -719,6 +723,7 @@ impl SlaService {
         .bind(priority_id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-7.1040: the read transaction is dropped without commit.
         drop(tx);
         // SPEC-7.123: no sla_targets row for (policy_id, priority_id)
         // is a no-op with no write.
@@ -747,6 +752,7 @@ impl SlaService {
 
         // SPEC-7.128: the final UPDATE runs in its own tenant-scoped transaction,
         // separate from and committed independently of the read above.
+        // SPEC-7.1039: sla_due_date = resolution_due; NULL hours overwrite the due column with NULL.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"UPDATE tickets SET first_response_due = $3, resolution_due = $4,
@@ -804,6 +810,7 @@ impl SlaService {
 
         let schedule = BusinessSchedule::parse(&timezone, &schedule_json);
 
+        // SPEC-7.1037: nothing in the API writes business_hours.holidays.
         // SPEC-7.126: holidays are the union of every holiday_calendars row referenced by
         // the holidays UUID[] column, tenant-scoped; empty or NULL skips the query.
         let mut holidays: HashSet<NaiveDate> = HashSet::new();
@@ -844,6 +851,7 @@ struct PolicyRow {
     is_default: Option<bool>,
 }
 
+// SPEC-7.1031: responses echo request values; NULL is_default reads as false.
 impl From<PolicyRow> for SlaPolicyResponse {
     fn from(r: PolicyRow) -> Self {
         Self {

@@ -16,6 +16,7 @@ use validator::Validate;
 /// Distinct from `crate::modules::auth::CurrentUser` (staff plane) so
 /// a staff-plane extractor cannot silently pick up a contact bearer +
 /// vice versa. The JWT `typ` claim is checked before this row lands.
+// SPEC-5.433
 #[derive(Debug, Clone)]
 pub struct ContactSession {
     pub id: Uuid,
@@ -48,6 +49,7 @@ pub struct ContactSession {
 /// JWT claims for the `typ: "contact"` token. Mirrors the shape of the
 /// pre-pivot portal token but with a fresh `typ` string so a staff
 /// verifier cannot accept it + vice versa.
+// SPEC-5.437
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactJwtClaims {
     pub sub: Uuid,
@@ -75,6 +77,7 @@ pub struct ContactJwtClaims {
 /// 16-char Crockford, kept for one release cycle so live invitation
 /// emails from prompts 003-010 keep working). At least one of the two
 /// must be present; if both are, `portal_id` wins.
+// SPEC-5.440
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct ContactLoginRequest {
     /// Company's 9-digit numeric Portal ID. Preferred over `slug`.
@@ -163,6 +166,7 @@ pub struct ContactMfaSetupResponse {
 /// possession of the authenticator with one live code, and re-proves
 /// the password so an enrolment started with a stolen token cannot be
 /// finished with it either.
+// SPEC-5.479
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct ContactMfaEnableRequest {
     #[validate(length(min = 6, max = 8, message = "code must be 6-8 digits"))]
@@ -181,6 +185,7 @@ pub struct ContactMfaEnableResponse {
 /// PMS-1063: `POST /api/v1/contact/auth/me/mfa/disable` body. Needs
 /// the current password AND a live code (or a recovery code) so a
 /// stolen access token cannot quietly remove the second factor.
+// SPEC-5.480
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct ContactMfaDisableRequest {
     #[validate(length(min = 1, message = "current_password is required"))]
@@ -195,6 +200,7 @@ pub struct ContactMfaDisableRequest {
 /// `contact` is populated on the full-session return; `mfa_required =
 /// true` returns everything else empty so the SPA re-prompts for a
 /// TOTP code (mirrors the staff-side pre-signal shape).
+// SPEC-5.445, SPEC-5.469
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactLoginResponse {
     pub access_token: String,
@@ -407,6 +413,7 @@ pub struct ActivityItem {
 /// without needing to round-trip the full contact row. Email is NOT
 /// accepted here - the staff CRM owns portal identity, so contacts
 /// cannot self-serve their own email address change via the portal.
+// SPEC-5.473
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct ContactSelfUpdateRequest {
     #[validate(length(min = 1, max = 100))]
@@ -459,6 +466,7 @@ pub struct PortalAccessRequestResponse {
 /// to know that `invoices:pay` and `invoices:download_pdf` are separate
 /// capability strings, and the column must never hold free text an MSP has to
 /// interpret.
+// SPEC-5.485
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct PortalAccessRequest {
     pub area: String,

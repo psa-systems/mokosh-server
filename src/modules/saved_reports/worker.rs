@@ -56,6 +56,7 @@ impl ScheduledReportsWorker {
         Self { db, reports }
     }
 
+    // SPEC-15.1629, SPEC-15.1632, SPEC-15.1633
     /// Process up to `limit` due schedules in a single transaction.
     /// Exposed publicly so the integration test can drive the worker
     /// deterministically (no sleep / no spawn).
@@ -156,6 +157,7 @@ impl ScheduledReportsWorker {
         Ok(stats)
     }
 
+    // SPEC-15.1630, SPEC-15.1631
     /// Run one schedule end-to-end: materialise via the executor,
     /// render to CSV, look up the recipient, and INSERT into
     /// `notifications` so the DispatcherWorker sends the email.
@@ -230,6 +232,7 @@ impl ScheduledReportsWorker {
 
 #[async_trait]
 impl Job for ScheduledReportsWorker {
+    // SPEC-15.1629: job name
     fn name(&self) -> &'static str {
         "scheduled_reports"
     }
@@ -242,6 +245,7 @@ impl Job for ScheduledReportsWorker {
     }
 }
 
+// SPEC-15.1630
 /// Render the executor's `(aliases, rows)` pair into a CSV string.
 /// Each row's JSON object is keyed by alias; missing keys land as
 /// empty cells. Values are stringified with `serde_json::to_string`
@@ -274,6 +278,7 @@ fn render_csv(aliases: &[String], rows: &[serde_json::Value]) -> String {
     out
 }
 
+// SPEC-15.1630
 /// Wrap a cell in CSV quotes when it contains a comma, quote, or
 /// newline. Doubles internal quotes per RFC 4180.
 fn csv_quote(s: &str) -> String {

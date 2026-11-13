@@ -187,6 +187,7 @@ impl BillingService {
     /// separately so no excluded row goes unaccounted for. If the two drift,
     /// this starts explaining the absence of rows that were never eligible for
     /// another reason, which is worse than the message it replaced.
+    // SPEC-13.29
     async fn uninvoiceable_time_for_company(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -253,6 +254,7 @@ impl BillingService {
     /// with `billing_prefs/invoice_numbering`, and the invoices they already
     /// issued keep the numbers they have, because a number is a stored string
     /// on the row it belongs to.
+    // SPEC-13.20
     async fn next_invoice_number(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -272,6 +274,7 @@ impl BillingService {
     }
 
     /// The pre-PMS-979 shape: one counter for the whole tenant, `INV-000042`.
+    // SPEC-13.20
     async fn next_tenant_invoice_number(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -318,6 +321,7 @@ impl BillingService {
     /// `amount_paid` under READ COMMITTED and the later write discards the
     /// earlier one. Every path that mutates an invoice's payment state takes
     /// this lock first, in the same order, so they queue rather than deadlock.
+    // SPEC-13.95
     async fn lock_invoice_totals(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -393,6 +397,7 @@ impl BillingService {
     /// paid, and stamping it would put a payment date on money nobody sent, so
     /// a fully credited invoice reads `paid` with no payment date - which is
     /// the honest pair: nothing is owed and nobody paid.
+    // SPEC-13.94
     async fn recompute_invoice_balance(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -463,6 +468,7 @@ impl BillingService {
     /// `update_invoice` does, and deliberately NOT through
     /// `recompute_invoice_balance`: that derives `status` for a payment event
     /// and its fallback arm is `sent`, which would flip a draft.
+    // SPEC-13.24, SPEC-13.25
     async fn apply_tax(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -521,6 +527,7 @@ impl BillingService {
 
     /// PMS-1029: the tenant's active default rate, if it has one. Shared with
     /// quotes (PMS-1038).
+    // SPEC-13.24
     pub(crate) async fn default_tax_rate(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -538,6 +545,7 @@ impl BillingService {
     /// PMS-1029: a `tax_rate_id` must name an active rate in the caller's
     /// tenant. An FK check bypasses RLS, so a foreign id would satisfy the
     /// constraint and link silently (the PMS-333 reason for payment terms).
+    // SPEC-13.24
     pub(crate) async fn assert_tax_rate_in_tenant(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -558,6 +566,7 @@ impl BillingService {
         })
     }
 
+    // SPEC-13.19
     async fn assert_payment_term_in_tenant(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -592,6 +601,7 @@ impl BillingService {
     /// the quote flow asks the same question and two copies would drift on
     /// what "a contact of this company" means. This stays as the name the
     /// invoice paths already call.
+    // SPEC-13.103
     async fn assert_billing_contact_for_company(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -617,6 +627,7 @@ impl BillingService {
     /// Only an ACTIVE default is consulted. A retired default is an operator
     /// forgetting to move the flag, and linking new invoices to a term that
     /// no longer appears in the picker would be surprising.
+    // SPEC-13.21
     pub(crate) async fn resolve_due_date(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -707,6 +718,7 @@ impl BillingService {
 
     /// Fill in `company_name` on a batch of invoice responses (PMS-186), and
     /// `billing_contact_name` beside it (PMS-1173).
+    // SPEC-13.13, SPEC-13.15
     async fn enrich_invoices(
         &self,
         tenant_id: TenantId,
@@ -750,6 +762,7 @@ impl BillingService {
     /// yields the first name alone rather than a trailing space, and a contact
     /// with neither yields nothing, which reads the same as having no billing
     /// contact at all - the honest answer, since a nameless row names nobody.
+    // SPEC-13.15
     async fn contact_name_map(
         &self,
         tenant_id: TenantId,
@@ -781,6 +794,7 @@ impl BillingService {
 
     /// Fill in `company_name` and `invoice_number` on a batch of payment
     /// responses (PMS-186).
+    // SPEC-13.88
     async fn enrich_payments(
         &self,
         tenant_id: TenantId,
@@ -897,6 +911,7 @@ impl BillingService {
     /// error means it does not, and no local row may be written, which
     /// is why this runs before the transaction opens rather than inside
     /// it.
+    // SPEC-13.26
     async fn issue_externally(
         &self,
         tenant_id: TenantId,
@@ -919,6 +934,7 @@ impl BillingService {
     /// their totals in the browser. Uses the same filter as `list_invoices`
     /// (including the overdue-in-tenant-day predicate) so a widget asking
     /// for "sent + overdue" gets the number the list would show.
+    // SPEC-13.9, SPEC-13.10
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn summarize_invoices(
         &self,
@@ -985,6 +1001,7 @@ impl BillingService {
     /// PMS-35: paginated + filterable invoice list. `lines` is left
     /// `None` on list rollups — the customer-facing UI fetches lines
     /// only when expanding a row.
+    // SPEC-13.7, SPEC-13.10, SPEC-13.11, SPEC-13.15
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_invoices(
         &self,
@@ -1130,6 +1147,7 @@ impl BillingService {
     /// `subtotal = sum(line.total)` and `total = subtotal + tax -
     /// discount`. `balance_due` is initialised to `total`; payments
     /// move it down via PMS-39.
+    // SPEC-13.19, SPEC-13.22, SPEC-13.23, SPEC-13.26
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_invoice(
         &self,
@@ -1499,6 +1517,7 @@ impl BillingService {
     /// this path mirrors that and leaves tax to a follow-up edit via
     /// `update_invoice`. Recurring contract-item billing is out of scope
     /// (depends on the unmerged PMS-64) and is a follow-up.
+    // SPEC-13.22, SPEC-13.27, SPEC-13.28, SPEC-13.30, SPEC-13.31, SPEC-13.32, SPEC-13.33
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_invoice_from_time_entries(
         &self,
@@ -1922,6 +1941,7 @@ impl BillingService {
     /// `now` is injected so tests (and the scheduler) drive periods
     /// deterministically. Returns the ids of invoices actually created
     /// this run (periods already billed contribute nothing). Tenant-scoped.
+    // SPEC-13.34, SPEC-13.35, SPEC-13.36
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn generate_due_recurring_invoices(
         &self,
@@ -2050,6 +2070,7 @@ impl BillingService {
     /// tick. A failure for one tenant is logged and skipped so a single
     /// bad tenant cannot stall the whole run. `now` is injected (the
     /// scheduler passes `Utc::now`).
+    // SPEC-13.41
     #[tracing::instrument(skip_all)]
     pub async fn generate_due_recurring_invoices_all_tenants(
         &self,
@@ -2096,6 +2117,7 @@ impl BillingService {
     /// gets its own transaction: one contract's conflict / empty-items
     /// skip never rolls back another contract's invoice.
     /// PMS-1037: every tenant's overdue reminders, once an hour.
+    // SPEC-13.43
     pub async fn send_due_reminders_all_tenants(&self, now: DateTime<Utc>) -> AppResult<u64> {
         let tenant_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM tenants")
             .fetch_all(self.db.migrator_pool())
@@ -2145,6 +2167,7 @@ impl BillingService {
     /// open, so an SMTP round trip never holds a tenant connection (or the
     /// invoice_reminders row locks) for the whole batch. A failed send
     /// releases its own claim in its own short transaction.
+    // SPEC-13.44, SPEC-13.47, SPEC-13.48, SPEC-13.49, SPEC-13.50
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn send_due_reminders(
         &self,
@@ -2242,6 +2265,7 @@ impl BillingService {
     /// `invoice_reminders` row. Returns only the invoices that were actually
     /// claimed (an invoice already reminded for this offset today is skipped,
     /// same as before).
+    // SPEC-13.45, SPEC-13.46, SPEC-13.47
     async fn claim_due_reminders(
         &self,
         tenant_id: TenantId,
@@ -2341,6 +2365,7 @@ impl BillingService {
         Ok(claims)
     }
 
+    // SPEC-13.25, SPEC-13.37, SPEC-13.38, SPEC-13.39, SPEC-13.40
     #[allow(clippy::too_many_arguments)]
     async fn generate_one_recurring_invoice(
         &self,
@@ -2567,6 +2592,7 @@ impl BillingService {
 
     /// PMS-41: list all tax rates for the tenant. Includes inactive
     /// ones so admins can see history; filter client-side as needed.
+    // SPEC-13.51
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_tax_rates(
         &self,
@@ -2598,6 +2624,7 @@ impl BillingService {
 
     /// PMS-41: create a tax rate. If `is_default = true`, demote any
     /// existing default first so only one rate is the tenant default.
+    // SPEC-13.52
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_tax_rate(
         &self,
@@ -2658,6 +2685,7 @@ impl BillingService {
     }
 
     /// PMS-41: update a tax rate. Same default-demote behaviour as create.
+    // SPEC-13.53
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_tax_rate(
         &self,
@@ -2738,6 +2766,7 @@ impl BillingService {
     }
 
     /// PMS-41: delete a tax rate.
+    // SPEC-13.54
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_tax_rate(
         &self,
@@ -2784,6 +2813,7 @@ impl BillingService {
     /// jurisdiction key (e.g. "US-CA", "EU-DE"). Returns the active
     /// rate for the supplied name, or the tenant's default if no name
     /// matches.
+    // SPEC-13.55
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn lookup_tax_rate(
         &self,
@@ -2826,6 +2856,7 @@ impl BillingService {
     /// non-secret metadata plus `configured` (whether a secret is stored). The
     /// decrypted config is never returned; decryption stays server-internal for
     /// actual gateway calls.
+    // SPEC-13.60, SPEC-13.61
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_payment_gateways(
         &self,
@@ -2910,6 +2941,7 @@ impl BillingService {
     /// stored secret; when omitted it preserves the existing secret (and is
     /// required when creating a gateway for the first time). The decrypted
     /// secret is never echoed back.
+    // SPEC-13.62, SPEC-13.63, SPEC-13.64, SPEC-13.65
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_payment_gateway(
         &self,
@@ -3164,6 +3196,7 @@ impl BillingService {
     }
 
     /// PMS-40: delete a payment gateway config. No-op if absent.
+    // SPEC-13.66
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_payment_gateway(
         &self,
@@ -3240,6 +3273,7 @@ impl BillingService {
     /// missing-gateway `None`. The row asserts a credential exists; if it does
     /// not, something moved half-way, and answering "not configured" would turn
     /// that into a payment integration that silently switched itself off.
+    // SPEC-13.68
     async fn gateway_plaintext(
         &self,
         tenant_id: Uuid,
@@ -3270,6 +3304,7 @@ impl BillingService {
     /// An `Err` from the store is not fatal to the caller: a gateway whose
     /// credential cannot be read still has a row to list, and the caller
     /// answers an empty field list rather than failing the whole read.
+    // SPEC-13.60
     async fn credential_state(
         &self,
         tenant_id: Uuid,
@@ -3317,6 +3352,7 @@ impl BillingService {
     /// discriminator) is reported as a single failed check rather than an
     /// error, because that IS the answer to "does this configuration work" and
     /// it is the one an admin most needs spelled out.
+    // SPEC-13.67
     pub async fn check_payment_gateway(
         &self,
         tenant_id: TenantId,
@@ -3418,6 +3454,7 @@ impl BillingService {
     /// without it - what every existing caller sends - and absent with several
     /// active is a request the server cannot answer, so it says so with the
     /// choices in the message rather than picking for the customer.
+    // SPEC-13.73
     fn pick_serveable(
         rows: Vec<(String, Option<String>)>,
         requested: Option<&str>,
@@ -3456,6 +3493,7 @@ impl BillingService {
     /// MAPPS-674: `pub` so the payment-methods service can build the same
     /// provider adapter the invoice pay path does, without a second reader
     /// of the encrypted credential.
+    // SPEC-13.73, SPEC-13.81
     pub async fn active_provider(
         &self,
         tenant_id: TenantId,
@@ -3578,6 +3616,7 @@ impl BillingService {
     ///
     /// It costs one secret read per active row, on a path that runs when an
     /// invoice is opened. That is the price of the answer being true.
+    // SPEC-13.74
     async fn usable_providers(
         &self,
         tenant_id: TenantId,
@@ -3656,6 +3695,7 @@ impl BillingService {
     /// away from is refused with no row; it is stated here rather than
     /// discovered. Trimming old rows on insert was considered and rejected for
     /// the same reason: it would let noise evict the history this exists for.
+    // SPEC-13.71
     #[allow(clippy::too_many_arguments)]
     pub async fn record_webhook_delivery(
         &self,
@@ -3697,6 +3737,7 @@ impl BillingService {
     /// this endpoint" is the single most informative sentence on the page when
     /// a payment did not record, and it is the one the application could not
     /// say before.
+    // SPEC-13.70
     pub async fn list_webhook_deliveries(
         &self,
         tenant_id: TenantId,
@@ -3731,6 +3772,7 @@ impl BillingService {
     /// single credential lookup runs on the BYPASSRLS `migrator_pool`, keyed by
     /// the `tenant_id` from the webhook URL path. `payment_gateway_configs` is
     /// RLS-covered and would fail closed on the unprivileged app pool here.
+    // SPEC-13.72
     pub async fn provider_for_webhook(
         &self,
         tenant_id: Uuid,
@@ -3764,6 +3806,7 @@ impl BillingService {
     /// invoice has nothing left to pay, or when the invoice is draft, pending,
     /// void, or written off. The payer is redirected to the returned `url`;
     /// the payment is reconciled later by the webhook, not by this call.
+    // SPEC-13.79, SPEC-13.80, SPEC-13.81
     pub async fn create_invoice_checkout_session(
         &self,
         tenant_id: TenantId,
@@ -3899,6 +3942,7 @@ impl BillingService {
     /// is accepted no matter which provider the customer eventually clicks;
     /// no active gateway falls back to [`DEFAULT_MIN_PARTIAL_AMOUNT`], the
     /// same value the pay endpoint would then reject the mint against.
+    // SPEC-13.77
     pub async fn min_partial_amount_across_active(
         &self,
         tenant_id: TenantId,
@@ -3921,6 +3965,7 @@ impl BillingService {
     /// clamps up to another provider's higher minimum on a dual-provider
     /// tenant, because by this point the payment is committed to the one
     /// gateway named.
+    // SPEC-13.77
     async fn provider_min_partial_amount(
         &self,
         tenant_id: TenantId,
@@ -3960,6 +4005,7 @@ impl BillingService {
     /// it answers is which tenant this is. It runs on the migrator pool for
     /// that reason and returns a tenant id and nothing else; every read and
     /// write after it is scoped to the tenant it returned.
+    // SPEC-13.86
     pub async fn tenant_for_external_organisation(
         &self,
         provider: &str,
@@ -3984,6 +4030,7 @@ impl BillingService {
     /// and `currency` come back with it because the caller is about to
     /// record what the provider collected, and both are what that record
     /// needs.
+    // SPEC-13.86
     pub async fn delegated_invoice(
         &self,
         tenant_id: TenantId,
@@ -4021,6 +4068,7 @@ impl BillingService {
     /// invoice (`external_provider IS NULL`) matches nothing. No
     /// `voided_by_id`, because no person did this; `void_reason` says who
     /// did.
+    // SPEC-13.87
     pub async fn void_delegated_invoice(
         &self,
         tenant_id: TenantId,
@@ -4081,6 +4129,7 @@ impl BillingService {
         Ok(true)
     }
 
+    // SPEC-13.83, SPEC-13.84
     #[allow(clippy::too_many_arguments)]
     pub async fn record_gateway_payment(
         &self,
@@ -4222,6 +4271,7 @@ impl BillingService {
     /// for a charge mokosh never recorded is a logged no-op (the provider may
     /// refund a payment taken outside mokosh). Recomputes the invoice's net
     /// payment state after inserting.
+    // SPEC-13.85
     pub async fn record_gateway_refunds(
         &self,
         tenant_id: TenantId,
@@ -4308,6 +4358,7 @@ impl BillingService {
 
     /// PMS-39: list payments. Optional filter on invoice_id and/or
     /// company_id.
+    // SPEC-13.88
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_payments(
         &self,
@@ -4377,6 +4428,7 @@ impl BillingService {
     /// invoice's `amount_paid` is bumped and `balance_due` recomputed
     /// in the same transaction; the status moves to `paid` (or
     /// `partially_paid`) accordingly.
+    // SPEC-13.90, SPEC-13.91
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_payment(
         &self,
@@ -4532,6 +4584,7 @@ impl BillingService {
     /// right call for unposted payments; once a payment has been
     /// posted to accounting it should be voided through a credit
     /// note instead - which is out of scope for this commit.
+    // SPEC-13.92
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_payment(
         &self,
@@ -4601,6 +4654,8 @@ impl BillingService {
     /// `InvoiceStatus::is_frozen` invoices (sent, paid, partially paid,
     /// void, written off) - correction goes through a credit note,
     /// which is out of scope for this commit.
+    // SPEC-13.25, SPEC-13.96, SPEC-13.97, SPEC-13.98, SPEC-13.99, SPEC-13.100, SPEC-13.101, SPEC-13.102, SPEC-13.105,
+    // SPEC-13.106, SPEC-13.107, SPEC-13.108, SPEC-13.109, SPEC-13.111, SPEC-13.112, SPEC-13.113
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_invoice(
         &self,
@@ -5408,6 +5463,7 @@ impl BillingService {
     ///
     /// `to` goes through [`Self::assert_company_in_tenant`] (PMS-1367): an FK
     /// check bypasses RLS, so another tenant's company id would satisfy it.
+    // SPEC-13.104
     async fn assert_draft_can_move_company(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -5497,6 +5553,7 @@ impl BillingService {
     /// guard does not pick one either. `Err` is the sentence the operator
     /// sees, naming the company and what is missing, because "no recipient"
     /// is a state of the company rather than of the request.
+    // SPEC-13.105
     async fn resolve_invoice_recipient(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -5557,6 +5614,7 @@ impl BillingService {
     /// The logo store is built from the environment here rather than injected,
     /// the way every other consumer of `crate::storage` does it, so this does
     /// not widen a constructor that four call sites already use.
+    // SPEC-13.106
     async fn freeze_issuer(
         tx: &mut crate::db::TenantTransaction<'_>,
         tenant_id: TenantId,
@@ -5587,6 +5645,7 @@ impl BillingService {
     /// when there is not - which is every invoice sent before PMS-911, and
     /// every draft. A draft resolving live is right: it has not been sent, so
     /// there is nothing to preserve yet.
+    // SPEC-13.133
     pub async fn invoice_issuer(
         &self,
         tenant_id: TenantId,
@@ -5624,6 +5683,7 @@ impl BillingService {
     /// when the document names one. A company that cannot be read resolves to
     /// "Customer" rather than failing the render, the way `company_name`
     /// already degrades to `None`.
+    // SPEC-13.134
     pub async fn bill_to(
         &self,
         tenant_id: TenantId,
@@ -5636,6 +5696,7 @@ impl BillingService {
 
     /// The same read, in a transaction the caller owns, for the documents
     /// rendered inside their issuing transaction (PMS-959).
+    // SPEC-13.134
     async fn bill_to_in_tx(
         tx: &mut crate::db::TenantTransaction<'_>,
         tenant_id: TenantId,
@@ -5730,6 +5791,7 @@ impl BillingService {
     /// `billing_contact_id` rather than from the company's current pointer, for
     /// the reason the invoice reads its own column: reassigning the billing
     /// role must not change who a document already issued says it went to.
+    // SPEC-13.134
     pub async fn credit_to(
         &self,
         tenant_id: TenantId,
@@ -5748,6 +5810,7 @@ impl BillingService {
     /// different person, and PMS-954 made it a read model that stores nothing,
     /// so it renders from today exactly as its issuer and its branding already
     /// do. There is no historical recipient for it to name.
+    // SPEC-13.134
     pub async fn statement_account(
         &self,
         tenant_id: TenantId,
@@ -5784,6 +5847,7 @@ impl BillingService {
 
     /// PMS-911: the tenant's identity as it stands now, for a document that is
     /// not snapshotted (the statement).
+    // SPEC-13.133
     pub async fn tenant_issuer(
         &self,
         tenant_id: TenantId,
@@ -5838,6 +5902,7 @@ impl BillingService {
     /// `postal` and `other` are available whenever the invoice's status
     /// allows sending (draft, approved). On a frozen invoice every method
     /// is unavailable with the reason the send would refuse with.
+    // SPEC-13.115
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, invoice_id = %invoice_id))]
     pub async fn invoice_delivery_options(
         &self,
@@ -5893,6 +5958,7 @@ impl BillingService {
         })
     }
 
+    // SPEC-13.115
     async fn resolve_email_option(
         &self,
         tenant_id: TenantId,
@@ -5959,6 +6025,7 @@ impl BillingService {
     /// so the audit row survives the rollback of the one that just rolled
     /// back the send. Any failure here is logged and swallowed by the
     /// caller; the mail error itself is still what the caller returns.
+    // SPEC-13.108
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, invoice_id = %invoice_id))]
     async fn record_invoice_send_failed(
         &self,
@@ -5991,6 +6058,7 @@ impl BillingService {
         Ok(())
     }
 
+    // SPEC-13.108, SPEC-13.110
     async fn email_invoice(
         &self,
         tenant_id: TenantId,
@@ -6081,6 +6149,7 @@ impl BillingService {
     /// `None`. The rows are the customer-safe subset (see
     /// [`InvoiceLedgerPayment`]); the staff `/payments` list keeps the
     /// notes and gateway columns.
+    // SPEC-13.6, SPEC-13.93
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, invoice_id = %invoice_id))]
     pub async fn invoice_ledger(
         &self,
@@ -6138,6 +6207,7 @@ impl BillingService {
         })
     }
 
+    // SPEC-13.12
     pub async fn get_invoice(
         &self,
         tenant_id: TenantId,
@@ -6162,6 +6232,7 @@ impl BillingService {
     /// those past its date); refused with a 409 naming the status from `draft`
     /// (delete it), `paid`, `void` and `written_off`. No reversal in v1: if one
     /// is needed it is its own decision with its own audit shape.
+    // SPEC-13.17, SPEC-13.116
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn write_off_invoice(
         &self,
@@ -6300,6 +6371,7 @@ impl BillingService {
     ///   Both keep the credit-note route, which is what they are for.
     /// * One draft amendment at a time, so "what replaces this invoice" has one
     ///   answer while the correction is being written.
+    // SPEC-13.118
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn amend_invoice(
         &self,
@@ -6468,6 +6540,7 @@ impl BillingService {
         Ok(amendment)
     }
 
+    // SPEC-13.117
     pub async fn void_invoice(
         &self,
         tenant_id: TenantId,
@@ -6563,6 +6636,7 @@ impl BillingService {
     /// calling `enrich_invoices`, which opens its own transactions and cannot
     /// be reached from inside one. `enrich_invoices` stays for the list paths,
     /// where batching one query for many rows is the point.
+    // SPEC-13.11, SPEC-13.12, SPEC-13.13, SPEC-13.14
     async fn load_invoice(
         tx: &mut crate::db::TenantTransaction<'_>,
         tenant_id: TenantId,
@@ -6723,6 +6797,7 @@ impl BillingService {
     // PMS-333 payment terms lookup (mirrors work_types; single default/tenant).
     // ========================================================================
 
+    // SPEC-13.56
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_payment_terms(
         &self,
@@ -6748,6 +6823,7 @@ impl BillingService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-13.57
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_payment_term(
         &self,
@@ -6805,6 +6881,7 @@ impl BillingService {
         })
     }
 
+    // SPEC-13.58
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_payment_term(
         &self,
@@ -6843,6 +6920,7 @@ impl BillingService {
         Ok(row.into())
     }
 
+    // SPEC-13.59
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_payment_term(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -6881,6 +6959,7 @@ impl BillingService {
     /// Same seed-or-bump as [`Self::next_invoice_number`] (PMS-194) against a
     /// separate sequence, because a credit note is a different document and an
     /// accountant reading `INV-000042` expects an invoice.
+    // SPEC-13.121
     async fn next_credit_note_number(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -6921,6 +7000,7 @@ impl BillingService {
     /// provider round trip. Re-reading rather than reusing the pre-pass's
     /// row is the point: a concurrent credit or payment that changed the
     /// invoice between the two transactions must not be missed.
+    // SPEC-13.120
     async fn lock_and_check_credit_note_invoice(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -7011,6 +7091,7 @@ impl BillingService {
     /// The invoice row is locked FIRST and in the same order the payment paths
     /// take it (PMS-695), so a credit racing a payment on one invoice queues
     /// rather than losing one of the two writes.
+    // SPEC-13.119, SPEC-13.120, SPEC-13.121, SPEC-13.122
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_credit_note(
         &self,
@@ -7371,6 +7452,7 @@ impl BillingService {
     /// notes alone so the invoice walks back to whatever status it would have
     /// had. Without this the fix for a wrong invoice would itself be
     /// uncorrectable, which is the dead end this whole issue removes.
+    // SPEC-13.123
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn void_credit_note(
         &self,
@@ -7492,6 +7574,7 @@ impl BillingService {
     }
 
     /// PMS-953: one credit note with its lines.
+    // SPEC-13.124
     pub async fn get_credit_note(
         &self,
         tenant_id: TenantId,
@@ -7507,6 +7590,7 @@ impl BillingService {
     /// transaction renders the document from what is about to commit, and there
     /// is one assembly rather than two definitions of what a credit note
     /// contains.
+    // SPEC-13.124
     async fn load_credit_note(
         tx: &mut crate::db::TenantTransaction<'_>,
         tenant_id: TenantId,
@@ -7559,6 +7643,7 @@ impl BillingService {
     }
 
     /// PMS-953: credit notes for the tenant, newest first.
+    // SPEC-13.124
     pub async fn list_credit_notes(
         &self,
         tenant_id: TenantId,
@@ -7643,6 +7728,7 @@ impl BillingService {
     /// on the same statement. Listing both would double the charge unless the
     /// voided one showed as zero, which is a change to what a statement line
     /// means and belongs to PMS-954's model rather than here.
+    // SPEC-13.127
     const STATEMENT_ISSUED_INVOICE: &'static str = "status NOT IN ('draft', 'pending', 'void')";
 
     /// PMS-954: a company's account over a period.
@@ -7657,6 +7743,7 @@ impl BillingService {
     /// closed last month must show what was outstanding then, and those columns
     /// have moved since. That is also why `closing_balance` is arithmetic over
     /// the four buckets rather than a sum of today's balances.
+    // SPEC-13.126, SPEC-13.127, SPEC-13.128
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn build_statement(
         &self,
@@ -7915,6 +8002,7 @@ impl BillingService {
     /// constraint and links silently. That is the PMS-333 hole for
     /// `payment_term_id` and the PMS-955 one for `product_id`; this is the
     /// same check for the company every billing document hangs off.
+    // SPEC-13.19
     async fn assert_company_in_tenant(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -7930,6 +8018,7 @@ impl BillingService {
             })
     }
 
+    // SPEC-13.19, SPEC-13.132
     async fn assert_product_sellable(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -7952,6 +8041,7 @@ impl BillingService {
         }
     }
 
+    // SPEC-13.130
     pub async fn list_products(
         &self,
         tenant_id: TenantId,
@@ -8000,6 +8090,7 @@ impl BillingService {
         ))
     }
 
+    // SPEC-13.130
     pub async fn get_product(
         &self,
         tenant_id: TenantId,
@@ -8021,6 +8112,7 @@ impl BillingService {
             .ok_or_else(|| AppError::NotFound("Product".to_string()))
     }
 
+    // SPEC-13.130
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_product(
         &self,
@@ -8080,6 +8172,7 @@ impl BillingService {
         Ok(ProductResponse::from(row))
     }
 
+    // SPEC-13.130, SPEC-13.132
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_product(
         &self,
@@ -8160,6 +8253,7 @@ impl BillingService {
     /// turned into a 409 naming the alternative rather than a 500: retiring a
     /// product an MSP has sold is `is_active = false`, because the documents
     /// that sold it still name it.
+    // SPEC-13.131
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_product(
         &self,
@@ -8211,6 +8305,7 @@ impl BillingService {
 
     /// Turn the two catalog uniqueness violations into a 409 that names which
     /// one was hit, rather than a 500 quoting an index name.
+    // SPEC-13.130
     fn product_conflict(e: sqlx::Error) -> AppError {
         if let sqlx::Error::Database(db) = &e {
             if db.code().as_deref() == Some("23505") {
@@ -8278,6 +8373,7 @@ struct RecurringItemRow {
 /// period per cycle (PMS-404).
 /// `pub(crate)` for `pms1572_period_agreement_tests` alone; every caller is
 /// in this file.
+// SPEC-13.35
 pub(crate) fn current_billing_period(
     billing_cycle: &str,
     start_date: NaiveDate,
@@ -8372,6 +8468,7 @@ impl UninvoiceableTime {
     ///
     /// Nothing logged at all means the original message, which is the one case
     /// it was ever true in.
+    // SPEC-13.29
     fn into_message(self) -> String {
         // Ordered by how much the reader needs it. An unarmed entry is the
         // surprising one and comes first; already-invoiced is the reassuring
@@ -8578,6 +8675,7 @@ struct PaymentRow {
     created_at: chrono::DateTime<Utc>,
 }
 
+// SPEC-13.17
 impl From<PaymentRow> for PaymentResponse {
     fn from(r: PaymentRow) -> Self {
         Self {
@@ -8614,6 +8712,7 @@ struct InvoiceLineRow {
     is_taxable: bool,
 }
 
+// SPEC-13.17
 impl From<InvoiceLineRow> for InvoiceLineResponse {
     fn from(r: InvoiceLineRow) -> Self {
         Self {
@@ -8688,6 +8787,7 @@ struct InvoiceRow {
     external_number: Option<String>,
 }
 
+// SPEC-13.17
 impl From<InvoiceRow> for InvoiceResponse {
     fn from(r: InvoiceRow) -> Self {
         Self {
@@ -9089,6 +9189,7 @@ struct CreditNoteRow {
     external_number: Option<String>,
 }
 
+// SPEC-13.17
 impl From<CreditNoteRow> for CreditNoteResponse {
     fn from(r: CreditNoteRow) -> Self {
         Self {
@@ -9134,6 +9235,7 @@ struct CreditNoteLineRow {
     sort_order: Option<i32>,
 }
 
+// SPEC-13.17
 impl From<CreditNoteLineRow> for CreditNoteLineResponse {
     fn from(r: CreditNoteLineRow) -> Self {
         Self {
@@ -9161,6 +9263,7 @@ struct StatementInvoiceRow {
     total: Decimal,
 }
 
+// SPEC-13.17
 impl From<StatementInvoiceRow> for StatementInvoiceLine {
     fn from(r: StatementInvoiceRow) -> Self {
         Self {
@@ -9184,6 +9287,7 @@ struct StatementPaymentRow {
     invoice_number: Option<String>,
 }
 
+// SPEC-13.17
 impl From<StatementPaymentRow> for StatementPaymentLine {
     fn from(r: StatementPaymentRow) -> Self {
         Self {
@@ -9227,6 +9331,7 @@ struct StatementWriteOffRow {
     write_off_reason: Option<String>,
 }
 
+// SPEC-13.140
 impl From<StatementWriteOffRow> for StatementWriteOffLine {
     fn from(r: StatementWriteOffRow) -> Self {
         Self {
@@ -9275,6 +9380,7 @@ impl From<StatementCreditRow> for StatementCreditLine {
 /// `invoice_lines`), and a product can only be referenced from its own tenant
 /// (`assert_product_sellable`), so no tenant filter is repeated in the
 /// subselects.
+// SPEC-13.139
 const PRODUCT_COLUMNS: &str = "\
     p.id, p.sku, p.name, p.description, p.unit_price, p.unit, p.is_taxable, \
     p.is_active, p.created_at, p.updated_at, \
@@ -9296,6 +9402,7 @@ struct ProductRow {
     updated_at: chrono::DateTime<Utc>,
 }
 
+// SPEC-13.139
 impl From<ProductRow> for ProductResponse {
     fn from(r: ProductRow) -> Self {
         Self {

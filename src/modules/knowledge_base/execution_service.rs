@@ -32,6 +32,7 @@ impl KbExecutionService {
         Self { db, kb }
     }
 
+    // SPEC-15.1109, SPEC-15.1110
     /// Resolve the ticket for a tenant, failing with 404 when the
     /// ticket does not exist under this tenant. The RLS policy on
     /// `tickets` already fails-closed on a mismatched tenant, so this
@@ -55,6 +56,7 @@ impl KbExecutionService {
         Ok(())
     }
 
+    // SPEC-15.1110
     /// Create a new execution: renders the article through the Phase
     /// 1a path, parses the rendered Markdown for GFM task-list items,
     /// and writes the execution + its step rows in one transaction.
@@ -145,6 +147,7 @@ impl KbExecutionService {
         self.get_execution(tenant_id, execution_id).await
     }
 
+    // SPEC-15.1112
     /// Full execution + step list by id, scoped to the caller's tenant.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, id = %id))]
     pub async fn get_execution(
@@ -188,6 +191,7 @@ impl KbExecutionService {
         Ok(row.into_response(steps))
     }
 
+    // SPEC-15.1109
     /// List executions on a ticket, newest first, with the rolled-up
     /// step counts for the ticket panel's progress bar.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, ticket_id = %ticket_id))]
@@ -230,6 +234,7 @@ impl KbExecutionService {
         Ok(rows.into_iter().map(SummaryRow::into_summary).collect())
     }
 
+    // SPEC-15.1113
     /// Flip the checked state on one step. Idempotent: a check on an
     /// already-checked step keeps its original `checked_at` and
     /// `checked_by_user_id` (no-op), an uncheck on an unchecked step
@@ -334,6 +339,7 @@ mod rows {
     }
 
     impl ExecutionRow {
+        // SPEC-15.1112
         pub(super) fn into_response(self, steps: Vec<StepRow>) -> KbExecutionResponse {
             let variable_values: BTreeMap<String, String> =
                 serde_json::from_value(self.variable_values).unwrap_or_default();

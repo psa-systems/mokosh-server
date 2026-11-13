@@ -32,9 +32,11 @@ use serde::Deserialize;
 
 use crate::utils::error::{AppError, AppResult};
 
+// SPEC-15.1083
 /// The quote may be long (a paragraph), the context is deliberately short:
 /// it disambiguates, it does not re-quote.
 pub const EXACT_MAX: usize = 2000;
+// SPEC-15.1084
 pub const CONTEXT_MAX: usize = 64;
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +62,7 @@ struct TextPositionSelector {
     end: i64,
 }
 
+// SPEC-15.1082, SPEC-15.1083, SPEC-15.1084, SPEC-15.1085
 /// Refuse an anchor whose shape the client cannot have meant. `Ok` says
 /// nothing about whether it resolves.
 pub fn validate(anchor: &serde_json::Value) -> AppResult<()> {

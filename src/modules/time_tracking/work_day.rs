@@ -112,6 +112,7 @@ impl SegmentRow {
 /// reason: PMS-1145 made `PUT /workday/segments/{id}` able to close a segment
 /// at a time the person chooses, so the recovery that keeps the record honest
 /// is available and worth naming here.
+// SPEC-14.42: the 409 text names the open segment's date and elapsed time.
 fn open_segment_conflict(open: &SegmentRow, now: DateTime<Utc>) -> String {
     let running = fmt_elapsed(open.minutes(now));
     if open.kind == SEGMENT_KIND_BREAK {
@@ -147,6 +148,7 @@ fn fmt_elapsed(minutes: i64) -> String {
 /// The person's open segment, whatever its kind or date, locked for the rest
 /// of the transaction so two transitions on one clock queue rather than both
 /// reading the same open row.
+// SPEC-14.42, SPEC-14.43: the person's single open segment, locked for the transaction.
 async fn open_segment(
     conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -164,6 +166,7 @@ async fn open_segment(
         .await?)
 }
 
+// SPEC-14.43, SPEC-14.44: closes at the given instant.
 async fn close_segment(
     conn: &mut sqlx::PgConnection,
     id: Uuid,
@@ -183,6 +186,7 @@ async fn close_segment(
 /// what closes the race between two clock-ins that both saw nothing open, the
 /// way `active_timers.UNIQUE(user_id)` does for the item timer; it surfaces as
 /// the same 409 the pre-check gives.
+// SPEC-14.42: a unique-index race surfaces as 409.
 async fn open_new_segment(
     conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -216,6 +220,7 @@ async fn open_new_segment(
 /// Break tracking is a tenant setting (PMS-943), off until an employer says
 /// otherwise. With it off the break routes answer the way the module gate
 /// does, 404, so a disabled control reads like a route that does not exist.
+// SPEC-14.44: 404 "Break tracking" while the tenant setting is off.
 async fn require_break_tracking(
     service: &TimeTrackingService,
     tenant_id: TenantId,
@@ -247,6 +252,7 @@ struct BreakdownRow {
 /// 'employee'`, PMS-942, which by the migration 119 CHECK names neither), and
 /// whatever is left is client work with no work item, which PMS-942 says is
 /// the client's time and so must not be filed under Administrative.
+// SPEC-14.45: ticket, then project, then employee, else unattached; largest first.
 fn bucket(rows: Vec<BreakdownRow>) -> WorkDayBreakdown {
     let mut breakdown = WorkDayBreakdown::default();
     for row in rows {
@@ -314,6 +320,7 @@ impl TimeTrackingService {
     /// the dashboard's "today" already follows, PMS-253). Refused while any
     /// segment is open, whatever its date, because a day that was never
     /// clocked out is still that day.
+    // SPEC-14.42: refused while any segment of any date is open.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn clock_in(
         &self,
@@ -357,6 +364,7 @@ impl TimeTrackingService {
     /// The day is not recomputed anywhere, because there is nothing to
     /// recompute: PMS-950 derives every total from the segments on each read,
     /// which is the property that makes this operation safe at all.
+    // SPEC-14.47: policy check, date/order/future/reopen refusals, audited in the same transaction.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, segment_id = %segment_id))]
     pub async fn update_segment(
         &self,
@@ -472,6 +480,7 @@ impl TimeTrackingService {
     /// complete by construction, and `audit_log` holds what it was. Deleting
     /// the OPEN segment is allowed and is how a mis-tapped clock-in is undone
     /// - it leaves the person clocked out, which is what they were.
+    // SPEC-14.48: same policy as the correction; audited delete.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, segment_id = %segment_id))]
     pub async fn delete_segment(
         &self,
@@ -525,6 +534,7 @@ impl TimeTrackingService {
     /// cannot be written through `PUT /settings`, which validates it, but can
     /// exist from a hand-written row - and reading it as the default is the
     /// same fallback `NoteEditPolicy` takes for the same reason.
+    // SPEC-14.49: unset or unrecognised setting reads as owner_or_admin.
     async fn segment_edit_policy(&self, tenant_id: TenantId) -> AppResult<SegmentEditPolicy> {
         Ok(read_segment_editing(&self.db, tenant_id)
             .await?
@@ -534,6 +544,7 @@ impl TimeTrackingService {
 
     /// Clock out: close whichever segment is open. A day may end on a break,
     /// because the person went home from lunch.
+    // SPEC-14.43: closes work or break; 409 "Not clocked in" otherwise.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn clock_out(
         &self,
@@ -553,6 +564,7 @@ impl TimeTrackingService {
     /// Start a break: close the open `work` segment and open a `break` one at
     /// the same instant, in one transaction, so the day has no gap and no
     /// overlap between the two.
+    // SPEC-14.44: work closes and break opens at one instant in one transaction.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn start_break(
         &self,
@@ -586,6 +598,7 @@ impl TimeTrackingService {
 
     /// End a break: close the open `break` segment and reopen `work` on the
     /// same day at the same instant.
+    // SPEC-14.44: break closes and work reopens on the same day.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn end_break(
         &self,
@@ -617,6 +630,7 @@ impl TimeTrackingService {
     /// No `date` means the day of the open segment if there is one, else
     /// today in the user's own zone, so a reload finds the clock where it was
     /// left.
+    // SPEC-14.45, SPEC-14.46: day resolution and derived minute totals.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn work_day(
         &self,

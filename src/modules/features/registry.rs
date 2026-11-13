@@ -37,6 +37,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One admin-managed feature switch.
+// SPEC-15.2101: the registered switches
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
     /// The integrations overview (MAPPS-971, server PMS-1310). Gates nothing
@@ -195,6 +196,7 @@ impl FeatureToggles {
     /// An unknown key is ignored with one warning per process. Warned once
     /// rather than per load because the refresh runs every 60 seconds, and a
     /// stale row would otherwise produce a log line a minute forever.
+    // SPEC-15.2102
     pub fn from_rows<'a>(rows: impl IntoIterator<Item = (&'a str, bool)>) -> Self {
         let mut on = BTreeSet::new();
         for (key, enabled) in rows {
@@ -209,6 +211,7 @@ impl FeatureToggles {
         Self { on }
     }
 
+    // SPEC-15.2102
     pub fn is_enabled(&self, feature: Feature) -> bool {
         self.on.contains(&feature)
     }
@@ -220,6 +223,7 @@ impl FeatureToggles {
     /// no row appears as `false` instead of being absent. A client that had to
     /// tell "off" from "not in the map" would get that wrong once and then gate
     /// on the wrong thing.
+    // SPEC-15.2108
     pub fn as_map(&self) -> BTreeMap<&'static str, bool> {
         Feature::ALL
             .iter()
@@ -229,6 +233,7 @@ impl FeatureToggles {
 }
 
 /// Unknown keys already warned about, so a stale row warns once per process.
+// SPEC-15.2102
 fn warn_unknown_key_once(key: &str) {
     use std::sync::{Mutex, OnceLock};
     static WARNED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();

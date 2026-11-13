@@ -50,6 +50,7 @@ pub struct SearchCounts {
 /// preview without producing a dropdown that scrolls forever. The
 /// matching `count` field on the response reports the true total so
 /// the SPA can show "more results" affordance when it's tight.
+// SPEC-15.2121
 const SECTION_LIMIT: i64 = 5;
 
 #[derive(Clone)]
@@ -84,6 +85,7 @@ impl SearchService {
     /// (`NOBYPASSRLS`) serving connection a bare-pool read would fail the
     /// `tenant_isolation` policy closed and return an empty result set with a
     /// 200 - silently wrong.
+    // SPEC-15.2119, SPEC-15.2120, SPEC-15.2122
     pub async fn search(&self, tenant_id: Uuid, q: &str) -> AppResult<SearchResponse> {
         let trimmed = q.trim();
         if trimmed.is_empty() {
@@ -124,6 +126,7 @@ impl SearchService {
         })
     }
 
+    // SPEC-15.2121
     async fn search_tickets(
         conn: &mut sqlx::PgConnection,
         tenant_id: Uuid,
@@ -164,6 +167,7 @@ impl SearchService {
         Ok((hits, total))
     }
 
+    // SPEC-15.2121
     async fn search_contacts(
         conn: &mut sqlx::PgConnection,
         tenant_id: Uuid,
@@ -204,6 +208,7 @@ impl SearchService {
         Ok((hits, total))
     }
 
+    // SPEC-15.2121
     async fn search_companies(
         conn: &mut sqlx::PgConnection,
         tenant_id: Uuid,
@@ -239,6 +244,7 @@ impl SearchService {
         Ok((hits, total))
     }
 
+    // SPEC-15.2121
     async fn search_assets(
         conn: &mut sqlx::PgConnection,
         tenant_id: Uuid,
@@ -285,6 +291,7 @@ impl SearchService {
         Ok((hits, total))
     }
 
+    // SPEC-15.2121
     async fn search_projects(
         conn: &mut sqlx::PgConnection,
         tenant_id: Uuid,

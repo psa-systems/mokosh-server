@@ -58,10 +58,12 @@ pub struct ContactRouterState {
 /// the same service that backs the top-level `/api/v1/portal-roles`
 /// mount. Passing it in (rather than building a second one here) keeps
 /// the pool + audit ctx path identical across both surfaces.
+// SPEC-15.1: one router for companies, contacts, sites, industries, portal access
 pub fn contact_routes(
     contact_service: ContactService,
     portal_role_service: PortalRoleService,
 ) -> Router {
+    // SPEC-15.11: a failed client build is logged here and 500s the probe route
     let website_probe = match WebsiteProbeService::live() {
         Ok(service) => Some(service),
         Err(e) => {
@@ -83,6 +85,7 @@ pub fn contact_routes(
         // PMS-805: static segment, so it resolves ahead of the
         // `{company_id}` routes below (same shape as
         // `/contacts/field-values`).
+        // SPEC-15.9: static segments must resolve ahead of the id routes
         .route("/companies/website-probe", get(probe_company_website))
         .route("/companies/{company_id}", get(get_company))
         .route("/companies/{company_id}", put(update_company))
@@ -117,6 +120,7 @@ pub fn contact_routes(
         // PMS-583: distinct title/department values for the free-text
         // autocomplete. Static segment, so it resolves ahead of the
         // `{contact_id}` route below.
+        // SPEC-15.9: static segment ahead of /contacts/{contact_id}
         .route("/contacts/field-values", get(list_contact_field_values))
         .route("/contacts/{contact_id}", get(get_contact))
         .route("/contacts/{contact_id}", put(update_contact))
@@ -127,6 +131,7 @@ pub fn contact_routes(
         // these routes. `contact_routes` is nested at `/contacts` in
         // the top-level router, so these paths resolve as
         // `/api/v1/contacts/*` at the HTTP layer.
+        // SPEC-15.9: static segment ahead of /contacts/{contact_id}
         .route("/contacts/portal-roles", get(list_portal_roles))
         .route(
             "/contacts/{contact_id}/grant-portal-access",
@@ -183,6 +188,7 @@ pub fn contact_routes(
 /// the Companies + Contacts staff CRM. The presence of a decoded
 /// `ContactAuthState.session` is enough to short-circuit with 403; the
 /// staff path leaves that extension defaulted and passes through.
+// SPEC-15.2: a contact session never reaches the staff CRM, reads included
 async fn reject_contact_plane(request: Request, next: Next) -> Response {
     if let Some(state) = request.extensions().get::<ContactAuthState>() {
         if state.session.is_some() {
@@ -197,6 +203,7 @@ async fn reject_contact_plane(request: Request, next: Next) -> Response {
 // COMPANY HANDLERS
 // ============================================================================
 
+// SPEC-15.3: validated filter, paginated, enriched page
 async fn list_companies(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -221,6 +228,7 @@ async fn list_companies(
     Ok(Json(response))
 }
 
+// SPEC-15.5: body validated (422) before the service runs
 async fn create_company(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -237,6 +245,7 @@ async fn create_company(
     Ok(Json(company.into()))
 }
 
+// SPEC-15.4: enriched company; 404 outside the tenant
 async fn get_company(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -257,6 +266,7 @@ async fn get_company(
     Ok(Json(enriched))
 }
 
+// SPEC-15.5: body validated (422) before the service runs
 async fn update_company(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -280,6 +290,7 @@ async fn update_company(
 /// counts it reports are already visible on the company page. Gating it harder
 /// than the page it serves would only mean the dialog cannot explain itself to
 /// somebody who can already see the numbers.
+// SPEC-15.6: any staff caller, not manager-gated
 async fn company_deletion_preview(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -293,6 +304,7 @@ async fn company_deletion_preview(
     ))
 }
 
+// SPEC-15.7: manager gate
 async fn delete_company(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -306,6 +318,7 @@ async fn delete_company(
         .await
 }
 
+// SPEC-15.8: sort and over-cap per_page are 422
 async fn get_company_contacts(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -326,6 +339,7 @@ async fn get_company_contacts(
     )))
 }
 
+// SPEC-15.8: sort and over-cap per_page are 422
 async fn get_company_sites(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -359,11 +373,13 @@ pub struct WebsiteProbeQuery {
 /// determining that a site does not answer is a successful probe. Input that
 /// cannot be a website at all is a 400 instead, so the form can tell "you typed
 /// something that is not a URL" apart from "your site is down".
+// SPEC-15.12: 200 for reachable and unreachable, 400 for non-URL input
 async fn probe_company_website(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
     Query(query): Query<WebsiteProbeQuery>,
 ) -> Result<Response, AppError> {
+    // SPEC-15.10: per-tenant 429 with Retry-After
     if let Err(retry_after) = state.website_probe_limiter.check(*user.tenant()) {
         tracing::warn!(
             tenant_id = %user.tenant(),
@@ -474,6 +490,7 @@ async fn update_contact(
     Ok(Json(contact.into()))
 }
 
+// SPEC-15.7: manager gate
 async fn delete_contact(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -537,6 +554,7 @@ async fn update_site(
     Ok(Json(site.into()))
 }
 
+// SPEC-15.7: manager gate
 async fn delete_site(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -554,6 +572,7 @@ async fn delete_site(
 // COMPANY-INDUSTRY LOOKUP HANDLERS (PMS-601)
 // ============================================================================
 
+// SPEC-15.8, SPEC-15.13: open to any staff caller; sort is 422
 async fn list_company_industries(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -571,6 +590,7 @@ async fn list_company_industries(
     )))
 }
 
+// SPEC-15.13: admin-only write
 async fn create_company_industry(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -586,6 +606,7 @@ async fn create_company_industry(
     Ok(Json(row))
 }
 
+// SPEC-15.13: admin-only write
 async fn update_company_industry(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -601,6 +622,7 @@ async fn update_company_industry(
     Ok(Json(row))
 }
 
+// SPEC-15.13: admin-only write
 async fn delete_company_industry(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -617,6 +639,7 @@ async fn delete_company_industry(
 // mokosh-contact-login prompt 003: PORTAL-ACCESS LIFECYCLE HANDLERS
 // ============================================================================
 
+// SPEC-15.14: manager gate
 async fn list_portal_roles(
     State(state): State<ContactRouterState>,
     _manager: crate::modules::auth::RequireManager,
@@ -632,6 +655,7 @@ async fn list_portal_roles(
     Ok(Json(roles))
 }
 
+// SPEC-15.14: manager gate
 async fn get_contact_portal_role_ids(
     State(state): State<ContactRouterState>,
     _manager: crate::modules::auth::RequireManager,
@@ -645,6 +669,7 @@ async fn get_contact_portal_role_ids(
     Ok(Json(ids))
 }
 
+// SPEC-15.14, SPEC-15.16: manager gate; 200 with the grant outcome
 async fn grant_portal_access(
     State(state): State<ContactRouterState>,
     _manager: crate::modules::auth::RequireManager,
@@ -661,6 +686,7 @@ async fn grant_portal_access(
     Ok(Json(outcome))
 }
 
+// SPEC-15.14, SPEC-15.16: manager gate; 204
 async fn resend_portal_invite(
     State(state): State<ContactRouterState>,
     _manager: crate::modules::auth::RequireManager,
@@ -675,6 +701,7 @@ async fn resend_portal_invite(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+// SPEC-15.14, SPEC-15.16: manager gate; 204
 async fn replace_contact_portal_role_ids(
     State(state): State<ContactRouterState>,
     _manager: crate::modules::auth::RequireManager,
@@ -696,6 +723,7 @@ async fn replace_contact_portal_role_ids(
 /// Any authenticated staff member may read them; granting is the manager gate
 /// below. A technician looking at a contact should be able to see that the
 /// customer asked for something, even if answering it is not theirs to do.
+// SPEC-15.15: readable by any staff caller
 async fn list_access_requests(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -712,6 +740,7 @@ async fn list_access_requests(
 ///
 /// `RequireManager`, the same gate as assigning roles by hand, because that is
 /// what granting does.
+// SPEC-15.14: manager gate
 async fn resolve_access_request(
     State(state): State<ContactRouterState>,
     _manager: crate::modules::auth::RequireManager,
@@ -727,6 +756,7 @@ async fn resolve_access_request(
     Ok(Json(row))
 }
 
+// SPEC-15.14, SPEC-15.16: manager gate; 204
 async fn revoke_portal_access(
     State(state): State<ContactRouterState>,
     _manager: crate::modules::auth::RequireManager,
@@ -758,6 +788,7 @@ async fn revoke_portal_access(
 // Company both 404 through this surface even though they are visible
 // through the top-level `/portal-roles/{id}` GET).
 
+// SPEC-15.17: admin-only; tenant-wide plus this company
 async fn list_company_portal_roles(
     State(state): State<ContactRouterState>,
     _admin: RequireAdmin,
@@ -771,6 +802,7 @@ async fn list_company_portal_roles(
     Ok(Json(roles))
 }
 
+// SPEC-15.17: admin-only; role is scoped to the path company
 async fn create_company_portal_role(
     State(state): State<ContactRouterState>,
     _admin: RequireAdmin,
@@ -784,6 +816,7 @@ async fn create_company_portal_role(
     // If it does, it must match the path so a client cannot mint a
     // scoped role for a different Company by lying in the body while
     // the path pretends otherwise.
+    // SPEC-15.18: body company_id may not disagree with the path
     if let Some(body_cid) = request.company_id {
         if body_cid != company_id {
             return Err(AppError::BadRequest(
@@ -810,6 +843,7 @@ async fn create_company_portal_role(
 /// scoped surface is deliberately blind to anything not owned by the
 /// path Company). Callers use this before every one-role handler so
 /// the same 404 shape applies to GET/PUT/DELETE.
+// SPEC-15.19: out-of-scope roles are 404 on this surface
 async fn require_role_in_company_scope(
     state: &ContactRouterState,
     tenant: crate::modules::auth::TenantId,
@@ -823,6 +857,7 @@ async fn require_role_in_company_scope(
     Ok(role)
 }
 
+// SPEC-15.17, SPEC-15.19: admin-only; scope-checked
 async fn get_company_portal_role(
     State(state): State<ContactRouterState>,
     _admin: RequireAdmin,
@@ -833,6 +868,7 @@ async fn get_company_portal_role(
     Ok(Json(role))
 }
 
+// SPEC-15.17, SPEC-15.19: admin-only; scope-checked
 async fn update_company_portal_role(
     State(state): State<ContactRouterState>,
     _admin: RequireAdmin,
@@ -856,6 +892,7 @@ async fn update_company_portal_role(
     Ok(Json(role))
 }
 
+// SPEC-15.17, SPEC-15.19: admin-only; scope-checked; 204
 async fn delete_company_portal_role(
     State(state): State<ContactRouterState>,
     _admin: RequireAdmin,

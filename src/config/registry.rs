@@ -52,7 +52,8 @@ use std::fmt;
 ///
 /// The line is bootstrap ORDER, not how secret a value is: bootstrap is what a
 /// provider is made from, so it cannot be served by one.
-// SPEC-1 and 2.123: the two-tier split a provider read is built on.
+// the two-tier split a provider read is built on.
+// SPEC-2.179
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
     /// Resolved exactly once per process, and carried across a
@@ -189,8 +190,10 @@ pub fn tier_of(name: &str) -> Option<Tier> {
 /// name what will not work if no provider holds the key. Keys without a
 /// feature attribute are legitimately-unset by design; see the module-level
 /// note for why silence is the default.
-// SPEC-1 and 2.122: the one declaration site a ConfigKey and its Tier/since/required
+// the one declaration site a ConfigKey and its Tier/since/required
 // facts come from; a flag or a read naming a key it does not emit cannot compile.
+// SPEC-6.1, SPEC-6.2: one declaration per key; get() takes only these constants, names are unique A-Z0-9_.
+// SPEC-2.178
 macro_rules! declare_keys {
     ($(
         $(#[doc = $doc:literal])*
@@ -222,19 +225,25 @@ macro_rules! declare_keys {
     (@required_since) => { None };
 }
 
+// SPEC-6.4, SPEC-6.5: the required set and the since/required_since facts are the per-key tail of each line below.
 declare_keys! {
     // -- Bootstrap: what a provider is made from ------------------------------
     // A configuration provider backed by the database (PMS-987) is built from
     // these, so they cannot be served by one without asking the database for
     // the credential used to reach the database.
 
+    // SPEC-6.3, SPEC-6.66: the bootstrap tier is exactly this block (ten keys); DATABASE_URL is required from v0.1.0.
+    // SPEC-2.226
     /// Privileged (`mokosh_migrator`) connection string.
     Bootstrap DATABASE_URL = "DATABASE_URL", since "v0.1.0", required;
+    // SPEC-6.66: request-serving URL; required since v0.14.0.
     /// Request-serving (`mokosh_app`) connection string (PMS-285).
     Bootstrap MOKOSH_APP_DATABASE_URL = "MOKOSH_APP_DATABASE_URL", since "v0.3.0", required "v0.14.0";
+    // SPEC-6.69: required since v0.4.0.
     /// AES-256-GCM key for at-rest encryption, which a database-backed
     /// provider would need in order to read anything it stored.
     Bootstrap ENCRYPTION_KEY = "ENCRYPTION_KEY", since "v0.1.0", required "v0.4.0";
+    // SPEC-6.73: blank means the file secret provider is not built.
     /// PMS-988: directory the file-backed application-tier secret provider
     /// reads. A provider is built from this at boot, so it is bootstrap; unset
     /// means the file provider is not enabled and holds nothing.
@@ -247,6 +256,7 @@ declare_keys! {
     // that says where to find configuration cannot live inside what it
     // locates.
 
+    // SPEC-6.87, SPEC-6.19: construction input of the file configuration provider.
     /// Directory the file configuration provider reads, one file per key.
     Bootstrap CONFIG_FILE_DIR = "CONFIG_FILE_DIR", since "v0.14.0", optional;
     /// Comma-separated priority list of enabled configuration providers,
@@ -261,6 +271,8 @@ declare_keys! {
     Bootstrap BUNYIP_CONFIG_CLIENT_ID = "BUNYIP_CONFIG_CLIENT_ID", since "v0.14.0", optional;
     /// Machine-credential client secret for the same HTTP Basic credential.
     Bootstrap BUNYIP_CONFIG_CLIENT_SECRET = "BUNYIP_CONFIG_CLIENT_SECRET", since "v0.14.0", optional;
+    // SPEC-6.77: enablement list, resolved once; the profile default stands when blank.
+    // SPEC-2.227
     /// PMS-981: authentication provider enablement, a comma-separated priority
     /// list (`bunyip,local` by default in `saas`; `local` in `self-hosted`).
     /// Bootstrap because provider enablement is bootstrap configuration
@@ -271,29 +283,43 @@ declare_keys! {
 
     // -- Application: the server's own shape ---------------------------------
 
+    // SPEC-6.52: default "development" only when unset.
     Application ENVIRONMENT = "ENVIRONMENT", since "v0.1.0", optional;
+    // SPEC-6.53: defaults 0.0.0.0 and 8080.
     Application HOST = "HOST", since "v0.1.0", optional;
     Application PORT = "PORT", since "v0.1.0", optional;
+    // SPEC-6.55: required since v0.14.0.
     Application BASE_URL = "BASE_URL", since "v0.1.0", required "v0.14.0";
+    // SPEC-6.54: bool literals true/false only; default true.
     Application RUN_MIGRATIONS = "RUN_MIGRATIONS", since "v0.1.0", optional;
+    // SPEC-6.68: JWT_SECRET required since v0.4.0, BUNYIP_WEBHOOK_SECRET required since v0.6.0.
     Application JWT_SECRET = "JWT_SECRET", since "v0.1.0", required "v0.4.0";
     Application BUNYIP_WEBHOOK_SECRET = "BUNYIP_WEBHOOK_SECRET", since "v0.6.0", required;
+    // SPEC-6.56: required since v0.14.0.
     Application CLIENT_ORIGIN = "CLIENT_ORIGIN", since "v0.2.0", required "v0.14.0";
+    // SPEC-6.58: comma list, wildcard form, panics on a malformed entry.
     Application CORS_ORIGIN = "CORS_ORIGIN", since "v0.2.0", optional;
+    // SPEC-6.61
     /// Optional `Domain=` attribute for the contact-portal refresh cookie
     /// (`mokosh:contact_token`). Set to the shared apex (e.g. `.a8n.run`) when
     /// the SPA runs on tenant-*.<apex> and reaches the API host at a different
     /// subdomain, so the cookie reaches `/api/v1/contact/auth/refresh` from
     /// that origin; unset leaves the cookie host-scoped as before.
     Application PORTAL_COOKIE_DOMAIN = "PORTAL_COOKIE_DOMAIN", since "v0.19.0", optional;
+    // SPEC-6.57: required since v0.14.0.
     Application SPA_BASE_URL = "SPA_BASE_URL", since "v0.12.0", required "v0.14.0";
+    // SPEC-6.59
     Application PUBLIC_API_BASE_URL = "PUBLIC_API_BASE_URL", since "v0.12.0", optional;
+    // SPEC-6.60
     Application ABUSE_CONTACT_EMAIL = "ABUSE_CONTACT_EMAIL", since "v0.12.0", optional;
+    // SPEC-6.62: positive integer, read once at boot.
     Application MOKOSH_MAX_TENANTS = "MOKOSH_MAX_TENANTS", since "v0.14.0", optional;
+    // SPEC-6.63
     Application MOKOSH_UPDATE_CHECK_URL = "MOKOSH_UPDATE_CHECK_URL", since "v0.3.0", optional;
 
     // -- Mail ----------------------------------------------------------------
 
+    // SPEC-6.90
     /// PMS-1013: named email provider selection. Explicit `log` or `smtp` wins
     /// over the hosting profile's default and over the implicit `SMTP_HOST`
     /// signal; unset falls back to the profile default (self-hosted: `log`,
@@ -303,12 +329,15 @@ declare_keys! {
     /// `log` while `SMTP_HOST` is set warns rather than silently discarding
     /// the operator's relay configuration.
     Application MAIL_PROVIDER = "MAIL_PROVIDER", since "v0.14.0", optional;
+    // SPEC-6.91
     Application SMTP_HOST = "SMTP_HOST", since "v0.2.0", optional;
     Application SMTP_PORT = "SMTP_PORT", since "v0.2.0", optional;
     Application SMTP_USERNAME = "SMTP_USERNAME", since "v0.2.0", optional;
+    // SPEC-6.76: also a governed application secret.
     Application SMTP_PASSWORD = "SMTP_PASSWORD", since "v0.2.0", optional;
     Application SMTP_FROM = "SMTP_FROM", since "v0.2.0", optional;
     Application SMTP_TLS = "SMTP_TLS", since "v0.2.0", optional;
+    // SPEC-6.92
     /// PMS-1482: base URL of Bunyip's mailer relay (`POST /v1/mailer/send`,
     /// BUNYIP-602) that `MAIL_PROVIDER=bunyip` sends through instead of SMTP.
     Application BUNYIP_MAILER_URL = "BUNYIP_MAILER_URL", since "v0.16.0", optional;
@@ -319,21 +348,28 @@ declare_keys! {
 
     // -- Authentication ------------------------------------------------------
 
+    // SPEC-6.78
     Application OIDC_ISSUER = "OIDC_ISSUER", since "v0.3.0", optional;
     Application OIDC_AUDIENCE = "OIDC_AUDIENCE", since "v0.3.0", optional;
+    // SPEC-6.79
     Application OIDC_JWKS_CACHE_TTL_SECS = "OIDC_JWKS_CACHE_TTL_SECS", since "v0.3.0", optional;
     Application OIDC_LEEWAY_SECONDS = "OIDC_LEEWAY_SECONDS", since "v0.3.0", optional;
+    // SPEC-6.80
     Application OIDC_DEFAULT_TENANT_ID = "OIDC_DEFAULT_TENANT_ID", since "v0.3.0", optional;
     // PMS-998: the OIDC client id bunyip addresses a back-channel logout
     // token to. NOT OIDC_AUDIENCE, which is the resource-server audience the
     // access token carries: bunyip mints a logout token with `aud =
     // client_id`, so the two are different values and the receiver refuses
     // everything while this is unset.
+    // SPEC-6.81
     Application OIDC_BACKCHANNEL_CLIENT_ID = "OIDC_BACKCHANNEL_CLIENT_ID", since "v0.15.0", optional;
+    // SPEC-6.82
     Application ADMIN_EMAIL = "ADMIN_EMAIL", since "v0.1.0", optional;
     Application ADMIN_PASSWORD = "ADMIN_PASSWORD", since "v0.1.0", optional;
+    // SPEC-6.84: boolean flag, read once at boot.
     Application LOGIN_APPROVAL_ENABLED = "LOGIN_APPROVAL_ENABLED", since "v0.8.0", optional;
 
+    // SPEC-6.83
     /// Opts in to JIT-provisioning a personal tenant for a first-sight
     /// bunyip identity whose email the OP has verified. Off by default so
     /// production stays invitation-only; staging turns it on explicitly.
@@ -341,6 +377,7 @@ declare_keys! {
     /// relaxes it.
     Application ALLOW_UNINVITED_BUNYIP_SIGNUP = "ALLOW_UNINVITED_BUNYIP_SIGNUP", since "v0.16.0", optional;
 
+    // SPEC-6.86
     /// PMS-1193 / BUNYIP-641: the Bunyip machine-credential client_id this
     /// deployment accepts on the admin provider-status routes. Set together
     /// with `BUNYIP_STATUS_CLIENT_SECRET`; when either is unset the machine-
@@ -355,6 +392,7 @@ declare_keys! {
     /// compose-secrets on staging and prod.
     Application BUNYIP_STATUS_CLIENT_SECRET = "BUNYIP_STATUS_CLIENT_SECRET", since "v0.14.0", optional;
 
+    // SPEC-6.85
     /// PMS-1208: base URL of the Bunyip API this deployment federates with in
     /// SaaS mode. Used by [`crate::modules::auth::bunyip_directory`] to call
     /// `GET /v1/users/lookup?email=` before creating a pending grant
@@ -380,17 +418,22 @@ declare_keys! {
     // annotation: an unset key is the flag's default and the boot log stays
     // silent, matching the registry convention.
 
+    // SPEC-6.31: declared flag with no reader outside src/config.
     /// PMS-983: the organizations feature. Read through
     /// `crate::config::flags::ORGANIZATIONS_ENABLED`, which defaults per
     /// hosting profile (off on self-hosted, on for SaaS).
     Application ORGANIZATIONS_ENABLED = "ORGANIZATIONS_ENABLED", since "v0.14.0", optional;
+    // SPEC-6.99, SPEC-6.100
     Application IP2LOCATION_DB_PATH = "IP2LOCATION_DB_PATH", since "v0.7.0", optional;
     Application IP2PROXY_DB_PATH = "IP2PROXY_DB_PATH", since "v0.11.0", optional;
 
     // -- Network ------------------------------------------------------------
 
+    // SPEC-6.101
     Application TRUSTED_PROXY_CIDR = "TRUSTED_PROXY_CIDR", since "v0.7.0", optional;
+    // SPEC-6.102
     Application OUTBOUND_PRIVATE_ALLOWLIST = "OUTBOUND_PRIVATE_ALLOWLIST", since "v0.14.0", optional;
+    // SPEC-6.75
     /// The in-network Infisical base the readiness probe reports on. Blank
     /// means unconfigured (PMS-707), never a failing probe. The Infisical
     /// SECRET provider reads its own copy at its entry point, because a
@@ -400,6 +443,7 @@ declare_keys! {
     // -- Payment provider hosts ----------------------------------------------
     // Overridable so an integration test can point the calls at a stub.
 
+    // SPEC-6.103
     Application STRIPE_API_BASE = "STRIPE_API_BASE", since "v0.10.0", optional;
     Application PAYPAL_API_BASE = "PAYPAL_API_BASE", since "v0.14.0", optional;
 
@@ -411,12 +455,14 @@ declare_keys! {
     // `STORAGE_S3_*` block are. Branding used to declare it here and read it a
     // second time; it now asks `crate::storage`, so there is one reader again.
 
+    // SPEC-6.96, SPEC-6.98: caps parse as positive integers; a bad value is a configuration error.
     Application ATTACHMENT_MAX_BYTES = "ATTACHMENT_MAX_BYTES", since "v0.4.0", optional;
     Application KB_ATTACHMENT_MAX_BYTES = "KB_ATTACHMENT_MAX_BYTES", since "v0.14.0", optional;
 
     // The six `BrandingAssetStore::max_bytes` caps. They are a closed match on
     // `(AssetScope, BrandAssetKind)`, which is why all six are declarable and
     // why a literal-only scan of the read site saw none of them.
+    // SPEC-6.97
     Application TENANT_LOGO_MAX_BYTES = "TENANT_LOGO_MAX_BYTES", since "v0.12.0", optional;
     Application BRANDING_TENANT_FAVICON_MAX_BYTES = "BRANDING_TENANT_FAVICON_MAX_BYTES", since "v0.14.0", optional;
     Application BRANDING_TENANT_BACKGROUND_MAX_BYTES = "BRANDING_TENANT_BACKGROUND_MAX_BYTES", since "v0.14.0", optional;
@@ -426,6 +472,7 @@ declare_keys! {
 
     // -- Seeding -------------------------------------------------------------
 
+    // SPEC-6.88, SPEC-6.89
     Application MOKOSH_SEED_TENANT_ID = "MOKOSH_SEED_TENANT_ID", since "v0.3.0", optional;
     Application MOKOSH_DEMO_SEED = "MOKOSH_DEMO_SEED", since "v0.3.0", optional;
 }

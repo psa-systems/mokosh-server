@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+// SPEC-15.1542: no credential fields on any response
 #[derive(Debug, Clone, Serialize)]
 pub struct RmmConnectionResponse {
     pub id: Uuid,
@@ -19,6 +20,7 @@ pub struct RmmConnectionResponse {
     pub created_at: DateTime<Utc>,
 }
 
+// SPEC-15.1540, SPEC-15.1541: validation and defaults
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateRmmConnectionRequest {
     #[validate(length(min = 1, max = 100))]
@@ -144,6 +146,7 @@ pub struct UpdateRmmAlertRuleRequest {
     pub is_active: Option<bool>,
 }
 
+// SPEC-15.1554: title length validated
 /// Body for `POST /api/v1/rmm/alerts`. The RMM agent fires this with an
 /// HMAC signature in the `X-Signature` header (HMAC-SHA256 of the raw
 /// body using the connection's `api_secret`). Service layer verifies.

@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+// SPEC-4.204, SPEC-4.205, SPEC-4.206: kind-tagged union; placed_by_grant_id omitted when None.
 /// One row in the merged members list.
 ///
 /// `#[serde(tag = "kind")]` so the SPA can key off a single discriminant;
@@ -58,6 +59,7 @@ pub enum MemberRow {
     },
 }
 
+// SPEC-4.207: chip fields for the members list.
 /// A team the user belongs to, kept to the fields the row chip renders.
 /// Pulled from `teams` + `team_members` in one batched query, not one per
 /// row.
@@ -68,6 +70,7 @@ pub struct TeamChip {
     pub color: Option<String>,
 }
 
+// SPEC-4.207: members envelope.
 /// Envelope for `GET /api/v1/members`. `bunyip_reachable` lets the SPA
 /// surface a "guest list unavailable" banner when the fan-out failed;
 /// standalone mode (no cross-process call) always sets it `true` because

@@ -91,6 +91,7 @@ pub struct Issuer {
     /// `serde(default)` because every snapshot written before PMS-1006 lacks
     /// the key, and the default is Classic, which is exactly what those
     /// invoices were rendered with.
+    // SPEC-13.449: older snapshots lack the key and read back as Classic.
     #[serde(default)]
     pub template: Template,
     /// PMS-1006: the accent the template draws in, the tenant's
@@ -103,6 +104,7 @@ pub struct Issuer {
 ///
 /// The fallback chain is the acceptance criterion about an MSP with nothing
 /// filled in: `legal_name`, then `company_name`, then the tenant's own name.
+// SPEC-13.445, SPEC-13.446, SPEC-13.447: name chain, trading name, trimmed copies, no storage access.
 pub fn resolve(tenant_name: &str, branding: &TenantBranding) -> Issuer {
     let template = resolve_template(clean(branding.invoice_template.as_deref()).as_deref());
     let legal = clean(branding.legal_name.as_deref());
@@ -136,6 +138,7 @@ pub fn resolve(tenant_name: &str, branding: &TenantBranding) -> Issuer {
 /// chosen template never appears has to be able to find out why. Falling back
 /// rather than failing, because refusing to render an invoice over its layout
 /// would withhold the document.
+// SPEC-13.448: unknown key falls back to Classic with a warning.
 fn resolve_template(key: Option<&str>) -> Template {
     match key {
         None => Template::Classic,
@@ -162,6 +165,7 @@ fn resolve_template(key: Option<&str>) -> Template {
 /// and drops the mark, which is the same trade the renderer makes for an image
 /// that will not decode: withholding an invoice over its decoration is worse
 /// than sending one without it.
+// SPEC-13.450, SPEC-13.452: logo copy failure keeps the text identity.
 pub async fn freeze(
     tx: &mut crate::db::TenantTransaction<'_>,
     tenant_id: Uuid,
@@ -196,6 +200,7 @@ fn branding_logo_file_id(digest_bytes: &[u8]) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+// SPEC-13.451: content-addressed copy plus ledger row in the caller's transaction.
 async fn copy_logo(
     tx: &mut crate::db::TenantTransaction<'_>,
     tenant_id: Uuid,
@@ -237,6 +242,7 @@ async fn copy_logo(
 /// Read back a frozen logo. `None` for an invoice whose snapshot carries none,
 /// and for one whose copy has gone missing, because a document without its mark
 /// is still the document.
+// SPEC-13.453: frozen logo read-back.
 pub async fn logo_bytes(tenant_id: Uuid, issuer: &Issuer) -> Option<Vec<u8>> {
     let digest = issuer.logo_digest.as_deref()?;
     let store = crate::storage::shared();
@@ -251,6 +257,7 @@ pub async fn logo_bytes(tenant_id: Uuid, issuer: &Issuer) -> Option<Vec<u8>> {
 /// A statement renders live (see `billing::documents`), so it reads the tenant
 /// logo where it lives rather than a frozen copy. `None` when there is no logo
 /// and when the file has gone, for the same reason as [`logo_bytes`].
+// SPEC-13.454: current logo for documents that are not snapshotted.
 pub async fn live_logo_bytes(tenant_id: Uuid, issuer: &Issuer) -> Option<Vec<u8>> {
     let mime = issuer.logo_mime.as_deref()?;
     // `read` below never consults `max_bytes` (that cap only gates `store`), so a

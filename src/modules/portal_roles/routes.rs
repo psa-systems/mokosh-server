@@ -49,6 +49,7 @@ pub fn portal_role_routes(service: PortalRoleService) -> Router {
     let state = PortalRoleRouterState {
         service: Arc::new(service),
     };
+    // SPEC-5.400
     Router::new()
         .route("/", get(list_roles))
         .route("/", post(create_role))
@@ -59,6 +60,7 @@ pub fn portal_role_routes(service: PortalRoleService) -> Router {
         .with_state(state)
 }
 
+// SPEC-5.403, SPEC-5.404, SPEC-5.405
 async fn list_roles(
     State(state): State<PortalRoleRouterState>,
     _admin: RequireAdmin,
@@ -72,6 +74,7 @@ async fn list_roles(
     Ok(Json(roles))
 }
 
+// SPEC-5.401
 async fn list_capabilities(
     State(state): State<PortalRoleRouterState>,
     _admin: RequireAdmin,
@@ -80,6 +83,7 @@ async fn list_capabilities(
     Ok(Json(state.service.capability_labels()))
 }
 
+// SPEC-5.406
 async fn get_role(
     State(state): State<PortalRoleRouterState>,
     _admin: RequireAdmin,
@@ -89,6 +93,7 @@ async fn get_role(
     Ok(Json(state.service.get_role(user.tenant(), id).await?))
 }
 
+// SPEC-5.407, SPEC-5.408, SPEC-5.409, SPEC-5.410, SPEC-5.411
 async fn create_role(
     State(state): State<PortalRoleRouterState>,
     _admin: RequireAdmin,
@@ -110,6 +115,7 @@ async fn create_role(
     Ok(Json(role))
 }
 
+// SPEC-5.412, SPEC-5.413, SPEC-5.414, SPEC-5.415
 async fn update_role(
     State(state): State<PortalRoleRouterState>,
     _admin: RequireAdmin,
@@ -126,6 +132,7 @@ async fn update_role(
     Ok(Json(role))
 }
 
+// SPEC-5.416
 async fn delete_role(
     State(state): State<PortalRoleRouterState>,
     _admin: RequireAdmin,

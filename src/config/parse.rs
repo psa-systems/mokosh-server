@@ -13,6 +13,9 @@
 
 use crate::config::ConfigKey;
 
+// SPEC-6.27
+// SPEC-6.46: the boot-time message for a set-but-unparseable PORT, RUN_MIGRATIONS or cap.
+// SPEC-2.228
 /// `raw` is `None` or blank: `Ok(None)`, the caller's default stands.
 /// `raw` parses as `T`: `Ok(Some(value))`.
 /// `raw` is set but does not parse as `T`: `Err`, naming `key` and the raw
@@ -36,6 +39,7 @@ where
     }
 }
 
+// SPEC-6.29
 /// Boot-time check for a key read later by its own per-call accessor (for
 /// example `OIDC_DEFAULT_TENANT_ID`, read by both
 /// `auth::middleware::default_bunyip_tenant_id` and
@@ -51,6 +55,7 @@ where
     parse_optional::<T>(key, crate::config::get(key)).map(|_| ())
 }
 
+// SPEC-6.28
 /// Same as [`parse_optional`], additionally rejecting a parsed value that is
 /// not strictly positive (a cap of zero or less is nonsensical, and PMS-1577
 /// refuses to read it as "uncapped" the way an unset value is read).

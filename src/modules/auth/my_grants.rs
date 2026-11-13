@@ -51,10 +51,12 @@ pub fn my_grants_routes(pool: PgPool) -> Router {
         pool: Arc::new(pool),
     };
     Router::new()
+        // SPEC-5.226: RequireAuth in handler
         .route("/{id}", delete(leave_grant))
         .with_state(state)
 }
 
+// SPEC-5.226, SPEC-5.227
 /// `DELETE /api/v1/my-grants/{id}`.
 ///
 /// - 204 on a fresh revoke.

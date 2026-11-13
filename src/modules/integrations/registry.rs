@@ -176,6 +176,7 @@ pub struct PollingSpec {
     pub min_minutes: i32,
 }
 
+// SPEC-15.1509: poll default 15 and minimum 5 minutes
 /// The default poll interval PMS-1310 settled on.
 pub const DEFAULT_POLL_INTERVAL_MINUTES: i32 = 15;
 /// The floor, mirroring the CHECK on `integrations.poll_interval_minutes`.
@@ -240,6 +241,7 @@ impl ProviderDescriptor {
         self.supported_capabilities.contains(&capability)
     }
 
+    // SPEC-15.1505: configurable_here derives from the credential home
     /// Whether this provider's lifecycle can be CHANGED through the
     /// integrations HTTP surface.
     ///
@@ -270,6 +272,7 @@ impl ProviderDescriptor {
         matches!(self.credential_home, CredentialHome::Integration)
     }
 
+    // SPEC-15.1506: per-provider setup surface
     /// The settings surface that owns this provider's setup, for the panel's
     /// one action (MAPPS-1122).
     ///
@@ -326,6 +329,7 @@ pub struct SetupSurface {
     pub label: &'static str,
 }
 
+// SPEC-15.1502, SPEC-15.1504, SPEC-15.1507: provider order, supported capabilities, connection homes
 /// Every provider, in the order the integrations page lists them.
 ///
 /// The `provider` strings are the same set the CHECK on

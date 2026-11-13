@@ -83,6 +83,7 @@ pub struct ProviderConfig {
     pub api_secret: Option<String>,
 }
 
+// SPEC-15.1562
 /// Build the right `RmmProvider` for a given `provider` string. Falls
 /// back to a fail-loud stub for unimplemented providers so the sync
 /// worker surfaces a real error in `last_error` instead of silently
@@ -115,6 +116,7 @@ pub struct TacticalRmmProvider {
 }
 
 impl TacticalRmmProvider {
+    // SPEC-15.1563: 30s timeout, no redirects
     pub fn new(cfg: ProviderConfig) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -132,6 +134,7 @@ impl TacticalRmmProvider {
         }
     }
 
+    // SPEC-15.1564
     /// Build the URL for `path` and screen it before the caller connects. The
     /// error is a `Configuration` failure the integration UI shows in
     /// `rmm_connections.last_error`, never a silent success.
@@ -174,6 +177,7 @@ impl TacticalRmmProvider {
         Ok(url)
     }
 
+    // SPEC-15.1565
     /// Fold a response into a hard failure unless it is a real 2xx. A 3xx is
     /// called out separately because the client does not follow redirects.
     fn check_status(
@@ -199,6 +203,7 @@ impl TacticalRmmProvider {
 
 #[async_trait]
 impl RmmProvider for TacticalRmmProvider {
+    // SPEC-15.1563, SPEC-15.1565
     async fn list_devices(&self) -> AppResult<Vec<ProviderDevice>> {
         let url = self.guarded_url("agents/").await?;
         let resp = self
@@ -246,6 +251,7 @@ impl RmmProvider for TacticalRmmProvider {
     }
 }
 
+// SPEC-15.1566
 fn parse_tactical_agent(v: serde_json::Value) -> ProviderDevice {
     let rmm_device_id = v
         .get("agent_id")
@@ -319,6 +325,7 @@ fn parse_tactical_alert(v: serde_json::Value) -> ProviderAlert {
     }
 }
 
+// SPEC-15.1562
 /// Fail-loud stub used for providers whose real adapter has not landed
 /// yet. The sync worker stores the error message in
 /// `rmm_connections.last_error` so an operator sees the unimplemented

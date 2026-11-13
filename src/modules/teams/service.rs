@@ -14,9 +14,11 @@
 //!   `tickets.team_id` (NO ACTION) per the cascade audit in
 //!   docs/mokosh-orgs/01-data-model.md.
 //! - `team_members.role = 'leader'` is a display / notification hint and
-//!   grants NO additional authorization (F4). This is enforced by the
-//!   route layer: every write is `RequireAdmin`, never `RequireAuth +
-//!   is-leader`.
+//!   grants NO additional authorization (F4). Route-level authorization
+//!   is split per write (PMS-1162): team creation stays `RequireAdmin`;
+//!   per-team edits widen to `RequireAuth` plus a `TeamManagementGuard`
+//!   that admits an admin or the team's recorded manager, and the leader
+//!   role is never a factor.
 //! - `list_members` filters `WHERE users.deleted_at IS NULL` so
 //!   soft-deleted user tombstones do not leak (F13).
 //! - Every write calls `audit_write` in the same transaction (F10).
@@ -37,6 +39,7 @@ use super::models::*;
 /// `^#[0-9A-Fa-f]{6}$` — enforced at the service layer rather than as a
 /// `validator` regex derive so mokosh-types does not need a `regex`
 /// dependency (see security review F5).
+// SPEC-5.556: three distinct 422 messages on field `color`.
 fn validate_hex_color(color: &str) -> AppResult<()> {
     if color.len() != 7 {
         return Err(AppError::validation_field(
@@ -62,6 +65,7 @@ fn validate_hex_color(color: &str) -> AppResult<()> {
 
 /// `role` on `team_members` is `"leader"` or `"member"`. Anything else is
 /// a 400 with a `field: "role"` hint.
+// SPEC-5.566, SPEC-5.568: leader or member only.
 fn validate_team_member_role(role: &str) -> AppResult<()> {
     if role == "leader" || role == "member" {
         Ok(())
@@ -82,6 +86,7 @@ pub struct TeamListFilters {
     pub manager_id: Option<Uuid>,
 }
 
+// SPEC-5.571: leader grants no extra authorization; every query is tenant-filtered.
 #[derive(Clone)]
 pub struct TeamsService {
     db: Database,
@@ -106,6 +111,7 @@ impl TeamsService {
     ///   `teams_name_ci_unique_idx` from migration 126 is the ultimate
     ///   guard; this probe surfaces a nicer error.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.555, SPEC-5.556, SPEC-5.557, SPEC-5.558, SPEC-5.559: checks precede the audited insert.
     pub async fn create_team(
         &self,
         tenant_id: TenantId,
@@ -164,6 +170,7 @@ impl TeamsService {
     /// Uniqueness re-check on `name` scopes to `id != $team_id` so a
     /// self-rename with a case flip is idempotent, not a collision.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, team_id = %team_id))]
+    // SPEC-5.556, SPEC-5.557, SPEC-5.558, SPEC-5.562, SPEC-5.563: bind-only dynamic UPDATE with audit.
     pub async fn update_team(
         &self,
         tenant_id: TenantId,
@@ -220,6 +227,7 @@ impl TeamsService {
                 .bind(team_id)
                 .fetch_optional(&mut *tx)
                 .await?;
+        // SPEC-5.562: unknown team is a 404 before any write.
         if before.is_none() {
             return Err(AppError::NotFound("Team".to_string()));
         }
@@ -268,6 +276,7 @@ impl TeamsService {
     /// on `tickets.team_id` / `appointments.team_id` (NO ACTION) so the
     /// service does not offer a hard-delete path at all.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, team_id = %team_id))]
+    // SPEC-5.564: archive only, with before and after audit snapshots.
     pub async fn soft_delete_team(
         &self,
         tenant_id: TenantId,
@@ -322,6 +331,7 @@ impl TeamsService {
     /// Read one team from the caller's tenant. RLS + the explicit
     /// `tenant_id` predicate keep other tenants' teams unreachable.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, team_id = %team_id))]
+    // SPEC-5.560: tenant-filtered read, 404 when absent.
     pub async fn get_team(&self, tenant_id: TenantId, team_id: Uuid) -> AppResult<Team> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<TeamRow> = sqlx::query_as(
@@ -359,6 +369,7 @@ impl TeamsService {
     /// same filters, so the client can render a real page count instead of
     /// the current page's length.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-5.553, SPEC-5.554: filtered page, shared WHERE for count and rows, member_count per team.
     pub async fn list_teams(
         &self,
         tenant_id: TenantId,
@@ -443,6 +454,7 @@ impl TeamsService {
     /// human-readable fields in one round-trip. Soft-deleted users are
     /// filtered out (F13).
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, team_id = %team_id))]
+    // SPEC-5.565: team must exist in the tenant; soft-deleted users excluded.
     pub async fn list_members(
         &self,
         tenant_id: TenantId,
@@ -486,6 +498,7 @@ impl TeamsService {
     /// SPA's "My teams" filter (phase 4) and the current-user session's
     /// team snapshot on session bootstrap.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, user_id = %user_id))]
+    // SPEC-5.570: active teams of this user in this tenant.
     pub async fn list_teams_for_user(
         &self,
         tenant_id: TenantId,
@@ -518,6 +531,7 @@ impl TeamsService {
     /// `UNIQUE (team_id, user_id)` guarantees uniqueness; a concurrent
     /// duplicate INSERT surfaces as a 409 from the 23505 arm below.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, team_id = %team_id))]
+    // SPEC-5.567: 404 for a missing team, audited create on success.
     pub async fn add_member(
         &self,
         tenant_id: TenantId,
@@ -525,6 +539,7 @@ impl TeamsService {
         request: &AddTeamMemberRequest,
         ctx: &AuditCtx,
     ) -> AppResult<TeamMember> {
+        // SPEC-5.566: default role member; user must be in this tenant.
         let role = request.role.as_deref().unwrap_or("member");
         validate_team_member_role(role)?;
         self.assert_user_in_tenant(*tenant_id, request.user_id, "user_id")
@@ -573,6 +588,7 @@ impl TeamsService {
             // the sqlx error carries nothing the caller does not already
             // get. Every other code falls through to the shared mapping,
             // which logs the Postgres message at `error`.
+            // SPEC-5.567: duplicate membership is a 409.
             Err(sqlx::Error::Database(dbe)) if dbe.code().as_deref() == Some("23505") => {
                 return Err(AppError::conflict("User is already a member of this team"));
             }
@@ -612,6 +628,7 @@ impl TeamsService {
 
     /// Change a member's role. 404 if the membership does not exist.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, team_id = %team_id, user_id = %user_id))]
+    // SPEC-5.568: 404 for a missing membership, audited update.
     pub async fn update_member_role(
         &self,
         tenant_id: TenantId,
@@ -706,6 +723,7 @@ impl TeamsService {
         .bind(user_id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-5.569: absent membership is a silent 204 with no audit row.
         // Idempotent short-circuit: no membership = nothing to do.
         if before.is_none() {
             tx.commit().await?;
@@ -747,6 +765,7 @@ impl TeamsService {
     /// resolving an incoming ID, which by definition is not yet checked).
     /// Error message is deliberately generic so an attacker cannot
     /// enumerate user existence across tenants.
+    // SPEC-5.557, SPEC-5.566: one generic message for missing and cross-tenant users.
     async fn assert_user_in_tenant(
         &self,
         tenant_id: Uuid,
@@ -773,6 +792,7 @@ impl TeamsService {
     /// (mirrors the partial index in migration 126). Pass `Some(id)` on
     /// the update path so a self-rename with a case flip does not
     /// self-collide.
+    // SPEC-5.558: case-insensitive among active teams, excluding the team being renamed.
     async fn assert_name_unique(
         &self,
         tenant_id: Uuid,

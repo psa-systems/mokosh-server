@@ -19,6 +19,7 @@ use crate::modules::knowledge_base::KbService;
 use crate::utils::error::AppResult;
 use crate::utils::pagination::PaginationParams;
 
+// SPEC-15.1149
 /// The one aggregate response. Three parallel lists, each already
 /// scoped to the one company at the service level.
 #[derive(Debug, Serialize)]
@@ -28,6 +29,7 @@ pub struct CompanyDocumentation {
     pub articles: Vec<KbArticleResponse>,
 }
 
+// SPEC-15.1150, SPEC-15.1152
 /// How many of each list the aggregate returns per request. The intent is
 /// a human reading an on-call screen, not a full-tenant export; the per-page
 /// cap keeps the response bounded. Call the owning module's list endpoints
@@ -45,6 +47,7 @@ impl DocumentationService {
         Self { assets, kb }
     }
 
+    // SPEC-15.1150, SPEC-15.1151, SPEC-15.1152, SPEC-15.1153, SPEC-15.1154
     /// Aggregate for one company. Each list is bounded at
     /// `PER_LIST_LIMIT`; totals and pagination belong on the module's
     /// own list endpoints.
