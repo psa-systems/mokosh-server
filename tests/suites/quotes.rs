@@ -906,8 +906,6 @@ async fn update_line_writes_is_taxable(pool: PgPool) {
     assert_eq!(line["is_taxable"], true);
 }
 
-}
-
 #[mokosh_test]
 async fn approvals_surface_still_works_on_an_api_created_quote(pool: PgPool) {
     // PMS-484 wired `/quotes/{id}/approvals` against the stub table. It
