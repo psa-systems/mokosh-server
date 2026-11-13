@@ -5673,8 +5673,24 @@ impl BillingService {
         // A branding document that will not destructure is an empty one, not a
         // failure: an unreadable logo colour must not stop an invoice being
         // sent.
+        //
+        // PMS-1660 finding: the old `unwrap_or_default()` was silent, so
+        // a drift between the stored JSONB and `TenantBranding` only
+        // showed up as "invoice looks odd" with nothing to grep. Keep
+        // the fallback (per the comment above), WARN with the tenant
+        // id + decode error so an operator can trace the drift back.
         let branding: mokosh_types::tenants::TenantBranding =
-            serde_json::from_value(branding).unwrap_or_default();
+            match serde_json::from_value(branding.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        error = %e,
+                        "freeze_issuer: tenants.branding failed to decode; freezing with default"
+                    );
+                    Default::default()
+                }
+            };
         let logos = crate::modules::tenants::logo::TenantLogoStore::new(
             crate::modules::tenants::logo::TenantLogoConfig::from_env()?,
         );
@@ -5706,8 +5722,23 @@ impl BillingService {
         .await?
         .flatten();
         if let Some(value) = snapshot {
-            if let Ok(issuer) = serde_json::from_value(value) {
-                return Ok(issuer);
+            // PMS-1660 finding: a frozen snapshot that failed to
+            // decode used to fall through to live branding silently,
+            // so a sent invoice could reprint under a different
+            // identity than the one frozen at send time. The fallback
+            // to live stays (so the render does not 500 on an edited
+            // row), but WARN with the invoice id + decode error so
+            // the drift is findable.
+            match serde_json::from_value(value.clone()) {
+                Ok(issuer) => return Ok(issuer),
+                Err(e) => {
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        invoice_id = %invoice_id,
+                        error = %e,
+                        "invoice_issuer: frozen issuer_snapshot failed to decode; falling back to live branding"
+                    );
+                }
             }
         }
         let row: Option<(String, serde_json::Value)> =
@@ -5717,7 +5748,18 @@ impl BillingService {
                 .await?;
         let (name, branding) = row.ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
         let branding: mokosh_types::tenants::TenantBranding =
-            serde_json::from_value(branding).unwrap_or_default();
+            match serde_json::from_value(branding.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        invoice_id = %invoice_id,
+                        error = %e,
+                        "invoice_issuer: tenants.branding failed to decode; rendering with default"
+                    );
+                    Default::default()
+                }
+            };
         Ok(crate::modules::billing::issuer::resolve(&name, &branding))
     }
 
@@ -5913,8 +5955,21 @@ impl BillingService {
                 .fetch_optional(&mut **tx)
                 .await?;
         let (name, branding) = row.ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
-        let branding: mokosh_types::tenants::TenantBranding =
-            serde_json::from_value(branding).unwrap_or_default();
+        // PMS-1660 finding: same shape as `invoice_issuer` above; a
+        // decode failure used to be silent. WARN with the tenant id.
+        let branding: mokosh_types::tenants::TenantBranding = match serde_json::from_value(
+            branding.clone(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    error = %e,
+                    "tenant_issuer_in_tx: tenants.branding failed to decode; rendering with default"
+                );
+                Default::default()
+            }
+        };
         Ok(crate::modules::billing::issuer::resolve(&name, &branding))
     }
 
