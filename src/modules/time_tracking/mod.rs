@@ -22,3 +22,5 @@ pub use models::*;
 pub use routes::time_tracking_routes;
 #[cfg(feature = "server")]
 pub use service::TimeTrackingService;
+// PMS-1662 F11: mileage_tracking reuses the billing-status resolver.
+pub(crate) use service::resolve_billing_status;

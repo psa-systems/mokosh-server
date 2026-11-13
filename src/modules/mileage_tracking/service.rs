@@ -267,6 +267,16 @@ impl MileageTrackingService {
         } else {
             None
         };
+        // PMS-1662 F11: flipping `is_billable` used to leave the stored
+        // `billing_status` alone, so a mileage entry made non-billable
+        // stayed `ready_to_bill` and would bill anyway. Mirror what
+        // PMS-944 did for time entries: resolve the status from the
+        // post-update billability, keeping `billed` sticky through the
+        // same helper time uses.
+        let billing_status = crate::modules::time_tracking::resolve_billing_status(
+            is_billable,
+            Some(current.billing_status),
+        );
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Write-side tenant validation on update, mirroring create: the UPDATE
@@ -291,6 +301,7 @@ impl MileageTrackingService {
                 rate_per_mile = $11,
                 total_amount  = $12,
                 task_id       = COALESCE($13, task_id),
+                billing_status = $14,
                 updated_at    = NOW()
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -308,6 +319,7 @@ impl MileageTrackingService {
         .bind(rate)
         .bind(total)
         .bind(request.task_id)
+        .bind(billing_status)
         .execute(&mut *tx)
         .await?
         .rows_affected();
