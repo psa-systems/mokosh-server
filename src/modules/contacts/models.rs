@@ -16,6 +16,7 @@ use uuid::Uuid;
 /// a hand-crafted test fixture without the field deserializes to
 /// tenant-wide instead of erroring, which matches the historical
 /// two-value shape and stays forward-compatible.
+// SPEC-15.130: missing company_id is tenant-wide, missing count is 0
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortalRoleSummary {
     pub id: Uuid,
@@ -53,6 +54,7 @@ pub struct PortalAccessRequestRow {
 }
 
 /// PMS-1187: how staff answer one.
+// SPEC-15.130: grant is a required boolean
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ResolveAccessRequest {
     /// `true` grants the area's built-in role and closes the request; `false`

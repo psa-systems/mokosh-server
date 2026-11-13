@@ -79,6 +79,7 @@ jobs:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
 
+      # SPEC-10.337
       - name: Cache Rust build
         # PMS-1639: share the key with integration.yml's PR job and
         # cache-warm.yml's warm-integration job. Workspace fingerprints
@@ -91,6 +92,7 @@ jobs:
           shared-key: integration
           cache-on-failure: true
 
+      # SPEC-10.329
       - name: Cache cargo-nextest tarball
         # PMS-1641: same version-keyed tarball cache as integration.yml.
         # The weekly cron runs infrequently enough that a fresh download
@@ -145,6 +147,7 @@ jobs:
         # this repository).
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
+      # SPEC-10.338
       - name: Start MinIO for the S3 storage suite
         # PMS-958. `tests/suites/s3_storage.rs` round-trips the S3 backend against a
         # real object store and skips (loudly) when STORAGE_S3_ENDPOINT is unset, so
@@ -269,6 +272,7 @@ jobs:
         # test output rather than here.
         run: psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 --file scripts/test-db-roles.sql
 
+      # SPEC-10.339
       - name: Unsupported integration tests
         # SPEC-10.27: no archive step, unlike integration.yml
         # `--profile unsupported` is the whole selection: its `default-filter`

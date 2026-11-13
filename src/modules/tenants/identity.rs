@@ -49,6 +49,7 @@ impl OrgIdentity {
     ///
     /// For callers that have read the tenant row for their own reasons and
     /// should not pay for a second round trip.
+    // SPEC-5.372
     pub fn from_branding(name: String, branding: &mokosh_types::tenants::TenantBranding) -> Self {
         Self {
             name: name.trim().to_string(),
@@ -65,6 +66,7 @@ impl OrgIdentity {
     /// than failing the caller: a malformed key must not stop an invoice email
     /// going out, and the worst case is a message with no contact line, which
     /// is exactly where this feature started.
+    // SPEC-5.373
     pub fn from_row(name: String, branding: serde_json::Value) -> Self {
         let branding: mokosh_types::tenants::TenantBranding =
             serde_json::from_value(branding).unwrap_or_default();
@@ -76,6 +78,7 @@ impl OrgIdentity {
     /// Tenant-scoped through `begin_with_tenant` so the RLS GUC is set; the
     /// identity in a client's email is always the identity of the tenant that
     /// owns the thing the email is about.
+    // SPEC-5.371
     pub async fn load(db: &Database, tenant_id: TenantId) -> AppResult<Self> {
         let mut tx = db.begin_with_tenant(tenant_id).await?;
         let (name, branding): (String, serde_json::Value) =
@@ -116,6 +119,7 @@ impl OrgIdentity {
     /// right before a number and wrong before an address. Built here rather
     /// than at the call sites so two messages cannot word the same two facts
     /// differently.
+    // SPEC-5.374
     pub fn channels(&self) -> Option<String> {
         match (self.phone(), self.email()) {
             (Some(p), Some(e)) => Some(format!("on {p} or by email at {e}")),
@@ -131,6 +135,7 @@ impl OrgIdentity {
     /// Cannot start with a preposition, so it opens on the contact person, or
     /// on the organisation when no contact person is set, and never on a phone
     /// number.
+    // SPEC-5.374
     pub fn phrase(&self) -> Option<String> {
         let name = self.contact_name().unwrap_or(&self.name);
         match (self.channels(), self.contact_name().is_some()) {
@@ -150,6 +155,7 @@ impl OrgIdentity {
     /// the same field always named someone. `{name} at {info}` matches the
     /// email's override branch ("Contact {org} at {info}."), so one form with
     /// its own contact and one without produce the same shape.
+    // SPEC-5.375
     pub fn phrase_with(&self, override_info: Option<&str>) -> Option<String> {
         match clean(override_info) {
             Some(info) => Some(format!("{} at {}", self.name, info)),
@@ -172,6 +178,7 @@ impl OrgIdentity {
     /// is a per-message contact string that wins when present: a request form
     /// that routes somewhere unusual carries one, and it should not be
     /// overruled by the organisation's general service-desk number.
+    // SPEC-5.375
     pub fn contact_line(&self, opening: &str, override_info: Option<&str>) -> String {
         let org = &self.name;
         if let Some(info) = clean(override_info) {
@@ -202,6 +209,7 @@ impl OrgIdentity {
     /// CSS, from [`LOGO_BOX_WIDTH`] / [`LOGO_BOX_HEIGHT`]. Without them a
     /// client cannot size the image before it arrives, so the message reflows,
     /// and it cannot pick a smaller decode for an oversized source.
+    // SPEC-5.376
     pub fn logo_html(&self, public_api_base: Option<&str>) -> String {
         let (Some(base), Some(path)) = (clean(public_api_base), self.logo_path()) else {
             return String::new();
@@ -218,6 +226,7 @@ impl OrgIdentity {
 
 /// Trim, and treat whitespace-only as absent. The one normalisation every
 /// field needs, applied on the way in so no reader has to remember it.
+// SPEC-5.372
 fn clean(v: Option<&str>) -> Option<String> {
     v.map(str::trim)
         .filter(|s| !s.is_empty())

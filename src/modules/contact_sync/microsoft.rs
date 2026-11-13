@@ -70,10 +70,12 @@ pub const GRAPH_API_BASE: &str = "https://graph.microsoft.com";
 /// The scope Mokosh asks for on the Entra consent screen. Read-only against
 /// the signed-in user's contacts. Changing this changes what the client can
 /// read, and widens the attack surface; keep it one scope.
+// SPEC-15.642
 pub const OAUTH_SCOPE: &str = "Contacts.Read offline_access";
 
 /// The $select mask carried on every list and delta call. Also carried on the
 /// stored delta token's URL, so a widened mask invalidates every live token.
+// SPEC-15.642
 pub const CONTACT_FIELDS: &str =
     "id,givenName,surname,displayName,emailAddresses,homePhones,businessPhones,\
      mobilePhone,companyName,jobTitle,department,categories";
@@ -110,6 +112,7 @@ impl RetryPolicy {
 
     /// Delay for `attempt` (1-indexed), honouring the server's own
     /// `Retry-After` when it offered one.
+    // SPEC-15.645
     fn delay(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
         if let Some(hint) = retry_after {
             return hint.min(self.cap);
@@ -159,6 +162,7 @@ impl MicrosoftContactsProvider {
     /// server minted). An absolute URL skips the base entirely and is sent
     /// verbatim, which is what Graph's nextLink / deltaLink mechanics
     /// require: the URL carries the state the server threaded into it.
+    // SPEC-15.644 to 15.646
     async fn get<T: DeserializeOwned>(&self, url_or_path: &str) -> SourceResult<Option<T>> {
         let url = if url_or_path.starts_with("http://") || url_or_path.starts_with("https://") {
             url_or_path.to_string()
@@ -240,6 +244,7 @@ impl MicrosoftContactsProvider {
     /// as stale. On a resend the caller passes the stored `@odata.deltaLink`
     /// URL verbatim; on a first (full) read the caller passes
     /// [`DELTA_PATH`].
+    // SPEC-15.643
     async fn read_all(&self, start_url: &str) -> SourceResult<Option<SourceChanges>> {
         let mut changes = SourceChanges::default();
         let mut url = start_url.to_string();
@@ -294,6 +299,7 @@ impl ContactSyncProvider for MicrosoftContactsProvider {
         "microsoft"
     }
 
+    // SPEC-15.647
     async fn list_groups(&self) -> SourceResult<Vec<SourceGroup>> {
         let mut groups = Vec::new();
         let mut url = FOLDERS_PATH.to_string();
@@ -312,6 +318,7 @@ impl ContactSyncProvider for MicrosoftContactsProvider {
         ))
     }
 
+    // SPEC-15.644
     async fn changes_since(&self, sync_token: Option<&str>) -> SourceResult<SourceChanges> {
         let start = sync_token.unwrap_or(DELTA_PATH);
         if let Some(changes) = self.read_all(start).await? {
@@ -430,6 +437,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
 }
 
 impl Contact {
+    // SPEC-15.648
     fn into_source(self) -> SourceContact {
         // Graph's own order; the first address is treated as primary by
         // the mapping layer. Microsoft does not mark one as primary the

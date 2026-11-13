@@ -19,6 +19,8 @@
 # SPEC-10.174: let _ = retry_after is banned even inside this helper file.
 const HELPER_FILE = 'src/utils/error.rs'
 
+# SPEC-10.357: reason precedence
+
 def main [] {
     let violations = (
         glob src/**/*.rs
@@ -38,6 +40,7 @@ def main [] {
                 let bypasses_constructor = (
                     ($row.item | str contains 'AppError::RateLimited')
                     and (not $is_helper)
+                    and (not ($trimmed | str starts-with '//'))
                 )
                 let reason = if $inline_429 {
                     'builds a 429 outside the shared helper'

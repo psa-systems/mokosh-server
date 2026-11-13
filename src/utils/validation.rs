@@ -451,6 +451,7 @@ pub fn validate_mac_address(value: &str) -> Result<(), ValidationError> {
 
 /// Generate a slug from a string
 // SPEC-4.47: lowercase, non-alphanumeric to "-", collapse consecutive separators.
+// SPEC-4.1011: Unicode alphanumerics kept; no leading, trailing or doubled separator.
 pub fn slugify(s: &str) -> String {
     s.to_lowercase()
         .chars()

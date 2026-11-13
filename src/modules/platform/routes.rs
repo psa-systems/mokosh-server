@@ -38,6 +38,7 @@ pub struct PlatformRouterState {
     pub login_limiter: Arc<AuthRateLimiter>,
 }
 
+// SPEC-5.308
 pub fn platform_routes(platform_service: PlatformAdminService) -> Router {
     let state = PlatformRouterState {
         platform_service: Arc::new(platform_service),
@@ -52,6 +53,7 @@ pub fn platform_routes(platform_service: PlatformAdminService) -> Router {
         .with_state(state)
 }
 
+// SPEC-5.307, SPEC-5.308
 async fn login(
     State(state): State<PlatformRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -76,6 +78,7 @@ async fn login(
     Ok(Json::<PlatformLoginResponse>(response).into_response())
 }
 
+// SPEC-5.318, SPEC-5.319
 async fn change_password(
     State(state): State<PlatformRouterState>,
     caller: RequirePlatformAdmin,
@@ -93,6 +96,7 @@ async fn change_password(
         .await
 }
 
+// SPEC-5.320, SPEC-5.321
 async fn mfa_setup(
     State(state): State<PlatformRouterState>,
     caller: RequirePlatformAdmin,
@@ -106,6 +110,7 @@ async fn mfa_setup(
     Ok(Json(response))
 }
 
+// SPEC-5.320, SPEC-5.322
 async fn mfa_enable(
     State(state): State<PlatformRouterState>,
     caller: RequirePlatformAdmin,
@@ -119,6 +124,7 @@ async fn mfa_enable(
     Ok(Json(response))
 }
 
+// SPEC-5.320, SPEC-5.323
 async fn mfa_disable(
     State(state): State<PlatformRouterState>,
     caller: RequirePlatformAdmin,
@@ -144,6 +150,7 @@ pub struct RequirePlatformAdmin {
     pub email: String,
 }
 
+// SPEC-5.317
 impl<S> axum::extract::FromRequestParts<S> for RequirePlatformAdmin
 where
     S: Send + Sync,

@@ -112,6 +112,7 @@ pub enum SecretKind {
 
 impl SecretKind {
     /// The kind's own segment of the name.
+    // SPEC-3.1012: PAYMENT_GATEWAY, CONTACT_SYNC, OAUTH_CLIENT, INTEGRATION name prefixes.
     fn prefix(&self) -> &'static str {
         match self {
             SecretKind::PaymentGateway { .. } => "PAYMENT_GATEWAY",
@@ -235,6 +236,8 @@ impl SecretKey {
     }
 }
 
+// SPEC-3.1011: Display is PREFIX/uuid/discriminator, not name(); name() errors on a bad
+// discriminator.
 impl fmt::Display for SecretKey {
     /// Names the key, never the value. Safe to log.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -374,6 +377,7 @@ impl SecretProviderKind {
                 )))
             }
             other => Err(AppError::Configuration(format!(
+                // SPEC-2.243
                 "SECRET_BACKEND {other:?} is not a known provider; expected 'database' or 'infisical'"
             ))),
         }
@@ -457,6 +461,7 @@ impl SecretsConfig {
 /// Returns the resolution alongside the provider (PMS-1011) so the boot record
 /// can report what serves secrets and whether the hosting profile or the
 /// operator chose it, without a second reader of `SECRET_BACKEND`.
+// SPEC-3.1013: builds the selected tenant provider and logs the provider and its source.
 pub fn provider_from_env(
     db: crate::db::Database,
     encryption_key: [u8; 32],

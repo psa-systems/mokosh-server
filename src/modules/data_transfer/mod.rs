@@ -29,6 +29,7 @@ use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::modules::seed::{LoadDemoOutcome, SeedService};
 use crate::utils::error::{AppError, AppResult};
 
+// SPEC-15.2124, SPEC-15.2125
 const SCHEMA_VERSION: i32 = 1;
 
 /// Tables excluded from the export entirely. Their rows never leave the
@@ -36,6 +37,7 @@ const SCHEMA_VERSION: i32 = 1;
 /// encrypted integration secrets; the auth identity/session/one-shot-token
 /// tables are Bunyip/OIDC-owned or transient; the audit/log tables are the
 /// system's own records, not portable tenant data.
+// SPEC-15.2123, SPEC-15.2126
 const EXCLUDE_TABLES: &[&str] = &[
     // integration secrets
     "payment_gateway_configs",
@@ -59,6 +61,7 @@ const EXCLUDE_TABLES: &[&str] = &[
 /// dropped from every exported row. Catches secrets that live inside otherwise
 /// business tables, e.g. `contacts.portal_password_hash` and
 /// `email_mailboxes.smtp_password_encrypted`.
+// SPEC-15.2123
 const SECRET_COLUMN_SUBSTRINGS: &[&str] = &[
     "encrypted",
     "password_hash",
@@ -78,6 +81,7 @@ pub struct DataTransferState {
     pub seed: Arc<SeedService>,
 }
 
+// SPEC-15.2125
 pub fn data_transfer_routes(db: Database, seed: Arc<SeedService>) -> Router {
     Router::new()
         .route("/data/export", get(export_tenant_data))
@@ -95,6 +99,7 @@ pub fn data_transfer_routes(db: Database, seed: Arc<SeedService>) -> Router {
 /// explicit request so an admin can populate a fresh/evaluation tenant from the
 /// Settings -> Data page. Always `200`: `seeded=false` is a legitimate "already
 /// has data" outcome, not an error.
+// SPEC-15.2130
 async fn seed_demo_data(
     State(s): State<DataTransferState>,
     RequireAuth(u): RequireAuth,
@@ -134,6 +139,7 @@ fn is_safe_identifier(name: &str) -> bool {
 }
 
 /// `GET /api/v1/data/export` - admin-only tenant data snapshot download.
+// SPEC-15.2123, SPEC-15.2124
 async fn export_tenant_data(
     State(s): State<DataTransferState>,
     RequireAuth(u): RequireAuth,
@@ -222,6 +228,7 @@ async fn export_tenant_data(
 /// 25 MB cap on the uploaded import envelope. Sync import for now; a larger
 /// tenant is a background-job follow-up (PMS-646). Enforced as an axum body
 /// limit, so an over-size upload gets a 413 before the handler runs.
+// SPEC-15.2125
 const IMPORT_MAX_BYTES: usize = 25 * 1024 * 1024;
 
 /// `POST /api/v1/data/import` request: the export envelope plus a destructive-
@@ -245,6 +252,7 @@ struct ImportEnvelope {
 /// id, so primary keys and FK references can be remapped consistently. Rows
 /// without a parseable string `id` are skipped (nothing can reference them by
 /// id). Pure - unit-tested without a database.
+// SPEC-15.2128
 fn build_id_map(entities: &Map<String, Value>) -> HashMap<Uuid, Uuid> {
     let mut map = HashMap::new();
     for rows in entities.values() {
@@ -268,6 +276,7 @@ fn build_id_map(entities: &Map<String, Value>) -> HashMap<Uuid, Uuid> {
 /// Values not in the map are left unchanged here; dangling-FK / user-reference
 /// resolution needs catalog metadata and is applied during the load
 /// (PMS-648 commit 2). Pure - unit-tested without a database.
+// SPEC-15.2128
 fn remap_row(mut row: Value, id_map: &HashMap<Uuid, Uuid>, target_tenant: Uuid) -> Value {
     if let Value::Object(obj) = &mut row {
         for (key, val) in obj.iter_mut() {
@@ -293,6 +302,7 @@ fn remap_row(mut row: Value, id_map: &HashMap<Uuid, Uuid>, target_tenant: Uuid) 
 /// file with remapped ids in ANY order. A failure anywhere rolls the whole
 /// thing back - the tenant is either fully replaced or untouched. Emits the
 /// `import` audit action.
+// SPEC-15.2125, SPEC-15.2126, SPEC-15.2127, SPEC-15.2128, SPEC-15.2129
 async fn import_tenant_data(
     State(s): State<DataTransferState>,
     RequireAuth(u): RequireAuth,

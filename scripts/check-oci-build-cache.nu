@@ -43,6 +43,8 @@ const FORBIDDEN = [
     ["dedicated :buildcache tag" ":buildcache"]
 ]
 
+# SPEC-10.361: selection and driver alternatives
+
 def main [] {
     let files = (
         glob .forgejo/workflows/*.yml

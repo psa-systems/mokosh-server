@@ -51,6 +51,7 @@ impl StoredMfaSecret {
     }
 }
 
+// SPEC-5.109: stored value is always ciphertext.
 /// Encrypt a base32 secret for storage in `users.mfa_secret`.
 pub(crate) fn seal(secret_b32: &str, key: &[u8; 32]) -> AppResult<String> {
     encrypt(secret_b32, key)
@@ -63,6 +64,7 @@ pub(crate) fn seal(secret_b32: &str, key: &[u8; 32]) -> AppResult<String> {
 /// `ENCRYPTION_KEY` into "this row is plaintext", hand the verifier 60 bytes of
 /// base64 decoded as if it were base32, and report a misconfigured deployment
 /// as a wrong code. A ciphertext that will not decrypt is an error here, loudly.
+// SPEC-5.110 SPEC-5.111 SPEC-5.112: plaintext shape tested first; undecryptable ciphertext is an error.
 pub(crate) fn open(stored: &str, key: &[u8; 32]) -> AppResult<StoredMfaSecret> {
     if is_plaintext_shape(stored) {
         return Ok(StoredMfaSecret::LegacyPlaintext(stored.to_string()));

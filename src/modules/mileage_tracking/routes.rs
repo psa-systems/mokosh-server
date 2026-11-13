@@ -31,6 +31,7 @@ pub struct MileageTrackingRouterState {
     pub service: Arc<MileageTrackingService>,
 }
 
+// SPEC-14.1: every mileage route carries the time_tracking module gate.
 pub fn mileage_tracking_routes(service: MileageTrackingService) -> Router {
     let state = MileageTrackingRouterState {
         service: Arc::new(service),
@@ -49,6 +50,7 @@ pub fn mileage_tracking_routes(service: MileageTrackingService) -> Router {
         .with_state(state)
 }
 
+// SPEC-14.50: lists every entry of the tenant, not only the caller's.
 async fn list_mileage_entries(
     State(state): State<MileageTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -73,6 +75,7 @@ async fn create_mileage_entry(
     ctx: crate::modules::audit::AuditCtx,
     Json(mut request): Json<CreateMileageEntryRequest>,
 ) -> AppResult<Json<MileageEntryResponse>> {
+    // SPEC-14.51: owner rewrite for non-admins, then distance and rate validation (422).
     // Non-admins can only log mileage for themselves.
     if !user.role.is_admin() && request.user_id != user.id {
         request.user_id = user.id;
@@ -86,6 +89,7 @@ async fn create_mileage_entry(
     ))
 }
 
+// SPEC-14.50: 404 "Mileage entry" when absent.
 async fn get_mileage_entry(
     State(state): State<MileageTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -103,6 +107,7 @@ async fn update_mileage_entry(
     Json(request): Json<UpdateMileageEntryRequest>,
 ) -> AppResult<Json<MileageEntryResponse>> {
     request.validate()?;
+    // SPEC-14.51, SPEC-14.55: validation, then 404 before the owner check.
     // A non-admin can only edit their own entry; an unknown id 404s first.
     let existing = state.service.get_mileage_entry(user.tenant(), id).await?;
     if !user.role.is_admin() && existing.user_id != user.id {
@@ -123,6 +128,7 @@ async fn delete_mileage_entry(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
+    // SPEC-14.55: 404 before the owner check.
     // A non-admin can only delete their own entry; an unknown id 404s first.
     let existing = state.service.get_mileage_entry(user.tenant(), id).await?;
     if !user.role.is_admin() && existing.user_id != user.id {

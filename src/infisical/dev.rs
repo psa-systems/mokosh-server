@@ -80,6 +80,7 @@ pub async fn run_dev_bootstrap(config: DevBootstrapConfig) -> Result<BootstrapOu
 // SPEC-3.41: preserves every existing line verbatim except a line
 // whose key matches an update, which is replaced in place; a key not
 // already present is appended at the end.
+// SPEC-3.1019: read and write failures are AppError::Internal naming the path.
 fn upsert_env_file(path: &Path, updates: &[(&str, &str)]) -> Result<(), AppError> {
     let existing = if path.exists() {
         fs::read_to_string(path)

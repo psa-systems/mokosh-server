@@ -54,6 +54,7 @@ const DEFAULT_ADMIN_LAST_NAME: &str = "Admin";
 // provider-set, provider-migrate, provider-purge, verify-providers;
 // any other token (including none) starts the HTTP server instead
 // of dispatching.
+// SPEC-12.43: any other first token, including --help and --version, starts the server.
 pub fn is_subcommand(name: &str) -> bool {
     matches!(
         name,
@@ -74,6 +75,7 @@ pub fn is_subcommand(name: &str) -> bool {
 /// Dispatch the operator subcommand named by `args[1]` (so `args` is the full
 /// argv). Only call this when [`is_subcommand`] returned true for `args[1]`.
 /// Returns `Ok(())` on success; the caller maps an `Err` to a non-zero exit.
+// SPEC-12.44: the caller prints `error: <chain>` to stderr and exits 1 on Err (src/main.rs run_cli).
 pub async fn run(args: &[String]) -> anyhow::Result<()> {
     match args.get(1).map(String::as_str) {
         Some("bootstrap-infisical") => run_bootstrap_infisical().await,
@@ -106,6 +108,9 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
 // absent, and otherwise falls back to fixed defaults for every other
 // input (address http://localhost:28002, project mokosh, identity
 // mokosh-machine, environment dev, env file .env, admin name Mokosh Admin).
+// SPEC-12.47: prints ids and the env file path, never the password or client secret.
+// SPEC-3.1038: reads INFISICAL_URL/_PROJECT_NAME/_IDENTITY_NAME/_ENVIRONMENT and MOKOSH_ENV_FILE;
+// prints no secret.
 async fn run_bootstrap_infisical() -> anyhow::Result<()> {
     let admin_email = require_env("INFISICAL_ADMIN_EMAIL")?;
     let admin_password = require_env("INFISICAL_ADMIN_PASSWORD")?;
@@ -163,6 +168,7 @@ async fn run_bootstrap_infisical() -> anyhow::Result<()> {
 /// `--tenant <uuid>` (or the `MOKOSH_QA_TENANT_ID` env var) and is
 /// cross-checked against the `is_qa` marker by the seed itself, which refuses
 /// (zero writes) for any tenant not explicitly marked QA, production included.
+// SPEC-12.46: DATABASE_URL for both pools; refusal rules live in the seed module.
 async fn run_qa(subcommand: &str, args: &[String]) -> anyhow::Result<()> {
     use crate::db::Database;
 
@@ -196,6 +202,7 @@ async fn run_qa(subcommand: &str, args: &[String]) -> anyhow::Result<()> {
 /// env var) and is cross-checked against the `is_showcase` marker by the seed
 /// itself, which refuses (zero writes) for any tenant not explicitly marked
 /// showcase, production included.
+// SPEC-12.46
 async fn run_showcase(subcommand: &str, args: &[String]) -> anyhow::Result<()> {
     use crate::db::Database;
 

@@ -91,6 +91,7 @@ impl IntegrationsService {
         Self { db, secrets }
     }
 
+    // SPEC-15.1502, SPEC-15.1516: one entry per registry provider, tenant-scoped
     /// Every provider, each with what it supports and what this tenant has
     /// handed it.
     ///
@@ -127,6 +128,7 @@ impl IntegrationsService {
             .collect())
     }
 
+    // SPEC-15.1512, SPEC-15.1513, SPEC-15.1514, SPEC-15.1515, SPEC-15.1516: contact-sync entries read from their own table
     /// The contact-sync connections this tenant holds, by provider
     /// discriminator (MAPPS-1122).
     ///
@@ -219,6 +221,7 @@ impl IntegrationsService {
         ))
     }
 
+    // SPEC-15.1520, SPEC-15.1521, SPEC-15.1527, SPEC-15.1530: update refusals and audit
     /// Change what this tenant delegates, and the non-secret settings.
     ///
     /// Refused for a provider managed elsewhere, and refused when there is no
@@ -303,6 +306,7 @@ impl IntegrationsService {
         Ok(compose(descriptor, Some(&updated), None))
     }
 
+    // SPEC-15.1520, SPEC-15.1521, SPEC-15.1522, SPEC-15.1523, SPEC-15.1530: connect for the integrations credential home
     /// Store the credential and mark the integration connected.
     ///
     /// The row is upserted, because `integrations` is UNIQUE on
@@ -412,6 +416,7 @@ impl IntegrationsService {
         Ok(compose(descriptor, Some(&row), None))
     }
 
+    // SPEC-15.1524, SPEC-15.1525, SPEC-15.1526, SPEC-15.1530: payment-gateway connect
     /// Connect a provider whose credential is entered on another surface
     /// (PMS-1312).
     ///
@@ -571,6 +576,7 @@ impl IntegrationsService {
         Ok(compose(descriptor, Some(&row), None))
     }
 
+    // SPEC-15.1528, SPEC-15.1529, SPEC-15.1530: disconnect keeps the row
     /// Mark the integration disconnected, and delete its credential when this
     /// surface is the one that stored it.
     ///
@@ -720,6 +726,7 @@ async fn read_row_in_tx(
     .map_err(|e| AppError::Database(e.to_string()))
 }
 
+// SPEC-15.1510, SPEC-15.1511, SPEC-15.1512, SPEC-15.1514: registry half joined to the tenant row
 /// The registry's half and the tenant's half, joined.
 fn compose(
     descriptor: &ProviderDescriptor,
@@ -781,6 +788,7 @@ fn compose(
     response
 }
 
+// SPEC-15.1512: contact-sync status mapping
 /// A contact-sync connection's state, as one of the four statuses this
 /// surface speaks (MAPPS-1122).
 ///
@@ -839,6 +847,7 @@ struct ContactSyncState {
     disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+// SPEC-15.1520: 409 for another subsystem's connection
 /// Refuse a provider whose connection is owned by another subsystem, naming
 /// where it is configured instead.
 ///
@@ -859,6 +868,7 @@ fn assert_managed_here(descriptor: &ProviderDescriptor) -> AppResult<()> {
     }
 }
 
+// SPEC-15.1521: 409 for a planned provider
 /// Refuse a provider this build has nothing behind (MAPPS-1121).
 ///
 /// A 409 rather than a 400, the `assert_managed_here` reading: the request is
@@ -883,6 +893,7 @@ fn assert_built(descriptor: &ProviderDescriptor) -> AppResult<()> {
     )))
 }
 
+// SPEC-15.1517: subset rule and registry order
 /// The subset rule: every requested capability has to be one the provider
 /// supports, and nothing may be asked for twice.
 ///
@@ -934,6 +945,7 @@ fn resolve_capabilities(
         .collect())
 }
 
+// SPEC-15.1518: config must be an object
 /// `config` holds per-provider settings, so it has to be a JSON object: an
 /// array or a scalar there would be a shape no provider can read, stored
 /// without complaint.
@@ -947,6 +959,7 @@ fn assert_config_object(config: Value) -> AppResult<Value> {
     }
 }
 
+// SPEC-15.1519: poll interval rules
 /// A poll interval is only meaningful for a provider that polls, and only above
 /// the floor the column enforces. Checked here so the refusal names the
 /// provider and the floor rather than surfacing a constraint violation.
@@ -972,6 +985,7 @@ fn assert_poll_interval(
     Ok(Some(minutes))
 }
 
+// SPEC-15.1530: snapshot holds no credential
 /// What the audit row records. Deliberately only the fields a change can move,
 /// and deliberately never the credential, which is not on the row to begin
 /// with.

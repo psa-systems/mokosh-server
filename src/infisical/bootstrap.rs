@@ -319,6 +319,7 @@ impl BootstrapClient {
         Self::parse_json(path, resp).await
     }
 
+    // SPEC-3.1018: non-success text is 'Infisical bootstrap call {path} returned {status}: {body}'.
     async fn parse_json<Resp: for<'de> Deserialize<'de>>(
         path: &str,
         resp: reqwest::Response,
@@ -392,6 +393,8 @@ pub async fn bootstrap_infisical(
 
     info!("Bootstrapping Infisical at {}", base_url);
 
+    // SPEC-3.1016: not idempotent: a re-run on an initialized instance fails here with the server
+    // error.
     // 1. Admin signup (no auth).
     info!("Creating admin user {}", input.admin_email);
     let signup: AdminSignupResp = client
@@ -517,6 +520,8 @@ pub async fn bootstrap_infisical(
         )
         .await?;
 
+    // SPEC-3.1017: project template default/type secret-manager; identity not delete-protected; ttl
+    // 0, uses 0.
     // 7. Create the client secret.
     info!("Creating client secret for identity {}", identity_id);
     let secret: CreateClientSecretResp = client

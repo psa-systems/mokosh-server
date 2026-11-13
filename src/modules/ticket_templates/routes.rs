@@ -95,6 +95,7 @@ async fn update(
     Ok(Json(s.service.update(u.tenant_id, id, req).await?))
 }
 
+// SPEC-7.1118: create stamps the calling admin as created_by_id; delete answers {"deleted": true}.
 async fn delete_one(
     State(s): State<TicketTemplatesRouterState>,
     RequireAdminUser(u): RequireAdminUser,

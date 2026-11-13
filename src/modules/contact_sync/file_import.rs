@@ -74,6 +74,7 @@ const FILENAME_MAX: usize = 200;
 
 /// The largest upload, the body limit the route sets from it, and the reader's
 /// own limit: one number.
+// SPEC-15.604
 pub fn max_upload_bytes() -> u64 {
     Limits::DEFAULT.max_file_bytes
 }
@@ -113,6 +114,7 @@ impl VcardFileSource {
     }
 }
 
+// SPEC-15.609
 #[async_trait]
 impl ContactSyncProvider for VcardFileSource {
     fn id(&self) -> &'static str {
@@ -180,6 +182,7 @@ pub struct UploadedFile {
 
 /// A browser's file name, reduced to something safe to show: the last path
 /// segment, no control or invisible characters, cut to fit.
+// SPEC-15.605
 fn clean_filename(raw: Option<&str>) -> String {
     let raw = raw.unwrap_or_default();
     let last = raw.rsplit(['/', '\\']).next().unwrap_or_default();
@@ -197,6 +200,7 @@ fn clean_filename(raw: Option<&str>) -> String {
 
 /// Read a file on a blocking thread: parsing is CPU work over up to the file
 /// limit, and the async executor must not wait on it.
+// SPEC-15.606
 async fn parse(bytes: Vec<u8>) -> AppResult<VcardFile> {
     tokio::task::spawn_blocking(move || read_vcards(bytes.as_slice(), Limits::DEFAULT))
         .await
@@ -210,6 +214,7 @@ async fn parse(bytes: Vec<u8>) -> AppResult<VcardFile> {
 }
 
 /// The stored upload, read and parsed. What the runner imports from.
+// SPEC-15.610
 pub async fn load_source(tenant_id: TenantId, file_id: Uuid) -> AppResult<VcardFileSource> {
     let bytes = crate::storage::shared()
         .read(&ObjectKey::contact_import(tenant_id.get(), file_id))
@@ -224,6 +229,7 @@ pub async fn load_source(tenant_id: TenantId, file_id: Uuid) -> AppResult<VcardF
 
 /// Delete a held upload and stamp its row. Idempotent: an object already gone
 /// is not an error, and a stamped row is left alone.
+// SPEC-15.611
 pub async fn discard(db: &Database, tenant_id: TenantId, file_id: Uuid) -> AppResult<()> {
     let key = ObjectKey::contact_import(tenant_id.get(), file_id);
     let storage = crate::storage::shared();
@@ -259,6 +265,7 @@ pub async fn discard(db: &Database, tenant_id: TenantId, file_id: Uuid) -> AppRe
 
 /// Every held upload past its hold with no run still reading it, across every
 /// tenant. The runner calls this each tick.
+// SPEC-15.612
 pub async fn discard_expired(db: &Database) -> AppResult<u64> {
     let expired: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "SELECT f.tenant_id, f.id FROM contact_import_files f \
@@ -286,6 +293,7 @@ pub async fn discard_expired(db: &Database) -> AppResult<u64> {
 
 impl ContactSyncService {
     /// The tenant's `vcard` source row, created on first use.
+    // SPEC-15.608
     async fn vcard_source_id(&self, tenant_id: TenantId, user_id: Option<Uuid>) -> AppResult<Uuid> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
@@ -312,6 +320,7 @@ impl ContactSyncService {
     }
 
     /// Store an uploaded `.vcf` and preview importing it. Writes no contact.
+    // SPEC-15.606, SPEC-15.607
     pub async fn upload_vcard(
         &self,
         tenant_id: TenantId,
@@ -416,6 +425,7 @@ impl ContactSyncService {
     }
 
     /// One upload, with the run importing it if there is one.
+    // SPEC-15.613
     pub async fn vcard_file(
         &self,
         tenant_id: TenantId,
@@ -455,6 +465,7 @@ impl ContactSyncService {
     /// Recent uploads, newest first. Three queries in one transaction (ids,
     /// file metadata batch, latest-run batch), not one transaction and two
     /// queries per row.
+    // SPEC-15.614
     pub async fn vcard_files(
         &self,
         tenant_id: TenantId,
@@ -526,6 +537,7 @@ impl ContactSyncService {
     }
 
     /// A held upload that can still be imported.
+    // SPEC-15.615
     async fn held_file(&self, tenant_id: TenantId, file_id: Uuid) -> AppResult<ImportFileView> {
         let file = self.vcard_file(tenant_id, file_id).await?;
         if file.discarded_at.is_some() || file.expires_at <= Utc::now() {
@@ -538,6 +550,7 @@ impl ContactSyncService {
 
     /// Preview a held upload for a set of categories, so the totals are exact
     /// for that choice. `None` previews every category.
+    // SPEC-15.615
     pub async fn preview_vcard(
         &self,
         tenant_id: TenantId,
@@ -556,6 +569,7 @@ impl ContactSyncService {
 
     /// Import a held upload's chosen categories. 202-shaped: the answer is the
     /// run to poll.
+    // SPEC-15.615 to 15.617
     pub async fn import_vcard(
         &self,
         tenant_id: TenantId,
@@ -634,6 +648,7 @@ impl ContactSyncService {
     }
 }
 
+// SPEC-15.617
 fn busy() -> AppError {
     AppError::Conflict(
         "A file import is already queued or running. Wait for it to finish, then import this one."

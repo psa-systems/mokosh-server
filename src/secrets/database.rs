@@ -52,6 +52,7 @@ impl SecretProvider for DatabaseSecretProvider {
         .await?;
 
         match stored {
+            // SPEC-3.1014: an undecryptable ciphertext is Err, never Ok(None).
             Some(ciphertext) => Ok(Some(crate::utils::crypto::decrypt(
                 &ciphertext,
                 &self.encryption_key,

@@ -1,3 +1,4 @@
+# SPEC-10.352: dev-dependency only
 [package]
 name = "mokosh-test"
 version = "0.1.0"
@@ -11,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 # The attribute itself. Re-exported from here so a test binary names one
 # crate, the split a proc-macro crate forces (it can export nothing else).
+# SPEC-2.5
 mokosh-test-macros = { path = "../mokosh-test-macros" }
 # `migrate` is what builds the template; the rest is what a test pool needs.
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate"] }

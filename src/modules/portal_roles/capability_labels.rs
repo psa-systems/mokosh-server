@@ -15,6 +15,7 @@
 use super::models::CapabilityDescriptor;
 use crate::modules::contact_portal::capabilities as caps;
 
+// SPEC-5.402
 pub fn descriptors() -> Vec<CapabilityDescriptor> {
     vec![
         CapabilityDescriptor {

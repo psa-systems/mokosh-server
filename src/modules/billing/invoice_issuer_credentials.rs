@@ -37,6 +37,7 @@ use crate::modules::billing::provider_invoice::{
 };
 use crate::utils::error::{AppError, AppResult};
 
+// SPEC-13.1014
 /// The JSON blob stored under `SecretKind::Integration { provider }`
 /// for a delegated invoice-issuer connection. One variant per
 /// provider; the `provider` tag sits beside the fields (serde calls
@@ -77,6 +78,7 @@ pub struct QuickbooksBlob {
     pub refresh_token_expires_at: Option<DateTime<Utc>>,
 }
 
+// SPEC-13.1018: host half and tenant half
 /// The credentials a client call takes: the deployment's application plus
 /// this tenant's tokens (MAPPS-1139).
 ///
@@ -108,6 +110,7 @@ pub fn quickbooks_credentials(app: &IssuerApp, blob: &QuickbooksBlob) -> QuickBo
     }
 }
 
+// SPEC-13.1015
 /// Deserialise a blob stored under `SecretKind::Integration` and
 /// confirm it names the expected provider (so a Xero caller cannot
 /// pick up a blob somebody wrote under the Xero key but tagged
@@ -140,6 +143,7 @@ pub fn parse_blob(
     }
 }
 
+// SPEC-13.1016
 /// Apply a refreshed Xero token response to a stored blob. Overwrites
 /// the access token and the rotated refresh token, and recomputes the
 /// absolute expiry from `now + expires_in` (the one source of truth,
@@ -151,6 +155,7 @@ pub fn apply_xero_refresh(blob: &mut XeroBlob, response: &XeroTokenResponse, now
     blob.access_token_expires_at = now + Duration::seconds(response.expires_in.max(0));
 }
 
+// SPEC-13.1016, SPEC-13.1017
 /// Apply a refreshed QuickBooks token response to a stored blob.
 /// Same shape as [`apply_xero_refresh`], with the extra step of
 /// writing the refresh-token-expiry QBO returns.
@@ -167,6 +172,7 @@ pub fn apply_quickbooks_refresh(
     }
 }
 
+// SPEC-13.1019
 /// Serialise a blob back to its stored string. Separate from
 /// `IntegrationCredentialBlob::serialize` through serde because the
 /// stored key is a `String` on the `SecretProvider` trait, so having a

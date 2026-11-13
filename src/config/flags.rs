@@ -58,6 +58,7 @@ pub trait FlagValue: Sized + Copy + PartialEq {
 }
 
 impl FlagValue for bool {
+    // SPEC-6.30: accepted spellings of a boolean flag.
     /// Case-insensitive `"1" | "true" | "yes"` for true and
     /// `"0" | "false" | "no"` for false; anything else is `None`,
     /// which lets the flag's default stand.
@@ -67,6 +68,7 @@ impl FlagValue for bool {
     /// migration onto [`Flag`] preserves the shipping behaviour.
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            // SPEC-2.220
             "1" | "true" | "yes" => Some(true),
             "0" | "false" | "no" => Some(false),
             _ => None,
@@ -116,8 +118,9 @@ pub enum FlagDefault<T: FlagValue> {
 /// of the default (`Constant` or `PerProfile`), never the flag's
 /// resolved value. A boolean is not sensitive on its own, but the
 /// pattern holds for future non-bool flags whose value may be.
-// SPEC-1 and 2.143: a Flag is a declared application-tier key plus a typed default, distinct
+// a Flag is a declared application-tier key plus a typed default, distinct
 // from a ConfigKey's own Tier (a flag always stays on Application so it is refresh-visible).
+// SPEC-2.217
 pub struct Flag<T: FlagValue> {
     key: &'static ConfigKey,
     default: FlagDefault<T>,
@@ -147,8 +150,10 @@ impl<T: FlagValue> Flag<T> {
     /// value (trimmed length zero) is treated as unset for the same
     /// reason [`AppConfig::from_env`] treats blanks as unset: a
     /// compose key forwarded but unset arrives as `""` (PMS-836).
-    // SPEC-1 and 2.144: the one read path for a flag; a blank or unparsable raw
+    // the one read path for a flag; a blank or unparsable raw
     // value falls back to the flag's default rather than failing the read.
+    // SPEC-6.30: a set value that does not parse warns and serves the default.
+    // SPEC-2.219
     pub fn read(&self) -> T {
         match config::get(self.key) {
             Some(raw) if !raw.trim().is_empty() => match T::parse(&raw) {
@@ -201,8 +206,9 @@ impl<T: FlagValue> Flag<T> {
     /// `MOKOSH_DEPLOYMENT_MODE`, and PMS-902 already argued the case
     /// for the lenient reader when the answer only gates behaviour
     /// with a safe default.
-    // SPEC-1 and 2.145: FlagDefault::PerProfile resolves against the current
+    // FlagDefault::PerProfile resolves against the current
     // DeploymentMode on every read rather than freezing a mode at construction.
+    // SPEC-2.222
     pub fn resolved_default(&self) -> T {
         match self.default {
             FlagDefault::Constant(value) => value,
@@ -242,13 +248,15 @@ impl<T: FlagValue> std::fmt::Debug for Flag<T> {
     }
 }
 
+// SPEC-6.31
+// SPEC-2.218
 /// PMS-983: the organizations feature.
 ///
 /// A SaaS deployment has multi-user organizations enabled by
-/// default, matching the current shipping behaviour on nc-01 and
-/// c-01. A self-hosted deployment starts with organizations off,
-/// matching the single-user default the customer image ships with
-/// today.
+/// default, matching the current shipping behaviour on the hosted
+/// deployments. A self-hosted deployment starts with organizations
+/// off, matching the single-user default the customer image ships
+/// with today.
 pub static ORGANIZATIONS_ENABLED: Flag<bool> = Flag::new(
     &registry::ORGANIZATIONS_ENABLED,
     FlagDefault::PerProfile {
@@ -257,6 +265,7 @@ pub static ORGANIZATIONS_ENABLED: Flag<bool> = Flag::new(
     },
 );
 
+// SPEC-6.31
 /// PMS-658 / PMS-983: opt-in gate on the suspicious-login
 /// notify-and-approve flow.
 ///
@@ -272,6 +281,7 @@ pub static LOGIN_APPROVAL_ENABLED: Flag<bool> = Flag::new(
     FlagDefault::Constant(false),
 );
 
+// SPEC-6.31
 /// Opts in to JIT-provisioning a personal tenant for a first-sight bunyip
 /// identity whose email the OP has verified. Off by default so production
 /// stays invitation-only; staging opts in through its compose.
@@ -310,6 +320,8 @@ static ALL_FLAGS: &[&dyn FlagCheck] = &[
     &ALLOW_UNINVITED_BUNYIP_SIGNUP,
 ];
 
+// SPEC-6.32
+// SPEC-2.221
 /// PMS-1577: refuse to start when any declared flag is set but unparseable.
 /// Collects every failing flag into one combined error, mirroring
 /// `main.rs`'s `check_deployment_requirements`.

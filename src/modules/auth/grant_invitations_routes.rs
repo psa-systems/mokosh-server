@@ -143,6 +143,7 @@ impl From<GrantInvitation> for InvitationResponse {
 }
 
 impl InvitationResponse {
+    // SPEC-5.262
     /// PMS-1499: fill `tenant_slug` from `tenants.slug` by `tenant_id`. Runs
     /// on the migrator pool because the grant-invitation handlers either are
     /// pre-auth (by-token) or carry an auth context whose tenant may NOT be
@@ -161,6 +162,7 @@ impl InvitationResponse {
     }
 }
 
+// SPEC-5.254, SPEC-5.262
 /// PMS-1499: batch-resolve `tenant_slug` for a list of invitations with one
 /// `WHERE id = ANY($1)` round trip. The grantee inbox is cross-tenant by
 /// design, so a per-row slug lookup would be an N+1 against `tenants`. A row
@@ -220,6 +222,7 @@ pub struct InvitationMetadata {
     pub status: String,
 }
 
+// SPEC-5.246: RequireAdminUser (super_admin, admin) on each handler
 /// Owner-facing mount. Sits under `/api/v1/grants/invitations` in
 /// `create_api_router`.
 pub fn grant_invitations_owner_routes(
@@ -241,6 +244,7 @@ pub fn grant_invitations_owner_routes(
         .with_state(state)
 }
 
+// SPEC-5.246: RequireAuth on each handler
 /// Grantee-facing mount. Sits under `/api/v1/my-grants/invitations`.
 ///
 /// PMS-1500: id-scoped accept/decline routes alongside the inbox GET so the
@@ -267,6 +271,7 @@ pub fn grant_invitations_grantee_routes(
         .with_state(state)
 }
 
+// SPEC-5.246: GET open, accept/decline RequireAuth
 /// Unauthenticated mount for the token-driven endpoints. Sits
 /// under `/api/v1/grants/invitations/by-token`.
 ///
@@ -304,12 +309,14 @@ pub fn grant_invitations_by_token_routes(
         // backstop every other one in this module has. Layered on the whole
         // router rather than checked per-handler so all three routes share
         // one budget and a future route added here cannot forget it.
+        // SPEC-5.261
         .layer(middleware::from_fn_with_state(
             GrantInvitationTokenLimiter::new(GRANT_INVITATION_TOKEN_PER_MIN),
             grant_invitation_token_limit,
         ))
 }
 
+// SPEC-5.247, SPEC-5.248, SPEC-5.249, SPEC-5.250, SPEC-5.251, SPEC-5.253
 async fn create_invitation(
     State(state): State<GrantInvitationsState>,
     RequireAdminUser(caller): RequireAdminUser,
@@ -518,6 +525,7 @@ mod salutation_greeting {
     }
 }
 
+// SPEC-5.252
 /// Best-effort display name for the inviter, matching the shape
 /// `auth.welcome` uses: `first_name last_name` when both are
 /// present, else whichever is set, else the email local part.
@@ -532,6 +540,7 @@ fn display_name_for(caller: &super::CurrentUser) -> String {
     }
 }
 
+// SPEC-5.252
 /// Title-cased human label for the PMS-1162 role vocab.
 fn role_display(role: &str) -> String {
     match role {
@@ -544,6 +553,7 @@ fn role_display(role: &str) -> String {
     }
 }
 
+// SPEC-5.252
 /// "in 7 days" for a 7-day-out expiry, an absolute date otherwise.
 /// Deliberately coarse: the template says "the invitation expires
 /// {{expires_at_human}}", and a to-the-minute label reads worse than
@@ -572,6 +582,7 @@ async fn lookup_tenant_name(state: &GrantInvitationsState, tenant_id: Uuid) -> O
         .map(|(name,)| name)
 }
 
+// SPEC-5.254
 async fn list_owner_outbox(
     State(state): State<GrantInvitationsState>,
     RequireAdminUser(caller): RequireAdminUser,
@@ -585,6 +596,7 @@ async fn list_owner_outbox(
     Ok(Json(fill_tenant_slugs(&state.db, out).await))
 }
 
+// SPEC-5.255
 async fn list_grantee_inbox(
     State(state): State<GrantInvitationsState>,
     RequireAuth(caller): RequireAuth,
@@ -603,6 +615,7 @@ async fn list_grantee_inbox(
     Ok(Json(fill_tenant_slugs(&state.db, out).await))
 }
 
+// SPEC-5.256
 async fn cancel_invitation(
     State(state): State<GrantInvitationsState>,
     RequireAdminUser(caller): RequireAdminUser,
@@ -625,6 +638,7 @@ async fn cancel_invitation(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// SPEC-5.257
 async fn get_invitation_by_token(
     State(state): State<GrantInvitationsState>,
     Path(token): Path<String>,
@@ -672,6 +686,7 @@ async fn get_invitation_by_token(
     }))
 }
 
+// SPEC-5.258
 async fn accept_invitation(
     State(state): State<GrantInvitationsState>,
     RequireAuth(caller): RequireAuth,
@@ -736,6 +751,7 @@ async fn accept_invitation(
     }
 }
 
+// SPEC-5.259
 async fn decline_invitation(
     State(state): State<GrantInvitationsState>,
     RequireAuth(caller): RequireAuth,
@@ -793,6 +809,7 @@ async fn resolve_caller_bunyip_sub(db: &Database, user_id: Uuid) -> AppResult<Op
     Ok(sub)
 }
 
+// SPEC-5.260
 async fn accept_invitation_by_id(
     State(state): State<GrantInvitationsState>,
     RequireAuth(caller): RequireAuth,
@@ -840,6 +857,7 @@ async fn accept_invitation_by_id(
     }
 }
 
+// SPEC-5.260
 async fn decline_invitation_by_id(
     State(state): State<GrantInvitationsState>,
     RequireAuth(caller): RequireAuth,

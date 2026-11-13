@@ -56,6 +56,7 @@ pub struct AmendmentRef {
     pub status: InvoiceStatus,
 }
 
+// SPEC-13.11, SPEC-13.16
 #[derive(Debug, Clone, Serialize)]
 pub struct InvoiceResponse {
     pub id: Uuid,
@@ -215,6 +216,7 @@ pub struct InvoiceSummaryResponse {
     pub total: Decimal,
 }
 
+// SPEC-13.5, SPEC-13.8
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct InvoiceFilter {
     pub company_id: Option<Uuid>,
@@ -263,6 +265,7 @@ pub struct CreateInvoiceLineRequest {
     pub sort_order: i32,
 }
 
+// SPEC-13.18
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[validate(schema(function = validate_invoice_date_range))]
 pub struct CreateInvoiceRequest {
@@ -296,6 +299,7 @@ pub struct CreateInvoiceRequest {
 /// Cross-field check: an invoice's `due_date` may not fall before its
 /// `invoice_date` (PMS-306). The inverted range was previously accepted;
 /// reject it with a 422 instead of persisting a due-before-issue invoice.
+// SPEC-13.18
 fn validate_invoice_date_range(
     req: &CreateInvoiceRequest,
 ) -> Result<(), validator::ValidationError> {
@@ -337,6 +341,7 @@ pub struct CreateInvoiceFromTimeEntriesRequest {
 }
 
 /// Header-only update. To replace line items, send `lines = Some(...)`.
+// SPEC-13.96, SPEC-13.100
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateInvoiceRequest {
     /// PMS-977: move a draft to another company. Refused once the invoice is
@@ -399,6 +404,7 @@ pub struct UpdateInvoiceRequest {
 /// extensible: adding a method is a migration widening the CHECK and a
 /// variant here. `serde(rename_all = "snake_case")` keeps the wire exactly
 /// the strings the CHECK accepts.
+// SPEC-13.114
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryMethod {
@@ -438,6 +444,7 @@ pub struct DeliveryRequest {
 /// PMS-1462: response from
 /// `GET /invoices/{id}/delivery-options` and
 /// `GET /quotes/{id}/delivery-options`.
+// SPEC-13.115
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryOptionsResponse {
     pub methods: Vec<DeliveryOptionResponse>,
@@ -491,6 +498,7 @@ pub struct DelegatedInvoiceRow {
     pub currency: String,
 }
 
+// SPEC-13.89
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreatePaymentRequest {
     pub invoice_id: Option<Uuid>,
@@ -615,6 +623,7 @@ pub struct WebhookDeliveryResponse {
 /// `url` is `None` when the deployment set no `PUBLIC_API_BASE_URL`. The
 /// client says which of those it is rather than rendering a blank, because an
 /// admin being asked for a webhook signing secret cannot act without it.
+// SPEC-13.69
 #[derive(Debug, Clone, Serialize)]
 pub struct GatewayWebhookEndpoint {
     /// The provider discriminator, as `payment_gateway_configs.provider`
@@ -652,6 +661,7 @@ pub struct PaymentProviderOption {
 /// Support Contact should see whether the button WOULD be enabled for
 /// a Billing Contact, so the empty state on their view is coherent
 /// with what a Billing Contact would see.
+// SPEC-13.76
 #[derive(Debug, Clone, Serialize)]
 pub struct InvoicePaymentReadinessResponse {
     /// True iff the tenant has an `is_active = TRUE` row in
@@ -718,6 +728,7 @@ pub struct InvoicePaymentReadinessResponse {
 /// on the CRM invoice row) and the server has no view onto which SPA
 /// is calling. Both are validated as URLs so a malformed value is
 /// refused before it reaches the payment provider.
+// SPEC-13.78
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct PayInvoiceRequest {
     #[validate(url)]
@@ -745,6 +756,7 @@ pub struct PayInvoiceRequest {
     pub amount: Option<Decimal>,
 }
 
+// SPEC-13.63, SPEC-13.64
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertPaymentGatewayConfigRequest {
     pub provider: GatewayProvider,
@@ -785,6 +797,7 @@ pub struct TaxRateResponse {
     pub is_active: bool,
 }
 
+// SPEC-13.52
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertTaxRateRequest {
     #[validate(length(min = 1, max = 100))]
@@ -814,6 +827,7 @@ pub struct PaymentTermResponse {
     pub net_days: Option<i32>,
 }
 
+// SPEC-13.57
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertPaymentTermRequest {
     #[validate(length(min = 1, max = 100))]
@@ -1024,6 +1038,7 @@ pub struct CreateCreditNoteLineRequest {
 /// a paid, void, written-off or draft invoice is never overdue, and neither
 /// is one due today. Derived, not stored: `due_date` and `balance_due`
 /// already hold the fact.
+// SPEC-13.11
 pub fn overdue_days(
     status: InvoiceStatus,
     balance_due: Decimal,
@@ -1040,6 +1055,7 @@ pub fn overdue_days(
 
 impl InvoiceResponse {
     /// Stamp `is_overdue` and `days_overdue` for a reader whose day is `today`.
+    // SPEC-13.11
     pub fn mark_overdue(&mut self, today: NaiveDate) {
         let days = overdue_days(self.status, self.balance_due, self.due_date, today);
         self.is_overdue = days.is_some();
@@ -1049,6 +1065,7 @@ impl InvoiceResponse {
 
 /// PMS-1036: write an invoice off. The customer owes it and will not pay;
 /// this is the bad-debt record, not a correction (that is a credit note).
+// SPEC-13.116
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct WriteOffInvoiceRequest {
     /// Required: the audit trail, and the first thing an auditor reads.
@@ -1063,12 +1080,14 @@ pub struct WriteOffInvoiceRequest {
 /// required and an auditor reads it first, while a void says the document
 /// never stood at all. A draft withdrawn before anyone saw it often has
 /// nothing to say, so the reason is optional here.
+// SPEC-13.117
 #[derive(Debug, Clone, Deserialize, Validate, Default)]
 pub struct VoidInvoiceRequest {
     #[validate(length(max = 2000))]
     pub reason: Option<String>,
 }
 
+// SPEC-13.119
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateCreditNoteRequest {
     /// The invoice being corrected. Required: see the column comment in
@@ -1089,6 +1108,7 @@ pub struct CreateCreditNoteRequest {
     pub lines: Vec<CreateCreditNoteLineRequest>,
 }
 
+// SPEC-13.124
 #[derive(Debug, Clone, Deserialize, Default, Validate)]
 pub struct CreditNoteFilter {
     pub company_id: Option<Uuid>,
@@ -1104,6 +1124,7 @@ pub struct CreditNoteFilter {
 /// What the caller asks for. There is no `status` filter and no free-text
 /// search: a statement is an account, so leaving rows out on the caller's say-so
 /// would produce a document that does not reconcile.
+// SPEC-13.126
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct StatementQuery {
     pub company_id: Uuid,
@@ -1264,6 +1285,7 @@ pub struct ProductResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-13.130
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertProductRequest {
     /// Optional, and unique within the tenant when present.
@@ -1289,6 +1311,7 @@ fn default_unit() -> String {
     "each".to_string()
 }
 
+// SPEC-13.130
 #[derive(Debug, Clone, Deserialize, Default, Validate)]
 pub struct ProductFilter {
     /// Omitted returns the whole catalog, active and retired, so an admin can
@@ -1372,6 +1395,7 @@ pub struct InvoiceLedgerRefund {
 /// object rather than a bare array so pagination can arrive later
 /// without a shape change; per-invoice payment counts are bounded by
 /// human behaviour, so the whole ledger is one response today.
+// SPEC-13.93
 #[derive(Debug, Clone, Serialize)]
 pub struct InvoiceLedgerResponse {
     pub invoice_id: Uuid,

@@ -1,4 +1,5 @@
 # SPEC-10.148: exactly these four members, in a workspace resolving with "2".
+# SPEC-2.1
 [workspace]
 resolver = "2"
 members = [
@@ -35,6 +36,7 @@ ipnetwork = "0.20"
 # `pool` is NOT a lettre default; opt in so LettreMailer reuses TCP
 # connections across sends. `native-tls` over rustls because some SMTP
 # relays' cert chains historically failed verification under rustls.
+# SPEC-2.11
 lettre = { version = "0.11.23", default-features = false, features = ["tokio1-native-tls", "builder", "smtp-transport", "pool"] }
 
 [package]
@@ -46,6 +48,7 @@ description = "Professional Services Automation platform for MSPs - API server"
 license = "Proprietary"
 repository = "https://dev.a8n.run/psa-systems/mokosh-server"
 
+# SPEC-2.2
 [[bin]]
 name = "mokosh-server"
 path = "src/main.rs"
@@ -54,11 +57,13 @@ path = "src/main.rs"
 name = "mokosh-bootstrap"
 path = "src/bin/mokosh-bootstrap.rs"
 
+# SPEC-2.3
 [features]
 default = ["multi-tenant", "server"]
 multi-tenant = []
 server = []
 
+# SPEC-2.2
 [lib]
 name = "mokosh_server"
 path = "src/lib.rs"
@@ -70,15 +75,18 @@ tower = { version = "0.5", features = ["full"] }
 # PMS-780: `compression-br` alongside `compression-gzip` so the global
 # `CompressionLayer` can answer `Accept-Encoding: br`; without the feature it
 # silently negotiates gzip instead.
+# SPEC-2.9
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "compression-br", "limit", "request-id"] }
 
 # Database
 # PMS-729 phase 2 H6: `ipnetwork` feature enables sqlx's IpNetwork
 # decode for the portal_refresh_tokens.ip_address column so
 # /portal/auth/me/sessions can surface the requesting IP.
+# SPEC-2.12
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "rust_decimal", "ipnetwork"] }
 
 # Async runtime
+# SPEC-2.7
 tokio = { version = "1", features = ["full"] }
 # PMS-1381: `try_join_all` runs a per-row set of gateway calls concurrently
 # instead of one row at a time, without spawning (the futures borrow `&self`).
@@ -119,6 +127,7 @@ argon2 = "0.5"
 # bunyip's `at+jwt`), and it is pure Rust. `aws_lc_rs` would add a C and
 # CMake build dependency to every image and every runner, which is the class
 # of thing that has broken this repository's CI before.
+# SPEC-2.8
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # Validation
@@ -149,6 +158,7 @@ secrecy = { workspace = true }
 # HTTP client (for integrations)
 # `stream` so the S3 backend (PMS-958) can hand a GET body to the
 # attachment download as a reader rather than buffering it (PMS-783 F6).
+# SPEC-2.10
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 urlencoding = "2"
 
@@ -224,6 +234,7 @@ mokosh-types = { path = "crates/mokosh-types" }
 # by a8n-tools and bunyip so the same defect is not solved three times. Pinned by
 # rev (not branch) so a dunite bump is an explicit reviewable diff, mirroring
 # bunyip's dunite pins. Pinned to dunite main.
+# SPEC-2.13
 dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "91e27f2b798128aa2cf54f742df8248564888bf0" }
 
 # BUNYIP-475: the shared ASN / VPN enrichment crate (BUNYIP-437), consumed here
@@ -254,6 +265,7 @@ dunite-provider-status = { git = "https://dev.a8n.run/psa-systems/dunite", rev =
 # is unused.
 minijinja = "2.11"
 
+# SPEC-2.14
 printpdf = { version = "0.12.7", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # PMS-1008 subsets the embedded faces per document. printpdf's own subsetter is
 # behind its `text_layout` feature, which is what we are declining, but the
@@ -293,13 +305,16 @@ serde_urlencoded = "0.7.1"
 # dev-dependency only, so nothing it expands to reaches a release build. It
 # re-exports the attribute from `mokosh-test-macros`, so that crate is not
 # named here.
+# SPEC-2.5
 mokosh-test = { path = "crates/mokosh-test" }
 
+# SPEC-2.4
 [build-dependencies]
 # Shared build-script logic (PMS-198). build.rs calls build_metadata::emit().
 build-metadata = { path = "crates/build-metadata" }
 
 # SPEC-10.152: release aborts on panic and ships stripped.
+# SPEC-2.6
 [profile.release]
 lto = true
 codegen-units = 1

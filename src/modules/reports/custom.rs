@@ -56,6 +56,7 @@ struct Source {
     filters: &'static [Filter],
 }
 
+// SPEC-15.1598, SPEC-15.1604: tickets catalog
 const TICKETS: Source = Source {
     key: "tickets",
     label: "Tickets",
@@ -111,6 +112,7 @@ const TICKETS: Source = Source {
     ],
 };
 
+// SPEC-15.1598: time_entries catalog
 const TIME: Source = Source {
     key: "time_entries",
     label: "Time entries",
@@ -216,6 +218,7 @@ const TIME: Source = Source {
     }],
 };
 
+// SPEC-15.1598: assets catalog, no date range
 const ASSETS: Source = Source {
     key: "assets",
     label: "Assets",
@@ -285,6 +288,7 @@ pub struct SourceSchema {
     pub has_date_range: bool,
 }
 
+// SPEC-15.1598
 /// The full catalog, for `GET /reports/custom/schema`.
 pub fn schema() -> Vec<SourceSchema> {
     SOURCES
@@ -358,6 +362,7 @@ enum Bind {
     Date(NaiveDate),
 }
 
+// SPEC-15.1599, SPEC-15.1600, SPEC-15.1601, SPEC-15.1602, SPEC-15.1604
 /// Validate `spec` against the catalog, build a parameterized SELECT, and
 /// run it tenant-scoped. Returns the generic columns / rows / totals
 /// envelope. Every unknown key is a 400 before any SQL is built.
@@ -532,6 +537,7 @@ pub async fn run(
     })
 }
 
+// SPEC-15.1602
 /// Render a totals number without a needless `.0` on whole values.
 fn fmt_num(n: f64) -> String {
     if n.fract().abs() < 1e-9 {
@@ -541,6 +547,7 @@ fn fmt_num(n: f64) -> String {
     }
 }
 
+// SPEC-15.1603
 /// Serialise a result as CSV (header row + data rows).
 pub fn to_csv(r: &CustomReportResponse) -> String {
     let mut s = r
@@ -562,6 +569,7 @@ pub fn to_csv(r: &CustomReportResponse) -> String {
     s
 }
 
+// SPEC-15.1595
 /// Quote a CSV cell if it contains a comma, quote, or newline.
 pub(super) fn csv_cell(v: &str) -> String {
     if v.contains([',', '"', '\n']) {

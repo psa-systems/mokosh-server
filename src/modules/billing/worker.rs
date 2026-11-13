@@ -36,6 +36,7 @@ impl RecurringInvoicingWorker {
     }
 }
 
+// SPEC-13.42
 #[async_trait]
 impl Job for RecurringInvoicingWorker {
     fn name(&self) -> &'static str {
@@ -69,6 +70,7 @@ impl InvoiceReminderWorker {
     }
 }
 
+// SPEC-13.43
 #[async_trait]
 impl Job for InvoiceReminderWorker {
     fn name(&self) -> &'static str {

@@ -98,6 +98,7 @@ impl RevokedSessions {
         Self::default()
     }
 
+    // SPEC-5.136 SPEC-5.137 SPEC-5.138: 900s TTL, 50,000 cap with earliest-expiry eviction, memory only.
     /// Record `sid` as ended. Idempotent: a replayed logout token refreshes
     /// the expiry and changes nothing else.
     pub async fn revoke(&self, sid: &str, now: DateTime<Utc>) {
@@ -118,6 +119,7 @@ impl RevokedSessions {
         map.insert(sid.to_string(), now + Duration::seconds(REVOKED_TTL_SECS));
     }
 
+    // SPEC-5.136: revoked only while the entry expiry is later than now.
     /// Whether a token carrying this `sid` must be refused. An entry past its
     /// expiry answers `false` and is left for the next `revoke` to sweep,
     /// because the read path holds only a read lock.
@@ -175,6 +177,7 @@ impl LogoutRejection {
 /// need the signing key. Pure, so each rejection is testable without a JWKS.
 ///
 /// Returns the `sid` to revoke.
+// SPEC-5.133: fixed rejection order iss, client id, aud, events, nonce, iat window, sid.
 pub fn validate_logout_claims<'a>(
     claims: &'a LogoutClaims,
     issuer: &str,
@@ -228,6 +231,7 @@ pub struct BackchannelLogoutLimiter {
 }
 
 impl BackchannelLogoutLimiter {
+    // SPEC-5.131: 60 requests per minute per client IP.
     pub fn new() -> Arc<Self> {
         let quota = Quota::per_minute(NonZeroU32::new(60).expect("60 is non-zero"));
         Arc::new(Self {
@@ -276,6 +280,7 @@ pub struct LogoutTokenForm {
 /// anything that did not verify, with the cause logged at `error`: the OP
 /// treats a non-2xx as a delivery failure and this server must not answer 200
 /// to something it did not act on.
+// SPEC-5.130 SPEC-5.131 SPEC-5.132 SPEC-5.134 SPEC-5.135: limiter, verify, validate, revoke; failures are 400 + error log.
 pub async fn backchannel_logout(
     State(state): State<Arc<BackchannelLogoutState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,

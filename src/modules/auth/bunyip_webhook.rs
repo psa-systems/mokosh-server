@@ -73,6 +73,7 @@ const EVENT_ACCOUNT_DELETED: &str = "account_deleted";
 const SIGNATURE_HEADER: &str = "X-Webhook-Signature";
 const TOMBSTONE_EMAIL_DOMAIN: &str = "@deleted.local";
 
+// SPEC-5.207, SPEC-5.209, SPEC-5.210: pre-auth route, HMAC only
 /// Handler for `POST /api/v1/bunyip/webhooks/account-deleted`.
 pub async fn account_deleted(
     State(state): State<Arc<BunyipWebhookState>>,
@@ -114,6 +115,7 @@ pub async fn account_deleted(
     ))
 }
 
+// SPEC-5.208
 /// Verify `expected_hex == hex(hmac_sha256(body, secret))` in constant time.
 /// Returns `Unauthorized` on any mismatch or malformed input.
 fn verify_signature(secret: &[u8], body: &[u8], expected_hex: &str) -> AppResult<()> {
@@ -138,6 +140,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+// SPEC-5.210, SPEC-5.211
 /// Soft-delete a user by id. No-op if the row is missing or already tombstoned.
 ///
 /// Runs on the migrator pool (BYPASSRLS) because the webhook has no tenant
@@ -254,6 +257,7 @@ struct MokoshGrantChangedPayload {
     at: chrono::DateTime<chrono::Utc>,
 }
 
+// SPEC-5.207, SPEC-5.208, SPEC-5.212, SPEC-5.213, SPEC-5.214, SPEC-5.215
 /// Handler for `POST /api/v1/bunyip/webhooks/mokosh-grant-changed`.
 ///
 /// Same signature-then-parse ordering as `account_deleted`: an
@@ -339,6 +343,7 @@ pub async fn mokosh_grant_changed(
     // by design: the placement row is JIT-provisioned on the
     // grantee's first request (there is no email or name in the
     // webhook payload to seed the row with).
+    // SPEC-5.216: best-effort tombstone, warn on failure
     if changed && payload.state == "revoked" {
         if let Err(e) = sqlx::query(
             "UPDATE users SET deleted_at = COALESCE(deleted_at, NOW()), updated_at = NOW() \

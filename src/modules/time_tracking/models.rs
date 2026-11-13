@@ -38,6 +38,7 @@ pub enum SegmentEditPolicy {
 impl SegmentEditPolicy {
     /// The stored spelling, which `validate_setting_value` refuses anything
     /// outside of. `None` for a value that is none of them.
+    // SPEC-14.49: closed set of stored policy names.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "off" => Some(Self::Off),
@@ -57,6 +58,7 @@ impl SegmentEditPolicy {
     }
 
     /// May `user` correct a segment belonging to `owner` under this policy?
+    // SPEC-14.49: who may correct a segment under each policy.
     pub fn permits(self, user: &mokosh_types::auth::CurrentUser, owner: uuid::Uuid) -> bool {
         match self {
             Self::Off => false,

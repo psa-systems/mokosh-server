@@ -96,6 +96,7 @@ impl QuoteStatus {
         }
     }
 
+    // SPEC-13.1367
     /// Statuses that accept no staff writes at all, not even a status
     /// change.
     ///
@@ -120,6 +121,7 @@ impl QuoteStatus {
         )
     }
 
+    // SPEC-13.1368
     /// Statuses in which the quote's CONTENT (title, scope, lines, money)
     /// may still change.
     ///
@@ -134,6 +136,7 @@ impl QuoteStatus {
         matches!(self, Self::Draft | Self::Rejected)
     }
 
+    // SPEC-13.1356, SPEC-13.1354
     /// Statuses a client contact may see through the portal (PMS-673).
     ///
     /// Everything before `sent` is internal working state: a `draft` or
@@ -149,6 +152,7 @@ impl QuoteStatus {
         )
     }
 
+    // SPEC-13.1369
     /// Statuses a staff user may set directly through `PUT /quotes/{id}`.
     ///
     /// Excludes every status that belongs to another actor or route:
@@ -165,6 +169,7 @@ impl QuoteStatus {
     }
 }
 
+// SPEC-13.1374
 /// Quote line type; mirrors the CHECK constraint on
 /// `quote_lines.line_type` (PMS-671).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +273,7 @@ pub struct QuoteResponse {
     pub emailed_at: Option<DateTime<Utc>>,
 }
 
+// SPEC-13.1353
 #[derive(Debug, Clone, Deserialize, Default, Validate)]
 pub struct QuoteFilter {
     pub company_id: Option<Uuid>,
@@ -276,6 +282,7 @@ pub struct QuoteFilter {
     pub q: Option<String>,
 }
 
+// SPEC-13.1360, SPEC-13.1365
 /// A line on create/update.
 ///
 /// `quantity` and `unit_price` are intentionally signed, matching
@@ -296,10 +303,12 @@ pub struct QuoteLineRequest {
     pub is_taxable: bool,
 }
 
+// SPEC-13.1366
 fn default_true() -> bool {
     true
 }
 
+// SPEC-13.1360
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateQuoteRequest {
     pub company_id: Uuid,
@@ -337,6 +346,7 @@ pub struct PortalQuoteDecisionRequest {
     pub notes: Option<String>,
 }
 
+// SPEC-13.1391
 /// Body of `POST /quotes/{id}/convert` (PMS-674).
 ///
 /// Carries only the fields a quote cannot supply. Name, scope, client,
@@ -358,6 +368,7 @@ pub struct ConvertQuoteRequest {
     pub budget_hours: Option<Decimal>,
 }
 
+// SPEC-13.1392
 fn validate_billing_method(value: &str) -> Result<(), validator::ValidationError> {
     // Mirrors the CHECK on `projects.billing_method`; rejected here so a
     // bad value is a 422 with a field name rather than a 500 from the
@@ -368,6 +379,7 @@ fn validate_billing_method(value: &str) -> Result<(), validator::ValidationError
     }
 }
 
+// SPEC-13.1392
 fn validate_project_dates(req: &ConvertQuoteRequest) -> Result<(), validator::ValidationError> {
     if let (Some(start), Some(end)) = (req.start_date, req.target_end_date) {
         if end < start {
@@ -398,6 +410,7 @@ pub struct ClientDecision {
     pub notes: Option<String>,
 }
 
+// SPEC-13.1372
 /// Header update. Every field is optional; omitted fields keep their
 /// current value. `lines`, when present, REPLACES the whole line set
 /// (mirrors `UpdateInvoiceRequest`).

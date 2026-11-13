@@ -32,6 +32,7 @@ const MAX_ORG_NAME: usize = 255;
 ///
 /// Split from the handler so the required/optional rules are testable without a
 /// database or a session.
+// SPEC-5.369, SPEC-5.370
 pub fn organization_update(request: &OrganizationProfileRequest) -> AppResult<UpdateTenantRequest> {
     let name = org_name(request.name.as_deref())?;
     let phone = required("phone", "support_phone", request.phone.as_deref())?;
@@ -73,6 +74,7 @@ pub fn organization_update(request: &OrganizationProfileRequest) -> AppResult<Up
 
 /// The organisation name: required, and bounded by the column it lands in
 /// rather than by the branding table (this one is `tenants.name`).
+// SPEC-5.369
 fn org_name(value: Option<&str>) -> AppResult<String> {
     let name = clean(value).ok_or_else(|| AppError::validation_required("name"))?;
     if name.chars().count() > MAX_ORG_NAME {
@@ -89,6 +91,7 @@ fn org_name(value: Option<&str>) -> AppResult<String> {
 
 /// A required contact field, checked against its branding rule and reported
 /// against the name the caller sent.
+// SPEC-5.369
 fn required(field: &str, key: &str, value: Option<&str>) -> AppResult<Value> {
     let value = clean(value).ok_or_else(|| AppError::validation_required(field))?;
     checked(field, key, Some(value))

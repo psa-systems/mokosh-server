@@ -71,6 +71,7 @@ impl AssetsService {
     // PMS-188: the zero-key `new()` constructor was removed. Every asset
     // secret (credential_vault, configuration_item) must be encrypted under
     // the configured key, so the only constructor takes that key explicitly.
+    // SPEC-15.1078: the only constructor takes the key
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
         Self { db, encryption_key }
     }
@@ -85,6 +86,7 @@ impl AssetsService {
     }
 
     // PMS-73 asset types ------------------------------------------------------
+    // SPEC-15.1022, SPEC-15.1081, SPEC-15.1079
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_types(
         &self,
@@ -111,6 +113,7 @@ impl AssetsService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-15.1023
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_asset_type(
         &self,
@@ -163,6 +166,7 @@ impl AssetsService {
         })
     }
 
+    // SPEC-15.1024
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_asset_type(
         &self,
@@ -200,6 +204,7 @@ impl AssetsService {
         })
     }
 
+    // SPEC-15.1025
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_asset_type(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -222,6 +227,7 @@ impl AssetsService {
     /// vendors vary); the returned strings preserve the request's casing by
     /// mapping through a lowercase lookup set and keeping first-occurrence
     /// order. The caller already enforced the 500-item cap at the validator.
+    // SPEC-15.1063
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn assets_exists(
         &self,
@@ -276,6 +282,7 @@ impl AssetsService {
     }
 
     // PMS-74 assets CRUD ------------------------------------------------------
+    // SPEC-15.1027, SPEC-15.1028, SPEC-15.1079
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_assets(
         &self,
@@ -490,6 +497,7 @@ impl AssetsService {
     /// turns an unexpected pair into a 500 at the SQL layer rather than
     /// a 422. The handler calls `AssetSearchRequest::validate_shape`
     /// first.
+    // SPEC-15.1060, SPEC-15.1028
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn search_assets(
         &self,
@@ -583,6 +591,7 @@ impl AssetsService {
     /// second round trip per facet. The named canned-view counts
     /// (`warranty_expiring_in_30_days`, `end_of_life_passed`) ride on
     /// the same request.
+    // SPEC-15.1061
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn asset_facets(
         &self,
@@ -670,6 +679,7 @@ impl AssetsService {
         })
     }
 
+    // SPEC-15.1031, SPEC-15.1032, SPEC-15.1033, SPEC-15.1034
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_asset(
         &self,
@@ -782,6 +792,8 @@ impl AssetsService {
     ///    tenant; `company_id` + `site_id` + `assigned_user_id` must
     ///    exist in-tenant. A missing model is a 422, not a 404, because
     ///    the SPA treats both as "fix your form".
+    // SPEC-15.1065, SPEC-15.1066, SPEC-15.1067, SPEC-15.1068, SPEC-15.1069, SPEC-15.1070, SPEC-15.1071,
+    // SPEC-15.1072, SPEC-15.1073
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, count = request.serials.len()))]
     pub async fn bulk_create_assets(
         &self,
@@ -1112,6 +1124,7 @@ impl AssetsService {
         Ok(created)
     }
 
+    // SPEC-15.1029, SPEC-15.1030, SPEC-15.1028
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_asset(&self, tenant_id: TenantId, id: Uuid) -> AppResult<AssetResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1150,6 +1163,7 @@ impl AssetsService {
         Ok(row.into())
     }
 
+    // SPEC-15.1035, SPEC-15.1036, SPEC-15.1037
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_asset(
         &self,
@@ -1301,6 +1315,7 @@ impl AssetsService {
     /// entry carrying the full before -> after diff, matching the
     /// shape `update_asset` emits so the audit panel renders both
     /// surfaces uniformly.
+    // SPEC-15.1038, SPEC-15.1039, SPEC-15.1040, SPEC-15.1041
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn patch_asset(
         &self,
@@ -1521,6 +1536,7 @@ impl AssetsService {
         self.get_asset(tenant_id, id).await
     }
 
+    // SPEC-15.1042
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_asset(
         &self,
@@ -1556,6 +1572,7 @@ impl AssetsService {
     }
 
     // PMS-75 relationships ----------------------------------------------------
+    // SPEC-15.1043
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_relationships(
         &self,
@@ -1588,6 +1605,7 @@ impl AssetsService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-15.1044
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_asset_relationship(
         &self,
@@ -1648,6 +1666,7 @@ impl AssetsService {
     /// the CTE visits each (asset_id, edge) pair up to `depth` times,
     /// which is acceptable for the modest CMDB sizes this surface
     /// targets.
+    // SPEC-15.1046, SPEC-15.1047
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, asset_id = %asset_id))]
     pub async fn compute_impact_graph(
         &self,
@@ -1706,6 +1725,7 @@ impl AssetsService {
         Ok((depth, nodes))
     }
 
+    // SPEC-15.1045
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_asset_relationship(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1723,6 +1743,7 @@ impl AssetsService {
     }
 
     // PMS-76 configuration items ---------------------------------------------
+    // SPEC-15.1048
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     /// List configuration items WITHOUT decrypting their values. The
     /// encrypted secret never appears in a list; callers reveal a single
@@ -1771,6 +1792,7 @@ impl AssetsService {
     /// Reveal a single configuration item's decrypted value. Authz is
     /// enforced at the route (`RequireAssets`); the reveal is recorded in
     /// `asset_audit_log` so every decryption is traceable.
+    // SPEC-15.1049
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn reveal_configuration_item(
         &self,
@@ -1810,6 +1832,7 @@ impl AssetsService {
         })
     }
 
+    // SPEC-15.1050
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_configuration_item(
         &self,
@@ -1866,6 +1889,7 @@ impl AssetsService {
         })
     }
 
+    // SPEC-15.1051
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_configuration_item(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1883,6 +1907,7 @@ impl AssetsService {
     }
 
     // PMS-77 credential vault ------------------------------------------------
+    // SPEC-15.1052
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     /// List vault credentials WITHOUT decrypting secrets. Username,
     /// password, and notes never appear in a list; callers reveal a single
@@ -1938,6 +1963,7 @@ impl AssetsService {
     /// `CredentialSummary` shape as `list_credentials` with no secret
     /// material; reveals still go through the audited single-credential
     /// endpoint.
+    // SPEC-15.1053
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
     pub async fn list_credentials_for_company(
         &self,
@@ -1975,6 +2001,7 @@ impl AssetsService {
     /// Reveal a single credential's decrypted secrets. Authz is enforced
     /// at the route (`RequireAssets`); the reveal is recorded in
     /// `asset_audit_log` so every decryption is traceable.
+    // SPEC-15.1054
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn reveal_credential(
         &self,
@@ -2027,6 +2054,7 @@ impl AssetsService {
         })
     }
 
+    // SPEC-15.1055
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_credential(
         &self,
@@ -2122,6 +2150,7 @@ impl AssetsService {
         })
     }
 
+    // SPEC-15.1056
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_credential(
         &self,
@@ -2177,6 +2206,7 @@ impl AssetsService {
     // the full history page by page; that is the explicit point of an
     // audit log read endpoint, so the enumeration cost is intentional
     // (and rate-limited via the per-page clamp).
+    // SPEC-15.1057
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_audit_log(
         &self,
@@ -2526,6 +2556,7 @@ impl SearchWhereBuilder {
         }
     }
 
+    // SPEC-15.1062
     fn push_bind_tenant(&mut self, tenant_id: TenantId) {
         self.tenant_id = Some(*tenant_id);
         let idx = self.binds.len() + 1;
@@ -2550,6 +2581,7 @@ impl SearchWhereBuilder {
         self.binds.push(value);
     }
 
+    // SPEC-15.1060
     fn apply_filter(&mut self, filter: &FacetFilter) {
         let column = column_for(filter.field);
         match filter.op {
@@ -2656,6 +2688,7 @@ impl SearchWhereBuilder {
 /// Map an `AssetField` to the aliased column reference the WHERE clause
 /// uses. Every variant has to appear here; a missing arm is a compile
 /// error, which is what makes the enum the allowlist.
+// SPEC-15.1060: the AssetField enum is the sort/filter column allowlist
 fn column_for(field: AssetField) -> &'static str {
     match field {
         AssetField::AssetType => "a.asset_type_id",
@@ -2680,6 +2713,7 @@ fn column_for(field: AssetField) -> &'static str {
 /// count. The IS NOT NULL filter keeps the facet focused on values an
 /// operator can meaningfully pick; absence lives in a separate `IsNull`
 /// pill the SPA offers from the sidebar.
+// SPEC-15.1061
 async fn facet_text_counts(
     conn: &mut sqlx::PgConnection,
     base: &SearchWhereBuilder,
@@ -2712,6 +2746,7 @@ async fn facet_text_counts(
 /// `label_expr` is a SELECT fragment that resolves to the human label
 /// (company name, user full name, asset type name) under the LEFT JOIN
 /// `join_clause` adds.
+// SPEC-15.1061
 async fn facet_uuid_counts(
     conn: &mut sqlx::PgConnection,
     base: &SearchWhereBuilder,
@@ -2760,6 +2795,7 @@ const ASSET_TAG_WIDTH: usize = 3;
 /// counter from the maximum numeric suffix already present in the
 /// tenant's `assets.asset_tag` so an export/import round-trip keeps
 /// issuing non-colliding tags.
+// SPEC-15.1032
 async fn reserve_asset_tags(
     conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,

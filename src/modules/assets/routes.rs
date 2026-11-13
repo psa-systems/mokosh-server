@@ -146,6 +146,7 @@ pub fn assets_routes(
         .with_state(state)
 }
 
+// SPEC-15.1022
 async fn list_asset_types(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -160,6 +161,7 @@ async fn list_asset_types(
     )))
 }
 
+// SPEC-15.1023
 async fn create_asset_type(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -173,6 +175,7 @@ async fn create_asset_type(
     ))
 }
 
+// SPEC-15.1024
 async fn update_asset_type(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -186,6 +189,7 @@ async fn update_asset_type(
     ))
 }
 
+// SPEC-15.1025
 async fn delete_asset_type(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -195,6 +199,7 @@ async fn delete_asset_type(
     s.service.delete_asset_type(u.tenant(), id).await
 }
 
+// SPEC-15.1026: dual-plane read, contact scoped to own company
 async fn list_assets(
     State(s): State<AssetsRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -239,6 +244,7 @@ async fn list_assets(
     })
 }
 
+// SPEC-15.1031
 async fn create_asset(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -251,6 +257,7 @@ async fn create_asset(
     ))
 }
 
+// SPEC-15.1029
 async fn get_asset(
     State(s): State<AssetsRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -280,6 +287,7 @@ async fn get_asset(
     })
 }
 
+// SPEC-15.1026, SPEC-15.1029: staff must carry an authenticated user
 /// PMS-935: baseline "must be authenticated staff" check inlined
 /// alongside the dual-plane read handlers. Reads used to sit behind
 /// `RequireAssets` (module gate + auth) with no additional role
@@ -295,6 +303,7 @@ fn assert_staff_authenticated(auth: &crate::modules::auth::AuthState) -> AppResu
     Ok(())
 }
 
+// SPEC-15.1035
 async fn update_asset(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -307,6 +316,7 @@ async fn update_asset(
     ))
 }
 
+// SPEC-15.1038
 /// PMS-1487: partial update sibling of `PUT /assets/{id}`.
 ///
 /// The SPA's inline-edit drawer PATCHes one field at a time on blur;
@@ -326,6 +336,7 @@ async fn patch_asset(
     ))
 }
 
+// SPEC-15.1042
 async fn delete_asset(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -335,6 +346,7 @@ async fn delete_asset(
     s.service.delete_asset(u.tenant(), id, u.id).await
 }
 
+// SPEC-15.1043
 async fn list_asset_relationships(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -353,6 +365,7 @@ async fn list_asset_relationships(
     )))
 }
 
+// SPEC-15.1044
 async fn create_asset_relationship(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -368,6 +381,7 @@ async fn create_asset_relationship(
     ))
 }
 
+// SPEC-15.1045
 async fn delete_asset_relationship(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -389,6 +403,7 @@ struct ImpactQuery {
     depth: Option<u32>,
 }
 
+// SPEC-15.1046
 async fn get_asset_impact(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -437,6 +452,7 @@ async fn get_asset_impact(
     }))
 }
 
+// SPEC-15.1048
 async fn list_configuration_items(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -455,6 +471,7 @@ async fn list_configuration_items(
     )))
 }
 
+// SPEC-15.1049
 /// Reveal a single configuration item's decrypted value (audited).
 async fn reveal_configuration_item(
     State(s): State<AssetsRouterState>,
@@ -468,6 +485,7 @@ async fn reveal_configuration_item(
     ))
 }
 
+// SPEC-15.1050
 async fn create_configuration_item(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -483,6 +501,7 @@ async fn create_configuration_item(
     ))
 }
 
+// SPEC-15.1051
 async fn delete_configuration_item(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -491,6 +510,7 @@ async fn delete_configuration_item(
     s.service.delete_configuration_item(u.tenant(), id).await
 }
 
+// SPEC-15.1052
 async fn list_credentials(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -509,6 +529,7 @@ async fn list_credentials(
     )))
 }
 
+// SPEC-15.1054
 /// Reveal a single credential's decrypted secrets (authz-gated + audited).
 async fn reveal_credential(
     State(s): State<AssetsRouterState>,
@@ -520,6 +541,7 @@ async fn reveal_credential(
     ))
 }
 
+// SPEC-15.1055
 async fn create_credential(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -535,6 +557,7 @@ async fn create_credential(
     ))
 }
 
+// SPEC-15.1056
 async fn delete_credential(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -544,6 +567,7 @@ async fn delete_credential(
     s.service.delete_credential(u.tenant(), id, &ctx).await
 }
 
+// SPEC-15.1057: admin only
 async fn list_asset_audit_log(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -576,6 +600,7 @@ struct ReportAssetIssueBody {
     description: Option<String>,
 }
 
+// SPEC-15.1074, SPEC-15.1075, SPEC-15.1076, SPEC-15.1077
 /// PMS-936: create a ticket linked to a specific asset.
 ///
 /// Contact caller: gated on `assets:report_issue`, scoped to the
@@ -710,6 +735,7 @@ async fn report_asset_issue(
 
 // -- PMS-1486 search handlers ---------------------------------------------
 
+// SPEC-15.1059
 /// Validate every (field, op, values) triple against the vocab in
 /// `models.rs`. The service trusts what it is handed and will emit SQL
 /// that misbinds on an illegal pair; the handler is where the pair is
@@ -760,6 +786,7 @@ fn validate_search_request(req: &AssetSearchRequest) -> AppResult<()> {
     Ok(())
 }
 
+// SPEC-15.1058
 fn require_search_v2(state: &AssetsRouterState) -> AppResult<()> {
     let on = state
         .features
@@ -774,6 +801,7 @@ fn require_search_v2(state: &AssetsRouterState) -> AppResult<()> {
     }
 }
 
+// SPEC-15.1060
 async fn search_assets_structured(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -793,6 +821,7 @@ async fn search_assets_structured(
     )))
 }
 
+// SPEC-15.1061
 async fn asset_facets_structured(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -806,6 +835,7 @@ async fn asset_facets_structured(
     Ok(Json(resp))
 }
 
+// SPEC-15.1063
 async fn assets_exists_handler(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
@@ -820,6 +850,7 @@ async fn assets_exists_handler(
     Ok(Json(AssetExistsResponse { existing }))
 }
 
+// SPEC-15.1064
 fn require_catalog(state: &AssetsRouterState) -> AppResult<()> {
     let on = state
         .features
@@ -834,6 +865,7 @@ fn require_catalog(state: &AssetsRouterState) -> AppResult<()> {
     }
 }
 
+// SPEC-15.1064, SPEC-15.1065
 async fn bulk_create_assets_handler(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,

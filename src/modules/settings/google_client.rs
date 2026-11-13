@@ -98,6 +98,7 @@ pub struct GoogleClientView {
 }
 
 impl GoogleClientView {
+    // SPEC-15.2045
     pub fn of(secrets: &AppSecrets) -> Self {
         let declared = secrets.declared();
         let id_set = holds(secrets, GovernedSecret::GoogleContactsClientId);
@@ -122,6 +123,7 @@ impl GoogleClientView {
 /// in another provider is not "set" for this purpose: it is the `Misplaced`
 /// state, and reporting it as set would tell an operator the deployment is
 /// configured while the next boot refuses to start.
+// SPEC-15.2046
 fn holds(secrets: &AppSecrets, secret: GovernedSecret) -> bool {
     secrets
         .get(secret)
@@ -146,6 +148,7 @@ pub fn get_google_client(secrets: &AppSecrets) -> GoogleClientView {
 /// value is the stored value by construction: if the provider normalised,
 /// truncated or refused a half, the process does not carry a client the next
 /// boot will not agree with.
+// SPEC-15.2047, SPEC-15.2049, SPEC-15.2051, SPEC-15.2052
 pub async fn put_google_client(
     db: &Database,
     secrets: &Arc<AppSecrets>,
@@ -236,6 +239,7 @@ pub async fn put_google_client(
 /// writes could interleave key by key and leave the provider holding one
 /// caller's id paired with the other's secret, which Google rejects as
 /// `invalid_client` on every later contact-sync attempt.
+// SPEC-15.2050
 async fn write_pair_locked(
     live: &SharedGoogleClient,
     provider: Arc<dyn crate::app_secrets::AppSecretProvider>,
@@ -277,6 +281,7 @@ async fn write_pair_locked(
 /// `invalid_client`, which names neither field. Recognised by Google's own
 /// affixes rather than by validating the id's whole format, so a future change
 /// to that format cannot lock an operator out of this form.
+// SPEC-15.2047, SPEC-15.2048
 fn validate(client_id: &str, client_secret: &str) -> AppResult<()> {
     if client_id.is_empty() || client_secret.is_empty() {
         return Err(AppError::validation_field(

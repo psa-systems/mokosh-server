@@ -213,6 +213,7 @@ impl AppSecretProvider for DatabaseProvider {
     /// cache. A row that is already gone is not an error: the caller
     /// (`provider-purge`) has already checked the interlock and either the
     /// row was never there or another writer got to it first.
+    // SPEC-3.1007: row removed via migrator pool, then cache entry dropped; zero rows is success.
     async fn delete(&self, secret: GovernedSecret) -> AppResult<()> {
         let db = match &self.writer {
             WriteBackend::Real { db, .. } => db,

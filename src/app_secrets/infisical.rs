@@ -131,6 +131,7 @@ impl AppSecretProvider for InfisicalProvider {
     /// PMS-1012: write the value into Infisical's application folder and
     /// update the cache in one call, so a read that follows the write sees
     /// it. The cache is only touched on a successful upstream write.
+    // SPEC-3.1010: write-through to /app; cache updated only after the upstream write succeeded.
     async fn set(&self, secret: GovernedSecret, value: &str) -> AppResult<()> {
         let (client, project_id, environment) = match &self.connection {
             ConnectionBackend::Real {

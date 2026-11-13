@@ -83,6 +83,7 @@ impl SavedReportsService {
         Self { db }
     }
 
+    // SPEC-15.1607, SPEC-15.1608
     /// List reports visible to `user_id` under `scope`. Filters by
     /// `entity_type` when supplied so the entity-page sidebar can
     /// ask "what saved reports target this entity".
@@ -133,6 +134,7 @@ impl SavedReportsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    // SPEC-15.1609, SPEC-15.1608
     pub async fn get(
         &self,
         tenant_id: Uuid,
@@ -163,6 +165,7 @@ impl SavedReportsService {
         Ok(row.into())
     }
 
+    // SPEC-15.1610
     pub async fn create(
         &self,
         tenant_id: Uuid,
@@ -193,6 +196,7 @@ impl SavedReportsService {
         self.get(tenant_id, user_id, inserted).await
     }
 
+    // SPEC-15.1611
     /// PATCH a saved report. Only the author may mutate it; another
     /// viewer (who can see a shared report) gets 404 on attempt to
     /// keep the response shape uniform with absent rows.
@@ -244,6 +248,7 @@ impl SavedReportsService {
         self.get(tenant_id, user_id, id).await
     }
 
+    // SPEC-15.1612
     pub async fn delete(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query(
@@ -263,6 +268,7 @@ impl SavedReportsService {
         Ok(())
     }
 
+    // SPEC-15.1613, SPEC-15.1614, SPEC-15.1619, SPEC-15.1623
     /// PMS-477: execute a saved report. Loads the row (which already
     /// enforces the per-user visibility rule via `get`), compiles
     /// its definition through the per-entity compiler, runs the SELECT,
@@ -343,6 +349,7 @@ impl SavedReportsService {
     }
 }
 
+// SPEC-15.1613: page size cap
 /// Cap on `per_page` for report execution. Stricter than the
 /// existing 100-default pagination cap because a report is a
 /// CALLER-CHOSEN column subset across MANY joined tables; pulling
@@ -352,6 +359,7 @@ impl SavedReportsService {
 /// scheduled-delivery path (PMS-478) which streams to S3 / email.
 const MAX_REPORT_ROWS_PER_PAGE: u32 = 10_000;
 
+// SPEC-15.1619
 /// PMS-1238: two columns may share a display header; the second would
 /// overwrite the first when rows are keyed by header, so repeats get a
 /// numeric suffix (`Name`, `Name (2)`).
@@ -370,6 +378,7 @@ fn dedupe_headers(aliases: Vec<String>) -> Vec<String> {
     out
 }
 
+// SPEC-15.1619
 /// Re-key one `row_to_json` object from the compiler's SQL output
 /// names to the display headers, keeping the declared column order.
 /// A column the row does not carry lands as null.
@@ -483,6 +492,7 @@ const SCHEDULE_SELECT: &str = "
 ";
 
 impl SavedReportsService {
+    // SPEC-15.1624, SPEC-15.1609
     /// PMS-478: create a schedule against a saved report. Reuses the
     /// `get` visibility rule (author OR shared) so a private report
     /// can only be scheduled by its owner. `next_run_at` is computed
@@ -521,6 +531,7 @@ impl SavedReportsService {
         self.schedule_get(tenant_id, id).await
     }
 
+    // SPEC-15.1626
     pub async fn schedule_list(
         &self,
         tenant_id: Uuid,
@@ -540,6 +551,7 @@ impl SavedReportsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    // SPEC-15.1627
     pub async fn schedule_get(
         &self,
         tenant_id: Uuid,
@@ -559,6 +571,7 @@ impl SavedReportsService {
         Ok(row.into())
     }
 
+    // SPEC-15.1628
     /// PATCH a schedule. Only the owner may mutate it; another
     /// viewer (who can see the parent shared report) gets 404 - keeps
     /// the response shape uniform with `update` on the parent.
@@ -603,6 +616,7 @@ impl SavedReportsService {
         self.schedule_get(tenant_id, id).await
     }
 
+    // SPEC-15.1628
     pub async fn schedule_delete(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query(
@@ -623,6 +637,7 @@ impl SavedReportsService {
     }
 }
 
+// SPEC-15.1625
 /// PMS-478: parse + advance a cron expression. Returns the next
 /// firing instant strictly after `anchor`. Used both on create (anchor
 /// = NOW; the first firing happens at the next cron tick after creation)

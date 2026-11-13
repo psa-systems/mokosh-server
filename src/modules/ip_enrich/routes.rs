@@ -28,6 +28,7 @@ pub struct IpEnrichRouterState {
 /// which renders the address today (`pages/audit_log.rs`) but never asks for
 /// the enrichment. Wiring it is tracked in PMS-870; the route stays mounted
 /// because the consumer is identified and unbuilt, not redundant.
+// SPEC-5.305
 pub fn ip_enrich_routes(service: Option<Arc<IpEnrichService>>) -> Router {
     Router::new()
         .route("/ip-enrichment", get(ip_enrichment))
@@ -59,6 +60,7 @@ pub struct IpEnrichmentResponse {
 }
 
 impl IpEnrichmentResponse {
+    // SPEC-5.306
     fn from_enrichment(ip: &str, e: &IpEnrichment) -> Self {
         Self {
             ip: ip.to_string(),
@@ -79,6 +81,7 @@ impl IpEnrichmentResponse {
 /// Resolve `ip` to its advisory ASN / VPN enrichment, or `null` when there is
 /// nothing to report (no dataset configured, a private/reserved address, or an
 /// address the dataset does not know). Only a malformed IP is a client error.
+// SPEC-5.303, SPEC-5.304, SPEC-5.305, SPEC-5.306
 async fn ip_enrichment(
     State(s): State<IpEnrichRouterState>,
     RequireAuth(_u): RequireAuth,

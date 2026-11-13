@@ -72,6 +72,7 @@ const MAX_URL: usize = 255;
 /// rather than merged: the document is read back as [`mokosh_types::tenants::TenantBranding`],
 /// so a key outside it is silently invisible to every reader while still
 /// sitting in the JSONB the next writer merges into.
+// SPEC-5.357
 pub fn validate_branding_patch(patch: &Value) -> AppResult<()> {
     validate_branding_patch_with_keys(patch, KNOWN_KEYS)
 }
@@ -82,6 +83,7 @@ pub fn validate_branding_patch(patch: &Value) -> AppResult<()> {
 /// document field-by-field by `effective_branding`, so any key it does not
 /// name (`portal_domain`, `invoice_template`) is refused with the same
 /// unknown-key message a typo gets, naming only the keys legal on this row.
+// SPEC-5.358
 pub fn validate_company_branding_patch(patch: &Value) -> AppResult<()> {
     let company_keys: Vec<&str> = KNOWN_KEYS
         .iter()
@@ -91,6 +93,7 @@ pub fn validate_company_branding_patch(patch: &Value) -> AppResult<()> {
     validate_branding_patch_with_keys(patch, &company_keys)
 }
 
+// SPEC-5.357
 fn validate_branding_patch_with_keys(patch: &Value, allowed: &[&str]) -> AppResult<()> {
     // PMS-758: an object or nothing. A string or an array here would replace
     // the document with something no reader can destructure, and `||` on two
@@ -135,6 +138,7 @@ pub fn validate_branding_value(key: &str, value: &Value) -> Result<(), String> {
 pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Result<(), String> {
     // PMS-758: an explicit null is how a merged document clears a key, and the
     // logo-delete route sends two of them.
+    // SPEC-5.359
     if value.is_null() {
         return Ok(());
     }
@@ -143,6 +147,7 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
         // `secondary_color`, removed with the storage alias sweep. A
         // client that still sends it reaches the unknown-key arm and is
         // rejected with the handler's standard "unknown field" message.
+        // SPEC-5.361
         "primary_color" | "secondary_color" | "background_color" => {
             let s = text(label, value, 7)?;
             if is_hex_color(s) {
@@ -151,10 +156,12 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
                 Err(format!("`{label}` must be a hex colour like #0066cc"))
             }
         }
+        // SPEC-5.362
         "support_email" => {
             let s = text(label, value, MAX_EMAIL)?;
             validate_email(s.trim()).map_err(|_| format!("`{label}` must be an email address"))
         }
+        // SPEC-5.362
         "support_phone" => {
             let s = text(label, value, MAX_PHONE)?;
             if s.chars().any(|c| c.is_ascii_digit()) {
@@ -165,6 +172,7 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
                 ))
             }
         }
+        // SPEC-5.362
         "support_contact_name" | "company_name" | "legal_name" | "display_name" => {
             text(label, value, MAX_NAME).map(|_| ())
         }
@@ -172,11 +180,13 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
         // invoice. Nothing parses it, so nothing validates its shape beyond
         // being one printable line: a rule that accepted a VAT number and
         // refused an ABN would be worse than no rule.
+        // SPEC-5.362
         "tax_id" => text(label, value, MAX_TAX_ID).map(|_| ()),
         // PMS-1006: which document template the tenant's invoices, credit
         // notes and statements are laid out with. An enumerated key rather
         // than free text, and the message names the three, because a typo
         // here silently reverts every document to Classic.
+        // SPEC-5.363
         "invoice_template" => {
             let s = text(label, value, 20)?;
             if crate::pdf::Template::from_key(s.trim()).is_some() {
@@ -191,11 +201,13 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
         // PMS-911: the one branding value that is legitimately multi-line,
         // because an address is. Held to a line count as well as a length, so
         // it stays an address block on an invoice rather than a paragraph.
+        // SPEC-5.364
         "postal_address" => multiline(label, value, MAX_ADDRESS, MAX_ADDRESS_LINES).map(|_| ()),
         // PMS-896: the organisation's own web address. Held to the same rule as
         // a company's (`mokosh_types::contacts::validate_website`) rather than a
         // second copy of it: the SPA renders both as a link, so `javascript:`
         // has to be as dead here as it is there.
+        // SPEC-5.365
         "website" => {
             let s = text(label, value, MAX_URL)?;
             mokosh_types::contacts::validate_website(s.trim())
@@ -207,6 +219,7 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
         // an arbitrary URL. Both the tenant and the Company prefix are legal
         // here (PMS-1197): the same key set is written to either row, and
         // which prefix is right depends on which row it lands in.
+        // SPEC-5.366
         "logo_url" | "favicon_url" | "background_url" => {
             let s = text(label, value, MAX_PATH)?;
             if ALLOWED_PUBLIC_PATH_PREFIXES
@@ -222,12 +235,14 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
         }
         // The content type the public asset routes answer with, so it is the
         // same set the uploads accept.
+        // SPEC-5.366
         "logo_mime" | "favicon_mime" | "background_mime" => {
             let s = text(label, value, 100)?;
             check_mime(s).map(|_| ()).map_err(|_| {
                 format!("`{label}` must be an image type the asset route can serve (PNG, JPEG, WebP or GIF)")
             })
         }
+        // SPEC-5.367
         "portal_domain" => {
             let s = text(label, value, MAX_DOMAIN)?;
             if is_hostname(s.trim()) {
@@ -238,6 +253,7 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
                 ))
             }
         }
+        // SPEC-5.357
         _ => Err(format!(
             "`{label}` is not a branding key; the known keys are {}",
             KNOWN_KEYS.join(", ")
@@ -266,6 +282,7 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
 /// the migrator pool with an explicit tenant filter, the same
 /// belt-and-braces shape `PortalRoleService::create_role`'s company check
 /// uses, rather than relying solely on RLS.
+// SPEC-5.368
 pub async fn assert_branding_patch_owned_by_tenant(
     patch: &Value,
     tenant_id: Uuid,
@@ -285,6 +302,7 @@ pub async fn assert_branding_patch_owned_by_tenant(
 /// The single-key twin of [`assert_branding_patch_owned_by_tenant`], for the
 /// per-key settings write (`PUT /api/v1/settings/branding/{key}`), which
 /// validates one key at a time rather than a whole document.
+// SPEC-5.368
 pub async fn assert_branding_value_owned_by_tenant(
     key: &str,
     value: &Value,
@@ -379,6 +397,7 @@ const TENANT_ONLY_KEYS: &[&str] = &["portal_domain", "invoice_template"];
 /// rendered length, and free of control characters. Blank is refused rather
 /// than stored because an operator clearing a field means null, and
 /// `OrgIdentity` would read `Some("")` back as unset anyway.
+// SPEC-5.360
 fn text<'a>(key: &str, value: &'a Value, max: usize) -> Result<&'a str, String> {
     let Some(s) = value.as_str() else {
         return Err(format!("`{key}` must be a string"));
@@ -399,6 +418,7 @@ fn text<'a>(key: &str, value: &'a Value, max: usize) -> Result<&'a str, String> 
 /// that is an address. Bounded by line count as well as length, so it stays a
 /// block on an invoice; `\r` is folded away so a Windows paste does not become
 /// blank lines, and every other control character is still refused.
+// SPEC-5.364
 fn multiline<'a>(
     key: &str,
     value: &'a Value,
@@ -424,6 +444,7 @@ fn multiline<'a>(
 }
 
 /// A bare hostname: no scheme, no path, no port.
+// SPEC-5.367
 fn is_hostname(s: &str) -> bool {
     s.contains('.')
         && !s.starts_with(['.', '-'])

@@ -170,6 +170,7 @@ impl EmailIntakeService {
             if let Some((id, number)) = self.find_by_references(tenant_id, &req.references).await? {
                 // SPEC-7.331: on a threading hit, the service attempts to resolve (or auto-create) a contact for from_email before deciding whether to append a reply comment.
                 // SPEC-7.332: an Err or Ok(None) from contact resolution is silently collapsed to "no contact" via .ok().flatten(); no reply comment is appended, comment_added=false, attachments_stored=0.
+                // SPEC-7.1077: the threading path also auto-creates the sender contact when a default company is set.
                 let resolved_contact = self
                     .resolve_or_create_contact(tenant_id, req)
                     .await
@@ -587,6 +588,7 @@ impl EmailIntakeService {
         id: Uuid,
     ) -> AppResult<EmailIntakeLogResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.1078: 404 "Email intake log" for an id outside the caller's tenant.
         let row: Option<IntakeLogRow> = sqlx::query_as(
             "SELECT id, tenant_id, message_id, ticket_id, raw_headers, \
                     raw_body_text, raw_body_html, received_at, error \
@@ -706,6 +708,7 @@ impl EmailIntakeService {
     /// a re-revoke of an already-revoked row is a no-op (does not
     /// move the timestamp), and a missing id surfaces as 404 so the
     /// SPA can confirm the row really existed.
+    // SPEC-7.1076: re-revoke keeps the original revoked_at.
     pub async fn revoke_token(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query(
