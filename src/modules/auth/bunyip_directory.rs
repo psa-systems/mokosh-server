@@ -18,8 +18,9 @@
 //! which is the standalone-mode signal: the handler's caller then
 //! skips the lookup and creates the invitation email-only. A
 //! deployment mis-configured with a partial set (some values but
-//! not all three) is a boot warning, because the operator almost
-//! certainly meant to enable the client and forgot one value.
+//! not all three) returns `Err` and refuses to boot, because the
+//! operator almost certainly meant to enable the client and forgot
+//! one value.
 //!
 //! Rate-limiting on the Bunyip side is `RateLimitConfig::USER_LOOKUP`
 //! (60/min per calling app); on this side the human path is bounded

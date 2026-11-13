@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use super::mokosh_bunyip_grants::{GranteeLeaveOutcome, MokoshBunyipGrantService};
 use crate::modules::auth::middleware::RequireAuth;
-use crate::utils::error::{AppError, AppResult};
+use crate::utils::error::AppResult;
 
 /// Wiring state: only the `PgPool`, because the grants table sits outside
 /// the standard tenant-scoped surface (cross-tenant BY DESIGN, see
@@ -106,8 +106,3 @@ async fn leave_grant(
         GranteeLeaveOutcome::NotFound => Ok(StatusCode::NOT_FOUND),
     }
 }
-
-// Silence unused-import warnings on the smaller feature sets; every symbol
-// is used above under the default features.
-#[allow(dead_code)]
-fn _unused_error(_: AppError) {}
