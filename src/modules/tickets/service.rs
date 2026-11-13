@@ -377,6 +377,11 @@ impl TicketService {
         // PSA audit: every foreign id from the request body must belong to
         // this tenant before it is linked, so a request cannot point a
         // ticket at another tenant's company/contact/site/etc.
+        //
+        // PMS-1667: priority_id, queue_id and the two kb_article fields were
+        // left out of this list and the FK defeated RLS, so a request could
+        // point a ticket at another tenant's row. A missing request-supplied
+        // id now surfaces as a named 400 instead of a database FK 500.
         self.validate_fks(
             tenant_id,
             &[
@@ -390,6 +395,10 @@ impl TicketService {
                 ("contracts", request.contract_id),
                 ("sla_policies", request.sla_id),
                 ("assets", request.asset_id),
+                ("ticket_priorities", request.priority_id),
+                ("ticket_queues", request.queue_id),
+                ("kb_articles", request.source_kb_article_id),
+                ("kb_articles", request.procedure_kb_article_id),
             ],
         )
         .await?;
@@ -713,9 +722,14 @@ impl TicketService {
         // (Option<Option<Uuid>>); only the inner Some(uuid) needs an FK
         // validation. Some(None) means "clear to NULL", which is always
         // safe; None means "leave unchanged".
+        // PMS-1667: status_id was left out of the validate_fks list, and the
+        // `is_closed` lookup below (and the UPDATE after it) read from
+        // `ticket_statuses` by id alone; a foreign-tenant status id surfaced
+        // as a 404 "Record" from fetch_one rather than a named 400.
         self.validate_fks(
             tenant_id,
             &[
+                ("ticket_statuses", request.status_id),
                 ("ticket_priorities", request.priority_id),
                 ("ticket_types", request.type_id.flatten()),
                 ("ticket_categories", request.category_id.flatten()),

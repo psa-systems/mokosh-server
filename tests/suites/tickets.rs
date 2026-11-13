@@ -2311,3 +2311,107 @@ async fn ticket_response_carries_every_editable_lookup(pool: PgPool) {
         }
     }
 }
+
+/// PMS-1667: `priority_id`, `queue_id`, `source_kb_article_id` and
+/// `procedure_kb_article_id` were left out of create_ticket's `validate_fks`
+/// call, so a request could point them at another tenant's row. The FK
+/// defeats RLS, so the DB either resolved the id against a foreign-tenant
+/// row (silent cross-tenant link) or raised 23503 and surfaced as a 500.
+///
+/// After PMS-1667, the service refuses with a named 400 before the INSERT
+/// runs.
+#[mokosh_test]
+async fn create_ticket_rejects_a_foreign_tenant_priority_id(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+
+    let (tenant_b, _ub, _eb, _pb) = common::seed_tenant_with_admin(&pool, "ptb").await;
+    let foreign_priority = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO ticket_priorities (id, tenant_id, name, color, is_default) VALUES ($1, $2, 'B-high', '#ff0000', FALSE)",
+    )
+    .bind(foreign_priority)
+    .bind(tenant_b)
+    .execute(&pool)
+    .await
+    .expect("seed foreign priority");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "cross-tenant priority probe",
+            "company_id": company_id,
+            "priority_id": foreign_priority,
+            "custom_fields": {},
+        }))
+        .send()
+        .await
+        .expect("send create ticket");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "a foreign-tenant priority_id must not surface as a cross-tenant link or a 500; body: {}",
+        resp.text().await.unwrap_or_default()
+    );
+}
+
+/// PMS-1667: same shape for `status_id` on PATCH /tickets/{id}. Previously
+/// the `is_closed` lookup ran `fetch_one` on `ticket_statuses` filtered by
+/// id alone, so a foreign-tenant status id surfaced as a generic 404
+/// "Record" rather than a named 400. Now rejected by `validate_fks`.
+#[mokosh_test]
+async fn update_ticket_rejects_a_foreign_tenant_status_id(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+
+    let (tenant_b, _ub, _eb, _pb) = common::seed_tenant_with_admin(&pool, "stb").await;
+    let foreign_status = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO ticket_statuses (id, tenant_id, name, color, is_closed) VALUES ($1, $2, 'B-done', '#00ff00', TRUE)",
+    )
+    .bind(foreign_status)
+    .bind(tenant_b)
+    .execute(&pool)
+    .await
+    .expect("seed foreign status");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let ticket: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "tenant-A ticket",
+            "company_id": company_id,
+            "custom_fields": {},
+        }))
+        .send()
+        .await
+        .expect("create ticket")
+        .json()
+        .await
+        .expect("ticket json");
+    let ticket_id = ticket["id"].as_str().expect("ticket id").to_string();
+
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "status_id": foreign_status }))
+        .send()
+        .await
+        .expect("patch ticket");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "a foreign-tenant status_id must refuse with a named 400; body: {}",
+        resp.text().await.unwrap_or_default()
+    );
+}
