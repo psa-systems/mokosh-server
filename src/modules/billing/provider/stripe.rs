@@ -433,10 +433,23 @@ fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
                 Some(pi) if !pi.is_empty() => pi.to_string(),
                 _ => return Ok(PaymentEvent::Ignored { kind }),
             };
-            let currency = object["currency"]
-                .as_str()
-                .unwrap_or("usd")
-                .to_ascii_uppercase();
+            // PMS-1660 finding: a `charge.refunded` without a currency
+            // used to be recorded as USD silently. The field is
+            // required by the Stripe contract, so an absent value is
+            // an upstream shape problem the operator should see, not
+            // a fact we invent. Treat as Ignored + WARN so the event
+            // delivery log records "refused" and the operator can grep
+            // for it.
+            let currency = match object["currency"].as_str() {
+                Some(c) if !c.is_empty() => c.to_ascii_uppercase(),
+                _ => {
+                    tracing::warn!(
+                        payment_intent = %provider_reference,
+                        "stripe charge.refunded missing currency; ignoring event"
+                    );
+                    return Ok(PaymentEvent::Ignored { kind });
+                }
+            };
             // A charge carries the cumulative list of every refund against it,
             // each with its own id. Recording all of them with ON CONFLICT DO
             // NOTHING on the refund id makes redelivery + incremental refunds
@@ -496,15 +509,29 @@ fn parse_stripe_payment_session(
     else {
         return Ok(PaymentEvent::Ignored { kind });
     };
+    // PMS-1660 finding: an absent `currency` used to be defaulted to
+    // USD silently. Stripe's contract requires currency on a succeeded
+    // payment, so an absent value is an upstream shape problem the
+    // operator should see; Ignore + WARN so the delivery log records
+    // "refused" and the operator can grep for it.
+    let Some(currency) = object["currency"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_uppercase())
+    else {
+        tracing::warn!(
+            tenant_id = %tenant_id,
+            invoice_id = %invoice_id,
+            "stripe payment session missing currency; ignoring event"
+        );
+        return Ok(PaymentEvent::Ignored { kind });
+    };
     Ok(PaymentEvent::PaymentSucceeded {
         provider_reference,
         tenant_id,
         invoice_id,
         amount: from_minor_units(amount_total),
-        currency: object["currency"]
-            .as_str()
-            .unwrap_or("usd")
-            .to_ascii_uppercase(),
+        currency,
         raw: raw.clone(),
     })
 }

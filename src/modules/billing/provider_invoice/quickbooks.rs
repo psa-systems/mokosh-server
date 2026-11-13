@@ -840,10 +840,21 @@ impl QuickBooksClient {
                     .json(&body)
             })
             .await?;
+        // PMS-1660 finding: same as the Xero twin. An absent DocNumber
+        // from QBO used to be stored as empty silently; log so the
+        // operator can tell apart "QBO did not assign a number" from
+        // "we never saw a number".
+        let external_number = envelope.invoice.doc_number.unwrap_or_else(|| {
+            tracing::warn!(
+                invoice_id = %envelope.invoice.id,
+                "QuickBooks issue_invoice returned no DocNumber; storing empty external_number"
+            );
+            String::new()
+        });
         Ok(ExternalInvoiceRef {
             provider: InvoiceProviderKind::Quickbooks,
             external_invoice_id: envelope.invoice.id,
-            external_number: envelope.invoice.doc_number.unwrap_or_default(),
+            external_number,
         })
     }
 
@@ -970,10 +981,18 @@ impl QuickBooksClient {
                     .json(&body)
             })
             .await?;
+        // PMS-1660 finding: same log shape as the issue_invoice site.
+        let external_number = envelope.credit_memo.doc_number.unwrap_or_else(|| {
+            tracing::warn!(
+                credit_memo_id = %envelope.credit_memo.id,
+                "QuickBooks issue_credit_memo returned no DocNumber; storing empty external_number"
+            );
+            String::new()
+        });
         Ok(ExternalCreditNoteRef {
             provider: InvoiceProviderKind::Quickbooks,
             external_credit_note_id: envelope.credit_memo.id,
-            external_number: envelope.credit_memo.doc_number.unwrap_or_default(),
+            external_number,
         })
     }
 
@@ -1245,10 +1264,14 @@ impl QuickBooksClient {
 fn classify_status(invoice: &QuickBooksInvoiceDto) -> QuickBooksInvoiceStatus {
     let total = invoice.total_amt.unwrap_or(0.0);
     let balance = invoice.balance.unwrap_or(total);
+    // PMS-1660 finding: the invoice-void marker was matched case
+    // sensitively (`Voided`) while the credit memo marker below (line
+    // ~1074) is case-insensitive. Normalise to the lowercase match so
+    // a hand-edited private note casing cannot flip the classification.
     let voided_marker = invoice
         .private_note
         .as_deref()
-        .map(|note| note.contains("Voided"))
+        .map(|note| note.to_ascii_lowercase().contains("voided"))
         .unwrap_or(false);
     if voided_marker || (total == 0.0 && invoice.sync_token.is_some() && balance == 0.0) {
         if voided_marker {
