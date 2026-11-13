@@ -1006,3 +1006,98 @@ async fn editing_a_spent_one_time_item_keeps_it_spent(pool: PgPool) {
         "an edit does not un-bill a charge that has already gone out"
     );
 }
+
+/// PMS-1661 F14: `CreateContractRequest` runs a cross-field
+/// `end_date >= start_date` check, but `UpdateContractRequest` carries
+/// no `start_date`, so `PUT /contracts/{id}` could set `end_date`
+/// before the stored `start_date` and the inverted range persisted.
+#[mokosh_test]
+async fn update_contract_rejects_end_date_before_stored_start_date(pool: PgPool) {
+    use mokosh_server::modules::audit::AuditCtx;
+    use mokosh_server::modules::contracts::{CreateContractRequest, UpdateContractRequest};
+
+    let company = common::seed_company(&pool).await;
+    let svc = ContractsService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    let created = svc
+        .create_contract(
+            tenant,
+            &CreateContractRequest {
+                contract_number: None,
+                name: "Dated".to_string(),
+                company_id: company,
+                contract_type: "service".to_string(),
+                status: "active".to_string(),
+                start_date: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+                end_date: Some(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
+                auto_renew: false,
+                billing_cycle: "monthly".to_string(),
+                billing_amount: None,
+                sla_id: None,
+                signed_date: None,
+                signed_by_contact_id: None,
+                notes: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect("create contract");
+
+    // An update whose end_date predates the stored start_date must 400.
+    let err = svc
+        .update_contract(
+            tenant,
+            created.id,
+            &UpdateContractRequest {
+                contract_number: None,
+                name: None,
+                status: None,
+                end_date: Some(NaiveDate::from_ymd_opt(2026, 5, 1).unwrap()),
+                auto_renew: None,
+                billing_cycle: None,
+                billing_amount: None,
+                sla_id: None,
+                signed_date: None,
+                signed_by_contact_id: None,
+                notes: None,
+            },
+            &ctx,
+        )
+        .await;
+    assert!(
+        matches!(
+            err,
+            Err(mokosh_server::utils::error::AppError::BadRequest(_))
+        ),
+        "an end_date before the stored start_date must 400, got {err:?}"
+    );
+
+    // A sane end_date still takes.
+    let edited = svc
+        .update_contract(
+            tenant,
+            created.id,
+            &UpdateContractRequest {
+                contract_number: None,
+                name: None,
+                status: None,
+                end_date: Some(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()),
+                auto_renew: None,
+                billing_cycle: None,
+                billing_amount: None,
+                sla_id: None,
+                signed_date: None,
+                signed_by_contact_id: None,
+                notes: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect("sane end_date must still take");
+    assert_eq!(
+        edited.end_date,
+        Some(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap())
+    );
+}

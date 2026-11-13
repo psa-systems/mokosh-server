@@ -226,6 +226,29 @@ impl ContractsService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // PMS-1661 F14: the create path validates `end_date >= start_date`
+        // via `validate_contract_date_range` on `CreateContractRequest`,
+        // but `UpdateContractRequest` carries no `start_date`, so PUT
+        // could set `end_date` before the stored `start_date`. Reject
+        // that here, matching the create-time cross-field check and the
+        // PMS-306 shape.
+        if let Some(end) = request.end_date {
+            let start: Option<NaiveDate> = sqlx::query_scalar(
+                "SELECT start_date FROM contracts WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(start) = start {
+                if end < start {
+                    return Err(AppError::BadRequest(
+                        "end_date must be on or after start_date".to_string(),
+                    ));
+                }
+            }
+        }
+
         let n = sqlx::query(
             r#"UPDATE contracts SET
                 contract_number = COALESCE($3, contract_number),
