@@ -5,10 +5,6 @@
 //! PayPal webhook attempts and their outcomes) that the admin reaches
 //! through the API; the delivery-log screen is deferred. Every other route
 //! in this file is consumed.
-//!
-//! parity record 2026-10-16: `/invoices/summary` has no SPA caller yet;
-//! MAPPS-983 wires the dashboard "open invoices" widget to it (MAPPS-984
-//! is the server half this adds). Note covers ONLY the summary route.
 
 use std::sync::Arc;
 
