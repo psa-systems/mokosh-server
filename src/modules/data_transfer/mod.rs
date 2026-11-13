@@ -108,7 +108,7 @@ async fn seed_demo_data(
     match s.seed.load_demo_data(u.tenant_id, u.id).await? {
         LoadDemoOutcome::Seeded => Ok(Json(json!({
             "seeded": true,
-            "message": "Demo data loaded: a sample company, two contacts, and three tickets.",
+            "message": "Demo data loaded: two companies, four contacts, five tickets, two projects and one SLA.",
         }))),
         LoadDemoOutcome::AlreadyHasData => Ok(Json(json!({
             "seeded": false,
