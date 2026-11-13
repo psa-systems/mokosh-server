@@ -382,6 +382,40 @@ pub async fn run(
         ));
     }
 
+    // Out-of-range `limit` used to be silently clamped to 1..=1000, so
+    // a caller asking for 2000 rows got 1000 back with no signal that
+    // the cap moved. Refuse up front naming the bound.
+    if let Some(n) = spec.limit {
+        if !(1..=1000).contains(&n) {
+            return Err(AppError::BadRequest(format!(
+                "Limit must be between 1 and 1000; got {n}"
+            )));
+        }
+    }
+
+    // Unknown `format` used to silently render JSON (the route only
+    // routes CSV; anything else fell through). A caller that asked for
+    // "pdf" got JSON and was left to wonder why their export tool
+    // refused to open it.
+    if let Some(ref f) = spec.format {
+        if !matches!(f.as_str(), "json" | "csv") {
+            return Err(AppError::BadRequest(format!(
+                "Format must be \"json\" or \"csv\"; got \"{f}\""
+            )));
+        }
+    }
+
+    // `from`/`to` on a source that has no date column (today: `assets`)
+    // used to be silently dropped. The caller then got the whole table
+    // and thought their filter had applied. Refuse up front naming the
+    // source that does not take a date range.
+    if src.date_col.is_none() && (spec.from.is_some() || spec.to.is_some()) {
+        return Err(AppError::BadRequest(format!(
+            "Source {} does not support a date range",
+            src.key
+        )));
+    }
+
     let mut dims = Vec::new();
     for k in &spec.dimensions {
         let d = src.dims.iter().find(|d| d.key == *k).ok_or_else(|| {
@@ -475,6 +509,9 @@ pub async fn run(
         sql.push_str(&format!(" GROUP BY {joined} ORDER BY {joined}"));
     }
 
+    // Range already enforced above as a 400, so an out-of-range value
+    // cannot reach here; the clamp is kept as a safety net against a
+    // future field type bump.
     let limit = spec.limit.unwrap_or(100).clamp(1, 1000);
     sql.push_str(&format!(" LIMIT {limit}"));
 
