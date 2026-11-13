@@ -407,32 +407,53 @@ impl BrandingAssetStore {
 
         if let Some(tenant_id) = Self::tenant_logo_id(scope, kind) {
             let extension = extension_for(mime);
-            if let Ok(bytes) = self
+            match self
                 .logo_store
                 .read(&ObjectKey::tenant_logo(tenant_id, extension))
                 .await
             {
-                return Ok(bytes);
+                Ok(bytes) => return Ok(bytes),
+                // Only "nothing at the new location" falls through to the
+                // legacy layout. A permission denied / backend outage used
+                // to be swallowed by `if let Ok(...)` and the caller saw a
+                // 404, which is the wrong signal to an operator debugging a
+                // storage mount. PMS-1657's fix to `LocalProvider::read`
+                // means `NotFound` is now a clean kind here.
+                Err(AppError::NotFound(_)) => {}
+                Err(e) => return Err(e),
             }
             // Same pre-move fallback `TenantLogoStore::read` falls back to: a
             // logo written before this converged is still at the shared
             // `tenant-logos/{tenant}.{ext}` layout until `TenantLogoMover`
-            // reaches it.
+            // reaches it. Pass the legacy error through verbatim so a
+            // permission failure on the shared directory is not reshaped
+            // as a 404 either.
             return self
                 .logo_store
                 .read(&ObjectKey::legacy_tenant_logo(tenant_id, extension))
-                .await
-                .map_err(|_| AppError::NotFound("Asset".to_string()));
+                .await;
         }
 
         // PMS-1397: prefer the tenant-first path, fall through to the
         // legacy shared-directory path until the one-shot mover reaches
         // it. Both reads use the same mime+ext.
+        //
+        // Distinguish `NotFound` from any other I/O error on both reads so
+        // a permission problem does not masquerade as a 404.
         match tokio::fs::read(self.path_for(scope, kind, mime)).await {
             Ok(bytes) => Ok(bytes),
-            Err(_) => tokio::fs::read(self.legacy_path_for(scope, kind, mime))
-                .await
-                .map_err(|_| AppError::NotFound("Asset".to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match tokio::fs::read(self.legacy_path_for(scope, kind, mime)).await {
+                    Ok(bytes) => Ok(bytes),
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {
+                        Err(AppError::NotFound("Asset".to_string()))
+                    }
+                    Err(e2) => Err(AppError::Internal(format!(
+                        "legacy asset read failed: {e2}"
+                    ))),
+                }
+            }
+            Err(e) => Err(AppError::Internal(format!("asset read failed: {e}"))),
         }
     }
 
@@ -497,26 +518,42 @@ impl BrandingAssetStore {
 
         if let Some(tenant_id) = Self::tenant_logo_id(scope, kind) {
             let extension = extension_for(mime);
-            if let Ok(reader) = self
+            match self
                 .logo_store
                 .open(&ObjectKey::tenant_logo(tenant_id, extension))
                 .await
             {
-                return Ok(reader);
+                Ok(reader) => return Ok(reader),
+                // Same distinction `read` makes: only "nothing at the new
+                // location" falls through, anything else bubbles verbatim.
+                Err(AppError::NotFound(_)) => {}
+                Err(e) => return Err(e),
             }
             return self
                 .logo_store
                 .open(&ObjectKey::legacy_tenant_logo(tenant_id, extension))
-                .await
-                .map_err(|_| AppError::NotFound("Asset".to_string()));
+                .await;
         }
 
         // PMS-1397: prefer the tenant-first path, fall through to legacy.
         let file = match tokio::fs::File::open(self.path_for(scope, kind, mime)).await {
             Ok(f) => f,
-            Err(_) => tokio::fs::File::open(self.legacy_path_for(scope, kind, mime))
-                .await
-                .map_err(|_| AppError::NotFound("Asset".to_string()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match tokio::fs::File::open(self.legacy_path_for(scope, kind, mime)).await {
+                    Ok(f) => f,
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(AppError::NotFound("Asset".to_string()));
+                    }
+                    Err(e2) => {
+                        return Err(AppError::Internal(format!(
+                            "legacy asset open failed: {e2}"
+                        )));
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(AppError::Internal(format!("asset open failed: {e}")));
+            }
         };
         Ok(Box::pin(file))
     }
