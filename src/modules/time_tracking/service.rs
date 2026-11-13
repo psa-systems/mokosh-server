@@ -1092,7 +1092,7 @@ impl TimeTrackingService {
         // 'pending') gives us exactly the set to consume hours for, and the
         // `pending` guard makes re-approval idempotent: a second call returns
         // no rows, so consume_hours is not double-counted (PMS-405).
-        let approved: Vec<(Uuid,)> = sqlx::query_as(
+        sqlx::query(
             r#"
             UPDATE time_entries
             SET approval_status = 'approved',
@@ -1109,7 +1109,6 @@ impl TimeTrackingService {
               AND date     >= $3
               AND date      < $4
               AND approval_status = 'pending'
-            RETURNING id
             "#,
         )
         .bind(tenant_id)
@@ -1117,11 +1116,10 @@ impl TimeTrackingService {
         .bind(anchor)
         .bind(week_end)
         .bind(approver_id)
-        .fetch_all(&mut *tx)
+        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
 
-        let _ = approved.len();
         // PMS-951: approval is NOT the consumption point any more, and must not
         // draw a second time. PMS-405 put it here because approval was then the
         // moment an entry became real; PMS-944 moved that to creation, and
