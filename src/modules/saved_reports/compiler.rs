@@ -283,7 +283,13 @@ fn ticket_column(key: &str) -> Option<TicketColumn> {
             requires_join: true,
         },
         "created_by_name" => TicketColumn {
-            sql: "COALESCE(TRIM(cu.first_name || ' ' || cu.last_name), '')",
+            // PMS-1665 finding: the old `COALESCE(..., '')` yielded an
+            // empty string for an unresolved creator, so
+            // `log_unresolved_person_names` (which tests for a string)
+            // never reported one. Use `NULLIF(TRIM(...), '')` so a
+            // missing/blank name stays NULL on the wire, matching the
+            // shape the unresolved-person logger expects.
+            sql: "NULLIF(TRIM(cu.first_name || ' ' || cu.last_name), '')",
             ty: Text,
             requires_join: true,
         },
@@ -332,6 +338,16 @@ fn compile_tickets(
     let mut binds: Vec<BindValue> = vec![BindValue::Uuid(tenant_id)];
     let mut where_clauses: Vec<String> = vec!["t.tenant_id = $1".into()];
 
+    // PMS-1665 finding: a `filters` that was not a JSON object (for
+    // example a top-level array or scalar) used to be ignored silently
+    // and the report ran unfiltered. The non-array `columns` case
+    // already 400s; mirror that for `filters` so a shape mistake
+    // surfaces instead of returning the wrong rows.
+    if !filters.is_null() && !filters.is_object() {
+        return Err(AppError::BadRequest(
+            "`filters` must be a JSON object keyed by field name".to_string(),
+        ));
+    }
     if let Some(filter_obj) = filters.as_object() {
         for (field, value) in filter_obj {
             let Some(col) = ticket_column(field) else {
@@ -632,6 +648,17 @@ pub fn log_unresolved_person_names(surface: &str, output_columns: &[String], row
 /// `{field, dir}` objects. Empty / missing -> default to
 /// `ORDER BY t.updated_at DESC` to give pagination a stable order.
 fn parse_sort(sort: &Value) -> AppResult<String> {
+    // PMS-1665 finding: a `sort` that was not an array (for example a
+    // top-level object or scalar) used to fall through to the default
+    // order silently, hiding a shape mistake behind the fallback. A
+    // malformed entry inside an array already 400s below; mirror that
+    // for the outer shape. `null` + missing + empty-array stay as
+    // the "no sort specified" signal.
+    if !sort.is_null() && !sort.is_array() {
+        return Err(AppError::BadRequest(
+            "`sort` must be a JSON array of {field, dir} objects".to_string(),
+        ));
+    }
     let Some(arr) = sort.as_array() else {
         return Ok("ORDER BY t.updated_at DESC".into());
     };

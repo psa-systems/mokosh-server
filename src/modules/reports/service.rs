@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::auth::TenantId;
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
 pub struct ReportsService {
@@ -316,6 +316,24 @@ impl ReportsService {
         company_id: Option<Uuid>,
     ) -> AppResult<BillingReportResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1665 finding: an unknown company_id used to fall through
+        // to WHERE filters that yielded zero totals + empty aging, and
+        // the doc comment below claimed the response "covers every
+        // client". A caller hitting a stale company id (deleted, wrong
+        // tenant) learned the mistake only by reading an empty report.
+        // 404 up front so the operator can tell the two apart.
+        if let Some(c) = company_id {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM companies WHERE tenant_id = $1 AND id = $2)",
+            )
+            .bind(tenant_id)
+            .bind(c)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !exists {
+                return Err(AppError::NotFound("Company".to_string()));
+            }
+        }
         let totals: Option<(Decimal, Decimal, Decimal)> = if let Some(c) = company_id {
             sqlx::query_as(
                 r#"SELECT COALESCE(SUM(total), 0), COALESCE(SUM(amount_paid), 0),
