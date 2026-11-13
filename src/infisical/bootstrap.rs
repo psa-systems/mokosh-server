@@ -364,8 +364,20 @@ impl BootstrapClient {
         {
             Ok(_) => Ok(()),
             Err(e) => {
+                // PMS-1657: `msg.contains("409")` could match "line 409"
+                // or a value that happens to contain the digits. Narrow
+                // to the status prefix the HTTP client renders ("status 409",
+                // "HTTP 409", "status: 409"), the server's own
+                // "AlreadyExists" error code string and the English
+                // "already exists" fallback. A real error that uses
+                // none of those still propagates.
                 let msg = e.to_string();
-                if msg.contains("already exists") || msg.contains("409") {
+                let already = msg.contains("already exists")
+                    || msg.contains("AlreadyExists")
+                    || msg.contains("status 409")
+                    || msg.contains("status: 409")
+                    || msg.contains("HTTP 409");
+                if already {
                     Ok(())
                 } else {
                     Err(e)

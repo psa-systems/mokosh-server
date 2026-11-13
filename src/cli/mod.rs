@@ -253,10 +253,15 @@ fn parse_tenant_arg_env(args: &[String], env_key: &str, label: &str) -> anyhow::
 }
 
 fn require_env(key: &str) -> anyhow::Result<String> {
-    std::env::var(key).map_err(|_| {
-        anyhow::anyhow!(
+    // PMS-1657: a set-but-empty value used to pass `std::env::var`'s
+    // "is it set" check, so an operator with `INFISICAL_ADMIN_PASSWORD=`
+    // (an export that did not land) got past this and failed deeper in
+    // the flow with a misleading error. Treat empty the same as unset.
+    match std::env::var(key) {
+        Ok(v) if !v.is_empty() => Ok(v),
+        _ => Err(anyhow::anyhow!(
             "{} is not set. Put it in .env.infisical or export it before running.",
             key
-        )
-    })
+        )),
+    }
 }
