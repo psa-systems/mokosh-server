@@ -325,18 +325,6 @@ pub struct CreateQuoteRequest {
     pub lines: Vec<QuoteLineRequest>,
 }
 
-/// Body of `POST /portal/quotes/{id}/accept|decline` (PMS-673).
-///
-/// Notes are optional: a client accepting rarely has anything to add,
-/// while a decline usually does. There is deliberately no status field;
-/// the route decides the outcome, so the client cannot post its way into
-/// an arbitrary state.
-#[derive(Debug, Clone, Default, Deserialize, Validate)]
-pub struct PortalQuoteDecisionRequest {
-    #[validate(length(max = 2000))]
-    pub notes: Option<String>,
-}
-
 /// Body of `POST /quotes/{id}/convert` (PMS-674).
 ///
 /// Carries only the fields a quote cannot supply. Name, scope, client,

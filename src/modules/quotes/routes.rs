@@ -218,9 +218,16 @@ async fn get_quote_pdf(
 /// Gates on quotes:accept, then delegates to the shared decision
 /// path so the state-machine invariants (valid_until check, single-
 /// decision guard) live in one place.
-#[derive(Debug, Clone, serde::Deserialize)]
+///
+/// `notes` is bounded to 2000 characters, matching the (otherwise
+/// unused) `PortalQuoteDecisionRequest` that models.rs carried for the
+/// same shape. An unbounded free-text field on an auth-gated route is
+/// an easy amplification channel for a malicious contact; the limit
+/// is the same as other long-form note fields in this codebase.
+#[derive(Debug, Clone, serde::Deserialize, validator::Validate)]
 struct QuoteDecisionBody {
     #[serde(default)]
+    #[validate(length(max = 2000))]
     notes: Option<String>,
 }
 
@@ -268,7 +275,14 @@ async fn contact_decide(
         }
     };
     caller.require_capability(caps::QUOTES_ACCEPT, db).await?;
-    let notes = body.and_then(|Json(b)| b.notes);
+    let notes = match body {
+        Some(Json(b)) => {
+            use validator::Validate;
+            b.validate()?;
+            b.notes
+        }
+        None => None,
+    };
     let decision = ClientDecision {
         company_id: session.company_id,
         accept,
