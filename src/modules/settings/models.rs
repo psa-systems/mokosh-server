@@ -69,6 +69,33 @@ pub struct PutSettingValueRequest {
     pub value: serde_json::Value,
 }
 
+/// PMS-1350: whether a tenant_settings category is reachable by every
+/// authenticated user (`Personal`) or by an admin only (`Administrative`).
+/// This is the single declaration site: adding a category to
+/// [`PERSONAL_CATEGORIES`] is what makes a setting reachable outside
+/// admin, not a route or page change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingVisibility {
+    Personal,
+    Administrative,
+}
+
+/// Every category whose settings are personal rather than
+/// administrative. Appearance is the first (PMS-1350); the rest of the
+/// catalogue stays administrative until reviewed.
+pub const PERSONAL_CATEGORIES: &[&str] = &["appearance"];
+
+/// Look up a category's declared visibility. Unknown categories default
+/// to `Administrative`, the safe default, so a category added without a
+/// declaration here stays admin-only rather than leaking to everyone.
+pub fn setting_visibility(category: &str) -> SettingVisibility {
+    if PERSONAL_CATEGORIES.contains(&category) {
+        SettingVisibility::Personal
+    } else {
+        SettingVisibility::Administrative
+    }
+}
+
 /// Validate a tenant_settings value against the known
 /// (category, key) shape table (PMS-113 AC1).
 ///
@@ -252,6 +279,16 @@ pub fn validate_setting_value(
         ("workflows", "rule_max_depth") => match value.as_u64() {
             Some(n) if (1..=10).contains(&n) => Ok(()),
             _ => Err(bad("value", "expected an integer in 1..=10")),
+        },
+        // PMS-1350: the first personal setting. A closed set, same reasoning
+        // as `tickets/note_editing` above: a value outside it would be read
+        // as the default in silence.
+        ("appearance", "theme") => match value.as_str() {
+            Some("light") | Some("dark") | Some("system") => Ok(()),
+            _ => Err(bad(
+                "value",
+                "expected one of \"light\", \"dark\", \"system\"",
+            )),
         },
         // Unknown (category, key): accept with a warning so a future SPA
         // experiment doesn't require a server change before the
