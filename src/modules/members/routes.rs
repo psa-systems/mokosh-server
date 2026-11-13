@@ -34,6 +34,7 @@ pub fn members_routes(members_service: Arc<MembersService>) -> Router {
         .with_state(state)
 }
 
+// SPEC-5.526, SPEC-5.527: manager-or-above gate; 422 on bad filters or sort.
 async fn list_members(
     State(state): State<MembersRouterState>,
     manager: RequireManager,

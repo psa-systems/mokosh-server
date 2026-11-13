@@ -24,6 +24,7 @@ pub struct DocumentationRouterState {
     pub service: Arc<DocumentationService>,
 }
 
+// SPEC-15.1149
 pub fn documentation_routes(service: DocumentationService) -> Router {
     let state = DocumentationRouterState {
         service: Arc::new(service),
@@ -33,6 +34,7 @@ pub fn documentation_routes(service: DocumentationService) -> Router {
         .with_state(state)
 }
 
+// SPEC-15.1149
 async fn company_documentation(
     State(state): State<DocumentationRouterState>,
     RequireAssets { user, .. }: RequireAssets,

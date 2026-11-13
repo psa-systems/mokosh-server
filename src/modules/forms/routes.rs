@@ -202,6 +202,7 @@ async fn delete_draft(
 /// parity record above.
 // SPEC-7.210: GET /forms/{id}/submissions requires only authentication (any authenticated
 // agent, not admin-only).
+// SPEC-7.1017: no existence check on the definition id; an unknown id lists nothing.
 async fn list_submissions(
     State(s): State<FormsRouterState>,
     RequireAuth(u): RequireAuth,

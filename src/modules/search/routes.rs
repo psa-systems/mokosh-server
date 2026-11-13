@@ -45,6 +45,7 @@ struct SearchQuery {
 /// intentionally NOT applied here - the search hits are the user's own
 /// tenant data and are read-only previews; clicking through goes to
 /// the entity's normal detail page which enforces its own access.
+// SPEC-15.2119
 async fn search(
     State(s): State<SearchRouterState>,
     RequireAuth(u): RequireAuth,

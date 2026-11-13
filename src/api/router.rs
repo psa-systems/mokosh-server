@@ -101,10 +101,12 @@ pub fn create_api_router(
     bunyip_webhook_secret: Vec<u8>,
     // PMS-657: IP -> country resolver for login-location alerts, built from
     // IP2LOCATION_DB_PATH in main.rs. `None` disables the feature.
+    // SPEC-8.3: `None` disables login-location alerts; the router still starts.
     geoip: Option<Arc<crate::utils::geoip::GeoIpService>>,
     // BUNYIP-475: advisory ASN / VPN enrichment service (shared dunite-ipenrich
     // crate), built from IP2PROXY_DB_PATH in main.rs. `None` disables the
     // admin enrichment lookup.
+    // SPEC-8.3: `None` disables the enrichment lookup; the router still starts.
     ip_enrich: Option<Arc<dunite_ipenrich::IpEnrichService>>,
     // PMS-658: master switch for the suspicious-login notify-and-approve gate,
     // from LOGIN_APPROVAL_ENABLED in main.rs. Off by default (can block logins).
@@ -130,6 +132,7 @@ pub fn create_api_router(
     // function cannot pick a provider, and so a deployment on Infisical has
     // every `BillingService` below on Infisical rather than whichever ones
     // remembered to ask.
+    // SPEC-8.2: the one injected tenant-secret provider; the router never picks one.
     secrets: Arc<dyn crate::secrets::SecretProvider>,
     // PMS-1429: the handle that runs the contact-import worker as soon as a
     // person queues an import, instead of leaving it to sleep out its 60s
@@ -167,11 +170,14 @@ pub fn create_api_router(
     features: crate::modules::features::FeatureSnapshot,
 ) -> Router {
     let cors_matcher = CorsOriginMatcher::from_entries(&cors_origins);
+    // SPEC-8.15: one shared swappable mailer handle for every sender and the settings routes.
     let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();
 
+    // SPEC-8.4: the verifier exists only when OIDC issuer and audience are configured.
     // PMS-905: `bunyip_verifier` is moved into the auth middleware below, so
     // capture the one fact the auth service needs from it first.
     let sso_mounted = bunyip_verifier.is_some();
+    // SPEC-11.6: error-logged but not fatal; local password login stays enabled.
     if deployment_mode.is_saas() && !sso_mounted {
         // Loud, but not fatal. A `saas` deployment with no verifier can
         // authenticate nobody through SSO, so the local password path is the
@@ -193,6 +199,8 @@ pub fn create_api_router(
     // rather than fail-boot so a deployment that later fills the config in
     // gets the gate on the next restart, and one that meant to leave it
     // off is unaffected.
+    // SPEC-8.6: absent config means no directory; partial config warns and is treated as absent.
+    // SPEC-11.7: the warning names the cause.
     let bunyip_directory =
         match crate::modules::auth::bunyip_directory::BunyipUserDirectory::from_config() {
             Ok(Some(client)) => Some(std::sync::Arc::new(client)),
@@ -391,6 +399,8 @@ pub fn create_api_router(
     // dispatcher with `with_api_base` / `with_identity_base` pointing at a
     // stub, which is what lets the delegated path be exercised end to end
     // without reaching Xero or Intuit.
+    // SPEC-8.12: one dispatcher shared by invoice path, bill path and both receivers.
+    // SPEC-11.4: Xero and QuickBooks clients carry a 45 s request timeout.
     let issuer_dispatcher = Arc::new(
         crate::modules::billing::invoice_issuer_dispatch::IssuerDispatcher::new(
             features.clone(),
@@ -477,6 +487,7 @@ pub fn create_api_router(
     // shared `ticket_attachments` blob path, so it holds its own
     // `AttachmentService` (same env-driven dir + size cap as the agent /
     // portal upload routes).
+    // SPEC-8.16: an invalid ATTACHMENT_MAX_BYTES panics the boot here and at every other from_env().expect below.
     let email_intake_service = EmailIntakeService::new(
         db.clone(),
         ticket_service.clone(),
@@ -541,11 +552,13 @@ pub fn create_api_router(
     let api_v1 = Router::new()
         // Liveness probe: cheap, never touches downstream deps. Used by
         // orchestrators to decide whether to restart the container.
+        // SPEC-12.18
         .route("/health", get(health_check))
         // Readiness probe (PMS-130): also pings the DB, and best-effort
         // pings Infisical when `INFISICAL_ADDRESS` is set. Returns 503
         // with a JSON breakdown when a dependency is down so the
         // orchestrator drains traffic until the probe goes green.
+        // SPEC-12.19
         .route(
             "/ready",
             get({
@@ -554,12 +567,15 @@ pub fn create_api_router(
             }),
         )
         // Build / version info (public, used for diagnostics)
-        // SPEC-1 and 2.150: GET /api/v1/version serves VersionInfo::current() with no auth extractor on the handler, confirming version.rs's doc-comment claim of endpoint consumption.
+        // GET /api/v1/version serves VersionInfo::current() with no auth extractor on the handler, confirming version.rs's doc-comment claim of endpoint consumption.
+        // SPEC-12.22
         .route("/version", get(version_info))
         // Self-hosted update check (PMS-238). Opt-in via
         // `MOKOSH_UPDATE_CHECK_URL`; compares the running build against the
         // latest published release and reports whether an upgrade is
         // available. Disabled (no outbound request) when the env var is unset.
+        // SPEC-12.22
+        // SPEC-2.84
         .route("/version/check", get(version_check))
         // PMS-1144: outward provider-configuration summary. Unauthenticated
         // by design, so BUNYIP-634's aggregator can read the identity per
@@ -567,12 +583,14 @@ pub fn create_api_router(
         // hosting profile + enabled provider names per kind. Peer to
         // /version, NOT to /admin/providers/status (the admin route stays
         // admin-gated and continues to serve the full per-key report).
+        // SPEC-12.23
         .merge(crate::providers::status::public_summary_route::provider_public_summary_routes())
         // Auth routes. MAPPS-493 (phase 4): share the AuthService Arc with
         // tenant_routes so `/tenants/self-serve` can decode identity_tokens
         // minted by /auth/login. AuthService derives Clone, so this is a
         // cheap Arc bump. PMS-837 removed the Google OAuth popup routes and
         // their `google_oauth` / `cookie_secure` parameters.
+        // SPEC-12.28
         .nest("/auth", auth_routes(auth_service.clone()))
         // PMS-1208: cross-account Mokosh grants with a Cloudflare-shaped
         // pending / accept / expire lifecycle. Three mounts:
@@ -584,6 +602,7 @@ pub fn create_api_router(
         // still gate on the caller's identity when they have one, but a
         // first-sight grantee bouncing through OIDC can hit the metadata
         // endpoint before the auth chain sees them.
+        // SPEC-12.25: the GET by-token route is open by design; the others need a caller.
         .nest(
             "/grants/invitations/by-token",
             grant_invitations_by_token_routes(Arc::new(db.clone()), bunyip_directory.clone()),
@@ -631,8 +650,9 @@ pub fn create_api_router(
         // api_v1 build (alongside `settings_service`) so every route
         // (including the MAPPS-518 platform-admin-gated tenant
         // endpoints) can resolve it.
-        // SPEC-1 and 2.66: builds its own `PlatformAdminService` instance, separate from the one the outer
+        // builds its own `PlatformAdminService` instance, separate from the one the outer
         // Extension layer injects near the end of this chain (around line 971); both target the same table.
+        // SPEC-12.29
         .nest(
             "/platform",
             platform_routes(
@@ -644,8 +664,9 @@ pub fn create_api_router(
         // single-tenant deployment there is exactly one tenant and the
         // CRUD endpoints would be a foot-gun. PMS-24.
         ;
-    // SPEC-1 and 2.67: `/tenants`, `/teams` and `/me` (teams) are only mounted when the `multi-tenant` cargo feature
+    // `/tenants`, `/teams` and `/me` (teams) are only mounted when the `multi-tenant` cargo feature
     // is on; a build without it has no tenant CRUD and no teams surface at all, not merely a gated handler.
+    // SPEC-2.79
     #[cfg(feature = "multi-tenant")]
     let api_v1 = api_v1.nest(
         "/tenants",
@@ -679,6 +700,7 @@ pub fn create_api_router(
         // Router::new())` here was dead - it matched nothing, so
         // `/api/v1/companies` returned a misleading 404 with no
         // explanation. Removed and documented (PMS-20).
+        // SPEC-12.30
         .nest(
             "/contacts",
             contact_routes(contact_service.clone(), PortalRoleService::new(db.clone())),
@@ -708,6 +730,7 @@ pub fn create_api_router(
         // `AttachmentService` so the portal `POST /tickets/{id}/attachments`
         // route can reuse the on-disk blob pipeline (same env-driven
         // dir + size cap as the agent surface).
+        // SPEC-12.31, SPEC-8.16
         .nest(
             "/tickets",
             ticket_routes(
@@ -723,6 +746,7 @@ pub fn create_api_router(
                 approvals_service.clone(),
             ),
         )
+        // SPEC-12.10: this router raises DefaultBodyLimit on its upload routes (cap + 64 KiB).
         // PMS-483: ticket-note attachment upload / download / delete.
         // Merged at the top level so its `/tickets/{id}/notes/...`
         // path nests cleanly under the existing ticket tree.
@@ -761,6 +785,7 @@ pub fn create_api_router(
         // Billing: invoices + payments + payment-gateways + tax-rates.
         // `billing_routes` defines the full paths so the URL structure
         // stays flat. PMS-34.
+        // SPEC-12.32
         .merge(billing_routes(billing_service, public_api_base_url.clone()))
         // MAPPS-1099 Phase 2c: admin surfaces that populate the
         // invoice-issuer mapping tables (Mokosh company -> external
@@ -788,6 +813,7 @@ pub fn create_api_router(
         // PMS-936: also carries a `TicketService` clone so the
         // `POST /assets/{id}/report-issue` endpoint can create the
         // linked ticket through the shared portal-ticket path.
+        // SPEC-12.33
         .merge(assets_routes(
             assets_service.clone(),
             ticket_service.clone(),
@@ -824,6 +850,8 @@ pub fn create_api_router(
         // PMS-923: images an article embeds. Upload / list / delete are
         // manager-gated here; the READ is public (see the public tree below),
         // because an `<img>` cannot carry an Authorization header.
+        // SPEC-12.10: raises DefaultBodyLimit on the image upload route.
+        // SPEC-11.7, SPEC-8.16: an invalid KB_ATTACHMENT_MAX_BYTES panics the boot.
         .merge(kb_attachment_routes(KbAttachmentService::new(
             db.clone(),
             KbAttachmentConfig::from_env().expect("KB_ATTACHMENT_MAX_BYTES invalid"),
@@ -846,6 +874,7 @@ pub fn create_api_router(
             ),
         )
         // RMM: connections, device mappings, alert rules, alert ingest. PMS-101.
+        // SPEC-8.13: alert ingest authenticates by X-Signature HMAC, not a session.
         .merge(rmm_routes(rmm_service))
         // Client service status: monitored systems and observed check
         // outcomes. Ingest is HMAC-authenticated (shares the RMM
@@ -862,6 +891,7 @@ pub fn create_api_router(
         ))
         // PMS-1212 (PSA-70): connect, status and disconnect for the Google
         // Contacts import. Admin-gated inside, the RMM shape.
+        // SPEC-12.10: its vCard upload route raises DefaultBodyLimit.
         .merge(crate::modules::contact_sync::routes::contact_sync_routes(
             contact_sync_service.clone(),
         ))
@@ -894,6 +924,7 @@ pub fn create_api_router(
         // pending queue, decide, cancel).
         .merge(approval_routes(approvals_service))
         // Settings: tenant settings + module configs. PMS-114.
+        // SPEC-8.15, SPEC-12.34
         .merge(settings_routes(
             settings_service.clone(),
             db.clone(),
@@ -909,6 +940,7 @@ pub fn create_api_router(
             features.clone(),
         ))
         // Audit log read. PMS-118.
+        // SPEC-12.34
         .merge(audit_routes(audit_service))
         // BUNYIP-475: advisory ASN / VPN enrichment lookup (admin-gated),
         // consuming the shared dunite-ipenrich crate.
@@ -916,6 +948,7 @@ pub fn create_api_router(
         // PMS-647: admin-only tenant data export (first slice of PMS-646).
         // PMS-679: also the "Load demo data" endpoint, sharing the same
         // `seed_service` Arc as the first-visit seed middleware below.
+        // SPEC-12.10: import route carries exactly 25 MiB.
         .merge(crate::modules::data_transfer::data_transfer_routes(
             db.clone(),
             seed_service.clone(),
@@ -927,6 +960,7 @@ pub fn create_api_router(
         // renderings cannot disagree, and both sit behind `RequireAdmin`.
         // The Bunyip machine credential swap for the JSON endpoint is a
         // follow-up when BUNYIP-634 lands (see the module doc).
+        // SPEC-12.23, SPEC-8.7
         .merge(crate::providers::status::route::provider_status_admin_routes())
         // PMS-275: the coarse per-request audit middleware (PMS-119) was
         // removed. It ran post-response with only the HTTP method + URL, so it
@@ -936,12 +970,15 @@ pub fn create_api_router(
         // "unknown". The in-transaction `audit_write` path (PMS-117) is the
         // sole audit writer and records the entity type, record id, and
         // before/after snapshots that the audit trail needs.
-        // SPEC-1 and 2.65: api_v1's middleware stack, innermost to outermost: seed_middleware (next), then auth_middleware (below), then the contact-plane middleware, then Extension<Database>, Extension<SettingsService>, Extension<PlatformAdminService>, and finally normalize_error_envelope as the outermost layer (end of this
+        // SPEC-12.24: seed, auth, contact-plane, three extensions, then the normaliser outermost.
+        // SPEC-12.25: none of these layers rejects on its own; each handler declares its extractor.
+        // api_v1's middleware stack, innermost to outermost: seed_middleware (next), then auth_middleware (below), then the contact-plane middleware, then Extension<Database>, Extension<SettingsService>, Extension<PlatformAdminService>, and finally normalize_error_envelope as the outermost layer (end of this
         // chain). Each later `.layer()` call wraps the ones before it. First-visit demo seeding (PMS-157). Added before the auth layer so it runs *inner* of it: auth populates AuthState, then this reads the resolved tenant/user and seeds a new account's demo data once (detached, best-effort). No-op for already-seen tenants.
         .layer(middleware::from_fn_with_state(
             crate::modules::seed::SeedMiddlewareState {
                 service: seed_service,
             },
+            // SPEC-2.83
             crate::modules::seed::seed_middleware,
         ))
         // MAPPS-877: refuse a `ReadOnly` caller on any non-safe HTTP
@@ -961,8 +998,10 @@ pub fn create_api_router(
             crate::modules::auth::middleware::require_write_for_mutations,
         ))
         // Apply auth middleware
+        // SPEC-12.26: the gates are the extractors, not this layer.
         .layer(middleware::from_fn_with_state(
             auth_middleware.clone(),
+            // SPEC-2.81
             crate::modules::auth::middleware::auth_middleware,
         ))
         // mokosh-contact-login prompt 008: the contact-plane middleware runs
@@ -980,12 +1019,14 @@ pub fn create_api_router(
                     jwt_secret.clone(),
                 ),
             ),
+            // SPEC-2.82
             crate::modules::contact_portal::middleware::portal_contact_middleware,
         ))
         // mokosh-contact-login prompt 008: `Extension<Database>` powers
         // `CallerContext::require_capability`'s DB-load of the effective
         // capability set. Attaching it once here lets every dual-plane
         // handler pull the db without threading it through router state.
+        // SPEC-12.27: a contact bearer reaches dual-plane staff-tree handlers through the layer above.
         .layer(axum::Extension(db.clone()))
         // PMS-113 AC3: make SettingsService reachable from
         // `RequireModuleEnabled` extractors via the request's
@@ -999,7 +1040,7 @@ pub fn create_api_router(
         // /api/v1 route (including the platform-admin-gated tenant
         // endpoints from MAPPS-518) can resolve it, not just the
         // /platform sub-tree.
-        // SPEC-1 and 2.66: this `PlatformAdminService` instance (built fresh here for the Extension layer) is distinct from the one `/platform`
+        // this `PlatformAdminService` instance (built fresh here for the Extension layer) is distinct from the one `/platform`
         // builds for itself above (around line 627); both read the same `db` and `jwt_secret` but are separate objects serving separate call sites.
         .layer(axum::Extension(Arc::new(PlatformAdminService::new(
             db.clone(),
@@ -1010,9 +1051,10 @@ pub fn create_api_router(
         // returned as the standard `{error:{code,message}}` envelope instead
         // of raw axum/serde plaintext. JSON responses (every `AppError`) pass
         // through untouched.
-        // SPEC-1 and 2.62: this is one of seven independent normalize_error_envelope instances: api_v1 (here), bunyip_nest, stripe_webhooks,
+        // this is one of seven independent normalize_error_envelope instances: api_v1 (here), bunyip_nest, stripe_webhooks,
         // paypal_webhooks, invoice_issuer_webhooks (one per provider closure call), public_api, and contact_api each layer their own.
         .layer(middleware::from_fn(
+            // SPEC-2.88
             crate::utils::error::normalize_error_envelope,
         ));
 
@@ -1033,6 +1075,8 @@ pub fn create_api_router(
     // the client-portal wildcard host `{slug}.client.<apex>` so per-tenant
     // portal origins do not each need their own explicit CORS_ORIGIN entry.
     // See `CorsOriginMatcher::from_entries` for the parse rules.
+    // SPEC-12.11, SPEC-12.12, SPEC-12.13: fixed method/header lists, credentials, 600 s preflight cache.
+    // SPEC-12.14: the matcher was parsed once above; no match means no allow-origin header.
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _| {
             cors_matcher.matches(origin.as_bytes())
@@ -1065,6 +1109,7 @@ pub fn create_api_router(
         .allow_credentials(true)
         // Cache preflight for 10 minutes per docs/cors.md §5 so browsers do not
         // re-issue an OPTIONS before every credentialed request (PMS-389).
+        // SPEC-2.64
         .max_age(std::time::Duration::from_secs(600));
 
     // PMS-591: Bunyip account-deleted webhook. Nested under `/api/v1/bunyip`
@@ -1081,6 +1126,8 @@ pub fn create_api_router(
         // there is no `app.current_tenant` GUC to set beforehand. It runs on the
         // BYPASSRLS migrator pool; `users` is RLS-covered and would fail closed
         // on the unprivileged app pool.
+        // SPEC-8.1: privileged pool, because the receiver runs before any session exists.
+        // SPEC-2.75
         pool: db.migrator_pool().clone(),
         webhook_secret: bunyip_webhook_secret,
     });
@@ -1092,7 +1139,7 @@ pub fn create_api_router(
     // not the verifier exists; with no verifier there is nothing to verify
     // against, and the route answering 404 in that deployment would be
     // indistinguishable from a typo in bunyip's registered URI.
-    // SPEC-1 and 2.64 DEFECT: the comment above claims the receiver is "Mounted whether or not the verifier exists", but `logout_verifier.map(...)` below only builds `Some(router)` when `bunyip_verifier` was `Some`; the `match`
+    // DEFECT: the comment above claims the receiver is "Mounted whether or not the verifier exists", but `logout_verifier.map(...)` below only builds `Some(router)` when `bunyip_verifier` was `Some`; the `match`
     // further down (around line 1127) merges it into `bunyip_nest` only in that case, so with no verifier the route is NOT mounted and a request to it 404s exactly as the comment says it would not. Not fixed here; see Defects found.
     let backchannel_logout = logout_verifier.map(|verifier| {
         let state = Arc::new(
@@ -1107,12 +1154,14 @@ pub fn create_api_router(
         );
         Router::new()
             .route(
+                // SPEC-2.76
                 "/oauth2/backchannel-logout",
                 post(crate::modules::auth::backchannel_logout::backchannel_logout),
             )
             .with_state(state)
     });
 
+    // SPEC-12.40, SPEC-12.42, SPEC-8.5: no session middleware; webhooks sit under the normaliser.
     let bunyip_nest = Router::new()
         .route(
             "/webhooks/account-deleted",
@@ -1123,15 +1172,17 @@ pub fn create_api_router(
         // the next `at+jwt` refresh. Same HMAC signing key the
         // account-deleted receiver verifies (BUNYIP-332 / PMS-591).
         .route(
+            // SPEC-2.74
             "/webhooks/mokosh-grant-changed",
             post(crate::modules::auth::bunyip_webhook::mokosh_grant_changed),
         )
         .with_state(bunyip_webhook_state)
         // PMS-298: shared JSON error envelope so a bad request here matches
         // the rest of the API surface.
-        // SPEC-1 and 2.62: bunyip_nest's own independent normalize_error_envelope instance (one of seven; see the api_v1 one near line 992). SPEC-1 and 2.69: both routes on this nest authenticate via an
+        // bunyip_nest's own independent normalize_error_envelope instance (one of seven; see the api_v1 one near line 992). : both routes on this nest authenticate via an
         // HMAC signature over the raw body rather than a session; `account_deleted` runs on the migrator/BYPASSRLS pool because it is pre-auth and resolves its own tenant from the `users` row it reads.
         .layer(middleware::from_fn(
+            // SPEC-2.88
             crate::utils::error::normalize_error_envelope,
         ));
     // PMS-998: merged rather than routed inside the block above because the
@@ -1140,8 +1191,9 @@ pub fn create_api_router(
     // the OP's own status codes rather than this API's error envelope: a 400
     // it wraps would still be a delivery failure to bunyip, but the body
     // would claim to be a Mokosh error for a caller that is not a client.
-    // SPEC-1 and 2.64 DEFECT: this `match` is the actual mount decision for the back-channel logout route; it merges `logout` only when `backchannel_logout` is `Some`,
+    // DEFECT: this `match` is the actual mount decision for the back-channel logout route; it merges `logout` only when `backchannel_logout` is `Some`,
     // contradicting the "mounted whether or not the verifier exists" comment above `logout_verifier.map(...)` (around line 1072). Not fixed here; see Defects found.
+    // SPEC-12.40: the logout route is merged after the normaliser layer, and only when a verifier exists.
     let bunyip_nest = match backchannel_logout {
         Some(logout) => bunyip_nest.merge(logout),
         None => bunyip_nest,
@@ -1162,16 +1214,19 @@ pub fn create_api_router(
             secrets.clone(),
         )),
         payment_methods: payment_methods_service.clone(),
+        // SPEC-2.77
         provider_id: "stripe",
     });
-    // SPEC-1 and 2.70: Stripe and PayPal share `provider_webhook_handler` and the per-tenant `/webhooks/{tenant_id}`
+    // Stripe and PayPal share `provider_webhook_handler` and the per-tenant `/webhooks/{tenant_id}`
     // path shape; only `provider_id` and the state's `billing`/`payment_methods` differ between them.
+    // SPEC-12.41, SPEC-8.9, SPEC-12.42
     let stripe_webhooks = Router::new()
         .route("/webhooks/{tenant_id}", post(provider_webhook_handler))
         .with_state(stripe_webhook_state)
-        // SPEC-1 and 2.62: stripe_webhooks' own independent normalize_error_envelope
+        // stripe_webhooks' own independent normalize_error_envelope
         // instance (one of seven; see the api_v1 one near line 992).
         .layer(middleware::from_fn(
+            // SPEC-2.88
             crate::utils::error::normalize_error_envelope,
         ));
 
@@ -1190,12 +1245,14 @@ pub fn create_api_router(
         payment_methods: payment_methods_service.clone(),
         provider_id: "paypal",
     });
+    // SPEC-12.41, SPEC-8.9, SPEC-12.42
     let paypal_webhooks = Router::new()
         .route("/webhooks/{tenant_id}", post(provider_webhook_handler))
         .with_state(paypal_webhook_state)
-        // SPEC-1 and 2.62: paypal_webhooks' own independent normalize_error_envelope
+        // paypal_webhooks' own independent normalize_error_envelope
         // instance (one of seven; see the api_v1 one near line 992).
         .layer(middleware::from_fn(
+            // SPEC-2.88
             crate::utils::error::normalize_error_envelope,
         ));
 
@@ -1217,6 +1274,7 @@ pub fn create_api_router(
     // They share the dispatcher the serving `BillingService` was given, rather
     // than building a second one: it owns the credential load, the near-expiry
     // refresh and the two clients, and a receiver needs all three.
+    // SPEC-12.41, SPEC-8.10, SPEC-12.42: one URL per provider, raw-body signature.
     let invoice_issuer_webhooks = |path: &'static str, provider| {
         Router::new()
             .route(
@@ -1243,9 +1301,10 @@ pub fn create_api_router(
                     provider,
                 },
             ))
-            // SPEC-1 and 2.62: each call of this closure (one per provider, Xero and QuickBooks) builds its own
+            // each call of this closure (one per provider, Xero and QuickBooks) builds its own
             // independent normalize_error_envelope instance (two of the seven; see the api_v1 one near line 992).
             .layer(middleware::from_fn(
+                // SPEC-2.88
                 crate::utils::error::normalize_error_envelope,
             ))
     };
@@ -1259,6 +1318,7 @@ pub fn create_api_router(
     // the caller has no session at all: the magic-link token is the only
     // identity, and it resolves its own tenant. Same envelope normalization as
     // the other trees so a 400 here looks like a 400 anywhere else.
+    // SPEC-12.36, SPEC-8.11, SPEC-8.14
     let public_api = Router::new()
         // PMS-1414: what a client needs to know about the deployment BEFORE it
         // has a session. Public because a feature gating part of the sign-in
@@ -1313,6 +1373,7 @@ pub fn create_api_router(
             db.clone(),
             AttachmentConfig::from_env().expect("ATTACHMENT_MAX_BYTES invalid"),
         )))
+        // SPEC-2.85
         .merge(public_form_routes(
             FormsService::with_request_links(
                 db.clone(),
@@ -1322,17 +1383,21 @@ pub fn create_api_router(
             .with_abuse_contact(abuse_contact_email)
             .with_public_api_base(public_api_base_url),
         ))
-        // SPEC-1 and 2.63: triggers on every request to this nest, keyed by the caller's extracted client IP (trusted-proxy-aware); quota is `PUBLIC_API_PER_MIN` (60/minute) via `PublicIpLimiter::new`. A caller past the
+        // triggers on every request to this nest, keyed by the caller's extracted client IP (trusted-proxy-aware); quota is `PUBLIC_API_PER_MIN` (60/minute) via `PublicIpLimiter::new`. A caller past the
         // quota gets a 429 with `Retry-After` and body "Too many requests, please try again shortly" (`crate::utils::error::rate_limited_response`). PMS-1299 (F7b): per-IP budget over the whole unauthenticated nest.
         .layer(middleware::from_fn_with_state(
+            // SPEC-12.35: 60 per minute per client IP over the whole nest, 429 with Retry-After past it.
+            // SPEC-11.5: in-memory, per process.
             crate::modules::auth::rate_limit::PublicIpLimiter::new(
+                // SPEC-2.89
                 crate::modules::auth::rate_limit::PUBLIC_API_PER_MIN,
             ),
             crate::modules::auth::rate_limit::public_ip_limit,
         ))
-        // SPEC-1 and 2.62: public_api's own independent normalize_error_envelope
+        // public_api's own independent normalize_error_envelope
         // instance (one of seven; see the api_v1 one near line 992).
         .layer(middleware::from_fn(
+            // SPEC-2.88
             crate::utils::error::normalize_error_envelope,
         ));
 
@@ -1350,32 +1415,38 @@ pub fn create_api_router(
     // `settings:manage_company_branding` gate without a duplicate
     // instance.
     let contact_service_arc = std::sync::Arc::new(contact_service.clone());
-    // SPEC-1 and 2.68: contact_api composes contact_portal::contact_routes with the branding module's contact-scoped routes, sharing one
+    // contact_api composes contact_portal::contact_routes with the branding module's contact-scoped routes, sharing one
     // ContactAuthService instance (`contact_service_arc`) between the two merged routers so a single `load_capabilities` implementation backs both.
+    // SPEC-12.37, SPEC-12.39
+    // SPEC-12.38 DEFECT: the branding routes merged below sit outside the layer contact_routes applied.
     let contact_api = crate::modules::contact_portal::contact_routes(
         contact_service,
         payment_methods_service.clone(),
     )
+    // SPEC-2.80
     .merge(crate::modules::branding::routes::contact_routes(
         db.clone(),
         contact_service_arc,
     ))
-    // SPEC-1 and 2.62: contact_api's own independent normalize_error_envelope
+    // contact_api's own independent normalize_error_envelope
     // instance (one of seven; see the api_v1 one near line 992).
     .layer(middleware::from_fn(
+        // SPEC-2.88
         crate::utils::error::normalize_error_envelope,
     ));
 
-    // SPEC-1 and 2.60: the seven top-level mounts and their auth models (session /api/v1, no-auth-by-design /api/v1/public, contact Bearer /api/v1/contact, and the four signed
+    // the seven top-level mounts and their auth models (session /api/v1, no-auth-by-design /api/v1/public, contact Bearer /api/v1/contact, and the four signed
     // receivers) match CLAUDE.md's "Routing model" claim; the invoice-issuer webhooks mount below is the fourth signed receiver the CLAUDE.md prose does not name individually.
+    // SPEC-12.1: the seven route trees.
     Router::new()
         .nest("/api/v1", api_v1)
         .nest("/api/v1/public", public_api)
         .nest("/api/v1/contact", contact_api)
+        // SPEC-2.73
         .nest("/api/v1/bunyip", bunyip_nest)
         .nest("/api/v1/stripe", stripe_webhooks)
         .nest("/api/v1/paypal", paypal_webhooks)
-        // SPEC-1 and 2.71: one URL per provider (Xero, QuickBooks), not one per tenant: there is one application per provider
+        // one URL per provider (Xero, QuickBooks), not one per tenant: there is one application per provider
         // so one webhook subscription for the host to configure, unlike the per-tenant stripe/paypal `{tenant_id}` path above.
         .nest(
             "/api/v1/webhooks",
@@ -1384,12 +1455,14 @@ pub fn create_api_router(
                 crate::modules::billing::invoice_issuer::InvoiceProviderKind::Xero,
             )
             .merge(invoice_issuer_webhooks(
+                // SPEC-2.78
                 "/quickbooks",
                 crate::modules::billing::invoice_issuer::InvoiceProviderKind::Quickbooks,
             )),
         )
-        // SPEC-1 and 2.1: catches every request matching none of the seven nests above (including a bare GET to
+        // catches every request matching none of the seven nests above (including a bare GET to
         // `/`), answering a 404 HTML page rather than letting axum's default 404 leak internal route info.
+        // SPEC-12.2: GET-only fallback page for any path no tree handles.
         .fallback(get(move |headers| {
             not_a_frontend(headers, client_origin.clone())
         }))
@@ -1401,20 +1474,29 @@ pub fn create_api_router(
         // three signature-verified receivers by path. One layer rather than a
         // `SanitizedJson<T>` extractor on 157 `Json<T>` handlers, so a route
         // added later cannot forget to opt in.
-        // SPEC-1 and 2.61: layered once on the combined Router, outside every nest, so it runs on every path including the signed receivers; the
+        // layered once on the combined Router, outside every nest, so it runs on every path including the signed receivers; the
         // RAW_BODY_PATHS exemption is a prefix check inside the function itself (src/utils/text.rs), not a difference in which nests this layer wraps.
+        // SPEC-12.8, SPEC-12.9: innermost of the global layers; reads JSON bodies up to 25 MiB.
+        // SPEC-2.66
         .layer(middleware::from_fn(crate::utils::text::sanitize_json_body))
-        // SPEC-1 and 2.72: global stack order on the combined Router, each `.layer()` wrapping the previous outward: sanitize_json_body (just
+        // global stack order on the combined Router, each `.layer()` wrapping the previous outward: sanitize_json_body (just
         // above), then tracing, then compression, then CORS, then security headers (outermost, below) see every response from every nest.
+        // SPEC-12.5, SPEC-11.2: global order is sanitiser, trace, compression, CORS, security headers.
+        // SPEC-2.61
         .layer(TraceLayer::new_for_http())
+        // SPEC-12.7
+        // SPEC-2.65
         .layer(CompressionLayer::new())
+        // SPEC-2.63
         .layer(cors)
         // PMS-388: security response headers (HSTS, nosniff, frame-deny,
         // Referrer-Policy, Permissions-Policy, CSP) on every response -
         // the API, the portal API, and the `not_a_frontend` fallback. App-level
         // parity with bunyip-api's `SecurityHeaders`, per the 2026-06-17 standup
         // decision to keep this out of the shared Traefik layer.
+        // SPEC-12.6
         .layer(middleware::from_fn(
+            // SPEC-2.62
             crate::utils::security_headers::security_headers,
         ))
 }
@@ -1425,6 +1507,7 @@ pub fn create_api_router(
 /// link points at the Bunyip SaaS shell on the matching apex; if the
 /// host can't be parsed, falls back to `fallback_origin` (the env-injected
 /// `CLIENT_ORIGIN`). No domain is ever hardcoded here.
+// SPEC-12.3: Host prefix `api.msp.` picks the link target, else the client origin.
 async fn not_a_frontend(
     headers: axum::http::HeaderMap,
     fallback_origin: String,
@@ -1434,19 +1517,23 @@ async fn not_a_frontend(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let hub_link = host
+        // SPEC-2.95
         .strip_prefix("api.msp.")
         .map(|tld| format!("https://{tld}"))
         .unwrap_or(fallback_origin);
+    // SPEC-2.94
     (StatusCode::NOT_FOUND, Html(not_a_frontend_body(&hub_link)))
 }
 
 /// Builds the `not_a_frontend` page body. Split out from the handler so the
 /// shared shell (PMS-1201) can be pinned by a test with no `HeaderMap` to
 /// construct.
+// SPEC-12.4: cached app name, HTML-escaped; no database read.
 fn not_a_frontend_body(hub_link: &str) -> String {
     // PMS-789: read the cached name. This handler has no `State` and must
     // render when the database is down, which is when it is most looked at.
     // Escaped: `sanitize` bars control characters, not `<` or `&`.
+    // SPEC-2.96
     let app = crate::utils::html::html_escape(&crate::utils::app_name::app_name());
     let viewport = crate::utils::html::PAGE_SHELL_VIEWPORT;
     let shell_css = crate::utils::html::page_shell_css("36rem");
@@ -1469,8 +1556,9 @@ fn not_a_frontend_body(hub_link: &str) -> String {
     )
 }
 
-// SPEC-1 and 2.73: GET /api/v1/health answers the static string "OK" with no
+// GET /api/v1/health answers the static string "OK" with no
 // downstream dependency check at all (contrast /ready below).
+// SPEC-2.97
 /// Health check endpoint
 async fn health_check() -> &'static str {
     "OK"
@@ -1505,8 +1593,10 @@ async fn health_check() -> &'static str {
 /// shows the root cause without a separate metrics scrape. The
 /// response sets `Cache-Control: no-store` so an intermediate
 /// proxy / CDN does not pin the failing state past the next probe.
-// SPEC-1 and 2.74: GET /api/v1/ready answers 200 with {"status":"ready","checks":{"db":...,"infisical":...}} when both checks pass, else 503
+// GET /api/v1/ready answers 200 with {"status":"ready","checks":{"db":...,"infisical":...}} when both checks pass, else 503
 // with "status":"not_ready" and the failing check's value replaced by an "error: ..." string; every response carries `Cache-Control: no-store`.
+// SPEC-12.19: 200 ready or 503 not_ready, JSON, Cache-Control: no-store.
+// SPEC-2.98
 async fn ready_check(
     db: crate::db::Database,
 ) -> (
@@ -1558,8 +1648,10 @@ async fn ready_check(
 /// orchestrator drain or restart a healthy instance. The ping was
 /// previously unbounded, so a wedged connection could hold the probe
 /// open indefinitely.
-// SPEC-1 and 2.75: the readiness DB ping is bounded to 3 seconds; a ping that neither answers nor errors within
+// the readiness DB ping is bounded to 3 seconds; a ping that neither answers nor errors within
 // that bound is treated as a failure ("db ping exceeded 3s") rather than hanging the /ready response open.
+// SPEC-12.20
+// SPEC-2.99
 const READY_DB_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Run the readiness DB ping under [`READY_DB_PING_TIMEOUT`]. Takes the
@@ -1586,7 +1678,7 @@ async fn bounded_db_ping(
 /// pool. The lock is initialised on the first /ready request, not at
 /// `create_api_router` time, because the env var is process-global
 /// and reading it lazily keeps the router signature unchanged.
-// SPEC-1 and 2.76: built lazily in a `OnceLock` on the first /ready request (not at `create_api_router` time), caching the parsed URL, a credential-scrubbed
+// built lazily in a `OnceLock` on the first /ready request (not at `create_api_router` time), caching the parsed URL, a credential-scrubbed
 // display string, and a reused `reqwest::Client`; a blank or unset `INFISICAL_ADDRESS` at that first call means no probe runs for the lifetime of the process.
 struct InfisicalProbe {
     /// `<base>/api/status` URL with trailing-slash stripped from
@@ -1600,6 +1692,7 @@ struct InfisicalProbe {
     client: reqwest::Client,
 }
 
+// SPEC-2.100
 static INFISICAL_PROBE: std::sync::OnceLock<Option<InfisicalProbe>> = std::sync::OnceLock::new();
 
 fn infisical_probe() -> Option<&'static InfisicalProbe> {
@@ -1633,6 +1726,7 @@ fn build_infisical_probe(raw: Option<String>) -> Option<InfisicalProbe> {
     // `INFISICAL_ADDRESS` does not parse as a URL, fall back
     // to the literal trimmed string (no leak path exists for
     // a value that does not parse anyway, but stay defensive).
+    // SPEC-11.3: userinfo, query and fragment never reach an error string.
     let display = match url::Url::parse(&trimmed) {
         Ok(mut u) => {
             let _ = u.set_username("");
@@ -1643,6 +1737,7 @@ fn build_infisical_probe(raw: Option<String>) -> Option<InfisicalProbe> {
         }
         Err(_) => trimmed.clone(),
     };
+    // SPEC-11.4, SPEC-12.21: 1 second probe timeout.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(1))
         .build()
@@ -1663,8 +1758,10 @@ fn build_infisical_probe(raw: Option<String>) -> Option<InfisicalProbe> {
 ///   response, or 1s timeout). Error messages reference only the
 ///   sanitised display URL so credentials in the env var stay out
 ///   of the response body / access log.
-// SPEC-1 and 2.77: three-way result read by `ready_check`: `Ok(true)` (probe ran, 2xx response) renders "infisical":"ok"; `Ok(false)` (unconfigured) renders
+// three-way result read by `ready_check`: `Ok(true)` (probe ran, 2xx response) renders "infisical":"ok"; `Ok(false)` (unconfigured) renders
 // "skipped" and never fails readiness; `Err(_)` (configured but DNS/TCP/non-2xx/timeout failure) renders "error: ..." and fails readiness with a 503.
+// SPEC-12.21
+// SPEC-2.101
 async fn probe_infisical() -> Result<bool, String> {
     let Some(probe) = infisical_probe() else {
         return Ok(false);
@@ -1688,6 +1785,7 @@ async fn run_infisical_probe(probe: &InfisicalProbe) -> Result<bool, String> {
     Ok(true)
 }
 
+// SPEC-2.102
 /// Build / version info endpoint. Returns the package version, the
 /// `git describe` string (matches the release tag for tagged builds), the
 /// short commit hash, and the build timestamp. Useful when troubleshooting
@@ -1781,7 +1879,7 @@ mod tests {
         assert!(body.contains("a{color:light-dark(#0066cc,#6cb4ff)}"));
     }
 
-    // SPEC-1 and 2.78: this test is itself the enforcement site. It textually scans tickets/routes.rs (mounted at `/tickets`) and tickets/attachments.rs (merged at the top level) for `.route(...)` calls, computes
+    // this test is itself the enforcement site. It textually scans tickets/routes.rs (mounted at `/tickets`) and tickets/attachments.rs (merged at the top level) for `.route(...)` calls, computes
     // each one's effective `(method, prefix+path)`, and fails on any pair both sources register; it also fails if the scan finds 20 or fewer routes total, guarding against the parser silently matching nothing.
     /// The mokosh-contact-login <- main merge (chore/merge-main-into-contact-
     /// login) panicked axum at Router construction because two builders
@@ -1950,7 +2048,7 @@ mod tests {
         );
     }
 
-    // SPEC-1 and 2.79: the two tests below (brotli_is_negotiated_when_the_ client_advertises_it, gzip_only_client_still_gets_gzip) confirm the global `CompressionLayer::new()` (see line 1341/the global stack comment above
+    // the two tests below (brotli_is_negotiated_when_the_ client_advertises_it, gzip_only_client_still_gets_gzip) confirm the global `CompressionLayer::new()` (see line 1341/the global stack comment above
     // `Router::new()`'s outer layers) offers brotli when the client advertises it alongside gzip, and falls back to gzip for a gzip-only client, without the layer's offered algorithm set itself being visible from its construction call.
     /// Drive the same `CompressionLayer::new()` the router applies globally and
     /// report the `content-encoding` it negotiated for `accept_encoding`.
@@ -1964,6 +2062,7 @@ mod tests {
                 "/",
                 get(|| async { "a body long enough to clear the compression size floor" }),
             )
+            // SPEC-2.65
             .layer(CompressionLayer::new());
         let response = app
             .oneshot(

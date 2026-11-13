@@ -142,6 +142,7 @@ impl FileLedger {
     /// blob, and the logo's id is the tenant's own, so `entity_type` is the
     /// only way to ask for "the current logo" without threading an object
     /// id the caller does not otherwise need.
+    // SPEC-3.1025: newest files row size for tenant and entity type, or None.
     pub async fn latest_file_size(
         &self,
         tenant_id: Uuid,

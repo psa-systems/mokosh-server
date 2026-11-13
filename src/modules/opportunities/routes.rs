@@ -32,6 +32,7 @@ pub struct OpportunitiesRouterState {
     pub service: Arc<OpportunitiesService>,
 }
 
+// SPEC-14.82: RequireAuth on each handler, no module gate.
 pub fn opportunities_routes(service: OpportunitiesService) -> Router {
     let state = OpportunitiesRouterState {
         service: Arc::new(service),
@@ -63,6 +64,7 @@ struct ListOpportunitiesQuery {
     closed: Option<bool>,
 }
 
+// SPEC-14.86: company, stage and closed filters.
 async fn list_opportunities(
     State(state): State<OpportunitiesRouterState>,
     RequireAuth(user): RequireAuth,
@@ -76,6 +78,7 @@ async fn list_opportunities(
     Ok(Json(state.service.list(user.tenant(), &filter).await?))
 }
 
+// SPEC-14.83: 201 with the created row.
 async fn create_opportunity(
     State(state): State<OpportunitiesRouterState>,
     RequireAuth(user): RequireAuth,
@@ -89,6 +92,7 @@ async fn create_opportunity(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
+// SPEC-14.86: 404 for an unknown or deleted id.
 async fn get_opportunity(
     State(state): State<OpportunitiesRouterState>,
     RequireAuth(user): RequireAuth,
@@ -97,6 +101,7 @@ async fn get_opportunity(
     Ok(Json(state.service.get(user.tenant(), id).await?))
 }
 
+// SPEC-14.87: partial update.
 async fn update_opportunity(
     State(state): State<OpportunitiesRouterState>,
     RequireAuth(user): RequireAuth,
@@ -109,6 +114,7 @@ async fn update_opportunity(
     ))
 }
 
+// SPEC-14.89: the only way to reach a closed stage.
 async fn close_opportunity(
     State(state): State<OpportunitiesRouterState>,
     RequireAuth(user): RequireAuth,
@@ -121,6 +127,7 @@ async fn close_opportunity(
     ))
 }
 
+// SPEC-14.82, SPEC-14.91: manager role or above; 204 on success.
 async fn soft_delete_opportunity(
     State(state): State<OpportunitiesRouterState>,
     _manager: RequireManager,

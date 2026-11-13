@@ -89,6 +89,7 @@ impl TenantLogoMover {
     /// No batch cap, for the PMS-960 reason and one stronger: there is at most
     /// one logo per tenant, so the whole set is bounded by the tenant count and
     /// a rename is a metadata operation.
+    // SPEC-5.388, SPEC-5.389, SPEC-5.390
     pub async fn run_tick(&self) -> AppResult<LogoMoveOutcome> {
         // SAFETY (PMS-285): this runs on the BYPASSRLS migrator pool because it
         // is a cross-tenant sweep with no `app.current_tenant` to set - the
@@ -157,6 +158,7 @@ impl TenantLogoMover {
     /// row to the usage rollup). A tenant with no ledger row updates nothing
     /// and is left to PMS-957's own writers; this job exists to move files, not
     /// to backfill a ledger.
+    // SPEC-5.389
     async fn record_moved(&self, tenant_id: Uuid, key: &ObjectKey) -> AppResult<()> {
         let path = key.relative_path()?.to_string_lossy().to_string();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -181,6 +183,7 @@ impl TenantLogoMover {
     /// registered on the scheduler: this corrects history once and never
     /// becomes due again, so an hourly interval was a recurring job doing a
     /// one-time job's work.
+    // SPEC-5.388
     pub const ONE_SHOT_NAME: &'static str = "tenant_logo_move";
 }
 

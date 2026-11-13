@@ -24,6 +24,7 @@ pub struct DashboardsRouterState {
     pub service: Arc<DashboardsService>,
 }
 
+// SPEC-15.1634: RequireAuth only, default route before the id route
 pub fn dashboard_routes(service: DashboardsService) -> Router {
     let state = DashboardsRouterState {
         service: Arc::new(service),
@@ -57,6 +58,7 @@ pub fn dashboard_routes(service: DashboardsService) -> Router {
         .with_state(state)
 }
 
+// SPEC-15.1635
 async fn list(
     State(s): State<DashboardsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -65,6 +67,7 @@ async fn list(
     Ok(Json(rows))
 }
 
+// SPEC-15.1636
 async fn get_default(
     State(s): State<DashboardsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -73,6 +76,7 @@ async fn get_default(
     Ok(Json(row))
 }
 
+// SPEC-15.1637
 async fn get_one(
     State(s): State<DashboardsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -82,6 +86,7 @@ async fn get_one(
     Ok(Json(row))
 }
 
+// SPEC-15.1638, SPEC-15.1639
 async fn create(
     State(s): State<DashboardsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -92,6 +97,7 @@ async fn create(
     Ok(Json(row))
 }
 
+// SPEC-15.1640, SPEC-15.1639
 async fn update(
     State(s): State<DashboardsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -103,6 +109,7 @@ async fn update(
     Ok(Json(row))
 }
 
+// SPEC-15.1641
 async fn delete_one(
     State(s): State<DashboardsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -114,6 +121,7 @@ async fn delete_one(
 
 // PMS-471: schedule handlers ------------------------------------------------
 
+// SPEC-15.1644
 async fn list_schedules(
     State(s): State<DashboardsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -127,6 +135,7 @@ async fn list_schedules(
     Ok(Json(rows))
 }
 
+// SPEC-15.1642
 async fn create_schedule(
     State(s): State<DashboardsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -141,6 +150,7 @@ async fn create_schedule(
     Ok(Json(row))
 }
 
+// SPEC-15.1645
 async fn get_schedule(
     State(s): State<DashboardsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -150,6 +160,7 @@ async fn get_schedule(
     Ok(Json(row))
 }
 
+// SPEC-15.1646
 async fn update_schedule(
     State(s): State<DashboardsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -164,6 +175,7 @@ async fn update_schedule(
     Ok(Json(row))
 }
 
+// SPEC-15.1646
 async fn delete_schedule(
     State(s): State<DashboardsRouterState>,
     RequireAuth(u): RequireAuth,

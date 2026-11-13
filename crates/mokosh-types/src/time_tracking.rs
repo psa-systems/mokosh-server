@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+// SPEC-4.223: four values, default pending.
 /// Per-entry approval state for time entries. Mirrors the
 /// `approval_status` column enum (`draft|pending|approved|rejected`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -60,6 +61,7 @@ pub struct WorkTypeResponse {
     pub sort_order: i32,
 }
 
+// SPEC-4.224: name limit, rate rule, boolean defaults.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertWorkTypeRequest {
     #[validate(length(min = 1, max = 100))]
@@ -79,6 +81,7 @@ pub struct UpsertWorkTypeRequest {
 // Time entries
 // ============================================================================
 
+// SPEC-4.227: minute fields and nullable joined names.
 #[derive(Debug, Clone, Serialize)]
 pub struct TimeEntryResponse {
     pub id: Uuid,
@@ -140,6 +143,7 @@ pub struct TimeEntryResponse {
     pub task_title: Option<String>,
 }
 
+// SPEC-4.213: every filter key optional.
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct TimeEntryFilter {
     pub user_id: Option<Uuid>,
@@ -149,6 +153,7 @@ pub struct TimeEntryFilter {
     pub date_to: Option<NaiveDate>,
 }
 
+// SPEC-4.235: summary carries only minutes.
 /// MAPPS-984: server-side aggregate for the dashboard "time this week"
 /// widget. One number per request so the SPA stops paging the full
 /// `/time-entries` list and summing in the browser.
@@ -158,6 +163,7 @@ pub struct TimeEntrySummaryResponse {
     pub minutes: i64,
 }
 
+// SPEC-4.225: minute caps, rate rule, defaults.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateTimeEntryRequest {
     /// Only super_admin / admin / manager can attribute time to a
@@ -218,6 +224,7 @@ pub struct CreateTimeEntryRequest {
     pub hourly_rate: Option<Decimal>,
 }
 
+// SPEC-4.226: same caps on present fields only.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateTimeEntryRequest {
     pub date: Option<NaiveDate>,
@@ -256,6 +263,7 @@ pub struct UpdateTimeEntryRequest {
 // Timesheets (week aggregation over time_entries)
 // ============================================================================
 
+// SPEC-4.230: decided_* and rejection_reason omitted when None.
 #[derive(Debug, Clone, Serialize)]
 pub struct TimesheetSummaryResponse {
     pub user_id: Uuid,
@@ -293,6 +301,7 @@ pub struct TimesheetSummaryResponse {
     pub rejection_reason: Option<String>,
 }
 
+// SPEC-4.228: status length 1 to 16 when present.
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct TimesheetFilter {
     pub user_id: Option<Uuid>,
@@ -315,6 +324,7 @@ pub struct TimesheetFilter {
     pub to: Option<NaiveDate>,
 }
 
+// SPEC-4.229: reason 1 to 1000 characters.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct RejectTimesheetRequest {
     #[validate(length(min = 1, max = 1000))]
@@ -325,6 +335,7 @@ pub struct RejectTimesheetRequest {
 // Active timers
 // ============================================================================
 
+// SPEC-4.236: timer wire shape.
 #[derive(Debug, Clone, Serialize)]
 pub struct ActiveTimerResponse {
     pub id: Uuid,
@@ -337,6 +348,7 @@ pub struct ActiveTimerResponse {
     pub started_at: DateTime<Utc>,
 }
 
+// SPEC-4.236: every field optional.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct StartTimerRequest {
     pub ticket_id: Option<Uuid>,
@@ -360,6 +372,7 @@ pub struct TimeRoundingRuleResponse {
     pub is_default: bool,
 }
 
+// SPEC-4.231: name, increment and minimum limits.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertTimeRoundingRuleRequest {
     #[validate(length(min = 1, max = 100))]
@@ -379,6 +392,7 @@ pub struct UpsertTimeRoundingRuleRequest {
 // PMS-950 work day: clock in and out, breaks, and the day's breakdown
 // ============================================================================
 
+// SPEC-4.235: kind is work or break; ended_at null while open.
 /// One segment of a person's working day: `work` from clock-in to clock-out
 /// (or to the start of a break), `break` between two `work` segments. The day
 /// is derived from its segments rather than stored, so nothing here can
@@ -399,6 +413,7 @@ pub struct WorkDaySegmentResponse {
     pub minutes: i64,
 }
 
+// SPEC-4.235: date optional.
 /// The body of a clock-in. `date` is the client's local day, the way a time
 /// entry carries the date the client sent; absent, today in the user's own
 /// zone (`users.timezone`).
@@ -407,6 +422,7 @@ pub struct ClockInRequest {
     pub date: Option<NaiveDate>,
 }
 
+// SPEC-4.232: ended_at absent, null (reopen) or value.
 /// PMS-1145: the body of a segment correction. Every field is optional and
 /// an absent one leaves that part of the segment alone, so a caller fixing a
 /// clock-out time does not have to restate the start.
@@ -425,6 +441,7 @@ pub struct UpdateWorkDaySegmentRequest {
     pub ended_at: Option<Option<DateTime<Utc>>>,
 }
 
+// SPEC-4.235: date and user_id optional.
 /// `GET /workday`: which day, and whose. `date` absent means the day of the
 /// open segment if there is one, else today in the caller's own zone, so a
 /// reload finds the clock where it was left. `user_id` is honoured for an admin and ignored for
@@ -461,6 +478,7 @@ pub struct WorkDayBucket {
     pub entry_count: i64,
 }
 
+// SPEC-4.234: four-part breakdown shape.
 /// The day's `time_entries` read by what they are attached to. The four parts
 /// partition the day's entries, so their minutes sum to `logged_minutes`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -477,6 +495,7 @@ pub struct WorkDayBreakdown {
     pub unattached: WorkDayBucket,
 }
 
+// SPEC-4.234: day shape including date_source.
 /// A person's day: the clock and the work, as two readings of the same rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkDayResponse {
@@ -513,6 +532,7 @@ pub struct WorkDayResponse {
     pub date_source: WorkDayDateSource,
 }
 
+// SPEC-4.233: requested, open_segment or today.
 /// Where the day in a [`WorkDayResponse`] came from (PMS-1146).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

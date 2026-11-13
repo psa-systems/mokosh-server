@@ -125,6 +125,7 @@ pub enum SuppliedBy {
 /// can be tested under a concurrent runner without `set_var` — the shape
 /// `S3Config::parse` already uses, and the reason both of them are testable
 /// at all.
+// SPEC-3.1024: a setting reads from its STORAGE_ variable only, trimmed; blank is unset.
 pub fn resolve(
     var: StorageVar,
     lookup: impl Fn(&str) -> Option<String>,
@@ -171,6 +172,7 @@ pub fn supplied_by(var: StorageVar) -> SuppliedBy {
 // longer supplies a value at all, and this refuses to boot if any is
 // set to a non-blank value, naming every retired-to-replacement pair
 // at once; a forwarded-but-blank variable is treated as unset.
+// SPEC-6.38
 pub fn check_boot_env(lookup: impl Fn(&str) -> Option<String>) -> Result<(), String> {
     let read = |name: &str| {
         lookup(name)

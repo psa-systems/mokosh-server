@@ -21,6 +21,7 @@
 
 use serde::{Deserialize, Serialize};
 
+// SPEC-4.200: stored spelling is the snake_case wire form; ALL fixes the order.
 /// What an integration is allowed to do for a tenant.
 ///
 /// A capability answers the question connecting a provider does not: who owns
@@ -82,6 +83,7 @@ impl Capability {
         }
     }
 
+    // SPEC-4.201: checkbox label held beside the key.
     /// The checkbox label. Held beside the key so one edit moves both, the
     /// `portal_roles::capability_labels` arrangement.
     pub fn label(&self) -> &'static str {
@@ -93,6 +95,7 @@ impl Capability {
         }
     }
 
+    // SPEC-4.201: one sentence per variant.
     /// The one sentence under the checkbox, which has to say what handing this
     /// over MEANS rather than restate the label.
     pub fn description(&self) -> &'static str {
@@ -117,6 +120,7 @@ impl Capability {
     }
 }
 
+// SPEC-4.202: stored spelling, CHECKed in the integrations table; ALL fixes the order.
 /// A provider an integration can be installed for.
 ///
 /// The string form is stored in `integrations.provider` and CHECKed there, so
@@ -174,6 +178,7 @@ impl IntegrationProvider {
     }
 }
 
+// SPEC-4.203: four states; disconnected is distinct from not_connected.
 /// Where an installation stands; mirrors the CHECK on `integrations.status`.
 ///
 /// `Disconnected` is not a flavour of `NotConnected`, for the reason

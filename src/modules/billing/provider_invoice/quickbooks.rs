@@ -50,6 +50,7 @@ use crate::utils::error::{AppError, AppResult};
 /// Intuit's identity host for OAuth 2.0 token refresh. Overridable
 /// through `QuickBooksClient::with_identity_base` so a test can point
 /// at a local stub without touching Intuit's live host.
+// SPEC-13.786
 fn default_identity_base() -> String {
     "https://oauth.platform.intuit.com".to_string()
 }
@@ -66,12 +67,14 @@ fn default_api_base() -> String {
 /// shape stable across Intuit's minor-version bumps the way Stripe's
 /// `Stripe-Version` header does. Bump when the client is explicitly
 /// tested against a newer minor.
+// SPEC-13.786
 const MINOR_VERSION: &str = "70";
 
 /// How many times a 429 is retried before giving up. QBO's throttle is
 /// 500 requests/minute per realm; three retries sleeping the exact
 /// `Retry-After` covers a short burst over the per-minute cap without
 /// turning a hard quota breach into a very long synchronous wait.
+// SPEC-13.787
 const MAX_RETRIES: u32 = 3;
 
 /// A single QBO connection, built once per tenant and reused for the
@@ -528,6 +531,7 @@ impl Default for QuickBooksClient {
 }
 
 impl QuickBooksClient {
+    // SPEC-13.786
     pub fn new() -> Self {
         Self {
             http: reqwest::Client::builder()
@@ -569,6 +573,7 @@ impl QuickBooksClient {
     ///
     /// Returns the provider's payment id, which is what a reconciliation
     /// reads back.
+    // SPEC-13.798
     pub async fn pay_bill(
         &self,
         creds: &QuickBooksCredentials,
@@ -610,6 +615,7 @@ impl QuickBooksClient {
         Ok(envelope.bill_payment.id)
     }
 
+    // SPEC-13.797
     pub async fn record_spend(
         &self,
         creds: &QuickBooksCredentials,
@@ -667,6 +673,7 @@ impl QuickBooksClient {
     /// `/bill` rather than `/invoice`, with a `VendorRef` and
     /// account-based lines. The token refresh, the retry policy and the
     /// credentials are the ones MAPPS-1099 already built.
+    // SPEC-13.796
     pub async fn create_bill(
         &self,
         creds: &QuickBooksCredentials,
@@ -722,6 +729,7 @@ impl QuickBooksClient {
     /// authorized: the callback carries `realmId` itself, which is why
     /// this returns the token response alone where Xero's exchange is
     /// followed by `list_connections`.
+    // SPEC-13.790
     pub async fn exchange_code(
         &self,
         client_id: &str,
@@ -763,6 +771,7 @@ impl QuickBooksClient {
     /// writes the pair back into the secret store before the next
     /// invoice call. A terminal failure (`invalid_grant`) surfaces as
     /// `AppError::Unauthorized` so the handler shows reconnect copy.
+    // SPEC-13.789
     pub async fn refresh_access_token(
         &self,
         creds: &QuickBooksCredentials,
@@ -798,6 +807,7 @@ impl QuickBooksClient {
     /// Issue an invoice on behalf of the tenant. Returns the QBO id and
     /// its `DocNumber` (what the customer sees) for the caller to
     /// persist as `external_invoice_id` + `external_number`.
+    // SPEC-13.791
     pub async fn issue_invoice(
         &self,
         creds: &QuickBooksCredentials,
@@ -866,6 +876,7 @@ impl QuickBooksClient {
     /// `None` for an id this company file does not hold, which is an
     /// answer and not a failure: an invoice deleted over there is already
     /// in the state a void is asking for.
+    // SPEC-13.794
     pub async fn fetch_invoice_void_target(
         &self,
         creds: &QuickBooksCredentials,
@@ -895,6 +906,7 @@ impl QuickBooksClient {
         Ok(Some((status, dto.sync_token.clone().unwrap_or_default())))
     }
 
+    // SPEC-13.795
     pub async fn void_invoice(
         &self,
         creds: &QuickBooksCredentials,
@@ -929,6 +941,7 @@ impl QuickBooksClient {
     /// discount on what is still owed, and the two land in different
     /// places in the customer's ledger. The lines are sales lines like an
     /// invoice's, so every one needs its mapped `ItemRef`.
+    // SPEC-13.799
     pub async fn issue_credit_memo(
         &self,
         creds: &QuickBooksCredentials,
@@ -989,6 +1002,7 @@ impl QuickBooksClient {
     /// Returns the payment's id, which is what somebody reconciling the
     /// two ledgers has to look for: the application is its own document
     /// over there, not a field on either half.
+    // SPEC-13.800
     pub async fn apply_credit_memo(
         &self,
         creds: &QuickBooksCredentials,
@@ -1045,6 +1059,7 @@ impl QuickBooksClient {
     ///
     /// `None` for an id this company file does not hold, which is already
     /// the state a void is asking for.
+    // SPEC-13.801
     pub async fn fetch_credit_memo_void_target(
         &self,
         creds: &QuickBooksCredentials,
@@ -1081,6 +1096,7 @@ impl QuickBooksClient {
     /// memo's collection URL: the row stays and its amounts go to zero,
     /// and QuickBooks unapplies the payment that linked it to the
     /// invoice, which is what puts the invoice's balance back.
+    // SPEC-13.802
     pub async fn void_credit_memo(
         &self,
         creds: &QuickBooksCredentials,
@@ -1125,6 +1141,7 @@ impl QuickBooksClient {
     /// the two documents on separate resources, so an id that is not a
     /// bill answers 404 and the caller sees `None` rather than reading a
     /// customer's invoice as the MSP's bill.
+    // SPEC-13.803
     pub async fn fetch_bill_settlement(
         &self,
         creds: &QuickBooksCredentials,
@@ -1164,6 +1181,7 @@ impl QuickBooksClient {
         }))
     }
 
+    // SPEC-13.793
     pub async fn fetch_invoice_status(
         &self,
         creds: &QuickBooksCredentials,
@@ -1184,6 +1202,7 @@ impl QuickBooksClient {
         Ok(classify_status(&envelope.invoice))
     }
 
+    // SPEC-13.787, SPEC-13.788
     async fn call_with_retry<T>(
         &self,
         mut build: impl FnMut() -> reqwest::RequestBuilder,
@@ -1242,6 +1261,7 @@ impl QuickBooksClient {
 /// `TotalAmt > 0` is paid, `Balance == TotalAmt` is unpaid, in
 /// between is partially paid, a `Voided` marker on `PrivateNote` is
 /// voided, and a `TotalAmt` of zero without that marker is a draft.
+// SPEC-13.792
 fn classify_status(invoice: &QuickBooksInvoiceDto) -> QuickBooksInvoiceStatus {
     let total = invoice.total_amt.unwrap_or(0.0);
     let balance = invoice.balance.unwrap_or(total);
@@ -1287,6 +1307,7 @@ fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Duration {
 /// decimal string with the requested fraction width. QBO takes
 /// `Amount` as a decimal number; serialising as a string here keeps
 /// `f64` off the wire.
+// SPEC-13.804
 fn minor_to_decimal(minor: i64, places: u32) -> String {
     let scale: u64 = 10_u64.pow(places);
     let sign = if minor < 0 { "-" } else { "" };
@@ -1302,6 +1323,7 @@ fn minor_to_decimal(minor: i64, places: u32) -> String {
 /// Whether an access token is close enough to expiry that the caller
 /// should refresh before using it. 60s skew covers clock drift between
 /// Mokosh and Intuit plus the round-trip of the invoice call itself.
+// SPEC-13.770
 pub fn access_token_near_expiry(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     expires_at <= now + chrono::Duration::seconds(60)
 }

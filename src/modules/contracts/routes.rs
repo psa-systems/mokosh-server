@@ -26,6 +26,7 @@ pub struct ContractsRouterState {
     pub service: Arc<ContractsService>,
 }
 
+// SPEC-13.1306
 pub fn contracts_routes(service: ContractsService) -> Router {
     let state = ContractsRouterState {
         service: Arc::new(service),
@@ -65,6 +66,7 @@ pub fn contracts_routes(service: ContractsService) -> Router {
         .with_state(state)
 }
 
+// SPEC-13.1300, SPEC-13.1301, SPEC-13.1304, SPEC-13.1303
 async fn list_contracts(
     State(s): State<ContractsRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -108,6 +110,7 @@ async fn list_contracts(
     })
 }
 
+// SPEC-13.1306, SPEC-13.1307, SPEC-13.1308, SPEC-13.1309
 async fn create_contract(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -121,6 +124,7 @@ async fn create_contract(
     ))
 }
 
+// SPEC-13.1300, SPEC-13.1302, SPEC-13.1303
 async fn get_contract(
     State(s): State<ContractsRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -152,6 +156,7 @@ async fn get_contract(
     })
 }
 
+// SPEC-13.1300
 /// PMS-935: reproduce the RequireContracts + RequireFinance staff
 /// gate inline for the dual-plane read handlers. The module gate
 /// piece (RequireContracts) is intentionally dropped from the swept
@@ -168,6 +173,7 @@ fn assert_staff_contracts_finance(auth: &crate::modules::auth::AuthState) -> App
     Ok(())
 }
 
+// SPEC-13.1306, SPEC-13.1310
 async fn update_contract(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -184,6 +190,7 @@ async fn update_contract(
     ))
 }
 
+// SPEC-13.1306, SPEC-13.1311
 async fn delete_contract(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -194,6 +201,7 @@ async fn delete_contract(
     s.service.delete_contract(u.tenant(), id, &ctx).await
 }
 
+// SPEC-13.1306, SPEC-13.1312
 async fn list_contract_items(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -213,6 +221,7 @@ async fn list_contract_items(
     )))
 }
 
+// SPEC-13.1316
 async fn create_contract_item(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -229,6 +238,7 @@ async fn create_contract_item(
     ))
 }
 
+// SPEC-13.1317
 async fn update_contract_item(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -245,6 +255,7 @@ async fn update_contract_item(
     ))
 }
 
+// SPEC-13.1318
 async fn delete_contract_item(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -255,6 +266,7 @@ async fn delete_contract_item(
     s.service.delete_contract_item(u.tenant(), id, &ctx).await
 }
 
+// SPEC-13.1320
 async fn get_hour_balance(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -274,6 +286,7 @@ async fn get_hour_balance(
     )))
 }
 
+// SPEC-13.1321
 async fn list_rate_cards(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -289,6 +302,7 @@ async fn list_rate_cards(
     )))
 }
 
+// SPEC-13.1322
 async fn get_rate_card(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -298,6 +312,7 @@ async fn get_rate_card(
     Ok(Json(s.service.get_rate_card(u.tenant(), id).await?))
 }
 
+// SPEC-13.1323
 async fn create_rate_card(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -311,6 +326,7 @@ async fn create_rate_card(
     ))
 }
 
+// SPEC-13.1324
 async fn update_rate_card(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -327,6 +343,7 @@ async fn update_rate_card(
     ))
 }
 
+// SPEC-13.1325
 async fn delete_rate_card(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -337,6 +354,7 @@ async fn delete_rate_card(
     s.service.delete_rate_card(u.tenant(), id, &ctx).await
 }
 
+// SPEC-13.1326
 async fn list_rate_card_items(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -356,6 +374,7 @@ async fn list_rate_card_items(
     )))
 }
 
+// SPEC-13.1327
 async fn upsert_rate_card_item(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,
@@ -372,6 +391,7 @@ async fn upsert_rate_card_item(
     ))
 }
 
+// SPEC-13.1329
 async fn delete_rate_card_item(
     State(s): State<ContractsRouterState>,
     RequireContracts { user: u, .. }: RequireContracts,

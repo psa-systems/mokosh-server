@@ -37,6 +37,8 @@ const ALLOWED = [
     # (empty: every pair currently agrees)
 ]
 
+# SPEC-10.359: pairing rules
+
 # Split a Rust source file into the struct bodies we care about.
 #
 # Brace depth rather than a regex for the closing line: a field can carry a
@@ -126,6 +128,8 @@ def field-validators [raw_lines: list<string>] {
 
     $fields
 }
+
+# SPEC-10.360: field comparison
 
 # `Option<String>` on the update side and `String` on the create side is the
 # expected shape, not a difference, so the comparison is on attributes only.

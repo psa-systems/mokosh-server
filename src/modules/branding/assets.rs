@@ -43,6 +43,7 @@ use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider, ObjectRe
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::upload_limits::oversized_upload_error;
 
+// SPEC-15.2083
 const ALLOWED_MIME: &[(&str, &str)] = &[
     ("image/png", "png"),
     ("image/jpeg", "jpg"),
@@ -50,6 +51,7 @@ const ALLOWED_MIME: &[(&str, &str)] = &[
     ("image/gif", "gif"),
 ];
 
+// SPEC-15.2085
 const DEFAULT_LOGO_MAX_BYTES: u64 = 1024 * 1024; // 1 MiB
 const DEFAULT_FAVICON_MAX_BYTES: u64 = 512 * 1024; // 512 KiB
 const DEFAULT_BACKGROUND_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
@@ -199,6 +201,7 @@ fn extension_for(mime: &str) -> &'static str {
 /// Validate + normalize a content-type header. Same shape as the
 /// tenant logo module's `check_mime`; duplicated here so this module
 /// stays independent of any tenant-logo refactor.
+// SPEC-15.2083
 pub fn check_mime(raw: &str) -> AppResult<&'static str> {
     let base = raw
         .split(';')
@@ -277,6 +280,7 @@ impl BrandingAssetStore {
         }
     }
 
+    // SPEC-15.2085
     pub fn max_bytes(&self, kind: BrandAssetKind, scope: AssetScope) -> AppResult<u64> {
         let key = kind.config_key(scope);
         Ok(config::parse::parse_positive(key, config::get(key))
@@ -306,6 +310,7 @@ impl BrandingAssetStore {
     ///
     /// - Tenant/{favicon,background}: `{tenant}/branding/`
     /// - Company/*                  : `{tenant}/branding/company-{kind}/`
+    // SPEC-15.2086
     fn dir_for(&self, scope: AssetScope, kind: BrandAssetKind) -> PathBuf {
         let branding = self
             .root
@@ -344,6 +349,7 @@ impl BrandingAssetStore {
     /// Store the asset, overwriting whatever this (scope, kind) pair
     /// had. Returns the normalized MIME the caller records in the
     /// branding JSONB.
+    // SPEC-15.2084, SPEC-15.2086, SPEC-15.2087
     pub async fn store(
         &self,
         scope: AssetScope,
@@ -397,6 +403,7 @@ impl BrandingAssetStore {
         Ok(mime)
     }
 
+    // SPEC-15.2088
     pub async fn read(
         &self,
         scope: AssetScope,
@@ -449,6 +456,7 @@ impl BrandingAssetStore {
     /// exact same byte count within the asset's cache window are
     /// indistinguishable. That is an accepted tradeoff, not an oversight -
     /// closing it needs a stored digest this table does not carry yet.
+    // SPEC-15.2088, SPEC-15.2089
     pub async fn stat(
         &self,
         scope: AssetScope,
@@ -487,6 +495,7 @@ impl BrandingAssetStore {
     }
 
     /// Stream the currently-stored asset's bytes.
+    // SPEC-15.2088
     pub async fn open(
         &self,
         scope: AssetScope,
@@ -529,6 +538,7 @@ impl BrandingAssetStore {
     }
 
     /// Remove every stored format except `keep_mime`, the one just written.
+    // SPEC-15.2087
     async fn remove_except(
         &self,
         scope: AssetScope,
@@ -579,6 +589,7 @@ impl BrandingAssetStore {
 /// Public-URL path a client fetches this asset from. Relative on
 /// purpose: SPA joins with `API_BASE`; the email composer joins with
 /// the configured public base.
+// SPEC-15.2090
 pub fn asset_path(scope: AssetScope, kind: BrandAssetKind) -> String {
     let segment = match kind {
         BrandAssetKind::Logo => "logo",

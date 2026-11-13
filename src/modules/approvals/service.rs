@@ -142,6 +142,7 @@ const SELECT_FIELDS: &str = "
 /// whether or not the connecting role is subject to RLS. LEFT, so an
 /// approval whose parent has since been deleted still reads (both
 /// resolved columns land NULL) instead of vanishing from the queue.
+// SPEC-7.1072: the four parent joins are LEFT joins gated on a.target and tenant_id
 const SELECT_JOINS: &str = "
     LEFT JOIN users rb ON rb.id = a.requested_by_id
     LEFT JOIN contacts rbc ON rbc.id = a.requested_by_contact_id
@@ -690,6 +691,7 @@ impl ApprovalsService {
         // `quotes.status` keeps one owning module. Only quotes: a ticket, a
         // change request and a time entry are all gated by nothing, which is
         // this surface's stated position for them (see the routes header).
+        // SPEC-7.1068: a staff decision on a quote approval may move the quote's status (SPEC-13.1393)
         if ApprovalTarget::from_str(&target) == Some(ApprovalTarget::Quote) {
             if let Some(next) =
                 crate::modules::quotes::approval_sync::apply_decision(&mut tx, tenant_id, entity_id)
@@ -799,6 +801,7 @@ impl ApprovalsService {
         tx.commit().await?;
         // SPEC-7.540: writes a best-effort portal audit row; a
         // failure to write it does not fail the decision, only logs a warn.
+        // SPEC-7.1071: the audit event is portal.approval_approved or portal.approval_rejected
         if let Err(err) = crate::modules::audit::audit_portal_event(
             self.db.migrator_pool(),
             tenant_id,

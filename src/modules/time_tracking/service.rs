@@ -13,6 +13,7 @@ use crate::utils::pagination::PaginationParams;
 use super::models::*;
 use mokosh_types::tickets::BillingStatus;
 
+// SPEC-14.1: every method opens a tenant-scoped transaction.
 #[derive(Clone)]
 pub struct TimeTrackingService {
     /// Shared with `work_day.rs`, the PMS-950 half of this service.
@@ -28,6 +29,7 @@ impl TimeTrackingService {
     // PMS-50 work types
     // ========================================================================
 
+    // SPEC-14.1, SPEC-14.3: tenant-scoped list ordered by sort_order then name.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_work_types(
         &self,
@@ -58,6 +60,7 @@ impl TimeTrackingService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-14.4, SPEC-14.5: insert plus audit row in one transaction.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_work_type(
         &self,
@@ -114,6 +117,7 @@ impl TimeTrackingService {
         })
     }
 
+    // SPEC-14.5: full replacement; 404 when the id is not in the tenant.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_work_type(
         &self,
@@ -157,6 +161,7 @@ impl TimeTrackingService {
         })
     }
 
+    // SPEC-14.5: 404 when the id is not in the tenant.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_work_type(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -180,6 +185,7 @@ impl TimeTrackingService {
     /// Compute the worked minutes for an entry. Precedence (PMS-395):
     /// explicit `worked_minutes` > `duration_minutes` > derived from
     /// (start, end). This is the actual time spent and is never rounded.
+    // SPEC-14.8: worked minutes precedence and its two 400 errors.
     fn compute_minutes(request: &CreateTimeEntryRequest) -> AppResult<i32> {
         if let Some(m) = request.worked_minutes {
             return Ok(m);
@@ -201,6 +207,7 @@ impl TimeTrackingService {
         ))
     }
 
+    // SPEC-14.28: filtered page and a count over the same filter.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_time_entries(
         &self,
@@ -317,6 +324,7 @@ impl TimeTrackingService {
     /// Rejected entries are excluded for the same reason the project/task
     /// `actual_hours` roll-ups exclude them (PMS-944): a rejected entry is
     /// not time worked.
+    // SPEC-14.29: rejected entries are excluded; empty sum is 0.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn sum_time_entry_minutes(
         &self,
@@ -373,6 +381,8 @@ impl TimeTrackingService {
         Ok(minutes)
     }
 
+    // SPEC-14.9, SPEC-14.14, SPEC-14.16, SPEC-14.17, SPEC-14.18, SPEC-14.19, SPEC-14.20: checks, pricing,
+    // day cap, contract link and the post-commit hour draw.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_time_entry(
         &self,
@@ -525,6 +535,7 @@ impl TimeTrackingService {
         self.get_time_entry(tenant_id, id).await
     }
 
+    // SPEC-14.22, SPEC-14.27: 404 "Time entry" when absent.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_time_entry(
         &self,
@@ -561,6 +572,8 @@ impl TimeTrackingService {
         Ok(row.into())
     }
 
+    // SPEC-14.9, SPEC-14.16, SPEC-14.18, SPEC-14.23, SPEC-14.24, SPEC-14.25: the UPDATE binds ticket_id and
+    // project_id as given (null when omitted); release and re-draw after commit.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_time_entry(
         &self,
@@ -746,6 +759,7 @@ impl TimeTrackingService {
         self.get_time_entry(tenant_id, id).await
     }
 
+    // SPEC-14.26: release the draw before the row goes.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_time_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         // PMS-951: before the row goes, because the row is where the record of
@@ -770,6 +784,7 @@ impl TimeTrackingService {
     // PMS-46 timesheets (aggregate over time_entries)
     // ========================================================================
 
+    // SPEC-14.30, SPEC-14.31: status filter, 26-week span cap, weekly rollup.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_timesheets(
         &self,
@@ -960,6 +975,7 @@ impl TimeTrackingService {
     /// `timesheet_id` is interpreted as a `(user_id, week_start)` pair
     /// composite via two query params; for the path-based endpoint the
     /// route handler unpacks `user_id_week-anchor` into the pair.
+    // SPEC-14.32: every non-approved entry of the week becomes pending.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn submit_timesheet(
         &self,
@@ -1002,6 +1018,7 @@ impl TimeTrackingService {
     /// any entry in the week has been approved (PMS-183) - an approved week is
     /// past the point of withdrawal, because a manager has signed it off.
     /// Owner-only is enforced at the route.
+    // SPEC-14.33: refused with 409 once any entry of the week is approved.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn withdraw_timesheet(
         &self,
@@ -1059,6 +1076,7 @@ impl TimeTrackingService {
     /// Approve every pending entry in the user's week. Manager+ only
     /// (enforced at the route). Idempotent: re-approving an approved week is
     /// a no-op that returns the same summary.
+    // SPEC-14.34: only pending entries move; no billing or hour-draw side effects.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn approve_timesheet(
         &self,
@@ -1137,6 +1155,7 @@ impl TimeTrackingService {
     /// stamp: it resumes only after the first call has committed or rolled
     /// back, and by then `hours_consumed IS NULL` is no longer true, so it
     /// draws nothing.
+    // SPEC-14.20, SPEC-14.21: one locked transaction claims, draws and stamps.
     async fn consume_for_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<ConsumeCandidateRow> = sqlx::query_as(
@@ -1232,6 +1251,7 @@ impl TimeTrackingService {
     /// old figure standing against the contract. Exact, because the entry
     /// recorded the applied hours and the balance row rather than leaving them
     /// to be re-derived from a duration that has since changed.
+    // SPEC-14.25, SPEC-14.26: gives back the exact applied hours to the recorded balance row.
     async fn release_for_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // The old values come from a sub-select, not from `RETURNING`: in
@@ -1289,6 +1309,7 @@ impl TimeTrackingService {
 
     /// Reject every pending entry in the user's week with a reason. Manager+
     /// only (enforced at the route).
+    // SPEC-14.35: only pending entries move to rejected.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn reject_timesheet(
         &self,
@@ -1335,6 +1356,7 @@ impl TimeTrackingService {
     /// Current week summary for a user, or a zeroed `pending` summary when the
     /// week has no entries. Keeps submit/approve/reject responses consistent
     /// on empty weeks (no 404s).
+    // SPEC-14.32: an empty week answers a zeroed summary with status draft.
     async fn week_summary(
         &self,
         tenant_id: TenantId,
@@ -1374,6 +1396,7 @@ impl TimeTrackingService {
     // PMS-48 active timers
     // ========================================================================
 
+    // SPEC-14.36: newest timer first.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_active_timers(
         &self,
@@ -1414,6 +1437,7 @@ impl TimeTrackingService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-14.9, SPEC-14.37: 409 on an existing timer or a lost unique-constraint race.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn start_timer(
         &self,
@@ -1498,6 +1522,7 @@ impl TimeTrackingService {
 
     /// Stop a timer: removes the `active_timers` row and creates a
     /// `time_entries` row covering the elapsed window.
+    // SPEC-14.17, SPEC-14.18, SPEC-14.19, SPEC-14.20, SPEC-14.38, SPEC-14.39: timer becomes a priced entry.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn stop_timer(
         &self,
@@ -1660,6 +1685,7 @@ impl TimeTrackingService {
     // PMS-49 time rounding rules
     // ========================================================================
 
+    // SPEC-14.40: default rule first, then by name.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rounding_rules(
         &self,
@@ -1690,6 +1716,7 @@ impl TimeTrackingService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-14.40, SPEC-14.41: clears other defaults, audits the create.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_rounding_rule(
         &self,
@@ -1751,6 +1778,7 @@ impl TimeTrackingService {
         })
     }
 
+    // SPEC-14.41: clears other defaults; 404 "Time rounding rule".
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_rounding_rule(
         &self,
@@ -1801,6 +1829,7 @@ impl TimeTrackingService {
         })
     }
 
+    // SPEC-14.41: 404 "Time rounding rule".
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_rounding_rule(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1818,6 +1847,7 @@ impl TimeTrackingService {
         Ok(())
     }
 
+    // SPEC-14.41: closed set of rounding methods.
     fn validate_rounding_method(method: &str) -> AppResult<()> {
         match method {
             "up" | "down" | "nearest" => Ok(()),
@@ -1841,6 +1871,7 @@ struct WorkTypeDefaults {
 /// when the work type does not belong to `tenant_id` - this doubles as
 /// write-side tenant validation, closing the cross-tenant attach vector
 /// (FKs check existence, not ownership).
+// SPEC-14.9: 404 "Work type" for a work type outside the tenant.
 async fn fetch_work_type_defaults<'e, E>(
     exec: E,
     tenant_id: TenantId,
@@ -1870,6 +1901,7 @@ where
 
 /// Assert a ticket belongs to the tenant; return its `company_id` so the
 /// caller can both validate and infer company. `NotFound` cross-tenant.
+// SPEC-14.9: 404 "Ticket" for a ticket outside the tenant.
 async fn assert_ticket_in_tenant<'e, E>(
     exec: E,
     tenant_id: TenantId,
@@ -1887,6 +1919,7 @@ where
 }
 
 /// Assert a company belongs to the tenant. `NotFound` cross-tenant.
+// SPEC-14.9: 404 "Company" for a company outside the tenant.
 async fn assert_company_in_tenant<'e, E>(
     exec: E,
     tenant_id: TenantId,
@@ -1950,6 +1983,7 @@ pub(crate) struct EntryKindInput<'a> {
     pub is_billable: bool,
 }
 
+// SPEC-14.10, SPEC-14.11, SPEC-14.12: kind derivation, its 400 refusals, and billable forced off for employee.
 pub(crate) fn resolve_entry_kind(input: EntryKindInput<'_>) -> AppResult<ResolvedKind> {
     let EntryKindInput {
         requested,
@@ -2015,6 +2049,7 @@ pub(crate) fn resolve_entry_kind(input: EntryKindInput<'_>) -> AppResult<Resolve
 /// The date matters: an entry logged against last quarter draws from the
 /// contract that was live then, so an expired contract still covers time worked
 /// while it ran.
+// SPEC-14.19: newest covering block-hours contract, id as tiebreak.
 async fn block_hours_contract_for(
     tx: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -2070,6 +2105,7 @@ struct ConsumeCandidateRow {
 /// through weekly timesheet approval, which is the gate this issue removes. An
 /// entry that is already `billed` keeps that status whatever else changes,
 /// because its invoice line exists and re-arming the row would bill it twice.
+// SPEC-14.18: billed stays billed; otherwise billability decides.
 pub(crate) fn resolve_billing_status(
     is_billable: bool,
     current: Option<BillingStatus>,
@@ -2111,6 +2147,7 @@ where
 /// overhead, no work item). When the client supplies it, accept any value in
 /// the taxonomy but reject the contradiction of `ticketed` with no ticket so a
 /// mislabelled entry never persists.
+// SPEC-14.13: derived category and the two 400 refusals.
 fn derive_work_category(
     requested: Option<&str>,
     ticket_id: Option<Uuid>,
@@ -2145,6 +2182,7 @@ fn derive_work_category(
 /// excluding a single entry (the row being edited). The SUM is read through the
 /// caller's tenant-scoped executor so it stays consistent with the INSERT/UPDATE
 /// in the same transaction (PMS-396). `exclude_id` of `None` matches every row.
+// SPEC-14.16: the user's existing minutes for the date, optionally excluding the edited row.
 async fn day_minutes_excluding<'e, E>(
     exec: E,
     tenant_id: TenantId,
@@ -2175,6 +2213,7 @@ where
 /// Reject when adding `new_minutes` to a day that already holds `existing` would
 /// exceed the per-day `cap_minutes` (PMS-396). The error names the cap in hours
 /// and the minutes still available for the day before this entry.
+// SPEC-14.16: 400 with the cap and the minutes left.
 fn enforce_day_cap(existing: i64, new_minutes: i32, cap_minutes: i32) -> AppResult<()> {
     let total = existing + new_minutes as i64;
     if total > cap_minutes as i64 {
@@ -2213,6 +2252,7 @@ struct RoundingParams {
 ///
 /// Tie-break: an exact midpoint rounds UP (bill-favorable, MSP convention).
 /// `increment_minutes <= 0` is treated as no increment rounding (floor only).
+// SPEC-14.15: floor to the minimum first, then round to the increment.
 fn apply_rounding(raw_minutes: i32, rule: &RoundingParams) -> i32 {
     let floored = raw_minutes.max(rule.minimum_minutes);
     let inc = rule.increment_minutes;
@@ -2244,6 +2284,7 @@ fn apply_rounding(raw_minutes: i32, rule: &RoundingParams) -> i32 {
 /// them (PMS-395). Preserves the pre-change behavior: a billable entry bills
 /// the rounded worked time, a non-billable entry bills 0. Rounding only ever
 /// touches this figure now, never the stored worked minutes.
+// SPEC-14.14: rounded worked time for billable entries, 0 otherwise.
 fn derive_billable_minutes(
     worked_minutes: i32,
     is_billable: bool,
@@ -2261,6 +2302,7 @@ fn derive_billable_minutes(
 /// Tenant default rounding rule, if one is configured. `None` => identity
 /// (raw minutes, no rounding). Missing-rule = identity is a deliberate M1
 /// choice; tracked as debt, not a silent gap.
+// SPEC-14.14: no default rule means no rounding.
 async fn default_rounding_rule<'e, E>(
     exec: E,
     tenant_id: TenantId,
@@ -2294,6 +2336,7 @@ where
 /// overwritten by the derive step):
 ///   explicit request hourly_rate  >  work_type.default_rate  >  None
 /// `total_amount` is computed only when the entry is billable.
+// SPEC-14.17: explicit rate, then work type default; total only when billable.
 fn resolve_billing(
     explicit_rate: Option<Decimal>,
     is_billable: bool,
@@ -2367,6 +2410,7 @@ struct TimeEntryRow {
     task_title: Option<String>,
 }
 
+// SPEC-14.27: worked_minutes falls back to duration_minutes.
 impl From<TimeEntryRow> for TimeEntryResponse {
     fn from(r: TimeEntryRow) -> Self {
         Self {

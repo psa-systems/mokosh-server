@@ -39,6 +39,8 @@ const CONTENT_COLUMNS = [subject body_text body_html name description]
 
 # SPEC-10.169: only migrations numbered above CUTOFF_PREFIX are checked.
 
+# SPEC-10.355: uppercase UPDATE only
+
 def main [] {
     let files = (
         glob migrations/*.sql

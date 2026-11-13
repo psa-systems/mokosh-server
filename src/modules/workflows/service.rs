@@ -100,6 +100,7 @@ impl WorkflowsService {
     }
 
     // SPEC-7.155: returns every rule for tenant_id, ordered priority ASC, created_at ASC.
+    // SPEC-7.1051: unpaginated; created_by_name is NULL when the creator is missing or unnamed.
     pub async fn list(&self, tenant_id: Uuid) -> AppResult<Vec<WorkflowRuleResponse>> {
         let sql = format!(
             "SELECT {RULE_SELECT} \
@@ -158,6 +159,7 @@ impl WorkflowsService {
         user_id: Uuid,
         req: CreateWorkflowRuleRequest,
     ) -> AppResult<WorkflowRuleResponse> {
+        // SPEC-7.1047: validate DTO, then trigger allow-list (400), then insert and re-read.
         // Reject unrecognised triggers so an operator does not
         // silently create a rule that never fires. The Phase 2
         // allow-list covers `ticket.created`, `ticket.status_changed`,
@@ -214,6 +216,7 @@ impl WorkflowsService {
         if existing.is_none() {
             return Err(AppError::NotFound("Workflow rule".into()));
         }
+        // SPEC-7.1049: COALESCE means a field cannot be cleared.
         sqlx::query(
             "UPDATE workflow_rules SET \
                  name = COALESCE($3, name), \

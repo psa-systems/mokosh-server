@@ -426,6 +426,7 @@ impl AttachmentService {
         if size as u64 > self.config.max_bytes {
             return Err(oversized_upload_error("attachment", self.config.max_bytes));
         }
+        // SPEC-7.1115: the blob is written to the store before the metadata row is inserted.
         let id = Uuid::new_v4();
         let key = ObjectKey::ticket_attachment(tenant_id, id);
         self.store.put(&key, &bytes).await?;
@@ -589,6 +590,7 @@ impl AttachmentService {
         .ok_or_else(|| AppError::NotFound("attachment".into()))
     }
 
+    // SPEC-7.1116: row deleted first, then the blob; a blob failure errors, a ledger failure only warns.
     async fn delete_one(&self, tenant_id: Uuid, attachment_id: Uuid) -> AppResult<()> {
         // PMS-692: RLS-covered write - run under the tenant GUC so the DELETE's
         // USING/WITH CHECK matches, then commit.
@@ -707,6 +709,7 @@ pub struct AttachmentsRouterState {
     pub service: Arc<AttachmentService>,
 }
 
+// SPEC-7.1113: note attachments list/upload/download/delete, each scoped to a note of the ticket.
 pub fn agent_attachment_routes(service: AttachmentService) -> Router {
     // PMS-1233: read the caps before `service` moves into the state, so each
     // route's `DefaultBodyLimit` matches the cap its own handler enforces
@@ -814,6 +817,7 @@ async fn upload_agent(
 /// PMS-941: UNAUTHENTICATED READ AHEAD. What this handler stores is what
 /// `get_public_inline_attachment` will hand to anyone holding the id, so the
 /// validation in `create_inline` is the whole of the protection.
+// SPEC-7.1117: stores an is_inline image with no note; only inline rows carry a public url.
 async fn upload_inline_agent(
     State(s): State<AttachmentsRouterState>,
     RequireAuth(user): RequireAuth,

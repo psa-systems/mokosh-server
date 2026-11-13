@@ -125,6 +125,7 @@ pub fn generate_token(length: usize) -> String {
 }
 
 /// Generate a secure random API key
+// SPEC-4.1008: psa_ plus 40 alphanumeric characters.
 pub fn generate_api_key() -> String {
     format!("psa_{}", generate_token(40))
 }
@@ -240,6 +241,8 @@ pub fn verify_password_call_count() -> usize {
 /// Runs on the blocking pool for the same reason as [`hash_password`]
 /// (PMS-1245).
 #[cfg(feature = "server")]
+// SPEC-4.1009: Ok(false) only for a wrong password; a bad stored hash is Internal; every call is
+// counted.
 pub async fn verify_password(password: &str, hash: &str) -> AppResult<bool> {
     use argon2::{Argon2, PasswordHash, PasswordVerifier};
 

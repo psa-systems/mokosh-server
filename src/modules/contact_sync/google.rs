@@ -54,6 +54,7 @@ pub const PEOPLE_API_BASE: &str = "https://people.googleapis.com";
 /// What each person is read with. Changing this changes what Mokosh holds, so
 /// it moves with the table in `mapping`, and a sync token minted with one mask
 /// must be redeemed with the same one (the API refuses otherwise).
+// SPEC-15.634
 pub const PERSON_FIELDS: &str =
     "names,emailAddresses,phoneNumbers,organizations,memberships,metadata";
 
@@ -93,6 +94,7 @@ impl RetryPolicy {
     /// exponential ceiling, so many tenants throttled at once do not retry in
     /// lockstep. A `Retry-After` is a floor, still bounded by the cap so a
     /// hostile or mistaken header cannot park a worker.
+    // SPEC-15.637
     pub fn delay(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
         let exponent = attempt.saturating_sub(1).min(20);
         let ceiling = self.base.saturating_mul(1u32 << exponent).min(self.cap);
@@ -138,6 +140,7 @@ impl GoogleContactsProvider {
 
     /// One GET, retried per [`RetryPolicy`]. `Ok(None)` is the expired sync
     /// token, the one refusal the caller recovers from.
+    // SPEC-15.636 to 15.639
     async fn get<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -217,6 +220,7 @@ impl GoogleContactsProvider {
 
     /// Every page of one read. `Ok(None)` when the token was refused as
     /// expired.
+    // SPEC-15.635
     async fn read_all(&self, sync_token: Option<&str>) -> SourceResult<Option<SourceChanges>> {
         let mut changes = SourceChanges::default();
         let mut page_token: Option<String> = None;
@@ -263,6 +267,7 @@ impl ContactSyncProvider for GoogleContactsProvider {
         "google"
     }
 
+    // SPEC-15.640
     async fn list_groups(&self) -> SourceResult<Vec<SourceGroup>> {
         let mut groups = Vec::new();
         let mut page_token: Option<String> = None;
@@ -291,6 +296,7 @@ impl ContactSyncProvider for GoogleContactsProvider {
         ))
     }
 
+    // SPEC-15.636
     async fn changes_since(&self, sync_token: Option<&str>) -> SourceResult<SourceChanges> {
         if let Some(changes) = self.read_all(sync_token).await? {
             return Ok(changes);
@@ -435,6 +441,7 @@ struct Group {
 }
 
 impl Group {
+    // SPEC-15.640
     fn offered(self) -> Option<SourceGroup> {
         let own_label = self.group_type.as_deref() == Some("USER_CONTACT_GROUP");
         if !own_label && !OFFERED_SYSTEM_GROUPS.contains(&self.resource_name.as_str()) {
@@ -466,6 +473,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
 }
 
 impl Person {
+    // SPEC-15.641
     fn into_source(self) -> SourceContact {
         let name = primary_first(self.names, |n| n.metadata.primary)
             .into_iter()

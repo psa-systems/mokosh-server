@@ -89,6 +89,7 @@ pub struct BunyipUserDirectory {
 }
 
 impl BunyipUserDirectory {
+    // SPEC-5.200, SPEC-5.201: unset -> standalone, partial -> error
     /// Build a client from configuration. Returns `Ok(None)` when
     /// all three keys are unset (standalone mode, no directory
     /// call to make); `Ok(Some(_))` when all three are set; and
@@ -129,6 +130,7 @@ impl BunyipUserDirectory {
         }
     }
 
+    // SPEC-5.205
     /// PMS-1208 finding 5: register a grant on Bunyip so its
     /// `mokosh_account_grants` table has a row the SPA's later
     /// `POST /v1/grants/{id}/access-token` mint call can find. Called
@@ -188,6 +190,7 @@ impl BunyipUserDirectory {
         Ok(())
     }
 
+    // SPEC-5.206
     /// PMS-1486: undo a `register_grant` call that the local accept
     /// or cancel lost the race on, so a canceled invitation (or an
     /// accept that lost the race to a cancel) leaves no active,
@@ -258,6 +261,7 @@ impl BunyipUserDirectory {
         }
     }
 
+    // SPEC-5.202, SPEC-5.203
     /// Look one email up. Returns:
     /// - `Ok(Some(DirectoryHit { user_id, email_verified }))` on a
     ///   Bunyip match. Both fields matter: an unverified identity
@@ -317,6 +321,7 @@ impl BunyipUserDirectory {
     }
 }
 
+// SPEC-5.204
 /// Log-friendly redaction of an email address for observability.
 /// `alice@example.com` becomes `a****@example.com` so the domain
 /// stays visible for debugging while the local part is not.

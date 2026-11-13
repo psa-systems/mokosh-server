@@ -36,6 +36,7 @@ pub struct TimeTrackingRouterState {
     pub service: Arc<TimeTrackingService>,
 }
 
+// SPEC-14.1, SPEC-14.2: module gates are extractors on each handler below; tenant comes from the caller.
 pub fn time_tracking_routes(service: TimeTrackingService) -> Router {
     let state = TimeTrackingRouterState {
         service: Arc::new(service),
@@ -110,6 +111,7 @@ pub fn time_tracking_routes(service: TimeTrackingService) -> Router {
 // Work types
 // ============================================================================
 
+// SPEC-14.3: no sort support, so any sort parameter is a 422.
 async fn list_work_types(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -127,6 +129,7 @@ async fn list_work_types(
     )))
 }
 
+// SPEC-14.4: admin only, validated body.
 async fn create_work_type(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -143,6 +146,7 @@ async fn create_work_type(
     ))
 }
 
+// SPEC-14.4: admin only, validated body.
 async fn update_work_type(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -159,6 +163,7 @@ async fn update_work_type(
     ))
 }
 
+// SPEC-14.4: admin only.
 async fn delete_work_type(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -178,6 +183,7 @@ async fn delete_work_type(
 /// `{ minutes: i64 }` across every non-rejected entry matching the filter.
 /// The gate matches `list_time_entries`; a user without the time-tracking
 /// module gets a 404 just like the list route.
+// SPEC-14.29: the summary route.
 async fn time_entries_summary(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -191,6 +197,7 @@ async fn time_entries_summary(
     Ok(Json(TimeEntrySummaryResponse { minutes }))
 }
 
+// SPEC-14.28: lists every entry of the tenant, not only the caller's.
 async fn list_time_entries(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -215,6 +222,7 @@ async fn create_time_entry(
     ctx: crate::modules::audit::AuditCtx,
     Json(mut request): Json<CreateTimeEntryRequest>,
 ) -> AppResult<Json<TimeEntryResponse>> {
+    // SPEC-14.6, SPEC-14.7: owner rewrite for non-admins, then range validation.
     // Non-admins can only log time for themselves.
     if !user.role.is_admin() && request.user_id != user.id {
         request.user_id = user.id;
@@ -228,6 +236,7 @@ async fn create_time_entry(
     ))
 }
 
+// SPEC-14.27: single entry read.
 async fn get_time_entry(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -242,6 +251,7 @@ async fn update_time_entry(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateTimeEntryRequest>,
 ) -> AppResult<Json<TimeEntryResponse>> {
+    // SPEC-14.7, SPEC-14.22: range validation, then 404 before the owner check.
     request.validate()?;
     // A non-admin can only edit their own entry; an unknown id 404s first.
     let existing = state.service.get_time_entry(user.tenant(), id).await?;
@@ -263,6 +273,7 @@ async fn delete_time_entry(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
+    // SPEC-14.22: 404 before the owner check.
     // A non-admin can only delete their own entry; an unknown id 404s first.
     let existing = state.service.get_time_entry(user.tenant(), id).await?;
     if !user.role.is_admin() && existing.user_id != user.id {
@@ -277,6 +288,7 @@ async fn delete_time_entry(
 // Timesheets
 // ============================================================================
 
+// SPEC-14.2, SPEC-14.30, SPEC-14.31: timesheets gate, weekly rollup and filters.
 async fn list_timesheets(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -300,6 +312,7 @@ async fn list_timesheets(
     )))
 }
 
+// SPEC-14.32: owner or admin only.
 async fn submit_timesheet(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -322,6 +335,7 @@ async fn submit_timesheet(
     ))
 }
 
+// SPEC-14.33: owner or admin only.
 async fn withdraw_timesheet(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -344,6 +358,7 @@ async fn withdraw_timesheet(
     ))
 }
 
+// SPEC-14.34: manager role or above.
 async fn approve_timesheet(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -362,6 +377,7 @@ async fn approve_timesheet(
     ))
 }
 
+// SPEC-14.35: manager role or above, reason 1..=1000 characters.
 async fn reject_timesheet(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -391,6 +407,7 @@ struct ActiveTimersQuery {
     user_id: Option<Uuid>,
 }
 
+// SPEC-14.36: non-admins see only their own timer.
 async fn list_active_timers(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -415,6 +432,7 @@ async fn list_active_timers(
     )))
 }
 
+// SPEC-14.37: the timer always belongs to the caller.
 async fn start_timer(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -429,6 +447,7 @@ async fn start_timer(
     ))
 }
 
+// SPEC-14.38: only the caller's own timer can be stopped.
 async fn stop_timer(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -445,6 +464,7 @@ async fn stop_timer(
 
 /// The clock is always the caller's own. There is no body to speak of: a
 /// missing one is the same as `{}`, so a client may POST with no content type.
+// SPEC-14.42: a missing body is an empty one.
 async fn clock_in(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -464,6 +484,7 @@ async fn clock_in(
     ))
 }
 
+// SPEC-14.43: the clock is always the caller's own.
 async fn clock_out(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -472,6 +493,7 @@ async fn clock_out(
     Ok(Json(state.service.clock_out(user.tenant(), user.id).await?))
 }
 
+// SPEC-14.44: the break setting is checked in the service.
 async fn start_break(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -482,6 +504,7 @@ async fn start_break(
     ))
 }
 
+// SPEC-14.44: the break setting is checked in the service.
 async fn end_break(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -493,6 +516,7 @@ async fn end_break(
 /// PMS-1145: correct a recorded segment. Who may is
 /// `timesheets/segment_editing`, read in the service, so the answer is the
 /// tenant's rather than this route's.
+// SPEC-14.47: the policy check lives in the service.
 async fn update_segment(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -513,6 +537,7 @@ async fn update_segment(
 /// PMS-1145: remove a recorded segment, the same gate as the correction
 /// above. 204 rather than the removed row: there is nothing left to return
 /// and the day it belonged to is re-read from `GET /workday`.
+// SPEC-14.48: 204 on success.
 async fn delete_segment(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -532,6 +557,7 @@ async fn delete_segment(
 /// CALLER's zone even when an admin reads another person's day: the person
 /// whose day it is may be in another zone, but the admin is the one asking
 /// what today is, and a named `date` sidesteps the question entirely.
+// SPEC-14.45, SPEC-14.46: another user's day is admin only.
 async fn work_day(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -560,6 +586,7 @@ async fn work_day(
 // Rounding rules
 // ============================================================================
 
+// SPEC-14.40: no sort support.
 async fn list_rounding_rules(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -577,6 +604,7 @@ async fn list_rounding_rules(
     )))
 }
 
+// SPEC-14.40: admin only, validated body.
 async fn create_rounding_rule(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -593,6 +621,7 @@ async fn create_rounding_rule(
     ))
 }
 
+// SPEC-14.40: admin only, validated body.
 async fn update_rounding_rule(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -609,6 +638,7 @@ async fn update_rounding_rule(
     ))
 }
 
+// SPEC-14.40: admin only.
 async fn delete_rounding_rule(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,

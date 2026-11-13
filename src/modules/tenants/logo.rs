@@ -42,6 +42,7 @@ const EXTENSIONS: &[(&str, &str)] = &[
 /// Default cap when `TENANT_LOGO_MAX_BYTES` is unset. 1 MiB, a twenty-fifth of
 /// the 25 MiB attachment cap, on purpose: this one is embedded in every email a
 /// client receives, so it is a size that has to stay polite.
+// SPEC-5.377
 const DEFAULT_MAX_BYTES: u64 = 1024 * 1024;
 
 /// PMS-783 (F10): the box a rendered logo occupies, in CSS pixels. One pair of
@@ -59,6 +60,7 @@ pub struct TenantLogoConfig {
 }
 
 impl TenantLogoConfig {
+    // SPEC-5.377
     pub fn from_env() -> AppResult<Self> {
         let key = &crate::config::registry::TENANT_LOGO_MAX_BYTES;
         let max_bytes = crate::config::parse::parse_positive(key, crate::config::get(key))
@@ -104,6 +106,7 @@ fn extension_for(mime: &str) -> &'static str {
 /// (an `<img>` that cannot authenticate, served from the API origin) and must
 /// answer this question identically. Kept as a named function here so the call
 /// sites in this module read the same as before.
+// SPEC-5.378
 pub fn check_mime(raw: &str) -> AppResult<&'static str> {
     crate::utils::inline_image::check_inline_image_mime(raw)
 }
@@ -152,6 +155,7 @@ impl TenantLogoStore {
     /// uploaded, because downscaling means an image decoder in this path and
     /// that dependency call is a person's, not this change's. Tracked in
     /// PMS-784; until it lands, `max_bytes` is the only bound on a logo.
+    // SPEC-5.379, SPEC-5.380
     pub async fn store(
         &self,
         tenant_id: Uuid,
@@ -171,6 +175,7 @@ impl TenantLogoStore {
         let key = ObjectKey::tenant_logo(tenant_id, extension_for(mime));
         self.store.put(&key, bytes).await?;
         self.remove_except(tenant_id, Some(&key)).await;
+        // SPEC-5.381
         if let Some(ledger) = &self.ledger {
             // Keyed on the TENANT, not a fresh id: there is one logo per tenant
             // and replacing it must not add a second row to the rollup.
@@ -202,6 +207,7 @@ impl TenantLogoStore {
     /// and the first tick. The fallback is a named legacy KEY rather than a
     /// second lookup inside the provider, so it is visible here and dies with
     /// the variant.
+    // SPEC-5.382
     pub async fn read(&self, tenant_id: Uuid, mime: &str) -> AppResult<Vec<u8>> {
         let mime = check_mime(mime)?;
         let extension = extension_for(mime);
@@ -224,11 +230,13 @@ impl TenantLogoStore {
     /// Both locations, for as long as both can hold a file: a replace that
     /// cleared only the new path would leave the pre-move file behind, and the
     /// read above would serve it as if the logo had never been replaced.
+    // SPEC-5.383
     pub async fn remove(&self, tenant_id: Uuid) {
         self.remove_except(tenant_id, None).await;
     }
 
     /// Delete every stored format except `keep` (the object just written).
+    // SPEC-5.380, SPEC-5.383
     async fn remove_except(&self, tenant_id: Uuid, keep: Option<&ObjectKey>) {
         for (_, extension) in EXTENSIONS {
             let current = ObjectKey::tenant_logo(tenant_id, *extension);
@@ -250,6 +258,7 @@ impl TenantLogoStore {
 /// Path a client fetches the logo from. Relative on purpose: the SPA joins it
 /// with the API base it already knows, and the email composer joins it with the
 /// public API base it is configured with. Nothing here can know both.
+// SPEC-5.384
 pub fn logo_path(tenant_id: Uuid) -> String {
     format!("{PUBLIC_TENANT_PATH_PREFIX}{tenant_id}/logo")
 }

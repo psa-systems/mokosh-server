@@ -25,6 +25,7 @@ pub struct SavedReportsRouterState {
     pub service: Arc<SavedReportsService>,
 }
 
+// SPEC-15.1606: RequireAuth only, no module or role gate
 pub fn saved_reports_routes(service: SavedReportsService) -> Router {
     let state = SavedReportsRouterState {
         service: Arc::new(service),
@@ -86,6 +87,7 @@ struct ListQuery {
     entity_type: Option<String>,
 }
 
+// SPEC-15.1607
 async fn list(
     State(s): State<SavedReportsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -108,6 +110,7 @@ async fn list(
     Ok(Json(rows))
 }
 
+// SPEC-15.1609
 async fn get_one(
     State(s): State<SavedReportsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -117,6 +120,7 @@ async fn get_one(
     Ok(Json(row))
 }
 
+// SPEC-15.1610
 async fn create(
     State(s): State<SavedReportsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -127,6 +131,7 @@ async fn create(
     Ok(Json(row))
 }
 
+// SPEC-15.1611
 async fn update(
     State(s): State<SavedReportsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -138,6 +143,7 @@ async fn update(
     Ok(Json(row))
 }
 
+// SPEC-15.1612
 async fn delete_one(
     State(s): State<SavedReportsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -147,6 +153,7 @@ async fn delete_one(
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
+// SPEC-15.1613, SPEC-15.1609
 /// PMS-477: execute the saved report and return the materialised
 /// rows. The service's `get` step enforces the per-user visibility
 /// rule (author OR shared), so a caller cannot execute a private
@@ -168,6 +175,7 @@ async fn execute(
 
 // PMS-478: schedule handlers ------------------------------------------------
 
+// SPEC-15.1626
 async fn list_schedules(
     State(s): State<SavedReportsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -182,6 +190,7 @@ async fn list_schedules(
     Ok(Json(rows))
 }
 
+// SPEC-15.1624
 async fn create_schedule(
     State(s): State<SavedReportsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -196,6 +205,7 @@ async fn create_schedule(
     Ok(Json(row))
 }
 
+// SPEC-15.1627
 async fn get_schedule(
     State(s): State<SavedReportsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -205,6 +215,7 @@ async fn get_schedule(
     Ok(Json(row))
 }
 
+// SPEC-15.1628
 async fn update_schedule(
     State(s): State<SavedReportsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -219,6 +230,7 @@ async fn update_schedule(
     Ok(Json(row))
 }
 
+// SPEC-15.1628
 async fn delete_schedule(
     State(s): State<SavedReportsRouterState>,
     RequireAuth(u): RequireAuth,

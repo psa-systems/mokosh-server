@@ -33,6 +33,7 @@ impl OpportunitiesService {
         Self { db }
     }
 
+    // SPEC-14.84: 422 for a stage outside the set.
     fn ensure_stage(stage: &str) -> AppResult<()> {
         if !STAGES.contains(&stage) {
             return Err(AppError::validation_field(
@@ -43,6 +44,7 @@ impl OpportunitiesService {
         Ok(())
     }
 
+    // SPEC-14.89: 422 for an outcome outside the set.
     fn ensure_outcome(outcome: &str) -> AppResult<()> {
         if !OUTCOMES.contains(&outcome) {
             return Err(AppError::validation_field(
@@ -59,6 +61,7 @@ impl OpportunitiesService {
     /// Refuse a foreign company id up front so the FK is a backstop
     /// rather than the first defence. Returns the row's tenant_id for
     /// the caller to compare with expectations.
+    // SPEC-14.83: 422 on company_id for a company outside the tenant.
     async fn assert_company_in_tenant(
         &self,
         tx: &mut sqlx::PgConnection,
@@ -80,6 +83,7 @@ impl OpportunitiesService {
         Ok(())
     }
 
+    // SPEC-14.83, SPEC-14.84, SPEC-14.85: open-only create, USD default currency, tenant checks.
     pub async fn create(
         &self,
         tenant_id: TenantId,
@@ -150,11 +154,13 @@ impl OpportunitiesService {
         Ok(row)
     }
 
+    // SPEC-14.86: 404 for an unknown or deleted id.
     pub async fn get(&self, tenant_id: TenantId, id: Uuid) -> AppResult<Opportunity> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         self.load_row(&mut tx, tenant_id, id).await
     }
 
+    // SPEC-14.86: non-deleted rows, newest update first, no pagination.
     pub async fn list(
         &self,
         tenant_id: TenantId,
@@ -196,6 +202,7 @@ impl OpportunitiesService {
         Ok(rows.into_iter().map(row_to_opportunity).collect())
     }
 
+    // SPEC-14.85, SPEC-14.87, SPEC-14.88: open stages only, closed rows immutable, quote checked.
     pub async fn update(
         &self,
         tenant_id: TenantId,
@@ -306,6 +313,7 @@ impl OpportunitiesService {
     /// Close a previously-open opportunity. Sets stage, outcome and
     /// closed_at in one write, and (on `won`) accepts an optional
     /// `quote_id` link to the quote that closed the sale.
+    // SPEC-14.89, SPEC-14.90: stage, outcome and closed_at in one guarded write; quote link on won.
     pub async fn close(
         &self,
         tenant_id: TenantId,
@@ -369,6 +377,7 @@ impl OpportunitiesService {
     /// Soft-delete: the row keeps its history so a reporting query
     /// hitting it after the fact still sees the outcome. Reads exclude
     /// soft-deleted rows already.
+    // SPEC-14.91: sets deleted_at; 404 when unknown or already deleted.
     pub async fn soft_delete(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let result = sqlx::query(
@@ -392,6 +401,8 @@ impl OpportunitiesService {
     /// alone was a single flipped flag away from silently reading a row
     /// from the wrong tenant. Adding the predicate here is a belt-and-
     /// -braces defence matching the sibling queries' shape.
+    ///
+    /// SPEC-14.86, SPEC-14.91: soft-deleted rows read as absent.
     async fn load_row(
         &self,
         tx: &mut sqlx::PgConnection,

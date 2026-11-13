@@ -34,6 +34,7 @@ impl ProjectsService {
     /// side by side should not be able to show a budget that includes a
     /// project the counts do not.
     // SPEC-7.452: counts_by_status and total_budget are computed in one transaction, so both describe the same instant
+    // SPEC-7.1057: counts per status present, plus the string sum of budget_amount (0 when none)
     pub async fn project_summary(&self, tenant_id: TenantId) -> AppResult<ProjectSummaryResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
@@ -186,6 +187,7 @@ impl ProjectsService {
     ) -> AppResult<ProjectResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.1056: status and billing_method are not checked here; the DB CHECK answers a bad value with a 500
         sqlx::query(
             r#"
             INSERT INTO projects (
@@ -526,6 +528,7 @@ impl ProjectsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.1061: the response is the request plus the RETURNING project_id
     // SPEC-7.461: a full-field UPDATE (not COALESCE'd) scoped by tenant_id and id; no matching row 404s; no audit row is written on update
     // SPEC-7.462: does not call ensure_project_open, so a phase under a now-cancelled project can still be edited
     pub async fn update_project_phase(
@@ -701,6 +704,7 @@ impl ProjectsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.1063: a status still referenced by a task fails with an unmapped FK error (500)
     // SPEC-7.468: deletes by tenant_id + id; zero rows affected 404s; no audit row written, and no FK-violation mapping (contrast with delete_project_type)
     pub async fn delete_task_status(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -760,6 +764,7 @@ impl ProjectsService {
     ) -> AppResult<ProjectTypeResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.1062: a failed request rolls back the is_default clearing
         // SPEC-7.471: creating a default clears is_default on every other tenant row first, in the same transaction
         if request.is_default {
             sqlx::query("UPDATE project_types SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE")
@@ -967,6 +972,7 @@ impl ProjectsService {
         ctx: &AuditCtx,
     ) -> AppResult<TaskResponse> {
         let id = Uuid::new_v4();
+        // SPEC-7.1064: today is the caller's own-timezone date and is computed before the project guard
         // SPEC-7.483: an omitted due_date defaults from today + N business days, where N is the project's default_due_business_days override (0 disables it) if set, else the tenant-wide scheduling default; a supplied due_date is used as-is
         // PMS-345: when no due date is given, fall back to the standard due
         // date (today + N business days; N = 0 disables it). The offset is
@@ -1141,8 +1147,8 @@ impl ProjectsService {
                 .and_then(|v| v.as_str())
                 .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
         };
-        // PMS-1679: an absent date is the stored one; an explicit null is no
-        // date at all, so it cannot invert the range.
+        // SPEC-7.1060, PMS-1679: an absent date is the stored one; an explicit
+        // null is no date at all, so it cannot invert the range.
         let effective_start = request
             .start_date
             .unwrap_or_else(|| stored_date("start_date"));
