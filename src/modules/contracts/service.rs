@@ -447,9 +447,14 @@ impl ContractsService {
         ctx: &AuditCtx,
     ) -> AppResult<ContractItemResponse> {
         let total = request.quantity * request.unit_price;
-        let billing_rule = request
-            .billing_rule
-            .unwrap_or_else(|| BillingRule::derive(&request.item_type));
+        // PMS-1661 F7: on UPDATE, an omitted `billing_rule` must preserve
+        // the stored one, not re-derive from `item_type`. The create path
+        // still derives (nothing to preserve). The old code did
+        // `unwrap_or_else(|| BillingRule::derive(...))` here too, which
+        // silently clobbered an explicit rule the caller wasn't restating;
+        // a product set to `every_period` would snap back to `manual` on
+        // any edit that did not re-send the field.
+        let billing_rule = request.billing_rule.map(|r| r.as_str().to_string());
         // Mutation + audit row in one transaction: snapshot before and
         // after, write the audit entry on the same tx. PMS-117.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -463,13 +468,18 @@ impl ContractsService {
         // PMS-956: `billed_at` comes back from the UPDATE rather than being
         // assumed. An edit to a `once` item that has already billed must not
         // report it as unbilled, or the record would say it is still owed.
-        let updated: Option<(Uuid, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
+        //
+        // PMS-1661 F7: `billing_rule` also comes back from the UPDATE so the
+        // response reflects the stored value when COALESCE kept the prior
+        // one.
+        let updated: Option<(Uuid, Option<chrono::DateTime<Utc>>, String)> = sqlx::query_as(
             r#"UPDATE contract_items SET
                 name=$3, description=$4, item_type=$5, quantity=$6, unit_price=$7,
                 total_price=$8, billing_frequency=$9, work_type_id=$10, included_hours=$11,
                 overage_rate=$12, rollover_enabled=$13, max_rollover_hours=$14,
-                sort_order=$15, product_id=$16, billing_rule=$17, updated_at = NOW()
-               WHERE tenant_id = $1 AND id = $2 RETURNING contract_id, billed_at"#,
+                sort_order=$15, product_id=$16,
+                billing_rule=COALESCE($17, billing_rule), updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2 RETURNING contract_id, billed_at, billing_rule"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -487,12 +497,14 @@ impl ContractsService {
         .bind(request.max_rollover_hours)
         .bind(request.sort_order)
         .bind(request.product_id)
-        .bind(billing_rule.as_str())
+        .bind(billing_rule.as_deref())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((cid, billed_at)) = updated else {
+        let Some((cid, billed_at, stored_billing_rule)) = updated else {
             return Err(AppError::NotFound("Contract item".to_string()));
         };
+        let billing_rule = BillingRule::from_str(&stored_billing_rule)
+            .unwrap_or_else(|| BillingRule::derive(&request.item_type));
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM contract_items t WHERE tenant_id = $1 AND id = $2",
