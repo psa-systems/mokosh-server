@@ -178,7 +178,18 @@ impl BunyipUserDirectory {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            // PMS-1658: an unreadable body used to render as empty with
+            // no indication that the read itself failed. Log the read
+            // error separately so an operator sees "we got a non-2xx
+            // AND could not read the body" versus "we got a non-2xx
+            // with an empty body".
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "bunyip mokosh-grant register: non-2xx body read failed");
+                    String::new()
+                }
+            };
             tracing::warn!(
                 status = %status,
                 body = %body.chars().take(200).collect::<String>(),
@@ -233,7 +244,15 @@ impl BunyipUserDirectory {
             return Ok(());
         }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            // PMS-1658: same body-read error split as the register
+            // path above.
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "bunyip mokosh-grant revoke: non-2xx body read failed");
+                    String::new()
+                }
+            };
             tracing::warn!(
                 status = %status,
                 body = %body.chars().take(200).collect::<String>(),
@@ -292,7 +311,15 @@ impl BunyipUserDirectory {
             return Ok(None);
         }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            // PMS-1658: same body-read error split as the register /
+            // revoke paths above.
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "bunyip directory lookup: non-2xx body read failed");
+                    String::new()
+                }
+            };
             tracing::warn!(
                 status = %status,
                 body = %body.chars().take(200).collect::<String>(),
