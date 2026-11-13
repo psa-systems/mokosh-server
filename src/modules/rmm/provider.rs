@@ -247,11 +247,24 @@ impl RmmProvider for TacticalRmmProvider {
 }
 
 fn parse_tactical_agent(v: serde_json::Value) -> ProviderDevice {
-    let rmm_device_id = v
-        .get("agent_id")
-        .and_then(|x| x.as_str())
-        .unwrap_or_default()
-        .to_string();
+    // PMS-1665 finding: an agent payload without a string `agent_id`
+    // used to become a device with the empty-string id, which the
+    // sync then upserted as a mapping keyed on "" - all such agents
+    // collapsing onto one row. The fn signature cannot propagate, so
+    // keep the empty-string fallback but WARN with the hostname (the
+    // most human-readable identity on this payload) so the drift is
+    // findable.
+    let rmm_device_id = match v.get("agent_id").and_then(|x| x.as_str()) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => {
+            let hostname = v.get("hostname").and_then(|x| x.as_str()).unwrap_or("?");
+            tracing::warn!(
+                hostname = hostname,
+                "tactical agent payload has no agent_id; storing empty rmm_device_id"
+            );
+            String::new()
+        }
+    };
     let hostname = v
         .get("hostname")
         .and_then(|x| x.as_str())

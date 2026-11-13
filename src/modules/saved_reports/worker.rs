@@ -177,12 +177,28 @@ impl ScheduledReportsWorker {
             .execute(tenant_id, user_id, saved_report_id, 1, PER_PAGE)
             .await?;
         let csv = render_csv(&result.aliases, &result.rows);
-        let report_name = self
-            .reports
-            .get(tenant_id, user_id, saved_report_id)
-            .await
-            .map(|r| r.name)
-            .unwrap_or_else(|_| "Scheduled report".into());
+        // PMS-1665 finding: the second get() used to silently fall
+        // back to "Scheduled report" on any error, so a report whose
+        // execution succeeded above but whose row vanished between
+        // execute() and here (deleted mid-flight, DB fault, etc.)
+        // sent an email titled "Scheduled report" with no trace.
+        // WARN with the ids + cause; the delivery still goes out
+        // with the fallback title (the CSV body is valuable on its
+        // own and dropping the delivery would re-queue on the next
+        // tick).
+        let report_name = match self.reports.get(tenant_id, user_id, saved_report_id).await {
+            Ok(r) => r.name,
+            Err(e) => {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    user_id = %user_id,
+                    saved_report_id = %saved_report_id,
+                    error = ?e,
+                    "materialise_and_enqueue: saved_report name lookup failed after execute; using fallback title"
+                );
+                "Scheduled report".into()
+            }
+        };
 
         // Resolve recipient: explicit override > owner's users.email.
         let to: String = match recipient_override {

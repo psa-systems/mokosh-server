@@ -387,6 +387,16 @@ impl RmmSyncWorker {
         .map_err(|e| AppError::Database(format!("rmm read asset_type: {e}")))?;
         drop(type_tx);
         let Some(asset_type_id) = asset_type_id else {
+            // PMS-1665 finding: a tenant with no asset types used to
+            // silently leave every synced device unlinked. The sync
+            // tick ran clean but the asset list never grew; an admin
+            // had no trace. WARN with the tenant id + RMM device id
+            // (SPEC-15.1574).
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                rmm_device_id = %d.rmm_device_id,
+                "rmm: tenant has no asset_types seeded; leaving device unlinked"
+            );
             return Ok(None);
         };
 
