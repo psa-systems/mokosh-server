@@ -364,7 +364,24 @@ impl SeedService {
         // 4. Projects. The project is core (propagates on error); its phase and
         //    task are best-effort - a task needs a tenant task status, which a
         //    tenant provisioned without `copy_default_config` would lack.
-        let task_status = self.existing_task_status_id(tenant_id).await.ok().flatten();
+        //
+        // A DB error on the task-status lookup used to be swallowed by
+        // `.ok().flatten()`, which seeded the demo project without its example
+        // task and left the operator no trace: "no task status" and "the
+        // lookup query crashed" were indistinguishable. Log a warning with the
+        // tenant id on error, then fall back to None so the project itself
+        // still seeds.
+        let task_status = match self.existing_task_status_id(tenant_id).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    error = ?e,
+                    "demo seed: task status lookup failed; seeding project without an example task"
+                );
+                None
+            }
+        };
         for build in demo_projects(&company_ids, user_id) {
             let project = self
                 .projects
