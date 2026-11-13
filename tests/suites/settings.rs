@@ -755,3 +755,171 @@ async fn only_the_deployment_operator_touches_deployment_settings(pool: PgPool) 
         assert_eq!(status, reqwest::StatusCode::OK, "{path} for the operator");
     }
 }
+
+// --- PMS-1350: personal (appearance) vs administrative settings ------------
+
+#[mokosh_test]
+async fn non_admin_can_read_and_write_a_personal_setting(pool: PgPool) {
+    let (_id, email, password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "technician@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let put = app
+        .client
+        .put(app.url("/api/v1/settings/appearance/theme"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "value": "dark" }))
+        .send()
+        .await
+        .expect("send put appearance");
+    assert_eq!(
+        put.status(),
+        reqwest::StatusCode::OK,
+        "a non-admin may write a personal setting"
+    );
+
+    let get = app
+        .client
+        .get(app.url("/api/v1/settings/appearance/theme"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get appearance");
+    assert_eq!(get.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = get.json().await.expect("appearance JSON");
+    assert_eq!(body["value"].as_str(), Some("dark"));
+}
+
+#[mokosh_test]
+async fn non_admin_is_refused_an_administrative_setting(pool: PgPool) {
+    let (_id, email, password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "technician2@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let put = app
+        .client
+        .put(app.url("/api/v1/settings/notifications/channel_email_enabled"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "value": true }))
+        .send()
+        .await
+        .expect("send put administrative setting");
+    assert_eq!(
+        put.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a non-admin may not write an administrative setting"
+    );
+
+    let get_category = app
+        .client
+        .get(app.url("/api/v1/settings/notifications"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get category")
+        .status();
+    assert_eq!(get_category, reqwest::StatusCode::FORBIDDEN);
+
+    let get_key = app
+        .client
+        .get(app.url("/api/v1/settings/notifications/channel_email_enabled"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get key")
+        .status();
+    assert_eq!(get_key, reqwest::StatusCode::FORBIDDEN);
+}
+
+#[mokosh_test]
+async fn non_admin_listing_excludes_administrative_categories(pool: PgPool) {
+    let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
+    let (_id, email, password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "technician3@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool).await;
+    let admin_token = common::login(&app, &admin_email, &admin_password).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Seed one personal and one administrative setting as the admin.
+    for (path, body) in [
+        (
+            "/api/v1/settings/appearance/theme",
+            serde_json::json!({ "value": "light" }),
+        ),
+        (
+            "/api/v1/settings/notifications/channel_email_enabled",
+            serde_json::json!({ "value": true }),
+        ),
+    ] {
+        let r = app
+            .client
+            .put(app.url(path))
+            .bearer_auth(&admin_token)
+            .json(&body)
+            .send()
+            .await
+            .expect("seed setting");
+        assert!(r.status().is_success(), "seed {path} failed {}", r.status());
+    }
+
+    let non_admin_list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/settings?per_page=50"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list")
+        .json()
+        .await
+        .expect("list JSON");
+    let items = non_admin_list["data"]
+        .as_array()
+        .expect("items is an array");
+    assert!(
+        items.iter().all(|i| i["category"] == "appearance"),
+        "a non-admin's listing must exclude administrative categories: {items:?}"
+    );
+    assert!(
+        items.iter().any(|i| i["category"] == "appearance"),
+        "a non-admin's listing must still include personal categories: {items:?}"
+    );
+
+    let admin_list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/settings?per_page=50"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("send admin list")
+        .json()
+        .await
+        .expect("admin list JSON");
+    let admin_items = admin_list["data"]
+        .as_array()
+        .expect("admin items is an array");
+    assert!(
+        admin_items.iter().any(|i| i["category"] == "appearance"),
+        "an admin must see personal settings: {admin_items:?}"
+    );
+    assert!(
+        admin_items.iter().any(|i| i["category"] == "notifications"),
+        "an admin must see administrative settings: {admin_items:?}"
+    );
+}
