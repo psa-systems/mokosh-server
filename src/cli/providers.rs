@@ -377,12 +377,25 @@ fn purge_help() -> String {
 // provider only when BunyipSecretsConfig::from_env() returns
 // Ok(Some(_)), warn-and-absent on build failure or on an incomplete
 // three-variable set.
+/// Build the per-provider instance table plus the set of provider kinds
+/// that were enabled by config but failed to build.
+///
+/// PMS-1657: the status report's `unreachable` column was previously
+/// dead (`let _ = &mut unreachable;`), so a failed Infisical / bunyip /
+/// DB provider only showed up under `absent` / "not enabled" and an
+/// operator could not tell a legitimate unconfigured provider apart
+/// from a configured-but-broken one. Return a second output here and
+/// let `build_status_report` populate the column from it.
 async fn build_secret_providers(
     db: &Database,
     encryption_key: [u8; 32],
-) -> AppResult<Vec<Option<Arc<dyn AppSecretProvider>>>> {
+) -> AppResult<(
+    Vec<Option<Arc<dyn AppSecretProvider>>>,
+    Vec<AppSecretProviderKind>,
+)> {
     let mut out: Vec<Option<Arc<dyn AppSecretProvider>>> =
         vec![None; AppSecretProviderKind::ALL.len()];
+    let mut unreachable: Vec<AppSecretProviderKind> = Vec::new();
 
     out[AppSecretProviderKind::Environment.index()] = Some(Arc::new(SecretsEnvProvider));
 
@@ -406,6 +419,7 @@ async fn build_secret_providers(
                 "provider-status: the database app-secret provider could not be built; \
                  reporting it as unreachable"
             );
+            unreachable.push(AppSecretProviderKind::Database);
         }
     }
 
@@ -424,6 +438,7 @@ async fn build_secret_providers(
                     "provider-status: the Infisical app-secret provider could not be built; \
                      reporting it as unreachable"
                 );
+                unreachable.push(AppSecretProviderKind::Infisical);
             }
         }
     }
@@ -443,6 +458,7 @@ async fn build_secret_providers(
                     "provider-status: the bunyip app-secret provider could not be built; \
                      reporting it as unreachable"
                 );
+                unreachable.push(AppSecretProviderKind::Bunyip);
             }
         },
         Ok(None) => {}
@@ -452,10 +468,11 @@ async fn build_secret_providers(
                 "provider-status: the bunyip app-secret provider's inputs are incomplete; \
                  reporting it as unreachable"
             );
+            unreachable.push(AppSecretProviderKind::Bunyip);
         }
     }
 
-    Ok(out)
+    Ok((out, unreachable))
 }
 
 // -----------------------------------------------------------------------------
@@ -465,12 +482,18 @@ async fn build_secret_providers(
 pub async fn run_provider_status(args: &[String]) -> AppResult<()> {
     let mode = parse_status_args(args)?;
     let (db, encryption_key) = boot_shared_state().await?;
-    let secret_providers = build_secret_providers(&db, encryption_key).await?;
+    let (secret_providers, secret_unreachable) =
+        build_secret_providers(&db, encryption_key).await?;
     let secret_selection = current_secret_selection()?;
 
     let config_chain = build_config_chain(&db).await?;
 
-    let report = build_status_report(&secret_providers, secret_selection, &config_chain);
+    let report = build_status_report(
+        &secret_providers,
+        &secret_unreachable,
+        secret_selection,
+        &config_chain,
+    );
     redaction::assert_no_leak(&report);
 
     match mode {
@@ -554,6 +577,7 @@ struct StatusReport {
 // keys.
 fn build_status_report(
     secret_providers: &[Option<Arc<dyn AppSecretProvider>>],
+    secret_unreachable: &[AppSecretProviderKind],
     secret_selection: AppSecretsSelection,
     config_chain: &ConfigProviderChain,
 ) -> StatusReport {
@@ -568,22 +592,25 @@ fn build_status_report(
                 Some(provider) => {
                     // The trait's `has` is sync and never raises; a provider
                     // whose live probe would raise is caught at build time
-                    // (see `build_secret_providers`) and reported as absent.
+                    // (see `build_secret_providers`) and reported as
+                    // `unreachable`, below.
                     if provider.has(secret) {
                         holds.push(kind.as_str());
                     }
                 }
+                None if secret_unreachable.contains(&kind) => {
+                    // PMS-1657: a provider enabled by config but whose
+                    // build failed now surfaces here instead of under
+                    // `absent`, so an operator can tell a legitimate
+                    // unconfigured provider apart from a broken one.
+                    unreachable.push(kind.as_str());
+                }
                 None => {
-                    // Distinguish "not enabled" (no INFISICAL_ADDRESS, no
-                    // APP_SECRETS_DIR) from "enabled but unreachable": the
-                    // former is a legitimate configuration and the latter
-                    // is a warning. Today both surface here as absent
-                    // because the build path warns on the unreachable one.
+                    // Not enabled (no INFISICAL_ADDRESS, no APP_SECRETS_DIR, ...).
                     absent.push(kind.as_str());
                 }
             }
         }
-        let _ = &mut unreachable;
         let serving = if holds.contains(&secret_selection.provider.as_str()) {
             Some(secret_selection.provider.as_str())
         } else {
@@ -735,7 +762,7 @@ fn render_status_text(report: &StatusReport) -> String {
 pub async fn run_provider_migrate(args: &[String]) -> AppResult<()> {
     let args = parse_migrate_args(args)?;
     let (db, encryption_key) = boot_shared_state().await?;
-    let secret_providers = build_secret_providers(&db, encryption_key).await?;
+    let (secret_providers, _unreachable) = build_secret_providers(&db, encryption_key).await?;
     let config_chain = build_config_chain(&db).await?;
 
     let mut lines: Vec<MoveLine> = Vec::new();
@@ -971,7 +998,7 @@ pub async fn run_provider_set(args: &[String]) -> AppResult<()> {
     let plain = read_secret_from_env(&parsed.from_env)?;
 
     let (db, encryption_key) = boot_shared_state().await?;
-    let providers = build_secret_providers(&db, encryption_key).await?;
+    let (providers, _unreachable) = build_secret_providers(&db, encryption_key).await?;
     let selection = current_secret_selection()?;
     let secret = parsed.secret;
     let declared = declared_for_secret(selection, secret)?;
@@ -988,7 +1015,7 @@ pub async fn run_provider_set(args: &[String]) -> AppResult<()> {
             // same handle would prove the cache agrees with itself and say nothing
             // about the row. A fresh build re-reads the row (or re-fetches from
             // Infisical), which is what the next boot will do.
-            let fresh = build_secret_providers(&db, encryption_key).await?;
+            let (fresh, _unreachable) = build_secret_providers(&db, encryption_key).await?;
             Ok(fresh[declared.index()]
                 .as_ref()
                 .and_then(|provider| provider.get(secret)))
@@ -1041,7 +1068,7 @@ where
     if !target.is_writable() {
         return Err(AppError::Configuration(format!(
             "provider-set: the declared provider is {declared}, which cannot be written by this \
-             process. Point {secret}_FILE at a file holding the value, or set SECRET_BACKEND to \
+             process. Point {secret}_FILE at a file holding the value, or set APP_SECRET_BACKEND to \
              a provider that accepts writes ({}).",
             AppSecretProviderKind::LEGAL_VALUES
         )));
@@ -1062,7 +1089,9 @@ where
             crate::utils::deployment::EnablementSource::Profile => {
                 "the hosting profile's default".to_string()
             }
-            crate::utils::deployment::EnablementSource::Explicit => "SECRET_BACKEND".to_string(),
+            crate::utils::deployment::EnablementSource::Explicit => {
+                "APP_SECRET_BACKEND".to_string()
+            }
         },
         outcome: "written, read back and compared".to_string(),
         restart_required: true,
@@ -1138,7 +1167,7 @@ fn render_set_text(report: &SetReport) -> String {
 pub async fn run_provider_purge(args: &[String]) -> AppResult<()> {
     let args = parse_purge_args(args)?;
     let (db, encryption_key) = boot_shared_state().await?;
-    let secret_providers = build_secret_providers(&db, encryption_key).await?;
+    let (secret_providers, _unreachable) = build_secret_providers(&db, encryption_key).await?;
     let secret_selection = current_secret_selection()?;
     let config_chain = build_config_chain(&db).await?;
 
@@ -1276,7 +1305,7 @@ async fn purge_secrets(
                     tier: "secrets",
                     key: secret.name().to_string(),
                     outcome: format!(
-                        "refused: target provider {kind} is enabled (SECRET_BACKEND selects it); \
+                        "refused: target provider {kind} is enabled (APP_SECRET_BACKEND selects it); \
                          disable it first"
                     ),
                     deleted: false,
@@ -2137,7 +2166,7 @@ mod tests {
         // An empty config chain: this test cares about the secrets half.
         let empty_chain = ConfigProviderChain::new(vec![]);
 
-        let report = build_status_report(&providers, selection, &empty_chain);
+        let report = build_status_report(&providers, &[], selection, &empty_chain);
         let text = render_status_text(&report);
         assert!(text.contains("SMTP_PASSWORD"), "{text}");
         assert!(text.contains("environment"), "{text}");
@@ -2187,7 +2216,7 @@ mod tests {
             source: crate::utils::deployment::EnablementSource::Explicit,
         };
         let empty_chain = ConfigProviderChain::new(vec![]);
-        let report = build_status_report(&providers, selection, &empty_chain);
+        let report = build_status_report(&providers, &[], selection, &empty_chain);
         let row = &report.secrets[0];
         let absent = &row.absent;
         assert!(absent.contains(&"file"), "{absent:?}");
@@ -2451,7 +2480,7 @@ mod tests {
             provider: AppSecretProviderKind::Database,
             source: crate::utils::deployment::EnablementSource::Profile,
         };
-        let report = build_status_report(&providers, selection, &chain);
+        let report = build_status_report(&providers, &[], selection, &chain);
         assert!(
             report
                 .orphans

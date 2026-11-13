@@ -336,10 +336,13 @@ fn parse_tenant_arg(args: &[String]) -> anyhow::Result<uuid::Uuid> {
 }
 
 fn require_env(key: &str) -> anyhow::Result<String> {
-    std::env::var(key).map_err(|_| {
-        anyhow::anyhow!(
+    // PMS-1657: see src/cli/mod.rs's twin. A set-but-empty value is an
+    // operator mistake (unlanded export), not a valid value here.
+    match std::env::var(key) {
+        Ok(v) if !v.is_empty() => Ok(v),
+        _ => Err(anyhow::anyhow!(
             "{} is not set. Put it in .env.infisical or export it before running.",
             key
-        )
-    })
+        )),
+    }
 }

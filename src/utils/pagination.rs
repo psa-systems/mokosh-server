@@ -108,9 +108,17 @@ impl PaginationParams {
     /// Maximum allowed items per page
     pub const MAX_PER_PAGE: u32 = 100;
 
-    /// Calculate the offset for database queries
+    /// Calculate the offset for database queries.
+    ///
+    /// PMS-1657: `page` is an unbounded `u32`, and the old
+    /// `(page - 1) * per_page` would overflow for a large `page` - panic
+    /// in dev, wrap in release (overflow-checks are off in
+    /// `[profile.release]`) - and serve the wrong rows. `per_page` is
+    /// clamped to `MAX_PER_PAGE` before multiplying so `saturating_mul`
+    /// caps the offset at `u32::MAX`, which simply returns an empty
+    /// page instead of wrapping to the start.
     pub fn offset(&self) -> u32 {
-        (self.page.saturating_sub(1)) * self.per_page()
+        self.page.saturating_sub(1).saturating_mul(self.per_page())
     }
 
     /// Get the per_page value, clamped to MAX_PER_PAGE
