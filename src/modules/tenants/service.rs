@@ -278,13 +278,19 @@ impl TenantService {
         // WITH CHECK policies see app.current_tenant. PMS-256.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
+        // PMS-1659 finding: the old `unwrap_or_else(|_| json!({}))`
+        // discarded a serialize error and created the tenant with empty
+        // branding; a tenant that quietly loses its logo at creation
+        // is a bug the operator never sees. Propagate the error.
+        //
         // MAPPS-396: fold caller-supplied branding into the initial
         // insert so the tenant lands with its logo / colors already set,
         // rather than a create-then-update pair. `None` maps to the
         // empty-object default so `branding` never lands NULL (the
         // column is NOT NULL DEFAULT '{}').
         let branding_json = match &request.branding {
-            Some(b) => serde_json::to_value(b).unwrap_or_else(|_| serde_json::json!({})),
+            Some(b) => serde_json::to_value(b)
+                .map_err(|e| AppError::Internal(format!("branding serialize: {e}")))?,
             None => serde_json::json!({}),
         };
         // PMS-1472: create_tenant writes the same branding column
@@ -2464,13 +2470,42 @@ struct TenantListRow {
 
 impl From<TenantRow> for Tenant {
     fn from(row: TenantRow) -> Self {
+        // PMS-1659 finding: an unknown stored `status` used to read as
+        // the default `active`, and a malformed `branding` document as
+        // the empty default, with no trace. A corrupt status reading
+        // as active is the dangerous one: a suspended tenant whose
+        // status drifted off the closed set would quietly serve again.
+        // Keep the default fallback (From impl cannot propagate), but
+        // WARN per field with the tenant id + stored value / error.
+        let status = {
+            let parsed = TenantStatus::from_str(&row.status);
+            if parsed.is_none() {
+                tracing::warn!(
+                    tenant_id = %row.id,
+                    stored = %row.status,
+                    "tenants.status is not one of the known values; reading as default"
+                );
+            }
+            parsed.unwrap_or_default()
+        };
+        let branding = match serde_json::from_value(row.branding.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    tenant_id = %row.id,
+                    error = %e,
+                    "tenants.branding failed to decode; reading as default"
+                );
+                Default::default()
+            }
+        };
         Self {
             id: row.id,
             name: row.name,
             slug: row.slug,
-            status: TenantStatus::from_str(&row.status).unwrap_or_default(),
+            status,
             settings: row.settings,
-            branding: serde_json::from_value(row.branding).unwrap_or_default(),
+            branding,
             billing_email: row.billing_email,
             billing_contact_name: row.billing_contact_name,
             subscription_plan: row.subscription_plan,
