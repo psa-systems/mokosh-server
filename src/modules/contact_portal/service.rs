@@ -69,6 +69,31 @@ pub const LOGIN_LINK_TOKEN_TYP: &str = "contact_login_select";
 const LOGIN_INTENT_MAX_PER_IP_PER_MINUTE: i64 = 20;
 const LOGIN_INTENT_MAX_PER_EMAIL_PER_15_MIN: i64 = 5;
 
+/// PMS-1659 finding: eight sites used
+/// `serde_json::from_value(...).unwrap_or_default()` on tenant /
+/// company branding JSONB, so a corrupt stored document read as "no
+/// branding" with no trace. Keep the fallback (the invoice / email
+/// path must still render) but WARN with the tenant/company id and
+/// the decode error so the drift is findable.
+fn decode_branding_or_default<T: Default + serde::de::DeserializeOwned>(
+    label: &str,
+    scope_id: Uuid,
+    raw: serde_json::Value,
+) -> T {
+    match serde_json::from_value(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                label = label,
+                scope_id = %scope_id,
+                error = %e,
+                "contact-portal: branding failed to decode; reading as default"
+            );
+            T::default()
+        }
+    }
+}
+
 /// mokosh-contact-login prompt 004: contact-portal auth service.
 ///
 /// Clone-cheap - holds a `Database` handle + a jwt_secret + a builder
@@ -828,9 +853,9 @@ impl ContactAuthService {
         .await?;
         let caps = self.load_capabilities(tenant_id, contact_id).await?;
         let tenant_b: mokosh_types::tenants::TenantBranding =
-            serde_json::from_value(tenant_branding).unwrap_or_default();
+            decode_branding_or_default("tenant", tenant_id, tenant_branding);
         let company_b: mokosh_types::contacts::CompanyBranding =
-            serde_json::from_value(company_branding).unwrap_or_default();
+            decode_branding_or_default("company", cid, company_branding);
         // MAPPS-807: the customer's brand names the MSP even when no branding
         // name was configured, the way the MSP's emails already do.
         let effective_branding = crate::modules::branding::effective::customer_branding(
@@ -893,10 +918,25 @@ impl ContactAuthService {
                 tenant_branding,
                 company_branding,
             )| {
+                // PMS-1659 finding: WARN on decode failure. No tenant /
+                // company id in this closure, so key the log off the
+                // portal slug (the public identifier for this row).
                 let tenant_b: mokosh_types::tenants::TenantBranding =
-                    serde_json::from_value(tenant_branding).unwrap_or_default();
+                    match serde_json::from_value(tenant_branding) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(portal_slug = %slug, error = %e, "contact-portal resolve_host: tenant.branding failed to decode");
+                            Default::default()
+                        }
+                    };
                 let company_b: mokosh_types::contacts::CompanyBranding =
-                    serde_json::from_value(company_branding).unwrap_or_default();
+                    match serde_json::from_value(company_branding) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(portal_slug = %slug, error = %e, "contact-portal resolve_host: company.branding failed to decode");
+                            Default::default()
+                        }
+                    };
                 let effective_branding = crate::modules::branding::effective::customer_branding(
                     &tenant_b,
                     &company_b,
@@ -960,10 +1000,24 @@ impl ContactAuthService {
                 tenant_branding,
                 company_branding,
             )| {
+                // PMS-1659 finding: WARN on decode failure. Key by
+                // portal_id (the public identifier for this lookup).
                 let tenant_b: mokosh_types::tenants::TenantBranding =
-                    serde_json::from_value(tenant_branding).unwrap_or_default();
+                    match serde_json::from_value(tenant_branding) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(portal_id = portal_id, error = %e, "contact-portal resolve_host_by_portal_id: tenant.branding failed to decode");
+                            Default::default()
+                        }
+                    };
                 let company_b: mokosh_types::contacts::CompanyBranding =
-                    serde_json::from_value(company_branding).unwrap_or_default();
+                    match serde_json::from_value(company_branding) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(portal_id = portal_id, error = %e, "contact-portal resolve_host_by_portal_id: company.branding failed to decode");
+                            Default::default()
+                        }
+                    };
                 let effective_branding = crate::modules::branding::effective::customer_branding(
                     &tenant_b,
                     &company_b,
@@ -2726,9 +2780,9 @@ impl ContactAuthService {
         .ok_or_else(|| AppError::not_found("company"))?;
         let (tenant_json, company_json) = row;
         let tenant: mokosh_types::tenants::TenantBranding =
-            serde_json::from_value(tenant_json).unwrap_or_default();
+            decode_branding_or_default("tenant", tenant_id, tenant_json);
         let company: mokosh_types::contacts::CompanyBranding =
-            serde_json::from_value(company_json).unwrap_or_default();
+            decode_branding_or_default("company", company_id, company_json);
         let effective = crate::modules::branding::effective::effective_branding(&tenant, &company);
         Ok(super::models::ContactOwnCompanyBranding {
             tenant,
