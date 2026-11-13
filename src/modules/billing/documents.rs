@@ -428,10 +428,31 @@ fn document_file_id(document_id: Uuid) -> Uuid {
 /// `None` for a draft, and for anything issued before PMS-959; the caller
 /// renders live in that case, which is what those documents always did.
 pub async fn read_issued(tenant_id: Uuid, document_id: Uuid) -> Option<Vec<u8>> {
-    crate::storage::shared()
+    // PMS-1660 finding: `.ok()` used to discard every storage error
+    // including I/O, permission and corrupt-backend faults, so a
+    // read failure was indistinguishable from "no stored copy" and
+    // the caller fell back to a live render - for a sent invoice
+    // that is a different byte stream than the client holds. Match
+    // on `NotFound` specifically: only "nothing at this key" returns
+    // None (the legitimate "render live" path); any other error logs
+    // and still returns None (the caller cannot propagate), so an
+    // operator has the breadcrumb to grep for.
+    match crate::storage::shared()
         .read(&ObjectKey::financial_document(tenant_id, document_id))
         .await
-        .ok()
+    {
+        Ok(bytes) => Some(bytes),
+        Err(crate::utils::error::AppError::NotFound(_)) => None,
+        Err(e) => {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                document_id = %document_id,
+                error = ?e,
+                "read_issued: stored financial document read failed; falling back to live render"
+            );
+            None
+        }
+    }
 }
 
 /// Build the statement document.

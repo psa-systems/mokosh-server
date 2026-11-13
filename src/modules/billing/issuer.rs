@@ -240,10 +240,27 @@ async fn copy_logo(
 pub async fn logo_bytes(tenant_id: Uuid, issuer: &Issuer) -> Option<Vec<u8>> {
     let digest = issuer.logo_digest.as_deref()?;
     let store = crate::storage::shared();
-    store
+    // PMS-1660 finding: `.ok()` used to collapse every read error to
+    // None, so a missing-key fallthrough was indistinguishable from
+    // a permission denied / backend outage. Distinguish `NotFound`
+    // (returns None, the documented behaviour) from any other error
+    // (WARN before returning None so the drift is findable).
+    match store
         .read(&ObjectKey::branding_logo(tenant_id, digest))
         .await
-        .ok()
+    {
+        Ok(bytes) => Some(bytes),
+        Err(crate::utils::error::AppError::NotFound(_)) => None,
+        Err(e) => {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                digest = digest,
+                error = ?e,
+                "logo_bytes: frozen logo read failed; rendering without a logo"
+            );
+            None
+        }
+    }
 }
 
 /// PMS-911: the CURRENT logo, for a document that is not snapshotted.
@@ -256,10 +273,37 @@ pub async fn live_logo_bytes(tenant_id: Uuid, issuer: &Issuer) -> Option<Vec<u8>
     // `read` below never consults `max_bytes` (that cap only gates `store`), so a
     // malformed `TENANT_LOGO_MAX_BYTES` must not turn a rendered statement's logo
     // into a missing one; fall back to a value irrelevant to this call instead.
-    let config = crate::modules::tenants::logo::TenantLogoConfig::from_env()
-        .unwrap_or(crate::modules::tenants::logo::TenantLogoConfig { max_bytes: 0 });
+    //
+    // PMS-1660 finding: an unparseable config used to be swallowed by
+    // `unwrap_or`. WARN before falling back so the drift is findable
+    // and the operator can tell apart "env unset" from "env misparsed".
+    let config = match crate::modules::tenants::logo::TenantLogoConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                error = ?e,
+                "live_logo_bytes: TenantLogoConfig::from_env failed; using max_bytes=0 placeholder"
+            );
+            crate::modules::tenants::logo::TenantLogoConfig { max_bytes: 0 }
+        }
+    };
     let logos = TenantLogoStore::new(config);
-    logos.read(tenant_id, mime).await.ok()
+    // PMS-1660 finding: same read-vs-NotFound distinction as
+    // `logo_bytes` above.
+    match logos.read(tenant_id, mime).await {
+        Ok(bytes) => Some(bytes),
+        Err(crate::utils::error::AppError::NotFound(_)) => None,
+        Err(e) => {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                mime = mime,
+                error = ?e,
+                "live_logo_bytes: tenant logo read failed; rendering without a logo"
+            );
+            None
+        }
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
