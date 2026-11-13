@@ -1009,7 +1009,7 @@ async fn get_invoice_pdf(
     // the provider, which Mokosh cannot authenticate this caller for.
     if let Some(provider) = invoice.external_provider.as_deref() {
         return Err(AppError::Conflict(format!(
-            "This invoice was issued by {provider}, so its document is {provider}'s. Open it              there{}.",
+            "This invoice was issued by {provider}, so its document is {provider}'s. Open it there{}.",
             invoice
                 .external_number
                 .as_deref()

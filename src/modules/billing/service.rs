@@ -6315,30 +6315,6 @@ impl BillingService {
         Ok(invoice)
     }
 
-    /// PMS-1333: void an invoice. The document never stood.
-    ///
-    /// The other half of the credit-note fix: `void` had no writer of its own,
-    /// only the arm in [`Self::recompute_invoice_balance`] that fired when
-    /// credits covered an invoice's total, and three comments (here, in
-    /// `update_invoice`, and in the refusal `update_invoice` returns) named a
-    /// `void_invoice` that did not exist. PMS-1227 then closed the one path a
-    /// client had, `PUT /invoices/{id}` with `{"status":"void"}`, so voiding a
-    /// draft answered 422 and pointed at this method. This is it.
-    ///
-    /// Allowed from `draft` and `pending` only, and that bound is the product
-    /// rule rather than a cautious default: once an invoice is `sent` the
-    /// customer holds a copy and can quote its number back, so it is frozen
-    /// (`InvoiceStatus::is_frozen`) and its correction is a credit note
-    /// (PMS-953), which is what `locked_invoice_note` on the client already
-    /// tells the operator. Refused with a 409 naming the status from
-    /// everything else.
-    ///
-    /// Unlike a write-off (PMS-1036) this freezes no amount. A write-off
-    /// forgives a debt that was genuinely owed, so the balance at that moment
-    /// is the number the books need; a void says nothing was ever owed, and an
-    /// invoice that never left `draft` or `pending` has no payments, no
-    /// credits and no statement line to reconcile against.
-    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     /// PMS-1334: amend a sent invoice, which means replace it rather than edit
     /// it. Answers the new DRAFT.
     ///
@@ -6540,7 +6516,31 @@ impl BillingService {
         Ok(amendment)
     }
 
+    /// PMS-1333: void an invoice. The document never stood.
+    ///
+    /// The other half of the credit-note fix: `void` had no writer of its own,
+    /// only the arm in [`Self::recompute_invoice_balance`] that fired when
+    /// credits covered an invoice's total, and three comments (here, in
+    /// `update_invoice`, and in the refusal `update_invoice` returns) named a
+    /// `void_invoice` that did not exist. PMS-1227 then closed the one path a
+    /// client had, `PUT /invoices/{id}` with `{"status":"void"}`, so voiding a
+    /// draft answered 422 and pointed at this method. This is it.
+    ///
+    /// Allowed from `draft` and `pending` only, and that bound is the product
+    /// rule rather than a cautious default: once an invoice is `sent` the
+    /// customer holds a copy and can quote its number back, so it is frozen
+    /// (`InvoiceStatus::is_frozen`) and its correction is a credit note
+    /// (PMS-953), which is what `locked_invoice_note` on the client already
+    /// tells the operator. Refused with a 409 naming the status from
+    /// everything else.
+    ///
+    /// Unlike a write-off (PMS-1036) this freezes no amount. A write-off
+    /// forgives a debt that was genuinely owed, so the balance at that moment
+    /// is the number the books need; a void says nothing was ever owed, and an
+    /// invoice that never left `draft` or `pending` has no payments, no
+    /// credits and no statement line to reconcile against.
     // SPEC-13.117
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn void_invoice(
         &self,
         tenant_id: TenantId,
