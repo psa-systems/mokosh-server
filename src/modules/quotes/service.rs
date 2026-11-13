@@ -259,7 +259,21 @@ impl QuotesService {
                 .fetch_optional(&mut *tx)
                 .await?;
         let raw = raw.ok_or_else(|| AppError::NotFound("Quote".to_string()))?;
-        Ok(QuoteStatus::from_str(&raw).unwrap_or(QuoteStatus::Draft))
+        // PMS-1661 F2: an unknown stored status used to map to Draft
+        // silently, and Draft is editable + settable, so a corrupt
+        // status read as editable (SPEC-13.17 wants a loud error).
+        // `status_of` is reached before every content check, so a fail
+        // here propagates cleanly up the flow.
+        QuoteStatus::from_str(&raw).ok_or_else(|| {
+            tracing::warn!(
+                quote_id = %quote_id,
+                stored = %raw,
+                "quotes.status is not one of the known values; refusing the operation"
+            );
+            AppError::Internal(format!(
+                "quote {quote_id} has an unknown stored status {raw:?}"
+            ))
+        })
     }
 
     // SPEC-13.1368
@@ -1416,8 +1430,19 @@ impl QuotesService {
         .await?;
         let (row_company, raw_status, valid_until) =
             row.ok_or_else(|| AppError::NotFound("Quote".to_string()))?;
-        let stored = QuoteStatus::from_str(&raw_status).unwrap_or(QuoteStatus::Draft);
         // SPEC-13.1385
+        // Fail loud on an unknown stored status; an editable Draft
+        // default silently reached a decision path here.
+        let stored = QuoteStatus::from_str(&raw_status).ok_or_else(|| {
+            tracing::warn!(
+                quote_id = %quote_id,
+                stored = %raw_status,
+                "quotes.status is not one of the known values on decide_quote"
+            );
+            AppError::Internal(format!(
+                "quote {quote_id} has an unknown stored status {raw_status:?}"
+            ))
+        })?;
         if row_company != decision.company_id || !stored.is_client_visible() {
             return Err(AppError::NotFound("Quote".to_string()));
         }
@@ -1581,7 +1606,18 @@ impl QuotesService {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Quote".to_string()))?;
-        let status = QuoteStatus::from_str(&row.status).unwrap_or(QuoteStatus::Draft);
+        // PMS-1661 F2: fail loud on an unknown stored status.
+        let status = QuoteStatus::from_str(&row.status).ok_or_else(|| {
+            tracing::warn!(
+                quote_id = %quote_id,
+                stored = %row.status,
+                "quotes.status is not one of the known values on convert"
+            );
+            AppError::Internal(format!(
+                "quote {quote_id} has an unknown stored status {:?}",
+                row.status
+            ))
+        })?;
 
         // Already converted: return the existing link rather than 409ing.
         // A double-clicked Convert button is not an error, and the caller
@@ -1858,9 +1894,26 @@ struct QuoteLineRow {
 
 impl From<QuoteLineRow> for QuoteLineResponse {
     fn from(r: QuoteLineRow) -> Self {
+        // PMS-1661 F3: an unknown stored line_type used to map to
+        // Service with no trace. The From impl cannot propagate;
+        // keep the Service fallback (the response must still render)
+        // but WARN with the line id + stored value so the drift is
+        // findable, mirroring the enum-decode WARN shape in
+        // PMS-1662/1663/1664.
+        let line_type = {
+            let parsed = QuoteLineType::from_str(&r.line_type);
+            if parsed.is_none() {
+                tracing::warn!(
+                    line_id = %r.id,
+                    stored = %r.line_type,
+                    "quote_lines.line_type is not one of the known values; reading as Service"
+                );
+            }
+            parsed.unwrap_or(QuoteLineType::Service)
+        };
         Self {
             id: r.id,
-            line_type: QuoteLineType::from_str(&r.line_type).unwrap_or(QuoteLineType::Service),
+            line_type,
             description: r.description,
             quantity: r.quantity,
             unit_price: r.unit_price,
@@ -1926,11 +1979,20 @@ impl QuoteRow {
             // `valid_until` reports as `expired` even though the stored
             // column still says `sent`. See `effective_status`.
             // SPEC-13.1357
-            status: effective_status(
-                QuoteStatus::from_str(&r.status).unwrap_or(QuoteStatus::Draft),
-                r.valid_until,
-                today,
-            ),
+            // WARN on unknown stored status rather than silently
+            // reading as Draft; this row-to-response path cannot
+            // propagate the error.
+            status: {
+                let stored = QuoteStatus::from_str(&r.status).unwrap_or_else(|| {
+                    tracing::warn!(
+                        quote_id = %r.id,
+                        stored = %r.status,
+                        "quotes.status is not one of the known values on row-to-response; reading as Draft"
+                    );
+                    QuoteStatus::Draft
+                });
+                effective_status(stored, r.valid_until, today)
+            },
             valid_until: r.valid_until,
             subtotal: r.subtotal,
             tax_amount: r.tax_amount,
