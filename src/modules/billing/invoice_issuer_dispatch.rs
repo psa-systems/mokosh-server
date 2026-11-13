@@ -1499,9 +1499,18 @@ pub struct CreateInvoiceRequestShape<'a> {
 /// of a major unit, so `12.34` -> `1234`). The Xero and QuickBooks
 /// clients both take `i64` minor units in; this is the one place the
 /// decimal-to-integer conversion lives.
+///
+/// PMS-1660: `round_dp(0)` defaults to `MidpointNearestEven` (banker's
+/// rounding), so a midpoint rounded to the nearest EVEN integer. The
+/// `invoice_lines` writer rounds half-away-from-zero (and the sibling
+/// test below pins that rule as the contract), so a `122.5` minor-unit
+/// value stored as `12.25 * 100 = 1225` tenths would land on `122`
+/// here and `123` in the row that was already sent to the customer,
+/// causing the dispatched provider total to diverge from the issued
+/// invoice. Use `MidpointAwayFromZero` explicitly.
 fn decimal_to_minor(d: Decimal) -> i64 {
     (d * Decimal::from(100))
-        .round_dp(0)
+        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
         .to_i64()
         .unwrap_or_default()
 }
@@ -1534,5 +1543,20 @@ mod tests {
     fn decimal_to_minor_rounds_half_away_from_zero() {
         assert_eq!(decimal_to_minor(Decimal::new(1235, 3)), 124); // 1.235 -> 1.24
         assert_eq!(decimal_to_minor(Decimal::new(-1235, 3)), -124);
+    }
+
+    /// PMS-1660: the old `round_dp(0)` defaulted to banker's rounding,
+    /// which agreed with half-away-from-zero at `.235` (last-rounded
+    /// digit was odd either way) but disagreed on even-digit midpoints:
+    /// `1.225` landed on `122` under banker's and `123` under
+    /// half-away-from-zero, so the dispatched total drifted from the
+    /// row the customer already holds. Pin both cases so a future
+    /// regression trips here.
+    #[test]
+    fn decimal_to_minor_rounds_even_midpoints_away_from_zero() {
+        assert_eq!(decimal_to_minor(Decimal::new(1225, 3)), 123); // 1.225 -> 1.23
+        assert_eq!(decimal_to_minor(Decimal::new(-1225, 3)), -123);
+        assert_eq!(decimal_to_minor(Decimal::new(1245, 3)), 125); // 1.245 -> 1.25
+        assert_eq!(decimal_to_minor(Decimal::new(-1245, 3)), -125);
     }
 }
