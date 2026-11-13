@@ -302,24 +302,34 @@ pub fn demo_projects(company_ids: &[Uuid], manager_id: Uuid) -> Vec<DemoProjectB
 /// from the applicable policy, and the durable "this client is on an SLA"
 /// relationship is carried by the company's `sla_id`, not the ticket's.
 pub fn demo_tickets(company_ids: &[Uuid], contact_ids: &[Uuid]) -> Vec<CreateTicketRequest> {
-    demo_seed()
-        .tickets
-        .iter()
-        .filter_map(|t| {
-            // A ticket needs a company; skip any whose index does not resolve
-            // (only possible from a malformed bundle, which the tests catch).
-            let company_id = company_ids.get(t.company_index).copied()?;
-            Some(CreateTicketRequest {
-                title: t.title.clone(),
-                description: Some(t.description.clone()),
-                company_id,
-                contact_id: contact_ids.get(t.contact_index).copied(),
-                is_billable: true,
-                tags: vec!["demo".to_string()],
-                ..Default::default()
-            })
-        })
-        .collect()
+    let mut out = Vec::new();
+    for t in demo_seed().tickets.iter() {
+        // A ticket needs a company; skip any whose index does not resolve
+        // (only possible from a malformed bundle, which the tests catch).
+        //
+        // `filter_map` used to drop a dangling ticket with no trace, so a
+        // malformed bundle that slipped past the tests would seed a tenant
+        // with fewer tickets than the bundle promises and leave nothing to
+        // grep. Log the index + title before skipping.
+        let Some(company_id) = company_ids.get(t.company_index).copied() else {
+            tracing::warn!(
+                company_index = t.company_index,
+                title = %t.title,
+                "demo ticket references an unknown company index; skipping"
+            );
+            continue;
+        };
+        out.push(CreateTicketRequest {
+            title: t.title.clone(),
+            description: Some(t.description.clone()),
+            company_id,
+            contact_id: contact_ids.get(t.contact_index).copied(),
+            is_billable: true,
+            tags: vec!["demo".to_string()],
+            ..Default::default()
+        });
+    }
+    out
 }
 
 #[cfg(test)]
