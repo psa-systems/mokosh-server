@@ -338,7 +338,16 @@ impl QuotesService {
             cq = cq.bind(status);
         }
         if let Some(ref s) = filter.q {
-            let pattern = format!("%{s}%");
+            // Escape SQL-LIKE wildcards so a user typing `%` or `_` matches
+            // the literal character. Postgres ILIKE defaults its escape
+            // character to `\` when `ESCAPE` is omitted, so prefix each
+            // wildcard with a single backslash; the backslash itself is
+            // doubled first so a user-typed `\` does not vanish.
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let pattern = format!("%{escaped}%");
             q = q.bind(pattern.clone());
             cq = cq.bind(pattern);
         }
