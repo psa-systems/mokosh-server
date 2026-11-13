@@ -633,3 +633,60 @@ async fn the_quote_email_links_to_the_portal_login_returning_to_the_quote(pool: 
         "the retired route must never be emailed again:\n{body}"
     );
 }
+
+/// PMS-1661 finding 11: `QuoteDecisionBody.notes` was an unbounded free-
+/// text field on an auth-gated route. A contact could amplify a request
+/// into a megabyte-sized stored note. Validate max 2000, same bound the
+/// (previously unused) `PortalQuoteDecisionRequest` had carried.
+#[mokosh_test]
+async fn client_accept_refuses_an_oversized_decision_note(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company = seed_company_named(&pool, "Client Notes").await;
+    let contact = seed_portal_contact(&pool, company, "notes@example.com").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let quote = create_quote(
+        &app,
+        &token,
+        serde_json::json!({
+            "company_id": company, "billing_contact_id": contact.id, "title": "To decide",
+            "lines": [{"line_type":"service","description":"Build","quantity":"1","unit_price":"1000"}],
+        }),
+    )
+    .await;
+    let quote_id = quote["id"].as_str().unwrap().to_string();
+    approve(&app, &token, &quote_id).await;
+    assert_eq!(
+        send_quote(&app, &token, &quote_id).await.status(),
+        StatusCode::OK
+    );
+
+    let portal = common::contact_token(&app, &contact).await;
+    let oversized = "x".repeat(2001);
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/quotes/{quote_id}/accept")))
+        .bearer_auth(&portal)
+        .json(&serde_json::json!({ "notes": oversized }))
+        .send()
+        .await
+        .expect("accept with oversized notes");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "notes > 2000 chars must 422, got {}",
+        resp.status()
+    );
+
+    // And a well-sized note still accepts.
+    let ok = app
+        .client
+        .post(app.url(&format!("/api/v1/quotes/{quote_id}/accept")))
+        .bearer_auth(&portal)
+        .json(&serde_json::json!({ "notes": "looks good" }))
+        .send()
+        .await
+        .expect("accept with sane notes");
+    assert_eq!(ok.status(), StatusCode::OK, "sane notes must still accept");
+}
