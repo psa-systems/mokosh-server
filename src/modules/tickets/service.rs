@@ -745,25 +745,36 @@ impl TicketService {
         .await?;
 
         // SPEC-7.7: only fields actually present in the request get an UPDATE; an omitted field is never overwritten (PATCH semantics).
-        // Build update
+        // PMS-1682: one dynamic UPDATE via QueryBuilder instead of up to 22
+        // sequential single-field statements. Each present field appends
+        // `col = $N`; the unconditional last_updated_by_id/updated_at pair
+        // and the WHERE clause are appended once at the end, so a K-field
+        // PATCH costs one round trip regardless of K.
+        let mut qb: sqlx::QueryBuilder<'_, sqlx::Postgres> =
+            sqlx::QueryBuilder::new("UPDATE tickets SET ");
+        let mut first = true;
+        let mut touched = false;
+        let push = |qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>,
+                    first: &mut bool,
+                    touched: &mut bool,
+                    col: &str| {
+            if !*first {
+                qb.push(", ");
+            }
+            qb.push(col);
+            qb.push(" = ");
+            *first = false;
+            *touched = true;
+        };
+
         if let Some(ref title) = request.title {
-            sqlx::query("UPDATE tickets SET title = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(title)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "title");
+            qb.push_bind(title.clone());
         }
 
         if let Some(ref description) = request.description {
-            sqlx::query("UPDATE tickets SET description = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(description)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "description");
+            qb.push_bind(description.clone());
         }
 
         if let Some(status_id) = request.status_id {
@@ -775,57 +786,26 @@ impl TicketService {
                     .fetch_one(&mut *tx)
                     .await?;
 
+            push(&mut qb, &mut first, &mut touched, "status_id");
+            qb.push_bind(status_id);
             if is_closed && ticket.closed_at.is_none() {
-                sqlx::query(
-                    "UPDATE tickets SET status_id = $1, closed_at = NOW(), resolved_at = COALESCE(resolved_at, NOW()), last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4",
-                )
-                .bind(status_id)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
-            } else {
-                sqlx::query(
-                    "UPDATE tickets SET status_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4",
-                )
-                .bind(status_id)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+                qb.push(", closed_at = NOW(), resolved_at = COALESCE(resolved_at, NOW())");
             }
         }
 
         if let Some(priority_id) = request.priority_id {
-            sqlx::query("UPDATE tickets SET priority_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(priority_id)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "priority_id");
+            qb.push_bind(priority_id);
         }
 
         if let Some(assigned_to_id) = request.assigned_to_id {
-            sqlx::query("UPDATE tickets SET assigned_to_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(assigned_to_id)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "assigned_to_id");
+            qb.push_bind(assigned_to_id);
         }
 
         if let Some(queue_id) = request.queue_id {
-            sqlx::query("UPDATE tickets SET queue_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(queue_id)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "queue_id");
+            qb.push_bind(queue_id);
         }
 
         // PMS-344 follow-up: PATCH-style nullable update for asset_id.
@@ -835,13 +815,8 @@ impl TicketService {
         // FK but never ran an UPDATE, so the picker's PUT round-tripped
         // with a bare "Updated" audit row and no actual mutation.
         if let Some(asset_id_opt) = request.asset_id {
-            sqlx::query("UPDATE tickets SET asset_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(asset_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "asset_id");
+            qb.push_bind(asset_id_opt);
         }
 
         // PMS-1565: the remaining `UpdateTicketRequest` fields, previously
@@ -850,143 +825,83 @@ impl TicketService {
         // `asset_id` PATCH convention just above: `Some(None)` clears the
         // column, `Some(Some(v))` sets it, `None` leaves it untouched.
         if let Some(type_id_opt) = request.type_id {
-            sqlx::query("UPDATE tickets SET type_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(type_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "type_id");
+            qb.push_bind(type_id_opt);
         }
 
         if let Some(category_id_opt) = request.category_id {
-            sqlx::query("UPDATE tickets SET category_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(category_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "category_id");
+            qb.push_bind(category_id_opt);
         }
 
         if let Some(contact_id_opt) = request.contact_id {
-            sqlx::query("UPDATE tickets SET contact_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(contact_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "contact_id");
+            qb.push_bind(contact_id_opt);
         }
 
         if let Some(site_id_opt) = request.site_id {
-            sqlx::query("UPDATE tickets SET site_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(site_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "site_id");
+            qb.push_bind(site_id_opt);
         }
 
         if let Some(team_id_opt) = request.team_id {
-            sqlx::query("UPDATE tickets SET team_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(team_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "team_id");
+            qb.push_bind(team_id_opt);
         }
 
         if let Some(contract_id_opt) = request.contract_id {
-            sqlx::query("UPDATE tickets SET contract_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(contract_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "contract_id");
+            qb.push_bind(contract_id_opt);
         }
 
         if let Some(sla_id_opt) = request.sla_id {
-            sqlx::query("UPDATE tickets SET sla_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(sla_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "sla_id");
+            qb.push_bind(sla_id_opt);
         }
 
         if let Some(scheduled_start_opt) = request.scheduled_start {
-            sqlx::query("UPDATE tickets SET scheduled_start = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(scheduled_start_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "scheduled_start");
+            qb.push_bind(scheduled_start_opt);
         }
 
         if let Some(scheduled_end_opt) = request.scheduled_end {
-            sqlx::query("UPDATE tickets SET scheduled_end = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(scheduled_end_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "scheduled_end");
+            qb.push_bind(scheduled_end_opt);
         }
 
         if let Some(estimated_hours_opt) = request.estimated_hours {
-            sqlx::query("UPDATE tickets SET estimated_hours = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(estimated_hours_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "estimated_hours");
+            qb.push_bind(estimated_hours_opt);
         }
 
         if let Some(is_billable) = request.is_billable {
-            sqlx::query("UPDATE tickets SET is_billable = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(is_billable)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "is_billable");
+            qb.push_bind(is_billable);
         }
 
         if let Some(billing_status) = request.billing_status {
-            sqlx::query("UPDATE tickets SET billing_status = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(billing_status.as_str())
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "billing_status");
+            qb.push_bind(billing_status.as_str());
         }
 
         if let Some(ref custom_fields) = request.custom_fields {
-            sqlx::query("UPDATE tickets SET custom_fields = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(custom_fields)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "custom_fields");
+            qb.push_bind(custom_fields.clone());
         }
 
         if let Some(ref tags) = request.tags {
-            sqlx::query("UPDATE tickets SET tags = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(tags)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "tags");
+            qb.push_bind(tags.clone());
+        }
+
+        if touched {
+            push(&mut qb, &mut first, &mut touched, "last_updated_by_id");
+            qb.push_bind(user_id);
+            qb.push(", updated_at = NOW() WHERE tenant_id = ");
+            qb.push_bind(tenant_id);
+            qb.push(" AND id = ");
+            qb.push_bind(ticket_id);
+            qb.build().execute(&mut *tx).await?;
         }
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
