@@ -23,6 +23,7 @@ pub struct ParsedStep {
     pub text: String,
 }
 
+// SPEC-15.1111
 /// Scan `rendered` for GFM task-list items; see module docs for the
 /// shapes accepted. Fenced code blocks are tracked and skipped.
 pub fn parse_steps(rendered: &str) -> Vec<ParsedStep> {
@@ -61,6 +62,7 @@ pub fn parse_steps(rendered: &str) -> Vec<ParsedStep> {
     out
 }
 
+// SPEC-15.1111
 /// Return the fence marker character of a line that opens or closes a
 /// fenced code block, or `None` for any other line. A fence is a run
 /// of three or more identical backticks or tildes; anything after the
@@ -78,6 +80,7 @@ fn fence_marker_of(trimmed: &str) -> Option<char> {
     }
 }
 
+// SPEC-15.1111
 /// Parse a trimmed line as a task-list item. Returns `None` if the
 /// line is not a task-list item in either the unordered or ordered
 /// shape.

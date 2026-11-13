@@ -31,6 +31,7 @@ use crate::utils::error::{AppError, AppResult};
 /// space nobody-else has to guess is exactly that.
 const SECRET_LEN: usize = 32;
 
+// SPEC-5.228
 /// Default TTL for a fresh invite. Callers may override for tests;
 /// the parent ticket names 7 days to match Cloudflare's window.
 pub const DEFAULT_TTL: Duration = Duration::days(7);
@@ -88,6 +89,7 @@ pub enum AcceptRefusal {
 pub struct GrantInvitationsService;
 
 impl GrantInvitationsService {
+    // SPEC-5.228, SPEC-5.229
     /// Create a pending invitation and return the row + the
     /// plaintext accept token. The plaintext is only ever handed
     /// back here; the row stores only its Argon2 hash.
@@ -150,6 +152,7 @@ impl GrantInvitationsService {
         })
     }
 
+    // SPEC-5.230
     /// Resolve a plaintext token from the invitation email link
     /// to a row. `Ok(None)` covers a malformed token, an unknown
     /// id, and a mismatched secret; only a real match returns the
@@ -203,6 +206,7 @@ impl GrantInvitationsService {
         Ok(Some(invitation))
     }
 
+    // SPEC-5.231
     /// Every PENDING invite the tenant admin sent. Ordered
     /// newest-first because that is how the owner outbox reads:
     /// "what did I do most recently."
@@ -226,6 +230,7 @@ impl GrantInvitationsService {
         Ok(rows)
     }
 
+    // SPEC-5.232
     /// Every PENDING invite for one bunyip user across all
     /// tenants. This is the grantee inbox; runs cross-tenant so
     /// the caller passes their own `sub` and reads back invites
@@ -251,6 +256,7 @@ impl GrantInvitationsService {
         Ok(rows)
     }
 
+    // SPEC-5.233, SPEC-5.234
     /// Owner cancels a pending invite. Returns `Ok(true)` when a
     /// row was moved to `canceled`; `Ok(false)` when the id names
     /// a row in a terminal state already (idempotent), and does
@@ -308,6 +314,7 @@ impl GrantInvitationsService {
         Ok(true)
     }
 
+    // SPEC-5.241: by-token accept
     /// Grantee accepts. Runs one transaction: verifies the token
     /// AGAIN against the row (belt-and-braces on `find_by_token`
     /// racing another accept), gates on status + expiry + caller,
@@ -343,6 +350,7 @@ impl GrantInvitationsService {
         .await
     }
 
+    // SPEC-5.241
     /// PMS-1500: id-scoped accept for a grantee acting on an inbox row.
     /// Looks the invitation up by (id, invitee_bunyip_user_id = caller) so a
     /// caller cannot act on someone else's invitation; a mismatch returns
@@ -371,6 +379,7 @@ impl GrantInvitationsService {
         .await
     }
 
+    // SPEC-5.241
     /// PMS-1500: id-scoped decline, shaped like `accept_by_id`.
     pub async fn decline_by_id(
         pool: &PgPool,
@@ -385,6 +394,7 @@ impl GrantInvitationsService {
         Self::decline_resolved(pool, invitation, caller_bunyip_user_id).await
     }
 
+    // SPEC-5.242
     /// PMS-1500: look up an invitation by id, scoped to a grantee. Returns
     /// `Some` only when the invitation is bound to the caller directly
     /// (`invitee_bunyip_user_id = caller`) OR when the row is email-only
@@ -422,6 +432,7 @@ impl GrantInvitationsService {
         Ok(row)
     }
 
+    // SPEC-5.235, SPEC-5.236, SPEC-5.237, SPEC-5.238, SPEC-5.239, SPEC-5.240
     async fn accept_resolved(
         pool: &PgPool,
         invitation: GrantInvitation,
@@ -613,6 +624,7 @@ impl GrantInvitationsService {
         Self::decline_resolved(pool, invitation, caller_bunyip_user_id).await
     }
 
+    // SPEC-5.235, SPEC-5.243
     async fn decline_resolved(
         pool: &PgPool,
         invitation: GrantInvitation,
@@ -659,6 +671,7 @@ impl GrantInvitationsService {
         })
     }
 
+    // SPEC-5.244
     /// Scheduler entry point: mark every pending row past its
     /// expiry as `expired`. Returns the number of rows moved so
     /// the scheduler can log volume. Idempotent by construction:

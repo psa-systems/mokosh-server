@@ -30,18 +30,22 @@ use crate::utils::error::{AppError, AppResult};
 use super::models::*;
 
 /// 15 min. Same as the pre-pivot portal token.
+// SPEC-5.437
 const ACCESS_TOKEN_TTL_MIN: i64 = 15;
 /// 30 days. Same as the pre-pivot portal refresh token.
+// SPEC-5.438
 const REFRESH_TOKEN_TTL_DAYS: i64 = 30;
 
 /// The JWT `typ` claim value that identifies a contact-plane token.
 /// Middleware (`portal_contact_middleware`) checks this string
 /// exactly so a staff-plane bearer cannot cross the plane.
+// SPEC-5.429
 pub const CONTACT_TOKEN_TYP: &str = "contact";
 
 /// mokosh-contact-login prompt 010 (PMS-918): magic-link intent TTL.
 /// 15 min - long enough to check email + short enough to blunt
 /// exposure of a leaked link.
+// SPEC-5.465
 pub const LOGIN_INTENT_TTL_MIN: i64 = 15;
 
 /// mokosh-contact-login prompt 010: TTL of the intermediate
@@ -61,6 +65,7 @@ pub const LOGIN_LINK_TOKEN_TYP: &str = "contact_login_select";
 /// finder. Silent-drop shape: an over-limit request still returns
 /// 204 so an attacker cannot use the response shape as an
 /// enumeration oracle; it just doesn't insert or dispatch.
+// SPEC-5.464
 const LOGIN_INTENT_MAX_PER_IP_PER_MINUTE: i64 = 20;
 const LOGIN_INTENT_MAX_PER_EMAIL_PER_15_MIN: i64 = 5;
 
@@ -139,6 +144,7 @@ impl ContactAuthService {
     /// Every credential failure returns `AppError::Unauthorized` with
     /// the same message so the endpoint stays enumeration-resistant.
     // Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+    // SPEC-5.441, SPEC-5.442, SPEC-5.443, SPEC-5.444, SPEC-5.445, SPEC-5.446, SPEC-5.448, SPEC-5.499
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip_all)]
     pub async fn login(
@@ -361,6 +367,7 @@ impl ContactAuthService {
     /// secret is verified BEFORE the family is revoked: a session id
     /// is not a secret (it rides in the access token's `sid`), and a
     /// bare id must not be enough to sign a customer out.
+    // SPEC-5.450, SPEC-5.451, SPEC-5.452, SPEC-5.453, SPEC-5.454
     #[tracing::instrument(skip_all)]
     pub async fn refresh(
         &self,
@@ -520,6 +527,7 @@ impl ContactAuthService {
     /// and a family that somehow holds two live rows (a rotation
     /// race the refresh path lost) must not keep one alive past the
     /// customer's sign-out.
+    // SPEC-5.455
     #[tracing::instrument(skip_all)]
     pub async fn logout(
         &self,
@@ -559,6 +567,7 @@ impl ContactAuthService {
     /// PMS-1062: revoke every live session in one rotation family.
     /// Called by the replay branch of `refresh`, by `logout`, and when
     /// a refresh finds the contact's portal access gone.
+    // SPEC-5.456
     async fn revoke_session_family(&self, family_id: Uuid) -> AppResult<()> {
         sqlx::query(
             "UPDATE contact_sessions SET revoked_at = NOW() \
@@ -584,6 +593,7 @@ impl ContactAuthService {
     /// - valid, unused, unexpired -> Ok(())
     /// - already redeemed -> `AppError::Gone`
     /// - expired / malformed / unknown -> `AppError::BadRequest`
+    // SPEC-5.461
     #[tracing::instrument(skip_all)]
     pub async fn setup_password(&self, token: &str, new_password: &str) -> AppResult<()> {
         self.set_password_with_token(token, new_password, "portal.setup_password")
@@ -594,6 +604,7 @@ impl ContactAuthService {
     /// takes the audit subtype as an argument (PMS-1089): it served
     /// `reset_password` too until PMS-1343, and a later second redemption
     /// flow would name its own subtype the same way.
+    // SPEC-5.458, SPEC-5.459, SPEC-5.460, SPEC-5.461
     async fn set_password_with_token(
         &self,
         token: &str,
@@ -753,6 +764,7 @@ impl ContactAuthService {
     /// needs after a cold-load or a login. One JOIN so the SPA can
     /// render the top-bar + sidebar + capability gates without a
     /// second round-trip.
+    // SPEC-5.471
     pub async fn me(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<ContactMe> {
         // MAPPS-617: pull both branding JSONBs alongside the existing
         // top-bar / sidebar fields so `effective_branding` folds into
@@ -849,6 +861,7 @@ impl ContactAuthService {
     /// Public endpoint that returns branding + tenant status regardless
     /// of the tenant's active state so the SPA can render a suspended
     /// splash. Unknown slugs 404 (enumeration-resistant).
+    // SPEC-5.490
     pub async fn resolve_host(&self, slug: &str) -> AppResult<Option<ContactPortalHostHint>> {
         // MAPPS-617: pull both branding JSONBs so `effective_branding`
         // can resolve on this single round-trip; the SPA reads the
@@ -914,6 +927,7 @@ impl ContactAuthService {
     /// the slug column starts being deprecated; the returned hint
     /// carries the (possibly empty) slug value for backward compat with
     /// SPA code that still reads it.
+    // SPEC-5.490
     pub async fn resolve_host_by_portal_id(
         &self,
         portal_id: i64,
@@ -978,6 +992,7 @@ impl ContactAuthService {
     /// Returns `Ok(None)` when the slug is unknown OR when the
     /// matching Company has not been assigned a portal_id yet
     /// (upstream 404 either way, enum-resistant).
+    // SPEC-5.491
     pub async fn resolve_slug_to_portal_id(&self, slug: &str) -> AppResult<Option<i64>> {
         let row: Option<Option<i64>> =
             sqlx::query_scalar("SELECT portal_id FROM companies WHERE portal_slug = $1")
@@ -1008,6 +1023,7 @@ impl ContactAuthService {
     /// per-IP > 20 in 60 s and per-email > 5 in 15 min silently drop.
     /// Both counters query the table directly so no in-process
     /// middleware needs to be wired.
+    // SPEC-5.463, SPEC-5.464, SPEC-5.465, SPEC-5.466
     #[tracing::instrument(skip_all)]
     pub async fn request_login_link(
         &self,
@@ -1243,6 +1259,7 @@ impl ContactAuthService {
     /// Every link failure folds to the same generic 400 copy so the
     /// caller cannot tell WHY the token was rejected (expired vs.
     /// already-used vs. revoked vs. malformed).
+    // SPEC-5.467, SPEC-5.468, SPEC-5.469, SPEC-5.470
     #[tracing::instrument(skip_all)]
     pub async fn redeem_login_link(
         &self,
@@ -1539,6 +1556,7 @@ impl ContactAuthService {
     /// password to remember it" step before minting the session. On any
     /// pre-existing pending token this deletes it first so only the
     /// freshest link redeems.
+    // SPEC-5.469
     async fn mint_password_setup_url(
         &self,
         tenant_id: Uuid,
@@ -1582,6 +1600,7 @@ impl ContactAuthService {
     /// Shared session-minting used by `redeem_login_link` (single
     /// match) and `select_login_candidate` (multi match). Returns the
     /// same `ContactLoginResponse` shape the password login path uses.
+    // SPEC-5.449, SPEC-5.469
     async fn mint_session_for_contact(
         &self,
         tenant_id: Uuid,
@@ -1654,6 +1673,7 @@ impl ContactAuthService {
     /// cancel_tenant if we bring it back) kicks live contact
     /// sessions on the next fetch. Mirrors MAPPS-557 on the retired
     /// portal plane.
+    // SPEC-5.436
     pub async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
         // SAFETY (PMS-285 / PMS-692): `tenants` is the RLS-exempt isolation
         // root (migration 038: `table_name != 'tenants'`), so this single-
@@ -1691,6 +1711,7 @@ impl ContactAuthService {
     ///
     /// A `sid` naming no row leaves the sub-select NULL, which matches
     /// no family, so a purged session stays a refusal.
+    // SPEC-5.435
     pub async fn ensure_session_active(&self, tenant_id: Uuid, session_id: Uuid) -> AppResult<()> {
         let family_live: bool = sqlx::query_scalar(
             "SELECT EXISTS(\
@@ -1726,6 +1747,7 @@ impl ContactAuthService {
     ///
     /// Fails closed: any error (row gone, tenant gone) reads as `false`
     /// rather than propagating, so a caller only needs one bool check.
+    // SPEC-5.430, SPEC-5.436
     pub async fn contact_access_ok(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<bool> {
         if self.ensure_tenant_active(tenant_id).await.is_err() {
             return Ok(false);
@@ -1755,6 +1777,7 @@ impl ContactAuthService {
     /// mokosh-contact-login prompt 004: decode a Bearer token from
     /// request headers. Middleware calls this. Verifies signature +
     /// exp + typ.
+    // SPEC-5.429
     pub fn decode_token(&self, token: &str) -> AppResult<ContactJwtClaims> {
         let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
         validation.validate_exp = true;
@@ -1805,6 +1828,7 @@ impl ContactAuthService {
     /// The notification is best effort, after the row commits. A mail relay
     /// that is down must not lose the request: the row is what the MSP answers
     /// from, and the mail is how they find out to look.
+    // SPEC-5.485, SPEC-5.486
     pub async fn request_access(
         &self,
         session: &ContactSession,
@@ -1894,6 +1918,7 @@ impl ContactAuthService {
     /// nobody, and the request is still on the contact record where staff
     /// answer it - a gap that is stated rather than papered over with a guess
     /// at who the right person is.
+    // SPEC-5.487
     async fn notify_access_requested(
         &self,
         session: &ContactSession,
@@ -1967,6 +1992,7 @@ impl ContactAuthService {
         }
     }
 
+    // SPEC-5.472
     pub(crate) async fn load_capabilities(
         &self,
         tenant_id: Uuid,
@@ -1989,6 +2015,7 @@ impl ContactAuthService {
         Ok(rows.into_iter().map(|(c,)| c).collect())
     }
 
+    // SPEC-5.437
     fn mint_access_token(
         &self,
         tenant_id: Uuid,
@@ -2024,6 +2051,7 @@ impl ContactAuthService {
     /// one belongs to (PMS-1062): a login or a magic-link redeem
     /// passes its own `session_id`, a rotation passes the presented
     /// row's family forward.
+    // SPEC-5.438
     async fn mint_refresh_token(
         &self,
         tenant_id: Uuid,
@@ -2064,6 +2092,7 @@ impl ContactAuthService {
     /// stored secret with one step of skew, and a secret still stored
     /// in the pre-PMS-871 plaintext shape is rewritten sealed once the
     /// code it produced has verified.
+    // SPEC-5.446, SPEC-5.447
     async fn verify_second_factor(
         &self,
         tenant_id: Uuid,
@@ -2103,6 +2132,7 @@ impl ContactAuthService {
     /// PMS-1063: burn one recovery code. `array_remove` is a no-op when
     /// the hash is absent, and the `ANY` predicate keeps the UPDATE from
     /// matching then, so `rows_affected` says whether a code was spent.
+    // SPEC-5.446
     async fn consume_recovery_code(
         &self,
         tenant_id: Uuid,
@@ -2133,6 +2163,7 @@ impl ContactAuthService {
     /// PMS-1063 (the PMS-871 shape): rewrite a plaintext
     /// `portal_mfa_secret` sealed. Guarded on the old value so a
     /// concurrent re-enrolment is never overwritten.
+    // SPEC-5.447
     async fn upgrade_legacy_portal_mfa_secret(
         &self,
         tenant_id: Uuid,
@@ -2158,6 +2189,7 @@ impl ContactAuthService {
     /// its second factor. A stolen access token cannot cross this.
     /// Returns the row's `portal_mfa_enabled` and `portal_mfa_secret`
     /// for the caller's next step.
+    // SPEC-5.477
     async fn reauthenticate(
         &self,
         tenant_id: Uuid,
@@ -2194,6 +2226,7 @@ impl ContactAuthService {
     /// (the route spends re-auth budget on that one, PMS-881), 400
     /// with the policy message on a weak new password, and the hash
     /// is untouched on either.
+    // SPEC-5.475
     #[tracing::instrument(skip_all)]
     pub async fn change_password(
         &self,
@@ -2282,6 +2315,7 @@ impl ContactAuthService {
     /// SAFETY (PMS-285): both filters are the caller's own tenant and
     /// contact ids from the verified JWT; the migrator pool is what
     /// every `contact_sessions` read here uses.
+    // SPEC-5.481
     #[tracing::instrument(skip_all)]
     pub async fn list_sessions(
         &self,
@@ -2343,6 +2377,7 @@ impl ContactAuthService {
     /// `/auth/logout`, which also clears the SPA's in-memory token; a
     /// family that is not the caller's (unknown, or another contact's)
     /// is a silent 204, the enumeration-resistant shape logout has.
+    // SPEC-5.482
     #[tracing::instrument(skip_all)]
     pub async fn revoke_session(
         &self,
@@ -2391,6 +2426,7 @@ impl ContactAuthService {
     /// verified, turns it on, so a mis-set authenticator cannot lock
     /// the customer out. Calling this again before enable replaces the
     /// staged secret. 409 when MFA is already on: disable first.
+    // SPEC-5.478
     #[tracing::instrument(skip_all)]
     pub async fn start_mfa_enrollment(
         &self,
@@ -2441,6 +2477,7 @@ impl ContactAuthService {
     /// one live code against the staged secret, flips
     /// `portal_mfa_enabled`, and mints the single-use recovery codes,
     /// returned once and stored as hashes.
+    // SPEC-5.479
     #[tracing::instrument(skip_all)]
     pub async fn enable_mfa(
         &self,
@@ -2505,6 +2542,7 @@ impl ContactAuthService {
     /// or an unspent recovery code, so a stolen access token cannot
     /// quietly weaken the account. Not enabled is the same 401 as a
     /// wrong password, so the response does not say which.
+    // SPEC-5.480
     #[tracing::instrument(skip_all)]
     pub async fn disable_mfa(
         &self,
@@ -2564,6 +2602,7 @@ impl ContactAuthService {
     /// the subtype in `new_values.event`), the shape the retired portal
     /// wrote and `AuditService` already reads. Best-effort: a failed
     /// audit write is logged and never changes the auth response.
+    // SPEC-5.499
     async fn audit(
         &self,
         tenant_id: Uuid,
@@ -2598,6 +2637,7 @@ impl ContactAuthService {
     /// `portal_locked_until` per the PMS-501 doubling schedule when
     /// the counter crosses the threshold. Errors are absorbed by the
     /// caller.
+    // SPEC-5.444
     async fn register_failed_login(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<()> {
         // Simple constant-window lockout for now: 5 failures locks
         // for 5 min. A future ticket can port the PMS-501 doubling
@@ -2665,6 +2705,7 @@ impl ContactAuthService {
     ///   Company branding blocks plus the resolved effective set, for
     ///   the contact-plane branding editor. Handler has already
     ///   verified `settings:manage_company_branding`.
+    // SPEC-5.483
     pub async fn load_own_company_branding(
         &self,
         tenant_id: Uuid,
@@ -2702,6 +2743,7 @@ impl ContactAuthService {
     /// own, an explicit `null` clears a key. Handler has already
     /// verified the payload is an object and the caller holds
     /// `settings:manage_company_branding`.
+    // SPEC-5.484
     pub async fn update_own_company_branding(
         &self,
         tenant_id: Uuid,
@@ -2744,6 +2786,7 @@ impl ContactAuthService {
         self.load_own_company_branding(tenant_id, company_id).await
     }
 
+    // SPEC-5.488, SPEC-5.489
     pub async fn dashboard_summary(
         &self,
         tenant_id: TenantId,
@@ -2899,6 +2942,7 @@ impl ContactAuthService {
     /// COALESCE-style UPDATE: `NULL` inputs leave the underlying
     /// column unchanged so the SPA can PATCH a single field without
     /// having to round-trip the entire contact row.
+    // SPEC-5.473, SPEC-5.474
     pub async fn update_self(
         &self,
         tenant_id: TenantId,
@@ -2959,6 +3003,7 @@ impl ContactAuthService {
 /// `parse_session_bound_token` (both split on `.`, both parse the
 /// first half as a UUID, both return the tail as an untrusted secret
 /// the caller verifies against a stored hash).
+// SPEC-5.439
 pub(crate) fn parse_contact_bound_token(token: &str) -> Option<(Uuid, &str)> {
     let (id, secret) = token.split_once('.')?;
     if secret.is_empty() {
@@ -2968,6 +3013,7 @@ pub(crate) fn parse_contact_bound_token(token: &str) -> Option<(Uuid, &str)> {
     Some((contact_id, secret))
 }
 
+// SPEC-5.439
 pub(crate) fn parse_session_bound_token(token: &str) -> Option<(Uuid, &str)> {
     let (id, secret) = token.split_once('.')?;
     if secret.is_empty() {
@@ -2982,6 +3028,7 @@ pub(crate) fn parse_session_bound_token(token: &str) -> Option<(Uuid, &str)> {
 /// `parse_session_bound_token` / `parse_contact_bound_token` above;
 /// duplicated for readability at the call site (the first half is
 /// keyed to a different table).
+// SPEC-5.439
 pub(crate) fn parse_intent_bound_token(token: &str) -> Option<(Uuid, &str)> {
     let (id, secret) = token.split_once('.')?;
     if secret.is_empty() {

@@ -79,6 +79,7 @@ impl ICloudProvider {
 /// per-card loop and nothing else. A card that fails to parse is skipped rather
 /// than failing the read, which is the `.vcf` import's rule too: one malformed
 /// card in an address book of two thousand must not stop the sync.
+// SPEC-15.665
 pub fn parse_cards(cards: &[String]) -> (Vec<SourceContact>, Vec<GroupCard>) {
     let mut contacts = Vec::new();
     let mut groups = Vec::new();
@@ -98,6 +99,7 @@ pub fn parse_cards(cards: &[String]) -> (Vec<SourceContact>, Vec<GroupCard>) {
 /// counts what an import would bring rather than what the card claims: an Apple
 /// group card keeps a member line for a contact deleted from another device until
 /// something rewrites the group.
+// SPEC-15.666
 pub fn groups_from(contacts: &[SourceContact], group_cards: &[GroupCard]) -> Vec<SourceGroup> {
     let known: std::collections::HashSet<&str> =
         contacts.iter().map(|c| c.external_id.as_str()).collect();
@@ -142,6 +144,7 @@ pub fn groups_from(contacts: &[SourceContact], group_cards: &[GroupCard]) -> Vec
 /// arrives from the wire with no `group_ids` at all and the selection would match
 /// nothing. This is the pass that fills them in, and it is the reason the option
 /// chosen for PMS-1341 costs one extra walk over the cards.
+// SPEC-15.667
 pub fn apply_membership(contacts: &mut [SourceContact], group_cards: &[GroupCard]) {
     for card in group_cards {
         let Some(group_id) = card.id.as_deref() else {
@@ -168,6 +171,7 @@ impl ContactSyncProvider for ICloudProvider {
         Ok(groups_from(&contacts, &group_cards))
     }
 
+    // SPEC-15.668, SPEC-15.669
     async fn changes_since(&self, sync_token: Option<&str>) -> SourceResult<SourceChanges> {
         let book = self.client.address_book().await?;
         if let Some(token) = sync_token {

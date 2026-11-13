@@ -17,6 +17,7 @@ use crate::utils::error::{AppError, AppResult};
 
 use super::models::KbTemplateVariable;
 
+// SPEC-15.1090, SPEC-15.1091, SPEC-15.1092, SPEC-15.1093
 /// Render `content` with the caller-supplied `values` map, declared
 /// variables and all. Short-circuits when both the declared schema and
 /// the values map are empty: the stored Markdown is returned byte-
@@ -75,6 +76,7 @@ pub fn render_article(
         .map_err(|err| AppError::BadRequest(format!("Template render failed: {err}.")))
 }
 
+// SPEC-15.1092
 /// Scan `template` for `{{ ... }}` blocks whose body is a bare identifier
 /// `is_missing` says is absent, and replace each with `[missing: NAME]`.
 /// Everything else is passed through byte-identically, so a template with
@@ -109,6 +111,7 @@ fn substitute_missing_placeholders(template: &str, is_missing: impl Fn(&str) -> 
     out
 }
 
+// SPEC-15.1092
 /// A bare template identifier: a non-empty run of ASCII letters, digits
 /// and underscores starting with a letter or underscore. Anything with a
 /// dot, pipe, parenthesis or operator falls through unchanged, so a

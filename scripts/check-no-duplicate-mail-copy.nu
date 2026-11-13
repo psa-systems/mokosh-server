@@ -54,6 +54,8 @@ def check_ticket_note_parity [] {
     }
 }
 
+# SPEC-10.358: both checks always run
+
 def main [] {
     let hits = (
         glob src/**/*.rs

@@ -88,6 +88,7 @@ impl std::fmt::Debug for FeatureSnapshot {
 /// SAFETY (PMS-285): `feature_toggles` is deployment-wide and carries no
 /// `tenant_id`, so there is no RLS policy and no tenant GUC to set. The same
 /// shape as `app_secrets` and `app_config`.
+// SPEC-15.2103
 pub async fn all_rows(db: &Database) -> AppResult<Vec<FeatureToggleRow>> {
     sqlx::query_as::<_, FeatureToggleRow>(
         "SELECT key, enabled, updated_at, updated_by FROM feature_toggles ORDER BY key",
@@ -98,6 +99,7 @@ pub async fn all_rows(db: &Database) -> AppResult<Vec<FeatureToggleRow>> {
 }
 
 /// Read every row and resolve it against the registry.
+// SPEC-15.2102, SPEC-15.2107
 pub async fn load(db: &Database) -> AppResult<FeatureToggles> {
     let rows = all_rows(db).await?;
     Ok(FeatureToggles::from_rows(
@@ -115,6 +117,7 @@ pub async fn load(db: &Database) -> AppResult<FeatureToggles> {
 /// `feature` is a [`Feature`] rather than a string, so an unknown key cannot
 /// reach here. The route is what turns a path segment into a variant and answers
 /// 404 when it cannot.
+// SPEC-15.2105
 pub async fn set(
     db: &Database,
     feature: Feature,

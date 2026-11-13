@@ -67,6 +67,7 @@ pub enum BindValue {
     Bool(bool),
 }
 
+// SPEC-15.1615
 /// Public entry point. Validates the saved-report inputs, picks the
 /// per-entity compiler, returns the compiled query.
 pub fn compile(
@@ -127,6 +128,7 @@ enum ColumnType {
     Timestamp,
 }
 
+// SPEC-15.1622: inner joins limit the result to complete tickets
 /// JOIN tree the tickets compiler always emits. Same shape as
 /// `TICKET_RESPONSE_SELECT` in `src/modules/tickets/service.rs` so
 /// every whitelisted column resolves without an extra LEFT JOIN
@@ -146,6 +148,7 @@ const TICKETS_JOIN_TREE: &str = "
     LEFT  JOIN users              cu ON t.created_by_id = cu.id
 ";
 
+// SPEC-15.1618
 /// Column whitelist for the tickets entity. Anything outside this
 /// map is 422'd. Adding a column = one line here; the `requires_join`
 /// flag is informational since `TICKETS_JOIN_TREE` already covers
@@ -291,6 +294,7 @@ fn ticket_column(key: &str) -> Option<TicketColumn> {
     })
 }
 
+// SPEC-15.1614, SPEC-15.1616, SPEC-15.1619, SPEC-15.1620
 fn compile_tickets(
     tenant_id: Uuid,
     filters: &Value,
@@ -376,6 +380,7 @@ fn compile_tickets(
     })
 }
 
+// SPEC-15.1619
 /// Pick a unique SQL output name for a whitelisted field key. The same
 /// field selected twice would otherwise collapse to one `row_to_json`
 /// key, so repeats get a `_2`, `_3`, ... suffix. Input is always a
@@ -394,6 +399,7 @@ fn unique_output_key(taken: &[String], field: &str) -> String {
 /// label, not free text; anything longer is a malformed payload.
 const MAX_HEADER_LEN: usize = 100;
 
+// SPEC-15.1616
 /// Parse the saved-report `columns` JSON into `(field, header)` pairs.
 /// Accepts `[{"field": "ticket_number"}, {"field": "title", "header": "Subject"}]`
 /// or a plain string array `["ticket_number", "title"]`. When the
@@ -460,6 +466,7 @@ fn parse_columns(columns: &Value) -> AppResult<Vec<(String, String)>> {
     Ok(out)
 }
 
+// SPEC-15.1617
 /// Default column set when the saved report's `columns` array is
 /// empty. Mirrors the most-used fields on the agent ticket list so
 /// a freshly-saved blank report produces a useful default render.
@@ -479,6 +486,7 @@ fn default_ticket_columns() -> Vec<(String, String)> {
     .collect()
 }
 
+// SPEC-15.1620
 /// Compile a single `{field: value}` filter entry into a `WHERE`
 /// clause + bind value list. Value semantics:
 ///   - scalar (string/bool/number) => equality
@@ -525,6 +533,7 @@ fn compile_filter(
     }
 }
 
+// SPEC-15.1620
 fn coerce_bind_scalar(field: &str, ty: ColumnType, value: &Value) -> AppResult<BindValue> {
     match (ty, value) {
         (ColumnType::Uuid, Value::String(s)) => {
@@ -547,6 +556,7 @@ fn coerce_bind_scalar(field: &str, ty: ColumnType, value: &Value) -> AppResult<B
     }
 }
 
+// SPEC-15.1620
 fn coerce_bind_array(field: &str, ty: ColumnType, arr: &[Value]) -> AppResult<BindValue> {
     match ty {
         ColumnType::Uuid => {
@@ -588,6 +598,7 @@ const TICKET_PERSON_COLUMNS: &[(&str, &str)] = &[
     ("created_by_id", "created_by_name"),
 ];
 
+// SPEC-15.1623
 /// PMS-1491: once per call (never per row), logs the person ids a
 /// compiled report's `row_to_json` rows carried whose paired name
 /// column came back null, via the shared
@@ -628,6 +639,7 @@ pub fn log_unresolved_person_names(surface: &str, output_columns: &[String], row
     crate::utils::unresolved_person::log_unresolved_person_names(surface, &unresolved);
 }
 
+// SPEC-15.1621
 /// Parse `sort` JSON into an ORDER BY clause. Accepts an array of
 /// `{field, dir}` objects. Empty / missing -> default to
 /// `ORDER BY t.updated_at DESC` to give pagination a stable order.

@@ -33,6 +33,8 @@ const DEFAULT_ADMIN_LAST_NAME: &str = "Admin";
 // names both share: it never implements a provider-* command or
 // verify-providers, and mokosh-server never implements dev-seed-portal
 // or normalize-company-industries.
+// SPEC-12.45, SPEC-12.48, SPEC-11.1: env-file load, --version/--help behavior and the RUST_LOG default
+// (`info`) are all implemented in this function.
 #[tokio::main]
 async fn main() -> ExitCode {
     // Load .env / .env.infisical so values can be read via env vars without
@@ -175,6 +177,7 @@ ENVIRONMENT (bootstrap-infisical):
     );
 }
 
+// SPEC-12.47
 async fn run_bootstrap_infisical() -> anyhow::Result<()> {
     let admin_email = require_env("INFISICAL_ADMIN_EMAIL")?;
     let admin_password = require_env("INFISICAL_ADMIN_PASSWORD")?;
@@ -232,6 +235,7 @@ async fn run_bootstrap_infisical() -> anyhow::Result<()> {
 /// `--tenant <uuid>` (or the `MOKOSH_QA_TENANT_ID` env var) and is
 /// cross-checked against the `is_qa` marker by the seed itself, which refuses
 /// (zero writes) for any tenant not explicitly marked QA, production included.
+// SPEC-12.46
 async fn run_qa(subcommand: &str, args: &[String]) -> anyhow::Result<()> {
     use mokosh_server::db::Database;
 
@@ -261,6 +265,7 @@ async fn run_qa(subcommand: &str, args: &[String]) -> anyhow::Result<()> {
 /// one portal contact each, sharing a fixed dev password). The seeder
 /// itself refuses to run outside `ENVIRONMENT=development|dev|test`, so
 /// no additional guard is needed here.
+// SPEC-12.49
 async fn run_dev_seed_portal() -> anyhow::Result<()> {
     use mokosh_server::db::Database;
 
@@ -294,6 +299,7 @@ async fn run_dev_seed_portal() -> anyhow::Result<()> {
 /// canonical set across every tenant. Cross-tenant operator task, so it
 /// connects the privileged `DATABASE_URL` (BYPASSRLS) as both pools like the QA
 /// tooling does.
+// SPEC-12.49
 async fn run_normalize_industries() -> anyhow::Result<()> {
     use mokosh_server::db::Database;
 
@@ -313,6 +319,7 @@ async fn run_normalize_industries() -> anyhow::Result<()> {
 /// Resolve the QA tenant id from `--tenant <uuid>`, falling back to the
 /// `MOKOSH_QA_TENANT_ID` env var. Errors if neither is present or the value is
 /// not a UUID.
+// SPEC-3.1045: QA tenant from --tenant or MOKOSH_QA_TENANT_ID only.
 fn parse_tenant_arg(args: &[String]) -> anyhow::Result<uuid::Uuid> {
     let raw = args
         .iter()

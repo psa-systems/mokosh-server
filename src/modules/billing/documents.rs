@@ -52,6 +52,7 @@ pub struct BillTo {
 impl BillTo {
     /// The block as the document prints it: name, address, then the contact
     /// as an attention line with their email beneath.
+    // SPEC-13.400, SPEC-13.401: name, address, attention line, email.
     pub fn lines(&self) -> Vec<String> {
         let mut lines = vec![self.name.clone()];
         lines.extend(self.address_lines.iter().cloned());
@@ -78,6 +79,7 @@ impl BillTo {
 /// Line 1, line 2, then `city, state postal_code` with whichever of the three
 /// are present, then the country. A blank column is left out rather than
 /// printed as an empty line or a stray comma.
+// SPEC-13.402, SPEC-13.403: blank columns leave no line or stray comma.
 pub fn postal_lines(
     line1: Option<&str>,
     line2: Option<&str>,
@@ -121,6 +123,7 @@ fn items_align() -> Vec<Align> {
 /// The box a logo is fitted into, top right of the first page. Generous enough
 /// for a wordmark, small enough that a square logo cannot push the body down
 /// the page.
+// SPEC-13.407: logo box size.
 const LOGO_WIDTH_MM: f32 = 45.0;
 const LOGO_HEIGHT_MM: f32 = 20.0;
 
@@ -137,6 +140,7 @@ fn logo(bytes: Option<Vec<u8>>) -> Option<Logo> {
 /// One function, so the invoice, the credit note and the statement cannot come
 /// to disagree about where the template comes from. What the template MEANS is
 /// the renderer's business; this only hands it over.
+// SPEC-13.406: one template/accent applier for all three document kinds.
 fn styled(document: Document, issuer: &Issuer) -> Document {
     document
         .template(issuer.template)
@@ -148,6 +152,7 @@ fn styled(document: Document, issuer: &Issuer) -> Document {
 /// The payment terms and how to reach the issuer, which is what a reader
 /// looking at the bottom of an invoice wants. Carried by the document whatever
 /// template renders it; Classic draws no footer, so its output is unchanged.
+// SPEC-13.405: payment terms line and issuer contact line.
 fn footer_lines(issuer: &Issuer, terms: Option<&str>) -> Vec<String> {
     let mut lines = Vec::with_capacity(2);
     if let Some(terms) = terms.map(str::trim).filter(|t| !t.is_empty()) {
@@ -171,6 +176,7 @@ fn footer_lines(issuer: &Issuer, terms: Option<&str>) -> Vec<String> {
 /// Only the lines that have a value. An MSP that has filled nothing in gets its
 /// name alone, which is the whole of the no-branding acceptance criterion: a
 /// valid invoice, not a page of empty labels.
+// SPEC-13.404: only set values become lines.
 fn issuer_lines(issuer: &Issuer) -> Vec<String> {
     let mut lines = vec![issuer.name.clone()];
     if let Some(trading) = &issuer.trading_name {
@@ -194,6 +200,8 @@ fn issuer_lines(issuer: &Issuer) -> Vec<String> {
 }
 
 /// Build the invoice document.
+// SPEC-13.408, SPEC-13.409, SPEC-13.410, SPEC-13.411, SPEC-13.412, SPEC-13.413, SPEC-13.414,
+// SPEC-13.427: invoice layout; rendered from the frozen issuer.
 pub fn invoice(
     invoice: &InvoiceResponse,
     issuer: &Issuer,
@@ -301,6 +309,7 @@ pub fn invoice(
 /// A credit note is a document about a document, so it names the invoice it
 /// corrects on its face: a client filing it away has to be able to see what it
 /// cancels without opening anything else.
+// SPEC-13.415, SPEC-13.416, SPEC-13.417, SPEC-13.414: credit note layout.
 pub fn credit_note(
     note: &CreditNoteResponse,
     issuer: &Issuer,
@@ -376,6 +385,7 @@ pub fn credit_note(
 /// bytes behind. That is litter rather than a problem, because the key is the
 /// document's own id, so the next successful attempt overwrites it and nothing
 /// can reach an object whose row never committed.
+// SPEC-13.428, SPEC-13.429: object write, then ledger row in the caller's transaction.
 pub async fn store_issued(
     tx: &mut crate::db::TenantTransaction<'_>,
     tenant_id: Uuid,
@@ -413,6 +423,7 @@ pub async fn store_issued(
 /// re-issues of the same document and cannot collide with a feature row keyed
 /// on the document id itself. Deterministic, so a second store of the same
 /// document upserts one row rather than adding a second.
+// SPEC-13.430: stable ledger id distinct from the document id.
 fn document_file_id(document_id: Uuid) -> Uuid {
     let mut bytes = *document_id.as_bytes();
     // Flip the two bits that make it a distinct value while keeping it a valid
@@ -427,6 +438,7 @@ fn document_file_id(document_id: Uuid) -> Uuid {
 ///
 /// `None` for a draft, and for anything issued before PMS-959; the caller
 /// renders live in that case, which is what those documents always did.
+// SPEC-13.431: None means the caller renders live.
 pub async fn read_issued(tenant_id: Uuid, document_id: Uuid) -> Option<Vec<u8>> {
     crate::storage::shared()
         .read(&ObjectKey::financial_document(tenant_id, document_id))
@@ -435,6 +447,8 @@ pub async fn read_issued(tenant_id: Uuid, document_id: Uuid) -> Option<Vec<u8>> 
 }
 
 /// Build the statement document.
+// SPEC-13.418, SPEC-13.419, SPEC-13.420, SPEC-13.421, SPEC-13.422, SPEC-13.423, SPEC-13.424,
+// SPEC-13.426, SPEC-13.427: statement layout; rendered from the current issuer.
 pub fn statement(
     statement: &StatementResponse,
     issuer: &Issuer,
@@ -605,6 +619,7 @@ pub fn statement(
 
 /// A statement table's alignment: everything left but the amount, which is
 /// always the last column.
+// SPEC-13.425: amount column right aligned.
 fn last_right(columns: usize) -> Vec<Align> {
     let mut align = vec![Align::Left; columns];
     if let Some(last) = align.last_mut() {

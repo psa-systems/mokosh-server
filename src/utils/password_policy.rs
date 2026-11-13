@@ -52,6 +52,7 @@ pub struct PasswordPolicy {
     pub min_zxcvbn_score: u8,
 }
 
+// SPEC-4.1004: defaults 12..=128 chars and score 3; three distinct refusal messages.
 impl Default for PasswordPolicy {
     fn default() -> Self {
         Self {

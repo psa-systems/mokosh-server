@@ -87,6 +87,7 @@ impl GatewayCredentialMover {
     /// No batch cap. The rows selected are only the unmoved ones, so the set
     /// shrinks to nothing after the first successful pass, and a payment
     /// gateway is one row per provider per tenant rather than a bulk table.
+    // SPEC-13.136
     pub async fn run_tick(&self) -> AppResult<CredentialMoveOutcome> {
         // SAFETY (PMS-285): this runs on the BYPASSRLS migrator pool because it
         // is a cross-tenant sweep with no `app.current_tenant` to set - the
@@ -139,6 +140,7 @@ impl GatewayCredentialMover {
     ///
     /// Any error leaves the row untouched, which is what makes a failed move
     /// indistinguishable from one that never started.
+    // SPEC-13.137
     async fn move_one(&self, tenant_id: Uuid, provider: &str, ciphertext: &str) -> AppResult<()> {
         let plaintext = crate::utils::crypto::decrypt(ciphertext, &self.encryption_key)?;
         let key = SecretKey::payment_gateway(tenant_id, provider);
@@ -181,6 +183,7 @@ impl GatewayCredentialMover {
     /// through the API the winner: if `upsert_payment_gateway` has already
     /// stored a newer credential and NULLed this row, there is nothing here
     /// to clear and nothing to undo.
+    // SPEC-13.137
     async fn clear_column(&self, tenant_id: Uuid, provider: &str) -> AppResult<()> {
         sqlx::query(
             "UPDATE payment_gateway_configs SET config_encrypted = NULL \
@@ -201,5 +204,6 @@ impl GatewayCredentialMover {
     /// registered on the scheduler: this corrects history once and never
     /// becomes due again, so an hourly interval was a recurring job doing a
     /// one-time job's work.
+    // SPEC-13.138
     pub const ONE_SHOT_NAME: &'static str = "gateway_credential_move";
 }

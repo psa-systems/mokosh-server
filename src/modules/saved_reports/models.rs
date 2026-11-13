@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+// SPEC-15.1608
 #[derive(Debug, Clone, Serialize)]
 pub struct SavedReportResponse {
     pub id: Uuid,
@@ -24,6 +25,7 @@ pub struct SavedReportResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-15.1610
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateSavedReportRequest {
     #[validate(length(min = 1, max = 200))]
@@ -47,6 +49,7 @@ pub struct CreateSavedReportRequest {
     pub is_shared: bool,
 }
 
+// SPEC-15.1611
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateSavedReportRequest {
     #[validate(length(min = 1, max = 200))]
@@ -89,6 +92,7 @@ pub struct ScheduledReportResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-15.1624
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateScheduledReportRequest {
     /// Standard cron expression. Validated with
@@ -106,6 +110,7 @@ pub struct CreateScheduledReportRequest {
     pub is_active: bool,
 }
 
+// SPEC-15.1628
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateScheduledReportRequest {
     #[validate(length(min = 1, max = 100), custom(function = crate::utils::validation::validate_cron))]

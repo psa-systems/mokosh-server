@@ -37,6 +37,7 @@ export type MainFrameResponseLog = {
 // every entry.
 const logs = new WeakMap<Page, MainFrameResponseLog>();
 
+// SPEC-10.344 SPEC-10.345 SPEC-10.346 SPEC-10.347: one main-frame response log per page
 /// Record every main-frame document response (status + URL, plus a truncated
 /// body for non-2xx) on `page`. Idempotent per page. Attach before the
 /// navigation you care about; responses that arrive earlier are not replayed.
@@ -58,9 +59,12 @@ export function mainFrameResponseLog(page: Page): MainFrameResponseLog {
         (text) => {
           entry.body = truncate(text.replace(/\s+/g, ' ').trim(), RESPONSE_BODY_CAP);
         },
-        () => {
-          // Redirects and responses whose context is gone have no body. The
-          // status + URL already carry the signal.
+        (reason: unknown) => {
+          // Redirects and responses whose context is gone have no body. Record
+          // the cause on the entry so a failure that was really a text-read
+          // refusal is not misread as an empty body.
+          const cause = reason instanceof Error ? reason.message : String(reason);
+          entry.body = `(unreadable: ${truncate(cause, RESPONSE_BODY_CAP)})`;
         },
       );
     }
@@ -99,6 +103,7 @@ export type ApiErrorLog = {
   errors(): string[];
 };
 
+// SPEC-10.348: API 4xx/5xx trail
 /// Record every response from `apiBaseURL` with a 4xx/5xx status (PMS-1461).
 /// `mainFrameResponseLog` above only sees main-frame document navigations,
 /// but the SPA is a WASM app whose pages render from background XHR/fetch
@@ -115,6 +120,7 @@ export function trackApiErrors(page: Page, apiBaseURL: string): ApiErrorLog {
   return { errors: () => errors.slice() };
 }
 
+// SPEC-10.349: failure snapshot text
 /// Attach request + framenavigated + response listeners to `page` and return a
 /// `snapshot(label)` that renders the accumulated trail as a multi-line
 /// string suitable for folding into a thrown error message. The page is

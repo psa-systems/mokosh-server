@@ -85,6 +85,7 @@ const EXTERNAL_SOURCE_TACTICAL_RMM: &str = "tactical_rmm";
 /// body: a byte rewritten by any middle layer turns the signature into
 /// a 401, which is why the path is in the sanitizer's `RAW_BODY_PATHS`
 /// list.
+// SPEC-15.2109, SPEC-15.2113
 async fn ingest_status(
     State(state): State<StatusRouterState>,
     headers: HeaderMap,
@@ -138,6 +139,7 @@ async fn ingest_status(
 }
 
 /// Latest observation per known check kind for one monitored system.
+// SPEC-15.2114
 async fn get_system_current_status(
     State(state): State<StatusRouterState>,
     RequireAuth(user): RequireAuth,
@@ -152,6 +154,7 @@ async fn get_system_current_status(
 
 /// Per-company backup rollup: every monitored system on the company and
 /// the current backup outcome per system.
+// SPEC-15.2115
 async fn get_company_backup_status(
     State(state): State<StatusRouterState>,
     RequireAuth(user): RequireAuth,
@@ -172,6 +175,7 @@ struct AggregateWindow {
 }
 
 impl AggregateWindow {
+    // SPEC-15.2116, SPEC-15.2117
     fn validate(&self) -> AppResult<()> {
         if self.from >= self.to {
             return Err(AppError::validation_field(
@@ -187,6 +191,7 @@ impl AggregateWindow {
 /// Both `from` and `to` are RFC 3339 timestamps; the window is a
 /// half-open interval `[from, to)` so a day-by-day report can advance
 /// with no gap and no overlap.
+// SPEC-15.2116
 async fn backup_success_rate_report(
     State(state): State<StatusRouterState>,
     RequireAuth(user): RequireAuth,
@@ -202,6 +207,7 @@ async fn backup_success_rate_report(
 
 /// `GET /reports/status/uptime?company_id=..&from=..&to=..`. Same
 /// window semantics as the rate above.
+// SPEC-15.2117
 async fn uptime_report(
     State(state): State<StatusRouterState>,
     RequireAuth(user): RequireAuth,

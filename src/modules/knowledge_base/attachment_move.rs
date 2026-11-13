@@ -93,6 +93,7 @@ impl KbAttachmentMover {
         }
     }
 
+    // SPEC-15.1094, SPEC-15.1095, SPEC-15.1097
     /// One pass over everything still at the old location.
     ///
     /// No batch cap. The rows returned are only the unmoved ones, so the set
@@ -152,6 +153,7 @@ impl KbAttachmentMover {
         Ok(outcome)
     }
 
+    // SPEC-15.1096
     /// Point the ledger row at where the file now is.
     ///
     /// Tenant-scoped, unlike the sweep above: the tenant is known by this point
@@ -173,6 +175,7 @@ impl KbAttachmentMover {
 }
 
 impl KbAttachmentMover {
+    // SPEC-15.1097
     /// The name this pass is logged under, and the only thing left of the
     /// `Job` impl it used to carry (PMS-1320). It is handed to
     /// [`crate::scheduler::one_shot::spawn_once`] at boot rather than

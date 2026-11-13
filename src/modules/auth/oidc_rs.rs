@@ -29,6 +29,7 @@ use crate::config::{self, registry as keys};
 /// Mirrors `bunyip/crates/bunyip-oidc/src/services/oidc_provider.rs:31`,
 /// narrowed to the fields the middleware actually consumes (sub for user
 /// lookup, scope for gating, exp/iat for expiry, iss/aud for pinning).
+// SPEC-5.128: required vs optional claim set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AtClaims {
     pub iss: String,
@@ -98,6 +99,7 @@ pub struct AtClaims {
 /// resource-server audience, and it must be rejected if it carries a `nonce`.
 /// One struct for both would make every one of those differences a runtime
 /// `Option` check on a type whose name says access token.
+// SPEC-5.129: only iss, aud, iat are required by the type.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LogoutClaims {
     pub iss: String,
@@ -221,6 +223,7 @@ impl VerifierConfig {
     /// The pure rule, unchanged from what `from_env` did before the values
     /// moved: issuer and audience required, the two knobs optional with their
     /// built-in defaults.
+    // SPEC-5.113 SPEC-5.114 SPEC-5.115: issuer and audience required; TTL 600 and leeway 30 defaults.
     pub fn from_values(
         issuer: Option<String>,
         audience: Option<String>,
@@ -330,6 +333,7 @@ impl std::error::Error for VerifyError {}
 const FORCE_REFRESH_COOLDOWN_SECS: i64 = 60;
 
 impl Verifier {
+    // SPEC-5.116: 5s timeout, redirects refused.
     pub fn new(config: VerifierConfig) -> Self {
         Self {
             config,
@@ -351,6 +355,7 @@ impl Verifier {
         }
     }
 
+    // SPEC-5.117 SPEC-5.120: typ and kid required; one forced refresh only on UnknownKid.
     /// Validate an `at+jwt` Bearer. Returns the claims on success.
     pub async fn verify_at_jwt(&self, token: &str) -> Result<AtClaims, VerifyError> {
         let header = jsonwebtoken::decode_header(token)
@@ -397,6 +402,7 @@ impl Verifier {
     /// What this method DOES establish is the part only the key can: the
     /// token was signed by the configured issuer's active key, and its `iss`
     /// matches. Everything else is a claim assertion over verified bytes.
+    // SPEC-5.126: logout+jwt typ, issuer only; exp and aud left to validate_logout_claims.
     pub async fn verify_logout_token(&self, token: &str) -> Result<LogoutClaims, VerifyError> {
         let header = jsonwebtoken::decode_header(token)
             .map_err(|e| VerifyError::Malformed(format!("decode header: {e}")))?;
@@ -455,6 +461,7 @@ impl Verifier {
     /// Returns `None` (rather than failing the request) if userinfo is
     /// unreachable: the local users row is still created with email=NULL, and
     /// a subsequent call refreshes it.
+    // SPEC-5.127: every failure collapses to None.
     pub async fn userinfo(&self, bearer: &str) -> Option<UserInfo> {
         self.ensure_cache().await.ok()?;
         let guard = self.cache.read().await;
@@ -476,6 +483,7 @@ impl Verifier {
 
     // ── internals ────────────────────────────────────────────────────────────
 
+    // SPEC-5.118 SPEC-5.119: EdDSA, issuer, audience, exp with leeway; error kind mapping.
     async fn try_validate(&self, token: &str, kid: &str) -> Result<AtClaims, VerifyError> {
         self.ensure_cache().await?;
         let guard = self.cache.read().await;
@@ -505,6 +513,7 @@ impl Verifier {
         }
     }
 
+    // SPEC-5.122: stale when empty or older than the TTL.
     /// True when the cache is empty or older than the configured TTL.
     async fn cache_is_stale(&self) -> bool {
         let guard = self.cache.read().await;
@@ -516,6 +525,7 @@ impl Verifier {
         }
     }
 
+    // SPEC-5.122: concurrent stale callers coalesce into one fetch.
     async fn ensure_cache(&self) -> Result<(), VerifyError> {
         if !self.cache_is_stale().await {
             return Ok(());
@@ -542,6 +552,7 @@ impl Verifier {
     /// `Ok(())`; the caller's subsequent `try_validate` will see the
     /// same cache, return `UnknownKid`, and the request fails closed
     /// (Unauthorized) without any extra network IO.
+    // SPEC-5.121: 60s cooldown after a successful forced refresh; skipped when a peer refreshed.
     async fn force_refresh_jwks(&self) -> Result<(), VerifyError> {
         {
             let last = self.last_force_refresh.read().await;
@@ -570,6 +581,7 @@ impl Verifier {
         result
     }
 
+    // SPEC-5.123 SPEC-5.124: discovery issuer match; only Ed25519 sig keys kept; empty set fails.
     async fn refresh_jwks(&self) -> Result<(), VerifyError> {
         // 1. Discovery doc.
         let discovery_url = format!("{}/.well-known/openid-configuration", self.config.issuer);
@@ -649,6 +661,7 @@ impl Verifier {
 /// ```text
 /// 30 2A 30 05 06 03 2B 65 70 03 21 00 <32 bytes>
 /// ```
+// SPEC-5.125: x must be base64url decoding to exactly 32 bytes.
 fn ed25519_spki_pem_from_x(x_b64url: &str) -> Result<String, String> {
     let key_bytes = URL_SAFE_NO_PAD
         .decode(x_b64url)

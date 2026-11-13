@@ -104,6 +104,7 @@ pub mod fields {
     /// PMS-1288: the canonical `note` (vCard `NOTE`).
     pub const NOTES: &str = "notes";
 
+    // SPEC-15.560
     pub const ALL: &[&str] = &[
         FIRST_NAME,
         LAST_NAME,
@@ -158,6 +159,7 @@ pub struct RecordFailure {
 
 /// Enough to see the shape of a failure without letting one broken import
 /// grow a run row without bound. `failed` still counts every one.
+// SPEC-15.569
 pub const MAX_RECORDED_FAILURES: usize = 50;
 
 /// PMS-1303: how many records share one `begin_with_tenant` transaction in
@@ -169,11 +171,13 @@ pub const MAX_RECORDED_FAILURES: usize = 50;
 /// cancel-detection latency (every 25 records at worst) while dropping
 /// the begin/commit pair count 25x: a run of 500 records opens 20
 /// instead of 500.
+// SPEC-15.569
 const CHUNK_SIZE: usize = 25;
 
 impl SyncReport {
     /// Records that were read and deliberately not imported: outside the
     /// selection, unlinked or removed, or already answered by a reviewer.
+    // SPEC-15.588
     pub fn skipped(&self) -> u32 {
         self.not_selected + self.excluded + self.already_reviewed
     }
@@ -313,6 +317,7 @@ enum Plan<'a> {
     Create(Option<Uuid>),
 }
 
+// SPEC-15.561 to 15.565
 fn plan<'a>(
     record: &SourceContact,
     selected: &BTreeSet<String>,
@@ -493,6 +498,7 @@ impl LinkOrigin {
 
 /// How a removed record is recognised without being named
 /// (`contact_sync_suppressions.external_id_sha256`, migration 228).
+// SPEC-15.586
 pub fn external_id_digest(external_id: &str) -> String {
     format!("{:x}", Sha256::digest(external_id.as_bytes()))
 }
@@ -540,6 +546,7 @@ impl ContactSyncEngine {
     /// [`Self::run`], writing progress to `contact_sync_runs` row `run_id`
     /// every [`CHUNK_SIZE`] records and stopping at the first checkpoint
     /// after a cancel was requested (PMS-1215).
+    // SPEC-15.566 to 15.572
     pub async fn run_tracked(
         &self,
         tenant_id: TenantId,
@@ -837,6 +844,7 @@ impl ContactSyncEngine {
     /// A reviewer linked a queued record to a contact (PMS-1215), on the
     /// caller's transaction. The same first-link rule the sync uses: only
     /// empty fields are filled, from the snapshot the reviewer compared.
+    // SPEC-15.585
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn link_reviewed(
         &self,
@@ -880,6 +888,7 @@ impl ContactSyncEngine {
 
     /// A reviewer decided a queued record is nobody Mokosh holds (PMS-1215):
     /// create it exactly as the sync would have.
+    // SPEC-15.585
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_reviewed(
         &self,
@@ -951,6 +960,7 @@ impl ContactSyncEngine {
     }
 
     /// Write progress onto the run. Returns whether a cancel was requested.
+    // SPEC-15.570
     async fn checkpoint(
         &self,
         tenant_id: TenantId,
@@ -1003,6 +1013,7 @@ impl ContactSyncEngine {
         .ok_or_else(|| AppError::NotFound("contact sync connection".to_string()))
     }
 
+    // SPEC-15.573
     async fn set_status(
         &self,
         tenant_id: TenantId,
@@ -1027,6 +1038,7 @@ impl ContactSyncEngine {
         Ok(())
     }
 
+    // SPEC-15.572
     async fn finish(
         &self,
         tenant_id: TenantId,
@@ -1049,6 +1061,7 @@ impl ContactSyncEngine {
         Ok(())
     }
 
+    // SPEC-15.574
     async fn snapshot(
         &self,
         tenant_id: TenantId,
@@ -1177,6 +1190,7 @@ impl ContactSyncEngine {
     /// Any `begin_with_tenant` previously opened inside `flag_deleted` is now
     /// `flag_deleted_in` taking the external connection, so this function
     /// opens no transaction of its own and performs no commits.
+    // SPEC-15.575 to 15.577
     #[allow(clippy::too_many_arguments)]
     async fn apply_record_in_tx(
         &self,
@@ -1340,6 +1354,7 @@ impl ContactSyncEngine {
     /// labels, which is what makes its totals exact for that selection. `None`
     /// simulates every record carrying ANY offered label, so a client can show
     /// per-label figures from one read.
+    // SPEC-15.578
     pub async fn preview(
         &self,
         tenant_id: TenantId,
@@ -1434,6 +1449,7 @@ impl ContactSyncEngine {
         })
     }
 
+    // SPEC-15.579
     #[allow(clippy::too_many_arguments)]
     async fn insert_link(
         &self,
@@ -1487,6 +1503,7 @@ impl ContactSyncEngine {
         Ok(link)
     }
 
+    // SPEC-15.580
     async fn flag_deleted_in(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -1526,6 +1543,7 @@ impl ContactSyncEngine {
 
     /// Apply the field rules in the module doc. Returns whether anything was
     /// written.
+    // SPEC-15.581 to 15.584
     #[allow(clippy::too_many_arguments)]
     async fn apply_fields(
         &self,
@@ -1770,6 +1788,7 @@ impl ContactSyncEngine {
 impl Snapshot {
     /// A contact this pass created is a match target for the records after
     /// it, so two source records for one person do not create two contacts.
+    // SPEC-15.575
     fn remember(&mut self, contact_id: Uuid, record: &SourceContact, link: LinkRow) {
         let mapped = map_contact(record);
         self.locals.push(LocalContact::from_values(
@@ -1834,6 +1853,7 @@ fn create_request(mapped: &MappedContact, labels: &[String]) -> CreateContactReq
 /// The record a reviewer saw, rebuilt from its [`source_snapshot`]. Only
 /// what the snapshot holds: enough to apply the same mapping the sync would,
 /// never a second read of the source.
+// SPEC-15.587
 fn from_snapshot(
     external_id: &str,
     etag: Option<&str>,
@@ -1915,6 +1935,7 @@ fn from_snapshot(
 }
 
 /// The incoming record as the review queue's side-by-side renders it.
+// SPEC-15.587
 fn source_snapshot(
     record: &SourceContact,
     mapped: &MappedContact,

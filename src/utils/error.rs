@@ -208,6 +208,8 @@ impl AppError {
     /// - reaches for [`AppError::validation_required`] or
     ///   [`AppError::validation_must_be`] before writing a bespoke sentence,
     ///   when the shape matches one of those templates
+    // SPEC-4.1019: 422 with a fixed message and one FieldError of code invalid; query_error is the
+    // 400 form.
     pub fn validation_field(field: impl Into<String>, message: impl Into<String>) -> Self {
         // The `Validation` Display prefixes "Validation failed: ", so this
         // message must not repeat that phrase (PMS-298).
@@ -299,6 +301,7 @@ impl AppError {
             Self::Conflict(_) => 409,
             Self::BadRequest(_) => 400,
             Self::Gone(_) => 410,
+            // SPEC-2.92
             Self::AccountDeleted => 410,
             Self::TokenExpired => 401,
             Self::RateLimited { .. } => 429,
@@ -407,8 +410,11 @@ mod server_impl {
     /// PMS-773: the single definition. It lives beside the envelope it emits
     /// so route files import it instead of hand-rolling a fourth variant of
     /// the same thirteen lines.
+    // SPEC-4.1015: 429 with Retry-After, no-store and a flat {error, message, retry_after_seconds}
+    // body.
     pub fn rate_limited_response(retry_after: u64, message: &str) -> Response {
         let mut resp = (
+            // SPEC-2.90
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({
                 "error": "rate_limited",
@@ -443,6 +449,7 @@ mod server_impl {
             } = &self
             {
                 let retry_after =
+                    // SPEC-2.91
                     retry_after_seconds.unwrap_or(DEFAULT_RATE_LIMIT_RETRY_AFTER_SECONDS);
                 return rate_limited_response(retry_after, &self.to_string());
             }
@@ -460,6 +467,7 @@ mod server_impl {
     /// envelope. The original rejection body (raw axum/serde plaintext) is
     /// discarded so internal serde detail, field names, and line/column offsets
     /// never leak (PMS-298).
+    // SPEC-4.1017: fixed code and message for 400/415/413/411/422/405; other 4xx is BAD_REQUEST.
     fn envelope_for_rejection(status: StatusCode) -> ErrorResponse {
         let (code, message) = match status {
             StatusCode::BAD_REQUEST => (
@@ -511,6 +519,7 @@ mod server_impl {
     ) -> Response {
         let response = next.run(request).await;
         let status = response.status();
+        // SPEC-2.87
         if !status.is_client_error() {
             return response;
         }
@@ -525,6 +534,7 @@ mod server_impl {
         }
         // Non-JSON 4xx: an extractor rejection (or similar) leaked through.
         // Replace it with the canonical envelope, discarding the raw body.
+        // SPEC-2.86
         (status, Json(envelope_for_rejection(status))).into_response()
     }
 
@@ -561,6 +571,8 @@ mod server_impl {
         }
     }
 
+    // SPEC-4.1016: non-sqlx From mappings: JWT->Unauthorized, Argon2->Internal, mail->Email,
+    // reqwest->ExternalService.
     impl From<jsonwebtoken::errors::Error> for AppError {
         fn from(err: jsonwebtoken::errors::Error) -> Self {
             tracing::warn!("JWT error: {:?}", err);
@@ -633,6 +645,8 @@ fn format_bound(value: &serde_json::Value) -> String {
 /// present we synthesise one from the failing constraint's code and params so
 /// the response states what was wrong and includes the constraint bound (e.g.
 /// the max length).
+// SPEC-4.1018: wording for built-in validator codes; unknown code reads failed the '{code}'
+// validation.
 fn humanize_field_error(error: &validator::ValidationError) -> String {
     if let Some(message) = &error.message {
         return message.to_string();

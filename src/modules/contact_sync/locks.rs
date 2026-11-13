@@ -45,6 +45,7 @@ const SCALAR_COLUMNS: &[&str] = &[
 impl EditSnapshot {
     /// Capture the lockable fields, or `None` when the contact has no live
     /// link and so nothing to lock.
+    // SPEC-15.676
     pub async fn capture_if_linked(
         conn: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -64,6 +65,7 @@ impl EditSnapshot {
         Self::capture(conn, tenant_id, contact_id).await.map(Some)
     }
 
+    // SPEC-15.676
     async fn capture(
         conn: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -117,6 +119,7 @@ impl EditSnapshot {
 /// after its write, with the capture taken before it. Returns the fields newly
 /// locked; a field already locked stays as it was, with its original who and
 /// when.
+// SPEC-15.677
 pub async fn lock_edited_fields(
     conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,

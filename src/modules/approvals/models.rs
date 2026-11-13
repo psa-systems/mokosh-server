@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+// SPEC-7.1073: every field is always present, null when unset
 #[derive(Debug, Clone, Serialize)]
 pub struct ApprovalResponse {
     pub id: Uuid,
@@ -75,6 +76,7 @@ pub struct ApprovalResponse {
 /// A dedicated shape so the SPA does not read a bare number and so a
 /// later addition (a breakdown by target, say) is a field on this rather
 /// than a wire break.
+// SPEC-7.1069: the body is {"count": N}
 #[derive(Debug, Clone, Serialize)]
 pub struct ApprovalCountResponse {
     /// Number of pending approvals addressed to the caller. `i64`
@@ -140,6 +142,7 @@ pub struct CreateApprovalRequest {
     pub notes: Option<String>,
 }
 
+// SPEC-7.1065: decision 4 to 16 chars and decision_notes at most 4000, else 422
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct DecideApprovalRequest {
     /// "approve" or "reject". Rejected by the service if anything

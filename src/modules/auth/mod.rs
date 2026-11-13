@@ -2,6 +2,7 @@
 //!
 //! Handles user authentication, session management, and authorization.
 //!
+// SPEC-5.1: absence of /google routes and login_with_google is deliberate; test in routes.rs pins it.
 //! # Retired: Google OAuth (PMS-837)
 //!
 //! The `/google` and `/google/callback` mounts under `/api/v1/auth` (the

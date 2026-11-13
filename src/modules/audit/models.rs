@@ -74,6 +74,7 @@ pub struct EntityHistoryEntry {
     pub timestamp: DateTime<Utc>,
 }
 
+// SPEC-5.509, SPEC-5.510: entity_type and action cap at 100 characters (422).
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct AuditLogFilter {
     pub user_id: Option<Uuid>,

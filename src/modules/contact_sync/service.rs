@@ -448,6 +448,7 @@ impl ContactSyncService {
     /// has to be byte-identical in the authorization request and the token
     /// exchange, and it is also what gets registered in the Google Cloud
     /// console (PMS-794).
+    // SPEC-15.519
     pub fn redirect_uri(&self) -> AppResult<String> {
         let base = self
             .public_api_base
@@ -470,6 +471,7 @@ impl ContactSyncService {
     /// [`Self::redirect_uri`]: byte-identical in the authorization URL and
     /// the token exchange, and also what the Entra app registration lists
     /// as a permitted redirect URI.
+    // SPEC-15.519
     pub fn microsoft_redirect_uri(&self) -> AppResult<String> {
         let base = self
             .public_api_base
@@ -493,6 +495,7 @@ impl ContactSyncService {
     /// Refuses when the integration is unconfigured rather than producing a
     /// URL Google will reject: an operator who has not set the client sees
     /// that, not a Google error page.
+    // SPEC-15.518
     pub async fn begin_connect(&self, tenant_id: TenantId, user_id: Uuid) -> AppResult<String> {
         self.assert_enabled(tenant_id, GOOGLE).await?;
         let client = self.require_oauth_client()?;
@@ -534,6 +537,7 @@ impl ContactSyncService {
     /// SAFETY (PMS-285): this runs with no session, so the tenant comes from
     /// the state row, which the caller proved possession of. Every write below
     /// is scoped to that tenant.
+    // SPEC-15.521 to 15.525
     pub async fn complete_connect(&self, state: &str, code: &str) -> AppResult<String> {
         // PMS-1340: the client is loaded AFTER the state row, because which
         // client to exchange with is now a property of the tenant and the state
@@ -676,6 +680,7 @@ impl ContactSyncService {
     /// Writes a `contact_sync_oauth_states` row with provider = microsoft
     /// and returns the Entra authorization URL. A tenant without the
     /// `contact_sync` module enabled is refused, same as the Google path.
+    // SPEC-15.518, SPEC-15.526
     pub async fn begin_microsoft_connect(
         &self,
         tenant_id: TenantId,
@@ -720,6 +725,7 @@ impl ContactSyncService {
     /// state row the caller proved possession of. Every write is scoped to
     /// that tenant. Mirrors Google's shape: load state, verify, consume,
     /// exchange code, verify scope grant, record connection, redirect.
+    // SPEC-15.521 to 15.523, SPEC-15.526
     pub async fn complete_microsoft_connect(&self, state: &str, code: &str) -> AppResult<String> {
         let (state_id, secret) = state
             .split_once('.')
@@ -863,6 +869,7 @@ impl ContactSyncService {
     /// which words a refusal uses. A second copy of this for iCloud would have
     /// been a second place for the reconnect-keeps-the-connection rule to be
     /// got wrong.
+    // SPEC-15.527 to 15.529
     pub async fn record_connection(
         &self,
         tenant_id: TenantId,
@@ -992,6 +999,7 @@ impl ContactSyncService {
     /// to fix and says so in Apple's terms, a throttle is Apple asking us to wait
     /// and is not a wrong password, and anything else is this codebase's own
     /// words rather than the server's.
+    // SPEC-15.530
     pub async fn connect_icloud(
         &self,
         tenant_id: TenantId,
@@ -1037,6 +1045,7 @@ impl ContactSyncService {
     /// Where to send a browser whose callback failed. The reason is a shape,
     /// never the provider's text: this lands in a URL bar and a browser
     /// history.
+    // SPEC-15.531
     pub fn failure_redirect(&self) -> String {
         format!(
             "{}/settings/integrations/google-contacts?contact_sync=failed",
@@ -1047,6 +1056,7 @@ impl ContactSyncService {
     /// Everything the Settings card needs before it can decide what to draw
     /// (PMS-1241): whether the tenant allows the integration, whether this
     /// deployment can connect at all, and the connection if there is one.
+    // SPEC-15.532
     pub async fn overview(&self, tenant_id: TenantId) -> AppResult<ContactSyncOverview> {
         Ok(ContactSyncOverview {
             enabled: crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id)
@@ -1081,6 +1091,7 @@ impl ContactSyncService {
         self.host_client.current()
     }
 
+    // SPEC-15.520
     fn require_oauth_client(&self) -> AppResult<OauthClient> {
         self.oauth_client().ok_or_else(|| {
             // Addressed to a tenant admin, who cannot fix this and should not be
@@ -1101,6 +1112,7 @@ impl ContactSyncService {
         self.microsoft_client.current()
     }
 
+    // SPEC-15.520
     fn require_microsoft_oauth_client(&self) -> AppResult<super::microsoft_oauth::OauthClient> {
         self.microsoft_oauth_client().ok_or_else(|| {
             AppError::Configuration(
@@ -1117,6 +1129,7 @@ impl ContactSyncService {
     /// endpoints differ. `GrantRevoked` is handled identically: the
     /// connection is marked `reconnect_required` and the error is propagated
     /// unchanged.
+    // SPEC-15.557
     pub async fn microsoft_access_token(
         &self,
         tenant_id: TenantId,
@@ -1151,6 +1164,7 @@ impl ContactSyncService {
     /// Refuse while `integrations/google_contacts_enabled` is off (PSA-70 K).
     /// A 409 naming the setting, because the request is fine and the tenant's
     /// state is what stands in the way.
+    // SPEC-15.533
     pub async fn assert_enabled(&self, tenant_id: TenantId, provider: &str) -> AppResult<()> {
         // PMS-1409: each integration has its own switch (PMS-1341), so this asks
         // the one the caller is actually using. Reading Google's flag for an
@@ -1179,6 +1193,7 @@ impl ContactSyncService {
     /// The schema has allowed that since migration 220 - `idx_contact_sync_
     /// connections_live` is unique on `(tenant_id, provider)` - and this method
     /// filtering on `google` was the only reason a tenant could not.
+    // SPEC-15.534
     pub async fn connection(
         &self,
         tenant_id: TenantId,
@@ -1226,6 +1241,7 @@ impl ContactSyncService {
     /// contacts local records: nothing syncs into them again, nothing about
     /// them is deleted, and the link row still names the provider and account
     /// they came from.
+    // SPEC-15.535, SPEC-15.536
     pub async fn disconnect(
         &self,
         tenant_id: TenantId,
@@ -1331,6 +1347,7 @@ impl ContactSyncService {
     /// Boxed since PMS-1409, because there are two. The alternative, a second
     /// `icloud_source`, would mean every caller choosing which to call, and the
     /// caller is a route that was handed a provider name.
+    // SPEC-15.537
     async fn source(
         &self,
         tenant_id: TenantId,
@@ -1383,6 +1400,7 @@ impl ContactSyncService {
     /// What importing would do, without importing (PMS-1242). `group_ids`
     /// narrows the simulation to that selection so its totals are exact;
     /// `None` simulates every labelled record for per-label figures.
+    // SPEC-15.538
     pub async fn preview(
         &self,
         tenant_id: TenantId,
@@ -1409,6 +1427,7 @@ impl ContactSyncService {
     /// The shape is the PROVIDER's, which is what PMS-1409 had to fix: Google's
     /// ids are `contactGroups/...` and an iCloud group is a vCard `UID`, so the
     /// prefix check refused every id the iCloud picker could ever offer.
+    // SPEC-15.539
     pub async fn set_selection(
         &self,
         tenant_id: TenantId,
@@ -1475,6 +1494,7 @@ impl ContactSyncService {
     /// to happen. The ceiling is a day, because an interval longer than that
     /// is a way of saying "stop syncing" and the switch (PMS-1358) says it
     /// properly, leaving the cadence to mean what it says.
+    // SPEC-15.540
     pub async fn set_schedule(
         &self,
         tenant_id: TenantId,
@@ -1525,6 +1545,7 @@ impl ContactSyncService {
     }
 
     /// Queue an import now. The first one after connecting is `initial`.
+    // SPEC-15.541, SPEC-15.542
     pub async fn queue_run(
         &self,
         tenant_id: TenantId,
@@ -1593,6 +1614,7 @@ impl ContactSyncService {
     }
 
     /// Recent runs, newest first.
+    // SPEC-15.543
     pub async fn runs(&self, tenant_id: TenantId, limit: i64) -> AppResult<Vec<RunStatus>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         Ok(sqlx::query_as(&format!(
@@ -1605,6 +1627,7 @@ impl ContactSyncService {
         .await?)
     }
 
+    // SPEC-15.544
     pub async fn run(&self, tenant_id: TenantId, run_id: Uuid) -> AppResult<RunStatus> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query_as(&format!(
@@ -1619,6 +1642,7 @@ impl ContactSyncService {
 
     /// Stop an import. A queued run is cancelled at once; a running one stops
     /// at its next checkpoint with what landed kept and the cursor unmoved.
+    // SPEC-15.545
     pub async fn cancel_run(
         &self,
         tenant_id: TenantId,
@@ -1666,6 +1690,7 @@ impl ContactSyncService {
     }
 
     /// Everything waiting on a reviewer, oldest first.
+    // SPEC-15.546
     pub async fn review_queue(&self, tenant_id: TenantId) -> AppResult<Vec<ReviewItem>> {
         #[derive(sqlx::FromRow)]
         struct Row {
@@ -1728,6 +1753,7 @@ impl ContactSyncService {
     /// Answer one queued record. Every open question about it closes in the
     /// same transaction, so the next sync sees a human answered and does not
     /// ask again.
+    // SPEC-15.547, SPEC-15.548
     pub async fn resolve(
         &self,
         tenant_id: TenantId,
@@ -1868,6 +1894,7 @@ impl ContactSyncService {
 
     /// The live source a queued record waits in. An external id waiting in two
     /// sources at once needs the answer to name one.
+    // SPEC-15.548
     async fn review_source(
         &self,
         tenant_id: TenantId,
@@ -1921,6 +1948,7 @@ impl ContactSyncService {
 
     /// Where a contact came from, whether the source still has it, and which
     /// of its fields a person has locked (PMS-1214).
+    // SPEC-15.550
     pub async fn provenance(
         &self,
         tenant_id: TenantId,
@@ -1986,6 +2014,7 @@ impl ContactSyncService {
     }
 
     /// Let the source write a locked field again.
+    // SPEC-15.551
     pub async fn release_lock(
         &self,
         tenant_id: TenantId,
@@ -2036,6 +2065,7 @@ impl ContactSyncService {
     ///
     /// The link row stays, marked `unlinked`, and the sync skips that source
     /// record from then on instead of linking it straight back by its email.
+    // SPEC-15.552
     pub async fn unlink(
         &self,
         tenant_id: TenantId,
@@ -2096,6 +2126,7 @@ impl ContactSyncService {
     /// The audit row records that a removal happened, who asked and why, and
     /// deliberately not the removed values. Rows the audit log already holds
     /// from earlier writes are not rewritten: the log is append-only.
+    // SPEC-15.553 to 15.556
     pub async fn remove_imported_data(
         &self,
         tenant_id: TenantId,
@@ -2239,6 +2270,7 @@ impl ContactSyncService {
     /// a second place a credential can leak from. A revoked grant sets
     /// `reconnect_required` here, which is the state the Settings card renders
     /// and the only one an admin can act on (PSA-70 J).
+    // SPEC-15.557
     pub async fn access_token(
         &self,
         tenant_id: TenantId,
@@ -2289,6 +2321,7 @@ impl ContactSyncService {
     ///
     /// [`SecretProvider`]: crate::secrets::SecretProvider
     /// [`SourceError::Unauthorized`]: super::provider::SourceError::Unauthorized
+    // SPEC-15.558
     pub async fn icloud_credential(
         &self,
         tenant_id: TenantId,
@@ -2326,6 +2359,7 @@ impl ContactSyncService {
 
     /// Best effort: a failure to record the state must not mask the token
     /// failure the caller is already handling.
+    // SPEC-15.559
     async fn mark_reconnect_required(&self, tenant_id: TenantId, connection_id: Uuid) {
         let written = async {
             let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -2365,6 +2399,7 @@ impl ContactSyncService {
 /// `contactGroups/`. `UNGROUPED_ID` is accepted there because the iCloud source
 /// offers it (an Apple address book routinely holds contacts in no group), and
 /// deliberately NOT for Google, whose picker never has.
+// SPEC-15.539
 fn group_id_is_shaped(provider: &str, id: &str) -> bool {
     if id.is_empty() || id.len() > 255 {
         return false;
@@ -2378,6 +2413,7 @@ fn group_id_is_shaped(provider: &str, id: &str) -> bool {
 /// The live-link index refusing a second link for one record: a sync got
 /// there between the reviewer loading the queue and answering it. The unique
 /// violation arrives as the generic 409, which would tell the reviewer nothing.
+// SPEC-15.549
 fn already_linked(e: AppError) -> AppError {
     match e {
         AppError::Conflict(_) => AppError::Conflict(

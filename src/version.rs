@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 
-// SPEC-1 and 2.149: every version field is a compile-time env!() constant; there is no runtime git invocation in the server binary.
+// SPEC-2.250
 /// Crate version from `Cargo.toml` (e.g. `"0.1.0"`).
 pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -24,6 +24,7 @@ pub const GIT_HASH: &str = env!("MOKOSH_GIT_HASH");
 /// ISO-8601 UTC timestamp of the build.
 pub const BUILD_DATE: &str = env!("MOKOSH_BUILD_DATE");
 
+// SPEC-2.251
 /// JSON-serializable bundle returned by the `/version` endpoint.
 #[derive(Debug, Clone, Serialize)]
 pub struct VersionInfo {
@@ -45,6 +46,7 @@ impl VersionInfo {
         }
     }
 
+    // SPEC-2.252
     /// Single-line summary suitable for a startup log: `"<name> <describe>
     /// (<hash>) built <date>"`.
     pub fn banner(&self) -> String {

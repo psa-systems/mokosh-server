@@ -73,6 +73,7 @@ impl PaymentMethodsService {
     /// own (PMS-1235, the same refusal `pay_invoice` gets with no provider
     /// named), so a tenant with both Stripe and PayPal connected could not
     /// add a card at all until a caller could say which one.
+    // SPEC-5.493
     pub async fn start_add(
         &self,
         tenant_id: TenantId,
@@ -102,6 +103,7 @@ impl PaymentMethodsService {
     }
 
     /// Every card the caller has saved, default first, newest next.
+    // SPEC-5.494
     pub async fn list(
         &self,
         tenant_id: TenantId,
@@ -139,6 +141,7 @@ impl PaymentMethodsService {
     /// Remove the caller's card. Detaches on the provider side FIRST, then
     /// deletes the row. A missing row is `NotFound` before we touch the
     /// provider so a foreign-card guess costs nothing on the wire.
+    // SPEC-5.495
     pub async fn remove(&self, tenant_id: TenantId, contact_id: Uuid, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<(String, String, bool)> = sqlx::query_as(
@@ -225,6 +228,7 @@ impl PaymentMethodsService {
     /// held-lock time is bounded by the slowest single outbound call instead
     /// of their sum. `try_join_all` still returns the first error, leaving
     /// the caller's transaction (and thus the lock) for it to roll back.
+    // SPEC-5.498
     pub async fn detach_all_for_contact(
         &self,
         tx: &mut crate::db::TenantTransaction<'_>,
@@ -261,6 +265,7 @@ impl PaymentMethodsService {
     /// Flip the picked row to `is_default = TRUE` and clear every other row
     /// of the same contact in ONE transaction. The partial UNIQUE index on
     /// the table enforces at most one default even under concurrent writes.
+    // SPEC-5.496
     pub async fn set_default(
         &self,
         tenant_id: TenantId,
@@ -309,6 +314,7 @@ impl PaymentMethodsService {
     /// the operator decision on MAPPS-674: nobody wants an extra click on a
     /// page holding one card. Every subsequent card lands as
     /// `is_default = FALSE`.
+    // SPEC-5.497
     #[allow(clippy::too_many_arguments)]
     pub async fn record_from_webhook(
         &self,

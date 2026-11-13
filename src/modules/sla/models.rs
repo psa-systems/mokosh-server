@@ -50,6 +50,7 @@ pub struct UpsertSlaTargetRequest {
     pub resolution_hours: Option<Decimal>,
     /// "business_hours" | "24x7"
     // SPEC-7.80: defaults to "24x7" when absent from the request JSON.
+    // SPEC-7.1034: operational_hours is only checked by the DB CHECK constraint.
     #[serde(default = "default_24x7")]
     pub operational_hours: String,
 }
@@ -97,6 +98,7 @@ pub struct UpsertBusinessHoursRequest {
     pub name: String,
     // SPEC-7.85: timezone defaults to the literal string "UTC" when
     // omitted.
+    // SPEC-7.1035: timezone is not validated at write time.
     #[serde(default = "default_utc")]
     pub timezone: String,
     /// Per-day windows, e.g.

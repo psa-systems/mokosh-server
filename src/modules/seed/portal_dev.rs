@@ -149,6 +149,7 @@ impl std::fmt::Display for PortalDevSeedReport {
 }
 
 /// Refuse to run outside dev/test.
+// SPEC-15.2064
 fn require_dev_environment() -> anyhow::Result<()> {
     let env = crate::config::get(&crate::config::registry::ENVIRONMENT)
         .map(|s| s.to_ascii_lowercase())
@@ -165,6 +166,7 @@ fn require_dev_environment() -> anyhow::Result<()> {
 /// Insert the fixture set. Idempotent: skips any slug that already
 /// exists, only reporting the row set that resulted. The returned
 /// `inserted` flag distinguishes a first-run from a repeat run.
+// SPEC-15.2065
 pub async fn portal_dev_seed(pool: &PgPool) -> anyhow::Result<PortalDevSeedReport> {
     require_dev_environment()?;
 
@@ -228,6 +230,7 @@ struct FixtureSpec {
     agent_email: Option<&'static str>,
 }
 
+// SPEC-15.2065
 fn fixture_specs() -> Vec<FixtureSpec> {
     vec![
         FixtureSpec {
@@ -360,6 +363,7 @@ async fn upsert_company(
 /// the source templates on the default tenant after a first run does
 /// not clobber the fixture copies (matches the "migrations never
 /// clobber operator edits" contract from migration 096).
+// SPEC-15.2068
 async fn copy_notification_templates(pool: &PgPool, tenant_id: Uuid) -> anyhow::Result<()> {
     if tenant_id == DEFAULT_TENANT_ID {
         return Ok(());
@@ -417,6 +421,7 @@ async fn copy_notification_templates(pool: &PgPool, tenant_id: Uuid) -> anyhow::
 /// developer can sign into the agent panel of that tenant and click
 /// "Grant portal access" on a contact. Keyed by (tenant_id, email) so
 /// re-running is idempotent and does NOT reset an existing password.
+// SPEC-15.2067
 async fn upsert_agent_user(
     pool: &PgPool,
     tenant_id: Uuid,
@@ -479,6 +484,7 @@ fn derive_agent_name(slug: &str) -> (String, String) {
 /// `ensure_primary_company_link` rather than the mirror alone. A seeded contact
 /// that loses its company on the first edit is a fixture that reproduces the
 /// bug rather than the product.
+// SPEC-15.2066
 async fn upsert_portal_contact(
     pool: &PgPool,
     tenant_id: Uuid,

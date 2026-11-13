@@ -257,13 +257,16 @@ mod server_impl {
     /// which removes the second `serde_json` parse every JSON request used
     /// to pay for.
     // SPEC-4.38: skip raw-body/non-JSON/oversized paths; else stash parsed tree, empty the body.
+    // SPEC-4.1010: only application/json and +json bodies; undeclared-length overflow is 413.
     pub async fn sanitize_json_body(request: Request, next: Next) -> Response {
         let path = request.uri().path();
+        // SPEC-2.67
         if RAW_BODY_PATHS.iter().any(|p| path.starts_with(p)) {
             return next.run(request).await;
         }
         let is_json =
             header_str(request.headers(), header::CONTENT_TYPE).is_some_and(is_json_content_type);
+        // SPEC-2.68
         if !is_json {
             return next.run(request).await;
         }
@@ -278,6 +281,7 @@ mod server_impl {
                 })
                 .ok()
         });
+        // SPEC-2.69
         if declared_len.is_some_and(|len| len > MAX_SANITIZED_JSON_BYTES) {
             return next.run(request).await;
         }
@@ -294,6 +298,7 @@ mod server_impl {
                     error = %err,
                     "could not buffer JSON request body for invisible-character sanitization",
                 );
+                // SPEC-2.70
                 return AppError::PayloadTooLarge(
                     "The request body could not be read.".to_string(),
                 )
@@ -308,6 +313,7 @@ mod server_impl {
         let parsed = (!bytes.is_empty())
             .then(|| parse_and_sanitize(&bytes, &path))
             .flatten();
+        // SPEC-2.71
         let Some((value, _)) = parsed else {
             return next
                 .run(Request::from_parts(parts, Body::from(bytes)))
@@ -322,6 +328,7 @@ mod server_impl {
         parts
             .extensions
             .insert(crate::utils::json::ParsedJsonBody(value));
+        // SPEC-2.72
         parts.headers.remove(header::CONTENT_LENGTH);
         next.run(Request::from_parts(parts, Body::empty())).await
     }

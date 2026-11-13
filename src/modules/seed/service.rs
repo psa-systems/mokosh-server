@@ -56,6 +56,7 @@ use super::data::{demo_companies, demo_contacts, demo_projects, demo_sla, demo_t
 /// gated here. The shared multi-user landing tenant is also excluded separately
 /// and unconditionally by [`shared_landing_tenant`] (PMS-239). To remove demo
 /// rows seeded before this, run `scripts/wipe_demo_seed.sql`.
+// SPEC-15.2053
 fn demo_seed_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -72,6 +73,7 @@ fn demo_seed_enabled() -> bool {
 /// process env or the `OnceLock` memoization: production always seeds; every
 /// other environment seeds only when the `MOKOSH_DEMO_SEED` override is an
 /// explicit truthy value.
+// SPEC-15.2053
 fn seed_enabled_for(environment: &str, override_flag: Option<&str>) -> bool {
     if environment.trim().eq_ignore_ascii_case("production") {
         return true;
@@ -92,6 +94,7 @@ fn seed_enabled_for(environment: &str, override_flag: Option<&str>) -> bool {
 ///
 /// Returns `None` when the env var is unset (single-tenant / test / legacy
 /// deployments), in which case there is no shared tenant to exclude.
+// SPEC-15.2054
 fn shared_landing_tenant() -> Option<Uuid> {
     let raw = crate::config::get(&crate::config::registry::OIDC_DEFAULT_TENANT_ID);
     match crate::config::parse::parse_optional::<Uuid>(
@@ -197,6 +200,7 @@ impl SeedService {
     /// Ensure the tenant has demo data, seeding it on the first visit.
     /// Best-effort: all errors are logged and swallowed so a seeding
     /// problem can never break the request that triggered it.
+    // SPEC-15.2054, SPEC-15.2056
     pub async fn ensure_demo_seeded(&self, tenant_id: Uuid, user_id: Uuid) {
         if !self.enabled || self.is_seen(tenant_id) {
             return;
@@ -243,6 +247,7 @@ impl SeedService {
     /// stays a no-op for this tenant afterwards. It does NOT consult the
     /// `MOKOSH_DEMO_SEED` kill-switch: that governs the automatic first-visit
     /// path, whereas this is an explicit operator action.
+    // SPEC-15.2059
     pub async fn load_demo_data(
         &self,
         tenant_id: Uuid,
@@ -271,6 +276,7 @@ impl SeedService {
 
     /// Returns `Ok(true)` when demo rows were inserted, `Ok(false)` when the
     /// tenant was already claimed or already had data.
+    // SPEC-15.2057, SPEC-15.2058
     async fn run(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<bool> {
         if !self.try_claim(tenant_id).await? {
             // Another request (this process or another) already claimed the
@@ -291,6 +297,7 @@ impl SeedService {
     /// Atomically flip `tenants.settings->>'demo_seeded'` from unset/false to
     /// true. Returns `Ok(true)` iff this call won the claim. A missing tenant
     /// row (no match) returns `Ok(false)`.
+    // SPEC-15.2057
     async fn try_claim(&self, tenant_id: Uuid) -> AppResult<bool> {
         let claimed: Option<Uuid> = sqlx::query_scalar(
             r#"UPDATE tenants
@@ -334,6 +341,7 @@ impl SeedService {
     /// emptiness-checked tenant in `load_demo_data`), not user input, so every
     /// call bridges into the tenant-scoped services through
     /// `TenantId::from_trusted`.
+    // SPEC-15.2060, SPEC-15.2061, SPEC-15.2062, SPEC-15.2063
     async fn seed_rows(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
         let ctx = AuditCtx {
             tenant_id: Some(tenant_id),

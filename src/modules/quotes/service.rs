@@ -62,6 +62,7 @@ impl QuotesService {
         }
     }
 
+    // SPEC-13.1363
     /// Allocate the next gapless, per-tenant quote number inside the
     /// caller's transaction.
     ///
@@ -102,6 +103,7 @@ impl QuotesService {
         ))
     }
 
+    // SPEC-13.1361
     /// Validate that `company_id` names a company in the caller's tenant.
     ///
     /// The FK on `quotes.company_id` alone is not enough: foreign-key
@@ -145,6 +147,7 @@ impl QuotesService {
         Ok(rows.into_iter().collect())
     }
 
+    // SPEC-13.1358
     async fn enrich_quotes(
         &self,
         tenant_id: TenantId,
@@ -158,6 +161,7 @@ impl QuotesService {
         Ok(())
     }
 
+    // SPEC-13.1366
     /// Recompute `subtotal` / `total` from the quote's line rows and
     /// write them back.
     ///
@@ -199,6 +203,7 @@ impl QuotesService {
         Ok(())
     }
 
+    // SPEC-13.1365, SPEC-13.1366
     async fn recompute_totals(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -257,6 +262,7 @@ impl QuotesService {
         Ok(QuoteStatus::from_str(&raw).unwrap_or(QuoteStatus::Draft))
     }
 
+    // SPEC-13.1368
     /// Reject a content mutation when the quote is past the point where
     /// its figures may change.
     fn assert_content_editable(status: QuoteStatus) -> AppResult<()> {
@@ -269,6 +275,7 @@ impl QuotesService {
         Ok(())
     }
 
+    // SPEC-13.1353, SPEC-13.1352
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_quotes(
         &self,
@@ -353,6 +360,7 @@ impl QuotesService {
         Ok((resp, total as u64))
     }
 
+    // SPEC-13.1355, SPEC-13.1357, SPEC-13.1352
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     /// `today` is the caller's day (PMS-1027, `CallerContext::today`), the
     /// date read-time expiry compares `valid_until` against.
@@ -410,6 +418,7 @@ impl QuotesService {
     ) -> AppResult<QuoteResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
+        // SPEC-13.1361
         Self::assert_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
         // PMS-1000: a draft quote carries its recipient from the moment it
         // exists, the way an invoice does. An explicit contact is checked
@@ -417,6 +426,7 @@ impl QuotesService {
         // "a contact somewhere in this tenant" is not a person this customer
         // would expect to receive their quote; naming none inherits the
         // company's billing contact.
+        // SPEC-13.1362
         let billing_contact_id = crate::modules::contacts::billing_contact::resolve(
             &mut tx,
             tenant_id,
@@ -425,6 +435,7 @@ impl QuotesService {
         )
         .await?;
 
+        // SPEC-13.1363
         let quote_number = Self::next_quote_number(&mut tx, tenant_id).await?;
 
         let subtotal: Decimal = request
@@ -435,6 +446,7 @@ impl QuotesService {
         let tax = request.tax_amount.unwrap_or(Decimal::ZERO);
         let total = subtotal + tax;
 
+        // SPEC-13.1364, SPEC-13.1365
         let quote_id = Uuid::new_v4();
         sqlx::query(
             r#"
@@ -530,6 +542,7 @@ impl QuotesService {
         Ok(id)
     }
 
+    // SPEC-13.1372
     /// Update header fields, and optionally replace the whole line set.
     ///
     /// Rejects any write to a frozen quote, and any CONTENT change once
@@ -547,6 +560,7 @@ impl QuotesService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let current = Self::status_of(&mut tx, tenant_id, quote_id).await?;
 
+        // SPEC-13.1367
         if current.is_frozen() {
             return Err(AppError::Conflict(format!(
                 "Quote in status '{}' cannot be edited",
@@ -554,6 +568,7 @@ impl QuotesService {
             )));
         }
 
+        // SPEC-13.1368
         let changes_content = request.billing_contact_id.is_some()
             || request.title.is_some()
             || request.summary.is_some()
@@ -568,6 +583,7 @@ impl QuotesService {
         }
 
         if let Some(next) = request.status {
+            // SPEC-13.1369
             if !next.is_staff_settable() {
                 return Err(AppError::Conflict(format!(
                     "Status '{}' is not settable here; it is written by the send, portal, or convert route",
@@ -582,6 +598,7 @@ impl QuotesService {
             // Only `approved`. A manual `rejected` is the same answer a veto
             // gives, so it creates no conflicting claim, and refusing it
             // would strand a quote whose named approver has gone on leave.
+            // SPEC-13.1370
             if next == QuoteStatus::Approved
                 && super::approval_sync::has_pending_staff_approval(
                     &mut tx,
@@ -601,6 +618,7 @@ impl QuotesService {
         // PMS-1000: the same rule the create path applies. Validating against
         // the tenant alone let a quote be addressed to a contact of some other
         // customer, which is a disclosure rather than a typo.
+        // SPEC-13.1371
         if let Some(contact_id) = request.billing_contact_id {
             let company_id: Uuid = sqlx::query_scalar(
                 "SELECT company_id FROM quotes WHERE tenant_id = $1 AND id = $2",
@@ -698,6 +716,7 @@ impl QuotesService {
         self.get_quote(tenant_id, quote_id, today).await
     }
 
+    // SPEC-13.1373
     /// Cancel a quote.
     ///
     /// Modelled as a `cancelled` transition rather than a row delete: a
@@ -714,6 +733,7 @@ impl QuotesService {
     ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let current = Self::status_of(&mut tx, tenant_id, quote_id).await?;
+        // SPEC-13.1367
         if current.is_frozen() {
             return Err(AppError::Conflict(format!(
                 "Quote in status '{}' cannot be cancelled",
@@ -760,6 +780,7 @@ impl QuotesService {
     // PMS-673: issue to the client, and the client's sign-off.
     // ========================================================================
 
+    // SPEC-13.1382
     /// Send an approved quote to the client.
     ///
     /// Allowed only from `approved`: internal sign-off is the gate, and it
@@ -792,6 +813,7 @@ impl QuotesService {
     ) -> AppResult<QuoteResponse> {
         use crate::modules::billing::models::DeliveryMethod;
         // Resolve the delivery choice; omitted means email.
+        // SPEC-13.1377
         let (method, note) = match &delivery {
             Some(d) => {
                 let note = d
@@ -813,6 +835,7 @@ impl QuotesService {
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let current = Self::status_of(&mut tx, tenant_id, quote_id).await?;
+        // SPEC-13.1376
         if current != QuoteStatus::Approved {
             return Err(AppError::Conflict(format!(
                 "Quote in status '{}' cannot be sent; it must be internally approved first",
@@ -834,6 +857,7 @@ impl QuotesService {
         // PMS-992. The pre-PMS-1462 path left `email`-less contacts
         // reaching `sent` with nobody mailed, which is the gap the new
         // sentence shape closes.
+        // SPEC-13.1378
         let recipient_id = if method == DeliveryMethod::Email {
             let Some(recipient_id) = crate::modules::contacts::billing_contact::resolve(
                 &mut tx, tenant_id, company_id, requested,
@@ -889,6 +913,7 @@ impl QuotesService {
 
         // The resolved recipient is persisted. If `postal` / `other`,
         // billing_contact_id stays whatever it was.
+        // SPEC-13.1379
         if let Some((contact_id, _)) = &recipient_id {
             sqlx::query(
                 "UPDATE quotes SET status = 'sent', sent_at = NOW(), billing_contact_id = $3, \
@@ -927,6 +952,7 @@ impl QuotesService {
         } else {
             None
         };
+        // SPEC-13.1380, SPEC-13.1381
         if let (Some((_, address)), Some(quote)) = (&recipient_id, &quote_for_mail) {
             if let Err(mail_err) = self.mail_quote_to_client(tenant_id, quote, address).await {
                 let number = quote.quote_number.clone().unwrap_or_default();
@@ -1024,6 +1050,7 @@ impl QuotesService {
         Ok(row.into_response(today))
     }
 
+    // SPEC-13.1383
     /// PMS-1462: `GET /quotes/{id}/delivery-options`. Mirrors
     /// `BillingService::invoice_delivery_options`.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, quote_id = %quote_id))]
@@ -1083,6 +1110,7 @@ impl QuotesService {
         })
     }
 
+    // SPEC-13.1383
     async fn resolve_quote_email_option(
         &self,
         tenant_id: TenantId,
@@ -1147,6 +1175,7 @@ impl QuotesService {
         }
     }
 
+    // SPEC-13.1381
     /// PMS-1462: record a failed quote email attempt in a NEW transaction,
     /// so the audit row survives the rollback of the one that just rolled
     /// the send back.
@@ -1181,6 +1210,7 @@ impl QuotesService {
         Ok(())
     }
 
+    // SPEC-13.1380, SPEC-13.1381
     /// PMS-1462: no longer swallowed, no longer best-effort. Returns the
     /// mail error so the caller can roll the transition back and record a
     /// `quote.send_failed` audit row. The surrounding transaction stays
@@ -1273,6 +1303,7 @@ impl QuotesService {
             })
     }
 
+    // SPEC-13.1354, SPEC-13.1352
     /// List the quotes a portal contact's company may see.
     ///
     /// Scoped by BOTH the contact's tenant and their company, and further
@@ -1325,6 +1356,7 @@ impl QuotesService {
         Ok((resp, total as u64))
     }
 
+    // SPEC-13.1356
     /// Fetch one quote for a portal contact.
     ///
     /// Returns 404 rather than 403 when the quote belongs to another
@@ -1346,6 +1378,7 @@ impl QuotesService {
         Ok(quote)
     }
 
+    // SPEC-13.1387
     /// Record the client's accept / decline decision.
     ///
     /// Valid only from `sent`: an already-decided quote 409s, so a
@@ -1375,6 +1408,7 @@ impl QuotesService {
         let (row_company, raw_status, valid_until) =
             row.ok_or_else(|| AppError::NotFound("Quote".to_string()))?;
         let stored = QuoteStatus::from_str(&raw_status).unwrap_or(QuoteStatus::Draft);
+        // SPEC-13.1385
         if row_company != decision.company_id || !stored.is_client_visible() {
             return Err(AppError::NotFound("Quote".to_string()));
         }
@@ -1382,6 +1416,7 @@ impl QuotesService {
         // Read-time expiry: a quote past `valid_until` is treated as
         // expired without a sweeper having to have run.
         // PMS-1027: `today` is the customer's day, not UTC's.
+        // SPEC-13.1386
         let effective = effective_status(stored, valid_until, today);
         if effective != QuoteStatus::Sent {
             return Err(AppError::Conflict(format!(
@@ -1442,6 +1477,7 @@ impl QuotesService {
         Ok(quote)
     }
 
+    // SPEC-13.1388
     /// Best-effort "your client decided" fanout to the quote's owner.
     /// Errors are logged, never surfaced: the decision is committed and
     /// must not be undone by a notification failure.
@@ -1483,6 +1519,7 @@ impl QuotesService {
     // PMS-674: convert an accepted quote into a Project.
     // ========================================================================
 
+    // SPEC-13.1389, SPEC-13.1391
     /// Turn an accepted quote into a Project, in one transaction.
     ///
     /// This is the "upon approval, it becomes a project" step: the quote
@@ -1521,6 +1558,7 @@ impl QuotesService {
 
         // Serialise concurrent conversions of the same quote. Everything
         // below reads from this locked row.
+        // SPEC-13.1390
         let row = sqlx::query_as::<_, QuoteForConversion>(
             r#"
             SELECT status, converted_project_id, company_id, title, description, total
@@ -1539,6 +1577,7 @@ impl QuotesService {
         // Already converted: return the existing link rather than 409ing.
         // A double-clicked Convert button is not an error, and the caller
         // gets the same `converted_project_id` either way.
+        // SPEC-13.1390
         if status == QuoteStatus::Converted && row.converted_project_id.is_some() {
             drop(tx);
             return self.get_quote(tenant_id, quote_id, today).await;
@@ -1647,6 +1686,7 @@ impl QuotesService {
         self.get_quote(tenant_id, quote_id, today).await
     }
 
+    // SPEC-13.1374, SPEC-13.1368
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn add_line(
         &self,
@@ -1665,6 +1705,7 @@ impl QuotesService {
         self.get_quote(tenant_id, quote_id, today).await
     }
 
+    // SPEC-13.1374, SPEC-13.1368, SPEC-13.1375
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_line(
         &self,
@@ -1708,6 +1749,7 @@ impl QuotesService {
         self.get_quote(tenant_id, quote_id, today).await
     }
 
+    // SPEC-13.1374, SPEC-13.1368
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_line(
         &self,
@@ -1736,12 +1778,14 @@ impl QuotesService {
     }
 }
 
+// SPEC-13.1354
 /// Statuses a portal contact may see, as the bind for `status = ANY($n)`.
 /// Kept in step with [`QuoteStatus::is_client_visible`]; the unit tests
 /// assert the two agree so a new status cannot be added to one and
 /// forgotten in the other.
 const CLIENT_VISIBLE_STATUSES: &[&str] = &["sent", "accepted", "declined", "expired", "converted"];
 
+// SPEC-13.1357
 /// Derive the status a reader should see, applying expiry at read time.
 ///
 /// A `sent` quote whose `valid_until` has passed reads as `expired`
@@ -1864,6 +1908,7 @@ impl QuoteRow {
             // Read-time expiry (PMS-673): a `sent` quote past its
             // `valid_until` reports as `expired` even though the stored
             // column still says `sent`. See `effective_status`.
+            // SPEC-13.1357
             status: effective_status(
                 QuoteStatus::from_str(&r.status).unwrap_or(QuoteStatus::Draft),
                 r.valid_until,

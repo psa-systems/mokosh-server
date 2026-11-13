@@ -27,6 +27,7 @@ pub struct KbRouterState {
     pub service: Arc<KbService>,
 }
 
+// SPEC-15.1147
 pub fn kb_routes(service: KbService) -> Router {
     let state = KbRouterState {
         service: Arc::new(service),
@@ -117,6 +118,7 @@ pub fn kb_routes(service: KbService) -> Router {
         .with_state(state)
 }
 
+// SPEC-15.1114, SPEC-15.1115
 async fn list_categories(
     State(s): State<KbRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -147,6 +149,7 @@ async fn list_categories(
     )))
 }
 
+// SPEC-15.1114
 /// PMS-1082: the staff arm of a dual-plane KB read keeps exactly the
 /// surface `RequireKnowledgeBase` gave it: an authenticated staff
 /// user AND the tenant's `knowledge_base` module on, else the same
@@ -168,6 +171,7 @@ async fn assert_staff_kb_enabled(
     Ok(())
 }
 
+// SPEC-15.1116
 async fn create_category(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -181,6 +185,7 @@ async fn create_category(
     ))
 }
 
+// SPEC-15.1117
 async fn update_category(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -192,6 +197,7 @@ async fn update_category(
     Ok(Json(s.service.update_category(u.tenant(), id, &req).await?))
 }
 
+// SPEC-15.1117
 async fn delete_category(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -201,6 +207,7 @@ async fn delete_category(
     s.service.delete_category(u.tenant(), id).await
 }
 
+// SPEC-15.1114, SPEC-15.1118, SPEC-15.1119
 async fn list_articles(
     State(s): State<KbRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -244,6 +251,7 @@ async fn list_articles(
     })
 }
 
+// SPEC-15.1120
 async fn create_article(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -259,6 +267,7 @@ async fn create_article(
     ))
 }
 
+// SPEC-15.1114, SPEC-15.1125
 async fn get_article(
     State(s): State<KbRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -289,6 +298,7 @@ async fn get_article(
     })
 }
 
+// SPEC-15.1114, SPEC-15.1139
 /// Render an article's Markdown against the caller's values map.
 /// Dual-plane: a staff caller renders a staff article, a contact
 /// holding `kb:read` renders a published portal-visible article. Same
@@ -319,6 +329,7 @@ async fn render_article(
     Ok(Json(rendered))
 }
 
+// SPEC-15.1127
 async fn update_article(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -335,6 +346,7 @@ async fn update_article(
     ))
 }
 
+// SPEC-15.1130
 /// PMS-922: upsert the caller's draft.
 ///
 /// `RequireManager` like the article PUT it is a draft of: a draft is
@@ -353,6 +365,7 @@ async fn save_draft(
     ))
 }
 
+// SPEC-15.1130
 /// The caller's draft, or 404 when they have none.
 ///
 /// 404 rather than 200-with-null so "no draft" is a status the client can
@@ -371,6 +384,7 @@ async fn get_draft(
         .ok_or_else(|| crate::utils::error::AppError::NotFound("Draft".to_string()))
 }
 
+// SPEC-15.1130
 async fn delete_draft(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -381,6 +395,7 @@ async fn delete_draft(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+// SPEC-15.1135
 async fn delete_article(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -391,6 +406,7 @@ async fn delete_article(
     s.service.delete_article(u.tenant(), id, &ctx).await
 }
 
+// SPEC-15.1131
 async fn list_article_versions(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -409,6 +425,7 @@ async fn list_article_versions(
     )))
 }
 
+// SPEC-15.1132
 /// PMS-1126: `RequireManager` like the article PUT it is a form of. Before
 /// this the route carried only the module gate, so a technician who could
 /// not edit an article could still rewrite it to any past version. Takes an
@@ -434,6 +451,7 @@ async fn restore_article_version(
     ))
 }
 
+// SPEC-15.1133
 async fn mark_helpful(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -444,6 +462,7 @@ async fn mark_helpful(
     ))
 }
 
+// SPEC-15.1133
 async fn mark_not_helpful(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -456,6 +475,7 @@ async fn mark_not_helpful(
     ))
 }
 
+// SPEC-15.1134
 async fn get_article_vote(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -477,6 +497,7 @@ pub struct TopTicketDrivingQuery {
     pub limit: Option<i64>,
 }
 
+// SPEC-15.1137
 async fn list_top_ticket_driving_articles(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -492,6 +513,7 @@ async fn list_top_ticket_driving_articles(
     ))
 }
 
+// SPEC-15.1136
 /// PMS-1127: staff only, like every KB read that is not one of the three
 /// dual-plane ones; a contact bearer never satisfies `RequireKnowledgeBase`.
 async fn list_article_tickets(
@@ -512,6 +534,7 @@ async fn list_article_tickets(
     )))
 }
 
+// SPEC-15.1140
 /// PMS-1128: roots with their replies, oldest first.
 async fn list_comments(
     State(s): State<KbRouterState>,
@@ -521,6 +544,7 @@ async fn list_comments(
     Ok(Json(s.service.list_comments(u.tenant(), id).await?))
 }
 
+// SPEC-15.1141
 async fn create_comment(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -536,6 +560,7 @@ async fn create_comment(
     Ok((axum::http::StatusCode::CREATED, Json(created)))
 }
 
+// SPEC-15.1142
 /// The author, or an admin. `Manager` is deliberately absent, the
 /// ticket-note rule: editing another person's words is granted on purpose.
 async fn update_comment(
@@ -553,6 +578,7 @@ async fn update_comment(
     ))
 }
 
+// SPEC-15.1143
 async fn delete_comment(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -565,6 +591,7 @@ async fn delete_comment(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+// SPEC-15.1144
 async fn resolve_comment(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -578,6 +605,7 @@ async fn resolve_comment(
     ))
 }
 
+// SPEC-15.1144
 async fn unresolve_comment(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
@@ -597,6 +625,7 @@ struct MeasuredDurationQuery {
     to: Option<chrono::NaiveDate>,
 }
 
+// SPEC-15.1138
 async fn article_measured_duration(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,

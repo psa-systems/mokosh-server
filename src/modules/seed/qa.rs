@@ -159,6 +159,7 @@ impl fmt::Display for QaReport {
 /// Mark a QA tenant explicitly before seeding, e.g.:
 /// `UPDATE tenants SET settings = jsonb_set(COALESCE(settings,'{}'::jsonb),
 /// '{is_qa}', 'true'::jsonb, true) WHERE id = '<qa-tenant-id>';`
+// SPEC-15.2069
 pub async fn confirm_qa_tenant(db: &Database, tenant_id: Uuid) -> AppResult<()> {
     // `tenants` is the RLS-exempt isolation root (migration 038), so reading
     // the marker on the migrator pool is correct and avoids needing a tenant
@@ -206,6 +207,7 @@ pub async fn confirm_qa_tenant(db: &Database, tenant_id: Uuid) -> AppResult<()> 
 
 /// Seed the QA dataset into `tenant_id`. Confirms the QA marker first
 /// (fail closed) and is idempotent: a no-op if the dataset is already present.
+// SPEC-15.2070
 pub async fn qa_seed(db: &Database, tenant_id: Uuid) -> AppResult<QaReport> {
     confirm_qa_tenant(db, tenant_id).await?;
     QaSeeder::new(db.clone()).seed(tenant_id).await
@@ -213,6 +215,7 @@ pub async fn qa_seed(db: &Database, tenant_id: Uuid) -> AppResult<QaReport> {
 
 /// Remove the QA dataset (and the QA lookup rows it created) from `tenant_id`.
 /// Confirms the QA marker first (fail closed). Safe to run repeatedly.
+// SPEC-15.2070
 pub async fn qa_teardown(db: &Database, tenant_id: Uuid) -> AppResult<QaReport> {
     confirm_qa_tenant(db, tenant_id).await?;
     teardown(db, tenant_id).await
@@ -241,6 +244,7 @@ impl QaSeeder {
     /// has not been given can be neither paid (PMS-999) nor credited
     /// (PMS-953), and seeded data is issued rather than sent to a real
     /// address.
+    // SPEC-15.2074
     async fn issue_for_qa(
         &self,
         tenant: TenantId,
@@ -299,6 +303,7 @@ impl QaSeeder {
         }
     }
 
+    // SPEC-15.2071, SPEC-15.2073
     async fn seed(&self, tid: Uuid) -> AppResult<QaReport> {
         // Idempotency: any pre-existing QA company means we have already
         // seeded this tenant. Bail without writing so re-runs never duplicate.
@@ -561,6 +566,7 @@ impl QaSeeder {
         Ok(exists)
     }
 
+    // SPEC-15.2072
     async fn first_user(&self, tid: Uuid) -> AppResult<Uuid> {
         let mut tx = self.db.begin_with_tenant(tid).await?;
         let id: Option<Uuid> = sqlx::query_scalar(
@@ -713,6 +719,7 @@ impl QaSeeder {
 /// Remove the QA dataset for `tenant_id` in FK-dependency order. Runs in a
 /// single tenant-scoped transaction so it is all-or-nothing. Returns counts of
 /// the primary entities removed.
+// SPEC-15.2075
 async fn teardown(db: &Database, tid: Uuid) -> AppResult<QaReport> {
     let like = format!("{QA_PREFIX}%");
     let qa_companies = "SELECT id FROM companies WHERE tenant_id = $1 AND name LIKE $2";

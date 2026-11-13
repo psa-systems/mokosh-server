@@ -2,6 +2,8 @@
 
 # SPEC-10.170
 
+# SPEC-10.354: exit codes and filters
+
 # PMS-1402: catch a prefix collision that only appears after the merge.
 #
 # `common/scripts/check-migration-versions.nu` scans the migrations

@@ -94,6 +94,7 @@ pub fn approval_routes(service: ApprovalsService) -> Router {
         .with_state(state)
 }
 
+// SPEC-7.1070: no ticket existence check, so an unknown ticket answers 200 with an empty array
 async fn list_for_ticket(
     State(s): State<ApprovalsRouterState>,
     RequireAuth(u): RequireAuth,
@@ -243,6 +244,7 @@ async fn create_for_quote(
 /// (DB-loaded per request) gets the pending rows addressed to it by
 /// `approver_contact_id`. Same shape on both arms, so the SPA's one
 /// queue page serves both.
+// SPEC-7.1067: staff without a user is 401; a contact without approvals:decide is 403
 async fn pending_for_caller(
     State(s): State<ApprovalsRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -350,6 +352,7 @@ fn staff_user(
     auth.user.as_ref().ok_or(AppError::Unauthorized)
 }
 
+// SPEC-7.1066: staff-only (RequireAuth); no contact-plane arm
 async fn cancel(
     State(s): State<ApprovalsRouterState>,
     RequireAuth(u): RequireAuth,

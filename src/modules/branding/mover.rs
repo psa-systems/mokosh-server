@@ -36,6 +36,7 @@ use crate::utils::error::{AppError, AppResult};
 
 /// Entry point for the one-shot pass. Walks the five legacy
 /// directories under `root` and moves each file.
+// SPEC-15.2100
 pub async fn move_all(root: PathBuf, db: Database) -> AppResult<()> {
     let plan = [
         ("tenant-favicons", AssetKindDir::TenantFavicon),
@@ -106,6 +107,7 @@ enum MoveOutcome {
     Skipped,
 }
 
+// SPEC-15.2100
 async fn move_one(
     root: &Path,
     legacy_path: &Path,
@@ -193,6 +195,7 @@ async fn move_one(
 
 /// Register the one-shot pass at boot. Mirrors every other PMS-1320
 /// one-shot (e.g. `TenantLogoMover` for the pre-PMS-1234 logo).
+// SPEC-15.2100
 pub fn arm(root: PathBuf, db: Database) {
     crate::scheduler::one_shot::spawn_once("branding_mover_pms_1397", async move {
         move_all(root, db).await

@@ -281,6 +281,7 @@ pub trait Mailer: Send + Sync {
 pub struct LogMailer;
 
 #[async_trait]
+// SPEC-4.1027: logs recipient, subject and body lengths only, never the body.
 impl Mailer for LogMailer {
     async fn send_multipart(
         &self,
@@ -360,6 +361,8 @@ pub struct SmtpMailer {
     from: Mailbox,
 }
 
+// SPEC-4.1025: 15s transport timeout, uuid Message-ID, BadRequest on a bad recipient, mixed for
+// attachments.
 impl SmtpMailer {
     /// Build from explicit pieces. Use [`SmtpMailer::from_env`] in main.
     pub fn new(
@@ -456,6 +459,7 @@ fn reject_undeliverable_recipient(to: &Mailbox) -> AppResult<()> {
 /// wording is pinned by a test without a mailer: the link paragraph appears
 /// only when there is a link, and the attachment is named only when there is
 /// one, so no recipient is told to click or open something that is not there.
+// SPEC-4.1024: subject and attachment-name wording for invoice and reminder emails.
 pub fn compose_invoice_sent(
     org_name: &str,
     contact_line: &str,
@@ -734,6 +738,7 @@ impl ApiMailer {
     }
 }
 
+// SPEC-8.8: wire shape of the Bunyip relay send body.
 /// Request body for `POST /v1/mailer/send`, matching `bunyip-api`'s
 /// `handlers::mailer::RelaySendRequest`.
 #[derive(serde::Serialize)]
@@ -746,6 +751,8 @@ struct RelaySendRequest<'a> {
 }
 
 #[async_trait]
+// SPEC-4.1026: POST /v1/mailer/send with Basic auth, 10s timeout; attachments dropped with a
+// warning.
 impl Mailer for ApiMailer {
     async fn send_multipart(
         &self,
@@ -808,6 +815,7 @@ impl MailerConfig {
     /// upgrades without a fatal boot.
     // SPEC-4.67: rejects SMTP_USERNAME set without a non-empty SMTP_PASSWORD.
     pub fn from_env() -> AppResult<Self> {
+        // SPEC-4.1028: defaults: port 587, sender Mokosh <noreply@example.com>, STARTTLS.
         let host = config::get(&keys::SMTP_HOST).filter(|s| !s.is_empty());
         let port =
             crate::config::parse::parse_optional(&keys::SMTP_PORT, config::get(&keys::SMTP_PORT))
@@ -968,6 +976,7 @@ impl EmailProviderKind {
             s if s == provider::SMTP => Ok(EmailProviderKind::Smtp),
             s if s == provider::BUNYIP => Ok(EmailProviderKind::Api),
             other => Err(AppError::Configuration(format!(
+                // SPEC-2.245
                 "MAIL_PROVIDER {other:?} is not a known provider; expected 'log', 'smtp' or \
                  'bunyip'"
             ))),
@@ -1120,6 +1129,8 @@ static SELECTED_KIND: std::sync::OnceLock<EmailProviderKind> = std::sync::OnceLo
 /// Record the selection at boot. A second call from the same process is
 /// silently ignored, matching [`crate::storage::init_from_env`]'s once-per-
 /// process guarantee.
+// SPEC-4.1029: boot selection recorded once; names log/smtp/bunyip; unknown MAIL_PROVIDER is
+// Configuration.
 pub fn init_selected_kind(kind: EmailProviderKind) {
     let _ = SELECTED_KIND.set(kind);
 }
