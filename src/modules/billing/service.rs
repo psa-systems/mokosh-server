@@ -2936,19 +2936,16 @@ impl BillingService {
                     Vec::new()
                 }
             };
-            // PMS-1660 finding: an unknown stored provider used to
-            // silently relabel as `stripe`, so a hand-written row or
-            // a new provider the current build does not know would
-            // list under the wrong name. Keep the fallback so the
-            // list still renders (a corrupt row should not blank the
-            // page) but WARN with the row id + stored value.
+            // An unknown stored provider would silently relabel as
+            // `stripe`; WARN with the row id so a corrupt or new value
+            // surfaces while the list still renders.
             let provider = {
                 let parsed = GatewayProvider::from_str(&r.provider);
                 if parsed.is_none() {
                     tracing::warn!(
                         gateway_id = %r.id,
                         stored = %r.provider,
-                        "payment_gateway_configs.provider is not one of the known gateways; reading as Stripe"
+                        "stored gateway provider is not one of the known values; reading as Stripe"
                     );
                 }
                 parsed.unwrap_or(GatewayProvider::Stripe)

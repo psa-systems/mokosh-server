@@ -798,15 +798,13 @@ async fn decline_invitation(
 /// uses the same shape. Returns `None` for a legacy local user who has no
 /// Bunyip sub yet so the caller falls through to a 404 rather than a 500.
 async fn resolve_caller_bunyip_sub(db: &Database, user_id: Uuid) -> AppResult<Option<Uuid>> {
+    // `users.bunyip_user_id` is nullable: decode as `Option<Option<Uuid>>`
+    // and flatten so a NULL column reaches the "no sub -> None -> 404"
+    // branch instead of becoming a decode error (500). Same shape as
+    // `my_grants::leave_grant`.
     // SAFETY (PMS-285): identity-plane read of the caller's own row; the
     // grantee surface is cross-tenant by design and holds no scoped tenant
-    // GUC. Matches the shape `my_grants::leave_grant` uses.
-    // PMS-1658 finding: `users.bunyip_user_id` is nullable; the old
-    // `query_scalar::<Option<Uuid>>` + `fetch_optional` would decode
-    // a NULL column as a decode error (500) rather than reaching the
-    // "no Bunyip id -> 404" branch the SPEC-5.260 comments describe.
-    // Read `Option<Option<Uuid>>` and flatten, matching the twin fix
-    // in `my_grants::leave_grant`.
+    // GUC.
     let sub: Option<Uuid> = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT bunyip_user_id FROM users WHERE id = $1 LIMIT 1",
     )
