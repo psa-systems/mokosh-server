@@ -1620,8 +1620,47 @@ impl AssetsService {
         request: &CreateAssetRelationshipRequest,
         ctx: &AuditCtx,
     ) -> AppResult<AssetRelationshipResponse> {
-        let id = Uuid::new_v4();
+        // PMS-1664: the bare INSERT used to accept any UUID the caller
+        // supplied, so a parent or child id naming a foreign-tenant row
+        // either silently linked across tenants (if the FK resolved) or
+        // raised 23503 as a 500. The same INSERT also accepted any string
+        // as relationship_type, where the models.rs doc names a closed set
+        // ("contains" | "connected_to" | "depends_on" | "hosts"), and did
+        // not refuse a self-edge where parent == child. All four checks
+        // now run before the INSERT.
+        if parent_id == request.child_asset_id {
+            return Err(AppError::BadRequest(
+                "An asset cannot be related to itself".to_string(),
+            ));
+        }
+        if !ASSET_RELATIONSHIP_TYPES.contains(&request.relationship_type.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "relationship_type must be one of {}",
+                ASSET_RELATIONSHIP_TYPES.join(", ")
+            )));
+        }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let parent_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2)",
+        )
+        .bind(parent_id)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !parent_exists {
+            return Err(AppError::NotFound("Asset".to_string()));
+        }
+        let child_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2)",
+        )
+        .bind(request.child_asset_id)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !child_exists {
+            return Err(AppError::NotFound("Asset".to_string()));
+        }
+        let id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO asset_relationships
                (id, tenant_id, parent_asset_id, child_asset_id, relationship_type)
@@ -2809,6 +2848,12 @@ async fn facet_uuid_counts(
 /// Default `AST-NNN` prefix. Hard-coded for now; a tenant-level override
 /// (per PMS-1496's "configurable prefix" note) can land as a follow-up
 /// once a tenant setting is wired - the single call site here contains it.
+/// PMS-1664: the closed set of relationship types `create_asset_relationship`
+/// accepts. The models.rs doc comment on `CreateAssetRelationshipRequest`
+/// already names this set; the service now refuses anything else with a 400
+/// instead of writing a free-text value the DB happens to accept.
+const ASSET_RELATIONSHIP_TYPES: &[&str] = &["contains", "connected_to", "depends_on", "hosts"];
+
 const ASSET_TAG_PREFIX: &str = "AST-";
 
 /// Minimum numeric width in the formatted tag ("AST-001"); larger values
