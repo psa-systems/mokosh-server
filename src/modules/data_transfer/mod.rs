@@ -103,7 +103,14 @@ async fn seed_demo_data(
     match s.seed.load_demo_data(u.tenant_id, u.id).await? {
         LoadDemoOutcome::Seeded => Ok(Json(json!({
             "seeded": true,
-            "message": "Demo data loaded: a sample company, two contacts, and three tickets.",
+            // PMS-1666 F3: the old string hardcoded "one sample
+            // company, two contacts, and three tickets" while the
+            // embedded bundle seeds two companies, four contacts and
+            // five tickets (see `demo_seed_bundle_parses_to_the_expected_shape`
+            // in modules/seed/data.rs). SPEC-15.2130 states only
+            // that a message is returned, so align the text with the
+            // bundle it describes.
+            "message": "Demo data loaded: two sample companies, four contacts, and five tickets.",
         }))),
         LoadDemoOutcome::AlreadyHasData => Ok(Json(json!({
             "seeded": false,
@@ -156,7 +163,21 @@ async fn export_tenant_data(
     let mut entities = Map::new();
     let mut included: Vec<String> = Vec::new();
     for table in table_names {
-        if EXCLUDE_TABLES.contains(&table.as_str()) || !is_safe_identifier(&table) {
+        if EXCLUDE_TABLES.contains(&table.as_str()) {
+            continue;
+        }
+        // PMS-1666 F5: a tenant table whose name is not a plain lowercase
+        // identifier used to be skipped silently, and it was then absent
+        // from both `included_tables` and `excluded_tables` on the
+        // envelope. If one ever gets added (unlikely - the convention has
+        // held for every migration), WARN so the operator can tell
+        // apart "no such table" from "skipped on the export".
+        if !is_safe_identifier(&table) {
+            tracing::warn!(
+                table = %table,
+                tenant_id = %tenant,
+                "data_transfer export: tenant table is not a lowercase identifier; skipping"
+            );
             continue;
         }
         // `row_to_json` under the tenant transaction (RLS) + explicit
