@@ -337,17 +337,24 @@ impl KbAttachmentService {
     /// as the old `read_public` (see the module header): the tenant on both
     /// keys is the row's own, never the request's.
     async fn open_public(&self, row: &PublicAttachmentRow) -> AppResult<ObjectReader> {
+        // PMS-1664 finding: both opens used to collapse any error into
+        // 404, so a permission / backend outage surfaced as "not found"
+        // and an operator had no signal. Match on the error kind so
+        // only `NotFound` falls through to the legacy layout, and any
+        // other error on either read bubbles verbatim. Pairs with
+        // `LocalProvider::read`/`exists` (PR #1323).
         match self
             .store
             .open(&ObjectKey::kb_attachment(row.tenant_id, row.id))
             .await
         {
             Ok(reader) => Ok(reader),
-            Err(_) => self
-                .store
-                .open(&ObjectKey::legacy_kb_attachment(row.tenant_id, row.id))
-                .await
-                .map_err(|_| AppError::NotFound("Attachment".to_string())),
+            Err(AppError::NotFound(_)) => {
+                self.store
+                    .open(&ObjectKey::legacy_kb_attachment(row.tenant_id, row.id))
+                    .await
+            }
+            Err(e) => Err(e),
         }
     }
 }

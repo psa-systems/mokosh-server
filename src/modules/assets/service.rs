@@ -1205,7 +1205,10 @@ impl AssetsService {
                 contact_id = COALESCE($7, contact_id),
                 status = COALESCE(
                     $8,
-                    CASE WHEN $23 = 'retired' THEN 'retired' ELSE status END
+                    -- PMS-1664: PATCH compares case-insensitively below;
+                    -- the PUT branch does the same so a stage of "Retired"
+                    -- or "RETIRED" implies retired status consistently.
+                    CASE WHEN lower($23) = 'retired' THEN 'retired' ELSE status END
                 ),
                 manufacturer = COALESCE($9, manufacturer),
                 model = COALESCE($10, model),
@@ -1273,8 +1276,23 @@ impl AssetsService {
         };
         // Persist the before -> after diff as a JSON array of {field, old, new}
         // so the asset detail page can show the actual content of the edit.
-        let changes = serde_json::to_value(crate::modules::audit::field_changes(&before, &after))
-            .unwrap_or(serde_json::Value::Null);
+        //
+        // PMS-1664 finding: a serialize failure used to store Null with no
+        // trace, so the asset detail page would show "no changes" for an
+        // edit that did happen. Keep the Null fallback (the audit row
+        // itself must still write) but WARN with the asset id + error.
+        let changes =
+            match serde_json::to_value(crate::modules::audit::field_changes(&before, &after)) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        asset_id = %id,
+                        error = %e,
+                        "asset_audit_log: field_changes failed to serialize; writing Null"
+                    );
+                    serde_json::Value::Null
+                }
+            };
         sqlx::query(
             r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id, changes)
                VALUES ($1, $2, $3, $4, $5)"#,
@@ -1504,8 +1522,20 @@ impl AssetsService {
         } else {
             "updated"
         };
-        let changes = serde_json::to_value(crate::modules::audit::field_changes(&before, &after))
-            .unwrap_or(serde_json::Value::Null);
+        // Same shape as the matching audit log in `update_asset`: WARN
+        // on a serialize failure, keep the Null fallback (PMS-1664).
+        let changes =
+            match serde_json::to_value(crate::modules::audit::field_changes(&before, &after)) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        asset_id = %id,
+                        error = %e,
+                        "asset_audit_log: field_changes failed to serialize; writing Null"
+                    );
+                    serde_json::Value::Null
+                }
+            };
         sqlx::query(
             r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id, changes)
                VALUES ($1, $2, $3, $4, $5)"#,
