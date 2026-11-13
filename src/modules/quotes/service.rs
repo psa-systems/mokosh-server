@@ -1731,11 +1731,18 @@ impl QuotesService {
         // Scoped by quote_id as well as line id: the parent lookup above
         // is what proves tenancy, so a line from another quote must not be
         // reachable through this path.
+        //
+        // PMS-1661 F1: `is_taxable` from the request used to be ignored
+        // here, so `PUT /quotes/{id}/lines/{line_id}` could not change
+        // taxability even though `add_line` and the bulk update can.
+        // Writing it closes the gap and keeps the three write paths in
+        // step; SPEC-13.1375 says the stored value drives tax derivation.
         let affected = sqlx::query(
             r#"
             UPDATE quote_lines
             SET line_type = $3, description = $4, quantity = $5,
-                unit_price = $6, total = $5 * $6, sort_order = $7
+                unit_price = $6, total = $5 * $6, sort_order = $7,
+                is_taxable = $8
             WHERE id = $1 AND quote_id = $2
             "#,
         )
@@ -1746,6 +1753,7 @@ impl QuotesService {
         .bind(line.quantity)
         .bind(line.unit_price)
         .bind(line.sort_order)
+        .bind(line.is_taxable)
         .execute(&mut *tx)
         .await?
         .rows_affected();
