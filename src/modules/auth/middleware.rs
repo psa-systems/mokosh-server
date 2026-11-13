@@ -253,27 +253,51 @@ async fn enrich_auth_state_with_identity(
         return state;
     };
     let pool = auth_service.db().migrator_pool();
-    let identity_id = crate::db::identity::IdentityRepo::find_id_by_email(pool, &user.email)
+    // PMS-1658: `.ok().flatten()` / `.unwrap_or_default()` on each of
+    // the three repo calls used to render a DB failure as "no identity /
+    // no membership / no memberships" and the request kept running with
+    // no breadcrumb. Preserve the resilient fallback shape (an auth
+    // path should not 500 when identity enrichment is best-effort) but
+    // WARN per failure with the user id + tenant id.
+    let identity_id = match crate::db::identity::IdentityRepo::find_id_by_email(pool, &user.email)
         .await
-        .ok()
-        .flatten();
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(user_id = %user.id, tenant_id = %tenant_id, error = %e, "enrich_auth_state: identity lookup failed; proceeding without identity");
+            None
+        }
+    };
     let active_membership_id = match mid_hint {
         Some(mid) => Some(mid),
-        None => crate::db::identity::MembershipRepo::find_id_by_email_and_tenant(
+        None => match crate::db::identity::MembershipRepo::find_id_by_email_and_tenant(
             pool,
             &user.email,
             tenant_id,
         )
         .await
-        .ok()
-        .flatten(),
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(user_id = %user.id, tenant_id = %tenant_id, error = %e, "enrich_auth_state: active membership lookup failed");
+                None
+            }
+        },
     };
     let memberships = match identity_id {
-        Some(id) => {
-            crate::db::identity::MembershipRepo::list_views_for_identity(pool, id, Some(tenant_id))
-                .await
-                .unwrap_or_default()
-        }
+        Some(id) => match crate::db::identity::MembershipRepo::list_views_for_identity(
+            pool,
+            id,
+            Some(tenant_id),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(user_id = %user.id, tenant_id = %tenant_id, error = %e, "enrich_auth_state: list_views_for_identity failed");
+                Vec::new()
+            }
+        },
         None => Vec::new(),
     };
     AuthState {
@@ -1530,13 +1554,22 @@ async fn place_grantee_caller(
     };
     let target_tenant = match auth_service.resolve_tenant_slug_opt(target_slug).await {
         Ok(Some(t)) => t,
-        _ => {
+        Ok(None) => {
             return (
                 None,
                 Some(AppError::Forbidden(
                     "Access to this organization is not active".to_string(),
                 )),
             )
+        }
+        Err(e) => {
+            // PMS-1658: the old `_ =>` collapsed Err into the same
+            // 403 as Ok(None), so a DB fault on the slug lookup read
+            // as "unknown slug" with no breadcrumb. Log and surface
+            // Internal so the operator can tell the two apart; the
+            // caller still refuses the request.
+            tracing::warn!(slug = %target_slug, error = %e, "place_grantee_caller: tenant slug lookup failed");
+            return (None, Some(e));
         }
     };
 

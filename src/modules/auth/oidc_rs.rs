@@ -455,23 +455,56 @@ impl Verifier {
     /// Returns `None` (rather than failing the request) if userinfo is
     /// unreachable: the local users row is still created with email=NULL, and
     /// a subsequent call refreshes it.
+    ///
+    /// PMS-1658: every failure here used to collapse to `None` with no
+    /// trace (`.ok()?`), so an OP outage was indistinguishable from "no
+    /// userinfo endpoint discovered" and the login flow left no breadcrumb
+    /// for the operator. Log each stage's failure at warn; the return
+    /// shape stays `None` so the caller's resilient path is unchanged.
     pub async fn userinfo(&self, bearer: &str) -> Option<UserInfo> {
-        self.ensure_cache().await.ok()?;
+        if let Err(e) = self.ensure_cache().await {
+            tracing::warn!(error = %e, "userinfo: OP discovery cache load failed");
+            return None;
+        }
         let guard = self.cache.read().await;
-        let endpoint = guard.as_ref()?.userinfo_endpoint.clone()?;
+        let endpoint = match guard.as_ref().and_then(|c| c.userinfo_endpoint.clone()) {
+            Some(e) => e,
+            None => {
+                tracing::warn!(
+                    "userinfo: OP discovery carries no userinfo_endpoint; returning None"
+                );
+                return None;
+            }
+        };
         drop(guard);
 
-        self.http
-            .get(endpoint)
+        let resp = match self
+            .http
+            .get(endpoint.clone())
             .bearer_auth(bearer)
             .send()
             .await
-            .ok()?
-            .error_for_status()
-            .ok()?
-            .json::<UserInfo>()
-            .await
-            .ok()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(endpoint = %endpoint, error = %e, "userinfo: transport error");
+                return None;
+            }
+        };
+        let resp = match resp.error_for_status() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(endpoint = %endpoint, error = %e, "userinfo: non-2xx response");
+                return None;
+            }
+        };
+        match resp.json::<UserInfo>().await {
+            Ok(u) => Some(u),
+            Err(e) => {
+                tracing::warn!(endpoint = %endpoint, error = %e, "userinfo: response body did not parse as UserInfo");
+                None
+            }
+        }
     }
 
     // ── internals ────────────────────────────────────────────────────────────

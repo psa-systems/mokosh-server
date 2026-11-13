@@ -239,7 +239,17 @@ impl BackchannelLogoutLimiter {
     pub fn check(&self, ip: IpAddr) -> Result<(), u64> {
         match self.by_ip.check_key(&ip) {
             Ok(()) => Ok(()),
-            Err(not_until) => Err(not_until.wait_time_from(self.clock.now()).as_secs().max(1)),
+            Err(not_until) => {
+                // PMS-1658: `.as_secs()` floors the wait, so a 0.9s wait
+                // becomes 0 and then the `.max(1)` rounds it up to 1s
+                // anyway, but a 1.4s wait becomes 1 (under-report by
+                // 0.4s). The sibling limiters round up with
+                // `(nanos + 999_999_999) / 1_000_000_000`; match that
+                // SPEC-5.103 rule here.
+                let wait = not_until.wait_time_from(self.clock.now());
+                let ceil_secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+                Err(ceil_secs.max(1))
+            }
         }
     }
 }
