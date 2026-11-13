@@ -84,6 +84,24 @@ use super::mapping::{map_contact, MappedContact};
 use super::matching::{decide, IncomingKeys, LocalContact, MatchDecision};
 use super::normalize::{name_key, phone_key};
 use super::provider::{ContactSyncProvider, SourceContact, SourceEmail, SourceError};
+
+/// PMS-1663 finding: three sites in this file mapped an unknown stored
+/// phone_type to the enum default silently. The call sites are inside
+/// `map/collect` closures where propagation would reshape the chain,
+/// and PhoneType::Other is a safe default (the number is still
+/// recorded). Log once when parse fails so the drift is findable.
+fn phone_type_or_default(stored: &str) -> PhoneType {
+    match PhoneType::from_str(stored) {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                stored = stored,
+                "contact_sync: phone_type is not one of the known values; reading as default"
+            );
+            PhoneType::default()
+        }
+    }
+}
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
@@ -1723,13 +1741,13 @@ impl ContactSyncEngine {
             let entries: Vec<ContactPhoneInput> = existing_phones
                 .iter()
                 .map(|p| ContactPhoneInput {
-                    phone_type: PhoneType::from_str(&p.phone_type).unwrap_or_default(),
+                    phone_type: phone_type_or_default(&p.phone_type),
                     number: Some(p.number.clone()),
                     extension: p.extension.clone(),
                     is_primary: p.is_primary,
                 })
                 .chain(added.iter().map(|p| ContactPhoneInput {
-                    phone_type: PhoneType::from_str(p.phone_type.as_str()).unwrap_or_default(),
+                    phone_type: phone_type_or_default(p.phone_type.as_str()),
                     number: Some(p.number.clone()),
                     extension: None,
                     // The contact's existing primary stays primary.
@@ -1820,7 +1838,7 @@ fn create_request(mapped: &MappedContact, labels: &[String]) -> CreateContactReq
                 .phones
                 .iter()
                 .map(|p| ContactPhoneInput {
-                    phone_type: PhoneType::from_str(p.phone_type.as_str()).unwrap_or_default(),
+                    phone_type: phone_type_or_default(p.phone_type.as_str()),
                     number: Some(p.number.clone()),
                     extension: None,
                     is_primary: p.is_primary,

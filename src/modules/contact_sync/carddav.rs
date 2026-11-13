@@ -440,7 +440,14 @@ impl CardDavClient {
         // any file under `src/` that names that constant, because its job is to
         // stop a second hand-rolled 429 RESPONSE, and what this reads is
         // somebody else's status code. Do not tidy it back into the constant.
-        if status.as_u16() == 429 || status.is_server_error() {
+        // PMS-1663 finding: `is_server_error()` used to map every 5xx
+        // (500, 502, 504, 508, ...) to `Throttled`, so a genuine server
+        // fault read as "rate limited, retry later" and never surfaced
+        // as a hard failure. Narrow to the retry-after codes the DAV
+        // / HTTP contract carries: 429 (Too Many Requests) and 503
+        // (Service Unavailable). The other 5xx codes fall through to
+        // the Failed arm below.
+        if status.as_u16() == 429 || status.as_u16() == 503 {
             return Err(SourceError::Throttled);
         }
         if status.as_u16() == 507 || status == reqwest::StatusCode::FORBIDDEN {
@@ -574,8 +581,9 @@ impl CardDavClient {
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(SourceError::Unauthorized);
         }
-        // 429 by number, for the reason `dav` above states.
-        if status.as_u16() == 429 || status.is_server_error() {
+        // PMS-1663 finding: narrow Throttled to 429 + 503 (same reason
+        // the `dav` fn above states).
+        if status.as_u16() == 429 || status.as_u16() == 503 {
             return Err(SourceError::Throttled);
         }
         if status == reqwest::StatusCode::FORBIDDEN || status.as_u16() == 507 {
