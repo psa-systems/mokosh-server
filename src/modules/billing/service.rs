@@ -2185,7 +2185,23 @@ impl BillingService {
 
         let org = crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await?;
         let contact_line = org.contact_line("Questions about this invoice?", None);
-        let gateway = matches!(self.has_active_gateway(tenant_id).await, Ok(true));
+        // PMS-1660 finding: the old `matches!(.., Ok(true))` dropped
+        // the gateway-check error silently, so a transient DB fault
+        // would drop the pay link from every reminder in this sweep
+        // with no log. The sibling in `email_invoice` logs it; mirror
+        // that here. A failed check still falls back to "no gateway"
+        // (safer than sending a half-baked pay link).
+        let gateway = match self.has_active_gateway(tenant_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    error = ?e,
+                    "send_due_reminders: has_active_gateway failed; sending without pay link"
+                );
+                false
+            }
+        };
 
         // PMS-1381 (F4): one batch lookup for every distinct company in this
         // sweep instead of one `company_portal_id` transaction per claim.
@@ -2920,9 +2936,26 @@ impl BillingService {
                     Vec::new()
                 }
             };
+            // PMS-1660 finding: an unknown stored provider used to
+            // silently relabel as `stripe`, so a hand-written row or
+            // a new provider the current build does not know would
+            // list under the wrong name. Keep the fallback so the
+            // list still renders (a corrupt row should not blank the
+            // page) but WARN with the row id + stored value.
+            let provider = {
+                let parsed = GatewayProvider::from_str(&r.provider);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        gateway_id = %r.id,
+                        stored = %r.provider,
+                        "payment_gateway_configs.provider is not one of the known gateways; reading as Stripe"
+                    );
+                }
+                parsed.unwrap_or(GatewayProvider::Stripe)
+            };
             gateways.push(PaymentGatewayConfigResponse {
                 id: r.id,
-                provider: GatewayProvider::from_str(&r.provider).unwrap_or(GatewayProvider::Stripe),
+                provider,
                 is_active: r.is_active,
                 is_test_mode: r.is_test_mode,
                 configured,
@@ -3318,12 +3351,24 @@ impl BillingService {
         let plaintext = self
             .gateway_plaintext(tenant_id, provider_id, config_encrypted)
             .await?;
-        let stored: serde_json::Value = serde_json::from_str(&plaintext).unwrap_or(
-            // A blob that does not parse describes no fields. It is not an
-            // error here: `from_config` is what refuses it, with the message
-            // the admin needs, and this read exists to help them see why.
-            serde_json::Value::Null,
-        );
+        // PMS-1660 finding: a stored blob that did not parse used to
+        // read as "no fields stored" with no log, so an admin with a
+        // corrupt credential blob saw an empty list and had nothing to
+        // grep. Keep the fallback (the read exists to help them see
+        // why `from_config` refused it) but WARN with the provider id
+        // + decode error.
+        let stored: serde_json::Value = match serde_json::from_str(&plaintext) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    provider_id = provider_id,
+                    tenant_id = %tenant_id,
+                    error = %e,
+                    "credential_state: stored gateway credential blob failed to decode; reading as empty"
+                );
+                serde_json::Value::Null
+            }
+        };
         Ok(specs
             .iter()
             .map(|spec| {
