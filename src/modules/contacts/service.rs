@@ -1111,8 +1111,6 @@ impl ContactService {
         self.get_company(tenant_id, company_id).await
     }
 
-    /// Delete company
-    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     /// PMS-1187: the access requests a contact has open, newest first.
     ///
     /// Resolved ones are kept and returned too: an MSP looking at a contact
@@ -1386,7 +1384,9 @@ impl ContactService {
         })
     }
 
+    /// Delete company.
     // SPEC-15.41, SPEC-15.42: audit in one transaction; unknown id must be 404
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_company(
         &self,
         tenant_id: TenantId,
