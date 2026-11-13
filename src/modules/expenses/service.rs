@@ -907,7 +907,7 @@ impl ExpensesService {
         if !BILL_PAYMENT_METHODS.contains(&method.as_str()) {
             return Err(field_error(
                 "payment_method",
-                "payment_method is one of check, credit_card, ach, wire, cash, other",
+                "payment_method is one of check, credit_card, ach, wire, cash, paypal, other",
             ));
         }
 
@@ -1969,7 +1969,15 @@ fn search_pattern(q: Option<&str>) -> Option<String> {
 /// The payment methods `bill_payments`' CHECK allows, in one place so the
 /// service refuses a bad one with a message instead of a 23514.
 // SPEC-14.70: the closed set of payment methods.
-const BILL_PAYMENT_METHODS: [&str; 6] = ["check", "credit_card", "ach", "wire", "cash", "other"];
+const BILL_PAYMENT_METHODS: [&str; 7] = [
+    "check",
+    "credit_card",
+    "ach",
+    "wire",
+    "cash",
+    "paypal",
+    "other",
+];
 
 /// The ONE writer of `bills.paid_minor` and of `bills.status` on the paid
 /// edge (PMS-1536, the rule PMS-953 states for invoices).
