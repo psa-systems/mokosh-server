@@ -203,33 +203,48 @@ impl InvitationsService {
         // surface, which was already the shape of the old `INSERT INTO
         // notifications` after the row landed).
         // SPEC-5.546: dispatch failure is a WARN, not a request failure.
-        if let (Some(app_url), Some(notifications), Some(tenant_name)) = (
-            self.app_url.as_deref(),
-            self.notifications.as_ref(),
-            tenant_name,
-        ) {
-            let app = crate::utils::app_name::app_name();
-            let context = serde_json::json!({
-                "recipient_email": email,
-                "salutation": crate::utils::email::salutation(""),
-                "tenant_name": tenant_name,
-                "role": request.role,
-                "ttl_days": INVITE_TTL_DAYS,
-                "app_name": app,
-                "app_url": app_url,
-            });
-            if let Err(e) = notifications
-                .dispatch(tenant_id, "invitations.created", &context)
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    invite_id = %invite.id,
-                    recipient = %email,
-                    "invitation mail dispatch failed; the invite row is committed",
-                );
-            }
-        }
+        //
+        // PMS-1659: track whether the dispatch succeeded so the create
+        // response can tell the admin, instead of the WARN log being the
+        // only trace. `None` when there is no dispatcher configured at all
+        // (standalone mode without a mailer); `Some(false)` when dispatch
+        // was attempted and failed; `Some(true)` on a clean send.
+        let mail_sent: Option<bool> =
+            if let (Some(app_url), Some(notifications), Some(tenant_name)) = (
+                self.app_url.as_deref(),
+                self.notifications.as_ref(),
+                tenant_name,
+            ) {
+                let app = crate::utils::app_name::app_name();
+                let context = serde_json::json!({
+                    "recipient_email": email,
+                    "salutation": crate::utils::email::salutation(""),
+                    "tenant_name": tenant_name,
+                    "role": request.role,
+                    "ttl_days": INVITE_TTL_DAYS,
+                    "app_name": app,
+                    "app_url": app_url,
+                });
+                match notifications
+                    .dispatch(tenant_id, "invitations.created", &context)
+                    .await
+                {
+                    Ok(_) => Some(true),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            invite_id = %invite.id,
+                            recipient = %email,
+                            "invitation mail dispatch failed; the invite row is committed",
+                        );
+                        Some(false)
+                    }
+                }
+            } else {
+                None
+            };
+        let mut invite = invite;
+        invite.mail_sent = mail_sent;
         Ok(invite)
     }
 
