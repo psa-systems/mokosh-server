@@ -818,8 +818,19 @@ fn build_clear_cookie_with_domain(domain: Option<&str>) -> String {
 }
 
 fn add_cookie(headers: &mut HeaderMap, cookie: &str) {
-    if let Ok(v) = HeaderValue::from_str(cookie) {
-        headers.append(header::SET_COOKIE, v);
+    // PMS-1659 finding: a cookie that failed `HeaderValue::from_str`
+    // used to be silently not set, so a login would succeed with no
+    // refresh cookie and no trace for the operator. Log at error so
+    // a cookie string that carries an invalid byte is findable (the
+    // `cookie` value itself is not logged because it may carry the
+    // session or refresh token).
+    match HeaderValue::from_str(cookie) {
+        Ok(v) => {
+            headers.append(header::SET_COOKIE, v);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "add_cookie: cookie string contained a byte HeaderValue refused; Set-Cookie NOT emitted");
+        }
     }
 }
 

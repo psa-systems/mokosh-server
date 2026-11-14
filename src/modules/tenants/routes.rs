@@ -476,11 +476,24 @@ async fn get_public_logo(
     // SAFETY (PMS-285): pre-auth, cross-tenant read of the RLS-exempt `tenants`
     // root, resolved by primary key. There is no session to derive a tenant
     // from: resolving the tenant IS the request. Nothing tenant-scoped is read.
-    let tenant = s
+    // PMS-1659 finding: the old `.map_err(|_| NotFound)` collapsed
+    // every error, including DB faults, into 404 "Logo" with no log.
+    // Match on NotFound specifically; propagate any other error so a
+    // fault is distinguishable in the operator's logs.
+    let tenant = match s
         .tenant_service
         .get_tenant(TenantId::from_trusted(tenant_id))
         .await
-        .map_err(|_| AppError::NotFound("Logo".to_string()))?;
+    {
+        Ok(t) => t,
+        Err(AppError::NotFound(_)) => {
+            return Err(AppError::NotFound("Logo".to_string()));
+        }
+        Err(e) => {
+            tracing::warn!(tenant_id = %tenant_id, error = ?e, "get_public_logo: tenant lookup failed");
+            return Err(e);
+        }
+    };
     let mime = tenant
         .branding
         .logo_mime

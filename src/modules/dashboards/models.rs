@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+fn default_empty_layout() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
 /// One saved dashboard row returned to the SPA. The `layout` blob is
 /// passed through verbatim - shape is owned by the SPA so a UI change
 /// can ship without a server migration.
@@ -25,7 +29,13 @@ pub struct CreateSavedDashboardRequest {
     pub name: String,
     /// SPA-owned layout blob. Defaults to `{}` so the SPA can create an
     /// empty dashboard first and populate widgets in a follow-up PATCH.
-    #[serde(default)]
+    ///
+    /// PMS-1665 finding: `#[serde(default)]` on a bare `serde_json::Value`
+    /// deserializes a missing key as `null`, not `{}`, so the stored
+    /// row and the response carried `null` rather than the empty object
+    /// the doc promises (SPEC-15.1638). Use `default_empty_layout` so
+    /// a missing layout lands as `{}`.
+    #[serde(default = "default_empty_layout")]
     pub layout: serde_json::Value,
     /// When true, the create handler clears any existing default for
     /// the same (tenant, user) inside the same transaction before

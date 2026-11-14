@@ -2185,7 +2185,23 @@ impl BillingService {
 
         let org = crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await?;
         let contact_line = org.contact_line("Questions about this invoice?", None);
-        let gateway = matches!(self.has_active_gateway(tenant_id).await, Ok(true));
+        // PMS-1660 finding: the old `matches!(.., Ok(true))` dropped
+        // the gateway-check error silently, so a transient DB fault
+        // would drop the pay link from every reminder in this sweep
+        // with no log. The sibling in `email_invoice` logs it; mirror
+        // that here. A failed check still falls back to "no gateway"
+        // (safer than sending a half-baked pay link).
+        let gateway = match self.has_active_gateway(tenant_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    error = ?e,
+                    "send_due_reminders: has_active_gateway failed; sending without pay link"
+                );
+                false
+            }
+        };
 
         // PMS-1381 (F4): one batch lookup for every distinct company in this
         // sweep instead of one `company_portal_id` transaction per claim.
@@ -2920,9 +2936,23 @@ impl BillingService {
                     Vec::new()
                 }
             };
+            // An unknown stored provider would silently relabel as
+            // `stripe`; WARN with the row id so a corrupt or new value
+            // surfaces while the list still renders.
+            let provider = {
+                let parsed = GatewayProvider::from_str(&r.provider);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        gateway_id = %r.id,
+                        stored = %r.provider,
+                        "stored gateway provider is not one of the known values; reading as Stripe"
+                    );
+                }
+                parsed.unwrap_or(GatewayProvider::Stripe)
+            };
             gateways.push(PaymentGatewayConfigResponse {
                 id: r.id,
-                provider: GatewayProvider::from_str(&r.provider).unwrap_or(GatewayProvider::Stripe),
+                provider,
                 is_active: r.is_active,
                 is_test_mode: r.is_test_mode,
                 configured,
@@ -3318,12 +3348,24 @@ impl BillingService {
         let plaintext = self
             .gateway_plaintext(tenant_id, provider_id, config_encrypted)
             .await?;
-        let stored: serde_json::Value = serde_json::from_str(&plaintext).unwrap_or(
-            // A blob that does not parse describes no fields. It is not an
-            // error here: `from_config` is what refuses it, with the message
-            // the admin needs, and this read exists to help them see why.
-            serde_json::Value::Null,
-        );
+        // PMS-1660 finding: a stored blob that did not parse used to
+        // read as "no fields stored" with no log, so an admin with a
+        // corrupt credential blob saw an empty list and had nothing to
+        // grep. Keep the fallback (the read exists to help them see
+        // why `from_config` refused it) but WARN with the provider id
+        // + decode error.
+        let stored: serde_json::Value = match serde_json::from_str(&plaintext) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    provider_id = provider_id,
+                    tenant_id = %tenant_id,
+                    error = %e,
+                    "credential_state: stored gateway credential blob failed to decode; reading as empty"
+                );
+                serde_json::Value::Null
+            }
+        };
         Ok(specs
             .iter()
             .map(|spec| {
@@ -5628,8 +5670,24 @@ impl BillingService {
         // A branding document that will not destructure is an empty one, not a
         // failure: an unreadable logo colour must not stop an invoice being
         // sent.
+        //
+        // PMS-1660 finding: the old `unwrap_or_default()` was silent, so
+        // a drift between the stored JSONB and `TenantBranding` only
+        // showed up as "invoice looks odd" with nothing to grep. Keep
+        // the fallback (per the comment above), WARN with the tenant
+        // id + decode error so an operator can trace the drift back.
         let branding: mokosh_types::tenants::TenantBranding =
-            serde_json::from_value(branding).unwrap_or_default();
+            match serde_json::from_value(branding.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        error = %e,
+                        "freeze_issuer: tenants.branding failed to decode; freezing with default"
+                    );
+                    Default::default()
+                }
+            };
         let logos = crate::modules::tenants::logo::TenantLogoStore::new(
             crate::modules::tenants::logo::TenantLogoConfig::from_env()?,
         );
@@ -5661,8 +5719,23 @@ impl BillingService {
         .await?
         .flatten();
         if let Some(value) = snapshot {
-            if let Ok(issuer) = serde_json::from_value(value) {
-                return Ok(issuer);
+            // PMS-1660 finding: a frozen snapshot that failed to
+            // decode used to fall through to live branding silently,
+            // so a sent invoice could reprint under a different
+            // identity than the one frozen at send time. The fallback
+            // to live stays (so the render does not 500 on an edited
+            // row), but WARN with the invoice id + decode error so
+            // the drift is findable.
+            match serde_json::from_value(value.clone()) {
+                Ok(issuer) => return Ok(issuer),
+                Err(e) => {
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        invoice_id = %invoice_id,
+                        error = %e,
+                        "invoice_issuer: frozen issuer_snapshot failed to decode; falling back to live branding"
+                    );
+                }
             }
         }
         let row: Option<(String, serde_json::Value)> =
@@ -5672,7 +5745,18 @@ impl BillingService {
                 .await?;
         let (name, branding) = row.ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
         let branding: mokosh_types::tenants::TenantBranding =
-            serde_json::from_value(branding).unwrap_or_default();
+            match serde_json::from_value(branding.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        invoice_id = %invoice_id,
+                        error = %e,
+                        "invoice_issuer: tenants.branding failed to decode; rendering with default"
+                    );
+                    Default::default()
+                }
+            };
         Ok(crate::modules::billing::issuer::resolve(&name, &branding))
     }
 
@@ -5868,8 +5952,21 @@ impl BillingService {
                 .fetch_optional(&mut **tx)
                 .await?;
         let (name, branding) = row.ok_or_else(|| AppError::NotFound("Tenant".to_string()))?;
-        let branding: mokosh_types::tenants::TenantBranding =
-            serde_json::from_value(branding).unwrap_or_default();
+        // PMS-1660 finding: same shape as `invoice_issuer` above; a
+        // decode failure used to be silent. WARN with the tenant id.
+        let branding: mokosh_types::tenants::TenantBranding = match serde_json::from_value(
+            branding.clone(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    error = %e,
+                    "tenant_issuer_in_tx: tenants.branding failed to decode; rendering with default"
+                );
+                Default::default()
+            }
+        };
         Ok(crate::modules::billing::issuer::resolve(&name, &branding))
     }
 
@@ -6315,30 +6412,6 @@ impl BillingService {
         Ok(invoice)
     }
 
-    /// PMS-1333: void an invoice. The document never stood.
-    ///
-    /// The other half of the credit-note fix: `void` had no writer of its own,
-    /// only the arm in [`Self::recompute_invoice_balance`] that fired when
-    /// credits covered an invoice's total, and three comments (here, in
-    /// `update_invoice`, and in the refusal `update_invoice` returns) named a
-    /// `void_invoice` that did not exist. PMS-1227 then closed the one path a
-    /// client had, `PUT /invoices/{id}` with `{"status":"void"}`, so voiding a
-    /// draft answered 422 and pointed at this method. This is it.
-    ///
-    /// Allowed from `draft` and `pending` only, and that bound is the product
-    /// rule rather than a cautious default: once an invoice is `sent` the
-    /// customer holds a copy and can quote its number back, so it is frozen
-    /// (`InvoiceStatus::is_frozen`) and its correction is a credit note
-    /// (PMS-953), which is what `locked_invoice_note` on the client already
-    /// tells the operator. Refused with a 409 naming the status from
-    /// everything else.
-    ///
-    /// Unlike a write-off (PMS-1036) this freezes no amount. A write-off
-    /// forgives a debt that was genuinely owed, so the balance at that moment
-    /// is the number the books need; a void says nothing was ever owed, and an
-    /// invoice that never left `draft` or `pending` has no payments, no
-    /// credits and no statement line to reconcile against.
-    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     /// PMS-1334: amend a sent invoice, which means replace it rather than edit
     /// it. Answers the new DRAFT.
     ///
@@ -6540,7 +6613,31 @@ impl BillingService {
         Ok(amendment)
     }
 
+    /// PMS-1333: void an invoice. The document never stood.
+    ///
+    /// The other half of the credit-note fix: `void` had no writer of its own,
+    /// only the arm in [`Self::recompute_invoice_balance`] that fired when
+    /// credits covered an invoice's total, and three comments (here, in
+    /// `update_invoice`, and in the refusal `update_invoice` returns) named a
+    /// `void_invoice` that did not exist. PMS-1227 then closed the one path a
+    /// client had, `PUT /invoices/{id}` with `{"status":"void"}`, so voiding a
+    /// draft answered 422 and pointed at this method. This is it.
+    ///
+    /// Allowed from `draft` and `pending` only, and that bound is the product
+    /// rule rather than a cautious default: once an invoice is `sent` the
+    /// customer holds a copy and can quote its number back, so it is frozen
+    /// (`InvoiceStatus::is_frozen`) and its correction is a credit note
+    /// (PMS-953), which is what `locked_invoice_note` on the client already
+    /// tells the operator. Refused with a 409 naming the status from
+    /// everything else.
+    ///
+    /// Unlike a write-off (PMS-1036) this freezes no amount. A write-off
+    /// forgives a debt that was genuinely owed, so the balance at that moment
+    /// is the number the books need; a void says nothing was ever owed, and an
+    /// invoice that never left `draft` or `pending` has no payments, no
+    /// credits and no statement line to reconcile against.
     // SPEC-13.117
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn void_invoice(
         &self,
         tenant_id: TenantId,

@@ -121,7 +121,21 @@ pub fn parse_blob(
     stored: Option<&str>,
     expected: InvoiceProviderKind,
 ) -> AppResult<IntegrationCredentialBlob> {
-    let raw = stored.ok_or(AppError::Unauthorized)?;
+    let raw = match stored {
+        Some(r) => r,
+        None => {
+            // PMS-1660 finding: the missing-blob branch used to return
+            // 401 with no log, so an operator debugging "reconnect" on
+            // a tenant whose row survived while the blob was purged
+            // (or never written) had nothing to grep. Pair with the
+            // malformed and wrong-provider warns below.
+            tracing::warn!(
+                provider = %expected.as_str(),
+                "MAPPS-1099: stored integration credential blob is missing; treating as unauthorized"
+            );
+            return Err(AppError::Unauthorized);
+        }
+    };
     let blob: IntegrationCredentialBlob = serde_json::from_str(raw).map_err(|_| {
         tracing::warn!(
             provider = %expected.as_str(),

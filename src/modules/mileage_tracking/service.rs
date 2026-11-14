@@ -439,6 +439,39 @@ struct MileageEntryRow {
 
 impl From<MileageEntryRow> for MileageEntryResponse {
     fn from(r: MileageEntryRow) -> Self {
+        // PMS-1662 F5: same "unparseable enum maps to default silently"
+        // shape as time entries. Keep the default fallback, WARN with
+        // the entry id + stored value so a drift is findable.
+        let billing_status = r
+            .billing_status
+            .as_deref()
+            .and_then(|s| {
+                let parsed = BillingStatus::from_str(s);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        entry_id = %r.id,
+                        stored = %s,
+                        "mileage_entries.billing_status is not one of the known values; reading as default"
+                    );
+                }
+                parsed
+            })
+            .unwrap_or_default();
+        let approval_status = r
+            .approval_status
+            .as_deref()
+            .and_then(|s| {
+                let parsed = ApprovalStatus::from_str(s);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        entry_id = %r.id,
+                        stored = %s,
+                        "mileage_entries.approval_status is not one of the known values; reading as default"
+                    );
+                }
+                parsed
+            })
+            .unwrap_or_default();
         Self {
             id: r.id,
             user_id: r.user_id,
@@ -453,18 +486,10 @@ impl From<MileageEntryRow> for MileageEntryResponse {
             contract_id: r.contract_id,
             notes: r.notes,
             is_billable: r.is_billable.unwrap_or(true),
-            billing_status: r
-                .billing_status
-                .as_deref()
-                .and_then(BillingStatus::from_str)
-                .unwrap_or_default(),
+            billing_status,
             rate_per_mile: r.rate_per_mile,
             total_amount: r.total_amount,
-            approval_status: r
-                .approval_status
-                .as_deref()
-                .and_then(ApprovalStatus::from_str)
-                .unwrap_or_default(),
+            approval_status,
             created_at: r.created_at,
             updated_at: r.updated_at,
             ticket_number: r.ticket_number,

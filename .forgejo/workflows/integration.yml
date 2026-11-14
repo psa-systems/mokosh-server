@@ -10,6 +10,16 @@
 # gated nothing, and re-ran a 440s suite against a tree the pull-request run had
 # usually already tested.
 #
+# Classify-diff gotcha (2026-11-14): on a pull_request event the classifier
+# runs against HEAD^1..HEAD, which for a PR branch whose last push was an
+# "Update Branch by merge" commit is just the merge's incoming diff from the
+# base, not the full PR diff. If main's recent commits since the last update
+# were comments-only, the classifier reports `comments-only` and this gate
+# (plus every job that depends on it) cascades to `skipped` even though the
+# PR itself has real code changes. Force a code-class touch on the branch
+# (any `.forgejo/workflows/` or `.forgejo/actions/` file counts as code
+# outright) to re-run the integration suite.
+#
 # PMS-1252: `cache-warm.yml` archives the same `cargo nextest archive` on push
 # to main so the shared build cache is populated for a later pull-request run
 # to restore. The warm job archives and discards; it does not run tests, so
