@@ -346,24 +346,29 @@ impl KbAttachmentService {
     /// as the old `read_public` (see the module header): the tenant on both
     /// keys is the row's own, never the request's.
     async fn open_public(&self, row: &PublicAttachmentRow) -> AppResult<ObjectReader> {
-        // PMS-1664 finding: both opens used to collapse any error into
-        // 404, so a permission / backend outage surfaced as "not found"
-        // and an operator had no signal. Match on the error kind so
-        // only `NotFound` falls through to the legacy layout, and any
-        // other error on either read bubbles verbatim. Pairs with
-        // `LocalProvider::read`/`exists` (PR #1323).
-        match self
-            .store
-            .open(&ObjectKey::kb_attachment(row.tenant_id, row.id))
-            .await
-        {
+        // Fall back to the legacy layout on any error from the primary
+        // open; `LocalProvider::open` cannot distinguish NotFound from
+        // other I/O faults (see SPEC-3.44 note on storage::mod), so a
+        // genuinely missing file and a permission fault both land here.
+        // Decide 404 vs 500 after the legacy open by probing exists(),
+        // which does distinguish: a true absence is NotFound, an I/O
+        // fault bubbles verbatim so an operator sees it.
+        let primary = ObjectKey::kb_attachment(row.tenant_id, row.id);
+        if let Ok(reader) = self.store.open(&primary).await {
+            return Ok(reader);
+        }
+        let legacy = ObjectKey::legacy_kb_attachment(row.tenant_id, row.id);
+        match self.store.open(&legacy).await {
             Ok(reader) => Ok(reader),
-            Err(AppError::NotFound(_)) => {
-                self.store
-                    .open(&ObjectKey::legacy_kb_attachment(row.tenant_id, row.id))
-                    .await
+            Err(legacy_err) => {
+                let primary_absent = matches!(self.store.exists(&primary).await, Ok(false));
+                let legacy_absent = matches!(self.store.exists(&legacy).await, Ok(false));
+                if primary_absent && legacy_absent {
+                    Err(AppError::NotFound("Attachment".to_string()))
+                } else {
+                    Err(legacy_err)
+                }
             }
-            Err(e) => Err(e),
         }
     }
 }
