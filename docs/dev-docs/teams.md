@@ -18,7 +18,7 @@ These are not two names for one thing. A team can have three leaders and no mana
 - The "Leader" chip the SPA renders next to a member's name.
 - Notification fan-out selection (an announcement to "team leaders" reads `team_members WHERE role = 'leader'`; an announcement to "the team" reads every row).
 
-Permission checks read the caller's APP-level role (`super_admin`, `admin`, `manager`, `technician`, `dispatcher`, `sales`, `finance`, in `mokosh_types::auth::UserRole`). That vocabulary already gates every existing tenant-scoped surface. Team member role does not fork it.
+Permission checks read the caller's APP-level role (`super_admin`, `admin`, `manager`, `technician`, `dispatcher`, `sales`, `finance`, `read_only`, in `mokosh_types::auth::UserRole`). That vocabulary already gates every existing tenant-scoped surface. Team member role does not fork it.
 
 ## The team-management projection
 
