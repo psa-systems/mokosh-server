@@ -286,7 +286,7 @@ jobs:
         # per shard inside the suite's own advisory lock, idempotent across
         # the three shards and across runs.
         # SPEC-10.19
-        image: postgres:18.2-alpine3.23
+        image: postgres:18.7-alpine3.23
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_USER: postgres
