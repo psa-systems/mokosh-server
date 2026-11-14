@@ -1455,6 +1455,14 @@ impl ContactService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // PMS-1663: an id that names no row answered 200 and wrote an audit
+        // row with a null before-snapshot, so the stale caller saw a successful
+        // delete and the audit stream grew a bogus entry. Refuse before the
+        // unlink + DELETE + audit sequence runs.
+        if before.is_none() {
+            return Err(AppError::NotFound("Company".to_string()));
+        }
+
         // PMS-812: unlink this company's contacts, never delete them. Runs
         // BEFORE the company DELETE so `recompute_contact_mirrors` - the single
         // writer of `contacts.company_id` (PMS-806) - leaves no mirror pointing
@@ -2565,10 +2573,13 @@ impl ContactService {
         };
 
         let Some(notify) = self.notifications.as_ref() else {
+            // PMS-1663: the setup link carries the live single-use secret;
+            // CLAUDE.md invariant "a log line must not carry a usable
+            // credential". Record the contact id only and let an operator
+            // who needs the link re-mint one via the normal flow.
             tracing::warn!(
                 contact_id = %contact.id,
-                password_setup_link = %password_setup_link,
-                "no notifications dispatcher wired; portal setup token persisted but no message queued (setup_link logged for manual relay)",
+                "no notifications dispatcher wired; portal setup token persisted but no message queued",
             );
             return;
         };
@@ -2604,8 +2615,10 @@ impl ContactService {
         {
             Ok(_) => tracing::info!(
                 contact_id = %contact.id,
-                magic_link_url = ?magic_link_url,
-                password_setup_link = %password_setup_link,
+                // PMS-1663: the two URLs each carry a live single-use
+                // secret; log only whether a magic-link accompanied the
+                // setup link, not the links themselves.
+                magic_link_included = magic_link_url.is_some(),
                 "portal grant email queued"
             ),
             Err(e) => tracing::warn!(
@@ -4650,6 +4663,12 @@ impl ContactService {
                 .bind(site_id)
                 .fetch_optional(&mut *tx)
                 .await?;
+
+        // PMS-1663: an id that names no row answered 200 and wrote a bogus
+        // delete audit row. Refuse before the DELETE + audit runs.
+        if before.is_none() {
+            return Err(AppError::NotFound("Site".to_string()));
+        }
 
         sqlx::query("DELETE FROM sites WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)

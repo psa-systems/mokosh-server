@@ -32,7 +32,24 @@ impl GeoIpService {
     /// The ISO 3166-1 alpha-2 country code for `ip`, or `None` when the IP is not
     /// resolvable (private / reserved / unknown ranges carry no country).
     pub fn country_code(&self, ip: IpAddr) -> Option<String> {
-        let raw = match self.db.ip_lookup(ip).ok()? {
+        // PMS-1657: `.ok()?` used to collapse every error from the
+        // IP2Location crate into "no country" with no trace, so a
+        // "database not loaded" / "offset out of bounds" read exactly
+        // the same as "IP is in a private range". Log the error with
+        // the ip, then still return None so login tracking stays
+        // resilient.
+        let record = match self.db.ip_lookup(ip) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    ip = %ip,
+                    error = %e,
+                    "IP2Location lookup failed; treating as no-country"
+                );
+                return None;
+            }
+        };
+        let raw = match record {
             Record::LocationDb(rec) => rec.country.map(|c| c.short_name),
             Record::ProxyDb(_) => None,
         }?;
