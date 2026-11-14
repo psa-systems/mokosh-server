@@ -2685,7 +2685,7 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   with 403 `Access to this organization is not active` when the slug resolves to no tenant; a slug lookup or grantee
   lookup error on the local-state path must request userinfo instead.
 - **SPEC-5.172**: The grantee role must be `map_grant_role(mokosh_grant_role)` (`admin`, `manager`, `technician`,
-  `finance`, `read_only` mapping to Technician); an absent or unknown value must log at info and be refused with 403
+  `finance`, `read_only` mapping to ReadOnly); an absent or unknown value must log at info and be refused with 403
   `Access to this organization is not active`; a stored role that differs must be updated best effort (warn on failure)
   while the request uses the grant role.
 - **SPEC-5.173**: A first-sight grantee must be provisioned only with a non-blank verified email; otherwise the request
@@ -2785,7 +2785,7 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   warning naming the grantee and account and must not change the 200 answer. A `granted` event, or a revoked event that
   changed no mirror row, must not touch `users`.
 - **SPEC-5.217**: `map_grant_role` must map the Bunyip role names `admin`, `manager`, `technician` and `finance` to the
-  Mokosh roles of the same name, must map `read_only` to the Technician role, and must return `None` for any other
+  Mokosh roles of the same name, must map `read_only` to the ReadOnly role, and must return `None` for any other
   value so the caller refuses placement.
 - **SPEC-5.218**: `MokoshBunyipGrantService::is_grant_active` must return true only when a `mokosh_bunyip_grants` row
   exists for the (grantee, `mokosh_account_id`) pair with `revoked_at` NULL and a non-NULL role; it must return false
