@@ -38,6 +38,27 @@ fn field_error(field: &str, message: &str) -> AppError {
     }
 }
 
+/// PMS-1662 F16: serialize a snapshot for an audit row, logging the error
+/// if the serialize ever fails rather than writing `null` with no trace.
+///
+/// Every mutation in this module snapshots a row to JSON via
+/// `audit_json("expense_category", &row)`; a single helper
+/// keeps the call sites short and the warn log consistent. Only the
+/// `label` goes into the log so the audit payload itself does not leak.
+fn audit_json<T: Serialize>(label: &str, value: &T) -> Value {
+    match serde_json::to_value(value) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target = label,
+                error = %e,
+                "expense audit snapshot failed to serialize; writing Null"
+            );
+            Value::Null
+        }
+    }
+}
+
 /// Create / update body for a vendor. Name is required and bounded; the
 /// optional fields mirror the schema columns one-to-one.
 // SPEC-14.59: field length bounds; currency is exactly 3 characters.
@@ -202,7 +223,7 @@ impl ExpensesService {
         .bind(request.notes.as_deref())
         .fetch_one(&mut *tx)
         .await?;
-        let after: Option<Value> = Some(serde_json::to_value(&row).unwrap_or(Value::Null));
+        let after: Option<Value> = Some(audit_json("expense_category", &row));
         audit_write(
             &mut *tx,
             tenant_id,
@@ -262,7 +283,7 @@ impl ExpensesService {
         .bind(request.notes.as_deref())
         .fetch_one(&mut *tx)
         .await?;
-        let after: Option<Value> = Some(serde_json::to_value(&row).unwrap_or(Value::Null));
+        let after: Option<Value> = Some(audit_json("expense_category", &row));
         audit_write(
             &mut *tx,
             tenant_id,
@@ -773,7 +794,7 @@ impl ExpensesService {
 
         let lines = insert_bill_lines(&mut tx, tenant_id, id, &request.lines).await?;
 
-        let after: Option<Value> = Some(serde_json::to_value(&bill).unwrap_or(Value::Null));
+        let after: Option<Value> = Some(audit_json("bill", &bill));
         audit_write(
             &mut *tx,
             tenant_id,
@@ -861,8 +882,8 @@ impl ExpensesService {
             AuditAction::Update,
             "bills",
             Some(id),
-            Some(serde_json::to_value(&before).unwrap_or(Value::Null)),
-            Some(serde_json::to_value(&after).unwrap_or(Value::Null)),
+            Some(audit_json("bill_before", &before)),
+            Some(audit_json("bill_after", &after)),
         )
         .await?;
         tx.commit().await?;
@@ -975,7 +996,7 @@ impl ExpensesService {
             "bill_payments",
             Some(payment.id),
             None,
-            Some(serde_json::to_value(&payment).unwrap_or(Value::Null)),
+            Some(audit_json("bill_payment", &payment)),
         )
         .await?;
         tx.commit().await?;
@@ -1142,10 +1163,27 @@ impl ExpensesService {
                     bill.external_bill_id.as_deref(),
                 ) {
                     (Some(provider), Some(external_id)) => {
-                        crate::modules::billing::invoice_issuer::InvoiceProviderKind::parse(
-                            provider,
-                        )
-                        .map(|kind| (kind, external_id.to_string(), bill.vendor_id))
+                        // PMS-1662 F17: a provider string the current
+                        // build does not know used to silently fall
+                        // through to the local path, so a bill issued
+                        // through a provider that was later removed from
+                        // this build's enum would take a payment
+                        // locally with no record going out. WARN with
+                        // the bill id and the stored value; keep the
+                        // local fallback so a pay request does not 500,
+                        // but the drift is now findable.
+                        let kind =
+                            crate::modules::billing::invoice_issuer::InvoiceProviderKind::parse(
+                                provider,
+                            );
+                        if kind.is_none() {
+                            tracing::warn!(
+                                bill_id = %bill.id,
+                                stored = %provider,
+                                "bills.external_provider is not one of the providers this build knows; recording the payment locally"
+                            );
+                        }
+                        kind.map(|kind| (kind, external_id.to_string(), bill.vendor_id))
                     }
                     // A bill no provider holds: the local path unchanged,
                     // which is every bill on a deployment that has not
@@ -1455,7 +1493,7 @@ impl ExpensesService {
             "expenses",
             Some(id),
             None,
-            Some(serde_json::to_value(&expense).unwrap_or(Value::Null)),
+            Some(audit_json("expense", &expense)),
         )
         .await?;
         tx.commit().await?;
@@ -1724,8 +1762,8 @@ impl ExpensesService {
             AuditAction::Update,
             "expenses",
             Some(id),
-            Some(serde_json::to_value(&before).unwrap_or(Value::Null)),
-            Some(serde_json::to_value(&after).unwrap_or(Value::Null)),
+            Some(audit_json("expense_before", &before)),
+            Some(audit_json("expense_after", &after)),
         )
         .await?;
         tx.commit().await?;

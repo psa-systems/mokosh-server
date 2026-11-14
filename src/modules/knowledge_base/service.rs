@@ -547,8 +547,13 @@ impl KbService {
         let template_variables: Vec<KbTemplateVariable> =
             request.template_variables.clone().unwrap_or_default();
         Self::validate_template_variables(&template_variables)?;
-        let template_variables_json =
-            serde_json::to_value(&template_variables).unwrap_or_else(|_| serde_json::json!([]));
+        // PMS-1664 finding: a serialize failure here used to swap in
+        // an empty `[]` silently, dropping the author's declared
+        // variables. `KbTemplateVariable` serializes losslessly, so a
+        // failure is a type-system violation; propagate it as
+        // Internal rather than render a partial article.
+        let template_variables_json = serde_json::to_value(&template_variables)
+            .map_err(|e| AppError::Internal(format!("kb template_variables serialize: {e}")))?;
 
         // Resolve the company scope before any write. A
         // `client_specific` article requires a non-empty, tenant-owned
@@ -722,10 +727,13 @@ impl KbService {
         let (template_vars_touch, template_vars_json) = match &request.template_variables {
             Some(vars) => {
                 Self::validate_template_variables(vars)?;
-                (
-                    true,
-                    serde_json::to_value(vars).unwrap_or_else(|_| serde_json::json!([])),
-                )
+                // PMS-1664 finding: same serialize-failure fallback as
+                // the create path; propagate instead of silently
+                // dropping the caller's set.
+                let json = serde_json::to_value(vars).map_err(|e| {
+                    AppError::Internal(format!("kb template_variables serialize: {e}"))
+                })?;
+                (true, json)
             }
             None => (false, serde_json::json!([])),
         };
@@ -2334,9 +2342,27 @@ impl From<ArticleRow> for KbArticleResponse {
             // A row written before migration 292 reads NULL here; the
             // service always writes a non-null array, so a NULL means
             // "none declared".
+            //
+            // PMS-1664 finding: a non-null-but-corrupt stored value used
+            // to read as the empty vec silently, dropping the author's
+            // declared variables from the response. Keep the fallback
+            // (From impl cannot propagate) and WARN with article id +
+            // decode error.
             template_variables: r
                 .template_variables
-                .map(|v| serde_json::from_value::<Vec<KbTemplateVariable>>(v).unwrap_or_default())
+                .map(
+                    |v| match serde_json::from_value::<Vec<KbTemplateVariable>>(v) {
+                        Ok(vars) => vars,
+                        Err(e) => {
+                            tracing::warn!(
+                                article_id = %r.id,
+                                error = %e,
+                                "kb_articles.template_variables failed to decode; reading as empty"
+                            );
+                            Vec::new()
+                        }
+                    },
+                )
                 .unwrap_or_default(),
             created_at: r.created_at,
             updated_at: r.updated_at,

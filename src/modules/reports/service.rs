@@ -290,6 +290,22 @@ impl ReportsService {
             .map(|(id, _, _)| *id)
             .collect();
         crate::utils::unresolved_person::log_unresolved_person_names("reports.time", &unresolved);
+        // PMS-1665 finding: the user branch above logs unresolved ids,
+        // but the work-type branch rendered "Unknown work type" with
+        // no log. Mirror the shape: collect the ids whose name is
+        // None and WARN once (SPEC-15.1584).
+        let unresolved_work_types: Vec<Uuid> = by_work_type
+            .iter()
+            .filter(|(_, name, _)| name.is_none())
+            .map(|(id, _, _)| *id)
+            .collect();
+        if !unresolved_work_types.is_empty() {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                work_type_ids = ?unresolved_work_types,
+                "reports.time: work_type_ids did not resolve to names; rendering as 'Unknown work type'"
+            );
+        }
         Ok(TimeReportResponse {
             from,
             to,

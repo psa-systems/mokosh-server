@@ -199,6 +199,13 @@ impl OpportunitiesService {
             }
         }
         sql.push_str(" ORDER BY updated_at DESC");
+        // PMS-1662 F15 noted this as a dead assignment; it is load-bearing:
+        // the uniform per-filter branches above each bump `idx` after
+        // consuming it, so the final (unread) increment keeps every branch
+        // identical and new filters slot in without re-threading the
+        // numbering. `let _ = idx;` is how Rust silences
+        // `unused_assignments` here; the attribute form does not reach
+        // inside the surrounding block.
         let _ = idx;
 
         let mut q = sqlx::query(&sql).bind(*tenant_id);
@@ -294,6 +301,7 @@ impl OpportunitiesService {
         push!("quote_id", request.quote_id.is_some());
         push!("notes", request.notes.is_some());
         sql.push_str(" WHERE tenant_id = $1 AND id = $2 AND closed_at IS NULL");
+        // See note on the matching `let _ = idx;` in `list` above.
         let _ = idx;
 
         let mut q = sqlx::query(&sql).bind(*tenant_id).bind(id);

@@ -1111,8 +1111,6 @@ impl ContactService {
         self.get_company(tenant_id, company_id).await
     }
 
-    /// Delete company
-    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     /// PMS-1187: the access requests a contact has open, newest first.
     ///
     /// Resolved ones are kept and returned too: an MSP looking at a contact
@@ -1386,7 +1384,9 @@ impl ContactService {
         })
     }
 
+    /// Delete a company.
     // SPEC-15.41, SPEC-15.42: audit in one transaction; unknown id must be 404
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_company(
         &self,
         tenant_id: TenantId,
@@ -2066,6 +2066,14 @@ impl ContactService {
         // skip the token/email work; a role edit becomes just the
         // role-assignment rewrite above + the audit line.
         // SPEC-15.100: role-only edit sends no token or email
+        //
+        // PMS-1663 F: `.unwrap_or(false)` used to turn "row not found"
+        // into "not credentialled", which would mint a token and send
+        // a setup email for a contact that no longer exists. By the
+        // time this fn runs, the caller must have resolved a real
+        // contact row, so a missing row here is a bug, not a state.
+        // Refuse with 404 so we never email a credential to an
+        // orphaned contact id.
         let already_credentialled: bool = sqlx::query_scalar(
             "SELECT is_portal_user AND portal_password_hash IS NOT NULL \
              FROM contacts WHERE id = $1 AND tenant_id = $2",
@@ -2074,7 +2082,7 @@ impl ContactService {
         .bind(*tenant_id)
         .fetch_optional(&mut *tx)
         .await?
-        .unwrap_or(false);
+        .ok_or_else(|| AppError::NotFound("Contact".to_string()))?;
 
         // The token stays server-side; the response carries only whether
         // an email was queued so the SPA can distinguish a fresh grant
@@ -2244,9 +2252,11 @@ impl ContactService {
 
     /// mokosh-contact-login prompt 003: resend the setup link to an
     /// existing portal contact. Invalidates any prior unredeemed
-    /// token, mints a fresh one, dispatches the email. 400 when the
+    /// token, mints a fresh one, dispatches the email. 409 when the
     /// contact is not `is_portal_user = TRUE` (grant first) or has no
-    /// email on file.
+    /// email on file - the body states a condition the caller must
+    /// change before the retry can succeed, which is the `Conflict`
+    /// shape (SPEC-15.60).
     // SPEC-15.104, SPEC-15.105: 409 preconditions; new token and email
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
     pub async fn resend_portal_invite(
@@ -2999,8 +3009,21 @@ impl ContactService {
                     id: row.id,
                     // The column's CHECK constrains it to exactly the enum's
                     // five values, so the fallback is unreachable; it matches
-                    // the `contact_type` / `status` handling above.
-                    phone_type: PhoneType::from_str(&row.phone_type).unwrap_or_default(),
+                    // the `contact_type` / `status` handling above. A drift
+                    // past the CHECK can only come from a hand-written row;
+                    // WARN (PMS-1663 finding) so it is findable.
+                    phone_type: {
+                        let raw = &row.phone_type;
+                        let parsed = PhoneType::from_str(raw);
+                        if parsed.is_none() {
+                            tracing::warn!(
+                                phone_id = %row.id,
+                                stored = %raw,
+                                "contact_phones.phone_type is not one of the known values; reading as default"
+                            );
+                        }
+                        parsed.unwrap_or_default()
+                    },
                     number: row.number,
                     extension: row.extension,
                     is_primary: row.is_primary,
@@ -4749,13 +4772,40 @@ struct CompanyRow {
 
 impl From<CompanyRow> for Company {
     fn from(row: CompanyRow) -> Self {
+        // PMS-1663 finding: an unparseable stored enum used to map to
+        // the enum default with no trace, so corrupt data showed up as
+        // a legitimate "prospect"/"active" value. A From impl cannot
+        // propagate, so keep the default fallback and WARN with the
+        // company id + stored value.
+        let company_type = {
+            let parsed = CompanyType::from_str(&row.company_type);
+            if parsed.is_none() {
+                tracing::warn!(
+                    company_id = %row.id,
+                    stored = %row.company_type,
+                    "companies.company_type is not one of the known values; reading as default"
+                );
+            }
+            parsed.unwrap_or_default()
+        };
+        let status = {
+            let parsed = CompanyStatus::from_str(&row.status);
+            if parsed.is_none() {
+                tracing::warn!(
+                    company_id = %row.id,
+                    stored = %row.status,
+                    "companies.status is not one of the known values; reading as default"
+                );
+            }
+            parsed.unwrap_or_default()
+        };
         Self {
             id: row.id,
             tenant_id: row.tenant_id,
             name: row.name,
             parent_company_id: row.parent_company_id,
-            company_type: CompanyType::from_str(&row.company_type).unwrap_or_default(),
-            status: CompanyStatus::from_str(&row.status).unwrap_or_default(),
+            company_type,
+            status,
             industry: row.industry,
             website: row.website,
             phone: row.phone,
@@ -4797,7 +4847,25 @@ impl From<CompanyRow> for Company {
             // legacy row without the column will fail sqlx-decode
             // before we get here, so unwrap_or_default matches the
             // "empty JSONB" case only.
-            branding: serde_json::from_value(row.branding).unwrap_or_default(),
+            branding: {
+                let raw = row.branding;
+                match serde_json::from_value(raw.clone()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // PMS-1663 finding: a malformed stored branding
+                        // object used to render as the empty default
+                        // with no trace. Keep the fallback (a From impl
+                        // cannot propagate), WARN with the company id
+                        // and the decode error so a drift is findable.
+                        tracing::warn!(
+                            company_id = %row.id,
+                            error = %e,
+                            "companies.branding failed to decode as CompanyBranding; reading as default"
+                        );
+                        Default::default()
+                    }
+                }
+            },
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -4852,6 +4920,45 @@ struct ContactRow {
 
 impl From<ContactRow> for Contact {
     fn from(row: ContactRow) -> Self {
+        // PMS-1663 finding: unparseable `contact_type` / `status` /
+        // `preferred_contact_method` used to map to the enum default
+        // with no trace. Keep the fallback (a From impl cannot
+        // propagate), WARN with the contact id + stored value.
+        let contact_type = {
+            let parsed = ContactType::from_str(&row.contact_type);
+            if parsed.is_none() {
+                tracing::warn!(
+                    contact_id = %row.id,
+                    stored = %row.contact_type,
+                    "contacts.contact_type is not one of the known values; reading as default"
+                );
+            }
+            parsed.unwrap_or_default()
+        };
+        let status = {
+            let parsed = ContactStatus::from_str(&row.status);
+            if parsed.is_none() {
+                tracing::warn!(
+                    contact_id = %row.id,
+                    stored = %row.status,
+                    "contacts.status is not one of the known values; reading as default"
+                );
+            }
+            parsed.unwrap_or_default()
+        };
+        let preferred_contact_method = match row.preferred_contact_method.as_str() {
+            "email" => PreferredContactMethod::Email,
+            "phone" => PreferredContactMethod::Phone,
+            "mobile" => PreferredContactMethod::Mobile,
+            other => {
+                tracing::warn!(
+                    contact_id = %row.id,
+                    stored = %other,
+                    "contacts.preferred_contact_method is not one of the known values; reading as Email"
+                );
+                PreferredContactMethod::Email
+            }
+        };
         Self {
             id: row.id,
             tenant_id: row.tenant_id,
@@ -4865,24 +4972,17 @@ impl From<ContactRow> for Contact {
             fax: row.fax,
             title: row.title,
             department: row.department,
-            contact_type: ContactType::from_str(&row.contact_type).unwrap_or_default(),
+            contact_type,
             is_portal_user: row.is_portal_user,
             portal_user_id: row.portal_user_id,
-            // PMS-195: honor the stored value instead of hardcoding Email.
-            // Unknown values fall back to the enum default (Email), matching
-            // the `contact_type` / `status` `unwrap_or_default()` pattern.
-            preferred_contact_method: match row.preferred_contact_method.as_str() {
-                "phone" => PreferredContactMethod::Phone,
-                "mobile" => PreferredContactMethod::Mobile,
-                _ => PreferredContactMethod::Email,
-            },
+            preferred_contact_method,
             timezone: row.timezone,
             locale: row.locale,
             custom_fields: row.custom_fields,
             tags: row.tags,
             notes: row.notes,
             avatar_url: row.avatar_url,
-            status: ContactStatus::from_str(&row.status).unwrap_or_default(),
+            status,
             // PMS-806: filled by `hydrate_contacts` in one batched query per
             // child table; a bare row conversion leaves them empty.
             phones: Vec::new(),
@@ -5121,8 +5221,28 @@ impl From<SiteRow> for Site {
             timezone: row.timezone,
             notes: row.notes,
             // SPEC-15.84: coordinates returned as numbers
-            latitude: row.latitude.map(|d| d.to_string().parse().unwrap_or(0.0)),
-            longitude: row.longitude.map(|d| d.to_string().parse().unwrap_or(0.0)),
+            //
+            // PMS-1663 finding: the old `.parse().unwrap_or(0.0)`
+            // turned an unparseable coordinate into (0, 0), a real
+            // point in the Gulf of Guinea. The source is a stored
+            // Decimal, so an unparseable value is a type-system
+            // violation (Decimal::to_string is total); WARN with the
+            // site id and the raw text, keep the 0.0 fallback until
+            // the response type carries Option<Decimal> directly.
+            latitude: row.latitude.map(|d| {
+                let raw = d.to_string();
+                raw.parse().unwrap_or_else(|e| {
+                    tracing::warn!(site_id = %row.id, raw = %raw, error = %e, "sites.latitude did not parse as f64; using 0.0");
+                    0.0
+                })
+            }),
+            longitude: row.longitude.map(|d| {
+                let raw = d.to_string();
+                raw.parse().unwrap_or_else(|e| {
+                    tracing::warn!(site_id = %row.id, raw = %raw, error = %e, "sites.longitude did not parse as f64; using 0.0");
+                    0.0
+                })
+            }),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
