@@ -4,11 +4,6 @@
 //! `/timers/start`, `/timers/{id}/stop`) have no SPA caller. `WorkDayPage`
 //! uses the segment routes; the item-timer UI is deferred. Note covers
 //! ONLY the three timer routes; every other route in this file is consumed.
-//!
-//! parity record 2026-10-16: `/time-entries/summary` has no SPA caller
-//! yet; MAPPS-983 wires the dashboard "time this week" widget to it (and
-//! MAPPS-984 is the server half this adds). Note covers ONLY the summary
-//! route; every other `/time-entries*` route is consumed today.
 
 use std::sync::Arc;
 
