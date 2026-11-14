@@ -20,9 +20,10 @@
 # (any `.forgejo/workflows/` or `.forgejo/actions/` file counts as code
 # outright) to re-run the integration suite.
 #
-# Infra-retry touch (2026-11-14): template-DB clone pool timed out across
-# all three shards on the prior run; no code change this commit, workflow
-# touch alone re-triggers the matrix (Forgejo 16.0.3 has no rerun API).
+# Infra-retry touch (2026-11-14, attempt 2): shard 1/3 still timing out
+# on the template-DB clone pool while 2/3 and 3/3 pass; shard-1 subset
+# is pool-heavy. Workflow touch alone re-triggers the matrix (Forgejo
+# 16.0.3 has no rerun API).
 #
 # PMS-1252: `cache-warm.yml` archives the same `cargo nextest archive` on push
 # to main so the shared build cache is populated for a later pull-request run
