@@ -1110,7 +1110,7 @@ async fn update_contract_rejects_end_date_before_stored_start_date(pool: PgPool)
                 contract_number: None,
                 name: "Dated".to_string(),
                 company_id: company,
-                contract_type: "service".to_string(),
+                contract_type: "managed_services".to_string(),
                 status: "active".to_string(),
                 start_date: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
                 end_date: Some(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
