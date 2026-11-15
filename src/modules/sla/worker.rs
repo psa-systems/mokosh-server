@@ -115,6 +115,7 @@ impl SlaSweepWorker {
         // BYPASSRLS-scoped path.
         // SPEC-7.133: selects only open tickets (resolved_at/closed_at NULL, status not
         // closed) that have at least one due field set.
+        // SPEC-7.1042: inner join on status; NULL is_closed counts as open.
         let rows = sqlx::query_as::<_, TicketRow>(
             r#"SELECT t.id, t.tenant_id, t.assigned_to_id, t.created_at,
                       t.first_response_due, t.first_response_at, t.resolution_due
@@ -141,6 +142,7 @@ impl SlaSweepWorker {
 
             // SPEC-7.135: first_response (breach and at-risk) is skipped once
             // first_response_at is set; resolution has no such flag, always evaluated.
+            // SPEC-7.1043: four ledger kinds; events are sla.breached and sla.at_risk.
             let milestones = [
                 Milestone {
                     due: t.first_response_due,
@@ -185,6 +187,7 @@ impl SlaSweepWorker {
                 // the cost is that a dispatch failure leaves the ledger
                 // row in place (the milestone is not retried), which is
                 // acceptable for an at-risk/breach heads-up.
+                // SPEC-7.1044: a claim or scan error ends the tick via `?`.
                 let claimed = self
                     .service
                     .claim_sla_notification(t.tenant_id, t.id, kind)
@@ -222,6 +225,7 @@ impl SlaSweepWorker {
                     .dispatch(TenantId::from_trusted(t.tenant_id), event_type, &context)
                     .await
                 {
+                    // SPEC-7.1046: Ok(0) keeps the ledger row and is never retried.
                     Ok(n) => {
                         // SPEC-7.143: a successful dispatch logs at INFO with ticket_id,
                         // kind and fanout (n); dispatched is incremented by n.

@@ -230,6 +230,7 @@ async fn list_project_phases(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ProjectPhaseResponse>>> {
+    // SPEC-7.1059: sort and an over-cap per_page are 422 on the phase, task, task-status and project-type lists
     pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service

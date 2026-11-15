@@ -68,6 +68,7 @@ pub struct ExpensesRouterState {
 /// Build the expenses router. URLs are absolute (`/vendors`,
 /// `/expense-categories`) so the call site `merge`s rather than `nest`s,
 /// matching the billing router shape.
+// SPEC-14.57: billing module gate on every route; finance role on all but the claim routes.
 pub fn expenses_routes(service: ExpensesService) -> Router {
     let state = ExpensesRouterState {
         service: Arc::new(service),
@@ -109,6 +110,7 @@ pub fn expenses_routes(service: ExpensesService) -> Router {
 
 // ── Vendors ───────────────────────────────────────────────────────────
 
+// SPEC-14.58: no sort support.
 async fn list_vendors(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -127,6 +129,7 @@ async fn list_vendors(
     )))
 }
 
+// SPEC-14.58: 404 "Vendor" when absent.
 async fn get_vendor(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -137,6 +140,7 @@ async fn get_vendor(
     Ok(Json(v))
 }
 
+// SPEC-14.59: validated body.
 async fn create_vendor(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -152,6 +156,7 @@ async fn create_vendor(
     Ok(Json(v))
 }
 
+// SPEC-14.59: validated body.
 async fn update_vendor(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -168,6 +173,7 @@ async fn update_vendor(
     Ok(Json(v))
 }
 
+// SPEC-14.60: 409 while a bill references the vendor.
 async fn delete_vendor(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -181,6 +187,7 @@ async fn delete_vendor(
 
 // ── Expense categories ────────────────────────────────────────────────
 
+// SPEC-14.61: no sort support.
 async fn list_expense_categories(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -199,6 +206,7 @@ async fn list_expense_categories(
     )))
 }
 
+// SPEC-14.61: validated body.
 async fn create_expense_category(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -214,6 +222,7 @@ async fn create_expense_category(
     Ok(Json(c))
 }
 
+// SPEC-14.61: validated body.
 async fn update_expense_category(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -232,6 +241,7 @@ async fn update_expense_category(
 
 // ── Bills ─────────────────────────────────────────────────────────────
 
+// SPEC-14.68: status and q filters, no sort support.
 async fn list_bills(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -252,6 +262,7 @@ async fn list_bills(
     )))
 }
 
+// SPEC-14.69: bill with its lines.
 async fn get_bill(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -262,6 +273,7 @@ async fn get_bill(
     Ok(Json(b))
 }
 
+// SPEC-14.62: validated body.
 async fn create_bill(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -277,6 +289,7 @@ async fn create_bill(
     Ok(Json(b))
 }
 
+// SPEC-14.66: draft to approved.
 async fn approve_bill(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -288,6 +301,7 @@ async fn approve_bill(
     Ok(Json(b))
 }
 
+// SPEC-14.66: draft or approved to void.
 async fn void_bill(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -299,6 +313,7 @@ async fn void_bill(
     Ok(Json(b))
 }
 
+// SPEC-14.70, SPEC-14.72: operator path through pay_bill, which pushes to the provider.
 async fn record_bill_payment(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -319,6 +334,7 @@ async fn record_bill_payment(
     Ok(Json(b))
 }
 
+// SPEC-14.74: payments of one bill.
 async fn list_bill_payments(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -336,6 +352,7 @@ async fn list_bill_payments(
 ///
 /// `can_manage_billing()` and not `is_admin()`: finance is exactly who
 /// decides claims, and finance is not an admin.
+// SPEC-14.76: non-finance callers are scoped to their own claims.
 fn own_claims_only(user: &CurrentUser) -> Option<Uuid> {
     if user.role.can_manage_billing() {
         None
@@ -346,6 +363,7 @@ fn own_claims_only(user: &CurrentUser) -> Option<Uuid> {
 
 /// Refuse a claim that is somebody else's, unless this caller may see
 /// every claim (PMS-1535).
+// SPEC-14.77, SPEC-14.78: 403 for another person's claim unless finance-capable.
 fn assert_may_read(user: &CurrentUser, submitter: Uuid) -> AppResult<()> {
     if user.role.can_manage_billing() || submitter == user.id {
         Ok(())
@@ -356,6 +374,7 @@ fn assert_may_read(user: &CurrentUser, submitter: Uuid) -> AppResult<()> {
     }
 }
 
+// SPEC-14.76: scope forced from the caller's role, never from a parameter.
 async fn list_expenses(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -380,6 +399,7 @@ async fn list_expenses(
     )))
 }
 
+// SPEC-14.77: the 404 comes before the ownership check.
 async fn get_expense(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -394,6 +414,7 @@ async fn get_expense(
     Ok(Json(e))
 }
 
+// SPEC-14.75: the submitter is the caller.
 async fn create_expense(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -409,6 +430,7 @@ async fn create_expense(
     Ok(Json(e))
 }
 
+// SPEC-14.78: submitter or finance-capable caller.
 async fn submit_expense(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -428,6 +450,7 @@ async fn submit_expense(
     Ok(Json(e))
 }
 
+// SPEC-14.78, SPEC-14.79: finance role; the caller is recorded as approver.
 async fn approve_expense(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -442,6 +465,7 @@ async fn approve_expense(
     Ok(Json(e))
 }
 
+// SPEC-14.78, SPEC-14.79: finance role.
 async fn reject_expense(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -456,6 +480,7 @@ async fn reject_expense(
     Ok(Json(e))
 }
 
+// SPEC-14.78, SPEC-14.79, SPEC-14.81: finance role.
 async fn reimburse_expense(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,

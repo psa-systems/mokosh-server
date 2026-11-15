@@ -85,6 +85,8 @@ pub trait HostResolver: Send + Sync {
 pub struct SystemResolver;
 
 #[async_trait]
+// SPEC-4.1042: an IP-literal host (IPv6 brackets stripped) needs no DNS; else system lookup with
+// the port.
 impl HostResolver for SystemResolver {
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
         // `Url::host_str` reports an IPv6 literal with its brackets
@@ -180,6 +182,7 @@ static PRIVATE_TARGETS: OnceLock<PrivateTargetAllowlist> = OnceLock::new();
 /// PMS-982: the value comes from the configuration provider, which reports a
 /// variable that is set but unreadable itself. The `OnceLock` stays, so when
 /// the allowlist is parsed is unchanged.
+// SPEC-4.1043: read once per process via config; counts logged at info; WEB_PORTS is 80, 443.
 pub fn private_target_allowlist() -> &'static PrivateTargetAllowlist {
     PRIVATE_TARGETS.get_or_init(|| {
         let name = ALLOWLIST_KEY.name();

@@ -119,6 +119,7 @@ impl GoogleSourceFactory {
     }
 }
 
+// SPEC-15.594
 #[async_trait]
 impl SourceFactory for GoogleSourceFactory {
     async fn source(
@@ -271,6 +272,7 @@ impl ContactSyncRunner {
         }
     }
 
+    // SPEC-15.589
     pub async fn tick(&self) -> AppResult<TickSummary> {
         let mut summary = TickSummary {
             recovered: self.recover_stale().await?,
@@ -292,6 +294,7 @@ impl ContactSyncRunner {
         Ok(summary)
     }
 
+    // SPEC-15.590
     async fn recover_stale(&self) -> AppResult<u64> {
         let recovered = sqlx::query(
             "UPDATE contact_sync_runs SET status = 'queued', heartbeat_at = NULL \
@@ -314,6 +317,7 @@ impl ContactSyncRunner {
         Ok(recovered)
     }
 
+    // SPEC-15.591
     async fn schedule_due(&self) -> AppResult<u64> {
         Ok(sqlx::query(
             "INSERT INTO contact_sync_runs (tenant_id, connection_id, trigger) \
@@ -340,6 +344,7 @@ impl ContactSyncRunner {
         .rows_affected())
     }
 
+    // SPEC-15.592
     async fn claim(&self) -> AppResult<Option<Claimed>> {
         Ok(sqlx::query_as(
             "UPDATE contact_sync_runs SET status = 'running', attempts = attempts + 1, \
@@ -359,6 +364,7 @@ impl ContactSyncRunner {
     /// Start one queued run now and wait for its outcome, rather than for the
     /// next tick. What a test drives; the worker claims through [`Self::tick`].
     /// A run that cannot finish records why on its own row.
+    // SPEC-15.602
     pub async fn execute_run(&self, tenant_id: TenantId, run_id: Uuid) -> AppResult<RunStatus> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let claimed: Option<Claimed> = sqlx::query_as(
@@ -378,6 +384,7 @@ impl ContactSyncRunner {
         self.run_status(tenant_id, run_id).await
     }
 
+    // SPEC-15.595
     async fn execute(&self, claimed: Claimed) {
         let tenant_id = TenantId::from_trusted(claimed.tenant_id);
         // PMS-1429: one line per run saying how long the WORK took, separately
@@ -414,6 +421,7 @@ impl ContactSyncRunner {
         }
     }
 
+    // SPEC-15.593
     async fn attempt(&self, tenant_id: TenantId, claimed: &Claimed) -> AppResult<SyncReport> {
         let (provider, import_file_id): (String, Option<Uuid>) = {
             let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -467,6 +475,7 @@ impl ContactSyncRunner {
             .await
     }
 
+    // SPEC-15.596 to 15.599, SPEC-15.601
     async fn settle(
         &self,
         tenant_id: TenantId,
@@ -651,6 +660,7 @@ impl ContactSyncRunner {
 
     /// Best effort, after the outcome committed: a mail that fails to queue
     /// must not undo the record of why it was sent.
+    // SPEC-15.600
     async fn notify_failing(&self, tenant_id: TenantId, streak: StreakRow, error: Option<String>) {
         let Some(notifications) = self.notifications.as_ref() else {
             return;
@@ -673,7 +683,21 @@ impl ContactSyncRunner {
         .await;
         let (recipient_id, first_name) = match recipient {
             Ok(Some((id, first, _))) => (Some(id), first),
-            Ok(None) => (None, String::new()),
+            Ok(None) => {
+                // PMS-1663 finding: Ok(None) means the query ran fine
+                // but the tenant has no active admin and no active
+                // connected-by user. The notification still goes out
+                // (to the tenant inbox), but the operator's log had
+                // no trace that nobody was found. WARN with the tenant
+                // id so a tenant with zero admins is findable.
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    provider = %streak.provider,
+                    account_email = %streak.account_email,
+                    "contact sync: no active admin or connected-by user to route the failure notification to; dispatching with no recipient"
+                );
+                (None, String::new())
+            }
             Err(e) => {
                 tracing::warn!(
                     "contact sync: could not find who to tell about a failing connection: {e}"
@@ -713,6 +737,7 @@ impl ContactSyncRunner {
     }
 
     /// One run, tenant-scoped.
+    // SPEC-15.603
     pub async fn run_status(&self, tenant_id: TenantId, run_id: Uuid) -> AppResult<RunStatus> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query_as(&format!(

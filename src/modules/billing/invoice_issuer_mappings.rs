@@ -85,6 +85,7 @@ pub struct ProductMapping {
     pub external_item_id: String,
 }
 
+// SPEC-13.1072: every query is tenant-scoped
 /// Read-side service over the three mapping surfaces an external
 /// delegated issue needs. Writes land in Phase 2c with the admin SPA
 /// surfaces that build the mappings.
@@ -98,6 +99,7 @@ impl InvoiceIssuerMappingService {
         Self { db }
     }
 
+    // SPEC-13.1073
     /// Resolve the external customer id for one Mokosh company. Returns
     /// `None` when no mapping has been set for this `(tenant, provider,
     /// company)` triple; the dispatcher turns that into a well-known
@@ -123,6 +125,7 @@ impl InvoiceIssuerMappingService {
         Ok(row)
     }
 
+    // SPEC-13.1073
     /// Batched sibling of [`Self::get_customer_mapping`] for the lines
     /// of one invoice. Returns a map keyed by `product_id` so the
     /// caller resolves every line's `external_item_id` with one round
@@ -151,6 +154,7 @@ impl InvoiceIssuerMappingService {
         Ok(rows.into_iter().map(|r| (r.product_id, r)).collect())
     }
 
+    // SPEC-13.1073
     /// Resolve the external vendor id for one Mokosh vendor (MAPPS-1155).
     ///
     /// The bill half of [`Self::get_customer_mapping`]. A bill names a
@@ -179,6 +183,7 @@ impl InvoiceIssuerMappingService {
         Ok(row)
     }
 
+    // SPEC-13.1075: returns every provider
     /// Every vendor mapping this tenant holds for one provider, for the
     /// admin surface that lists vendors beside what they are over there.
     pub async fn list_vendor_mappings(&self, tenant_id: TenantId) -> AppResult<Vec<VendorMapping>> {
@@ -196,6 +201,7 @@ impl InvoiceIssuerMappingService {
         Ok(rows)
     }
 
+    // SPEC-13.1076
     /// Set (or replace) the vendor mapping for a `(tenant, provider,
     /// vendor)` triple.
     pub async fn upsert_vendor_mapping(
@@ -230,6 +236,7 @@ impl InvoiceIssuerMappingService {
         Ok(row)
     }
 
+    // SPEC-13.1073
     /// Resolve the ledger account for each expense category one bill
     /// touches (MAPPS-1155).
     ///
@@ -260,6 +267,7 @@ impl InvoiceIssuerMappingService {
         Ok(rows.into_iter().map(|r| (r.category_id, r)).collect())
     }
 
+    // SPEC-13.1075
     /// Every expense-account mapping this tenant holds, both providers,
     /// for the admin surface that lists categories beside the account
     /// they post to.
@@ -281,6 +289,7 @@ impl InvoiceIssuerMappingService {
         Ok(rows)
     }
 
+    // SPEC-13.1076
     /// Set (or replace) the account mapping for a `(tenant, provider,
     /// category)` triple.
     pub async fn upsert_expense_account_mapping(
@@ -315,6 +324,7 @@ impl InvoiceIssuerMappingService {
         Ok(row)
     }
 
+    // SPEC-13.1074
     /// The provider account a reimbursement is paid from (PMS-1541).
     ///
     /// Read from the `integrations` row rather than a mapping table,
@@ -344,6 +354,7 @@ impl InvoiceIssuerMappingService {
         Ok(value.flatten().filter(|v| !v.trim().is_empty()))
     }
 
+    // SPEC-13.1073
     /// Resolve the provider contact for one member of the tenant
     /// (PMS-1541).
     ///
@@ -370,6 +381,7 @@ impl InvoiceIssuerMappingService {
         Ok(row)
     }
 
+    // SPEC-13.1075
     /// Every people mapping this tenant holds, for the admin surface that
     /// lists members beside who they are over there.
     pub async fn list_user_mappings(&self, tenant_id: TenantId) -> AppResult<Vec<UserMapping>> {
@@ -387,6 +399,7 @@ impl InvoiceIssuerMappingService {
         Ok(rows)
     }
 
+    // SPEC-13.1076
     /// Set (or replace) the people mapping for a `(tenant, provider,
     /// user)` triple.
     pub async fn upsert_user_mapping(
@@ -421,6 +434,7 @@ impl InvoiceIssuerMappingService {
         Ok(row)
     }
 
+    // SPEC-13.1076
     /// Set (or replace) the customer mapping for a `(tenant, provider,
     /// company)` triple. Phase 2c's admin SPA calls this through a
     /// dedicated handler; the service method ships now so Phase 2c
@@ -457,6 +471,7 @@ impl InvoiceIssuerMappingService {
         Ok(row)
     }
 
+    // SPEC-13.1075
     /// Every company mapping this tenant has, both providers. Used by
     /// the admin SPA's listing surface.
     pub async fn list_company_mappings(
@@ -476,6 +491,7 @@ impl InvoiceIssuerMappingService {
         Ok(rows)
     }
 
+    // SPEC-13.1075
     /// Every product mapping this tenant has, both providers. Same
     /// shape as [`Self::list_company_mappings`].
     pub async fn list_product_mappings(
@@ -495,6 +511,7 @@ impl InvoiceIssuerMappingService {
         Ok(rows)
     }
 
+    // SPEC-13.1076
     /// Set (or replace) the product mapping for one `(tenant, provider,
     /// product)` triple. Same shape as [`Self::upsert_customer_mapping`].
     pub async fn upsert_product_mapping(

@@ -86,6 +86,7 @@ static CURRENT_SELECTION: OnceLock<AuthProviderSelection> = OnceLock::new();
 /// `src/main.rs`. A second call is a no-op that keeps the first install,
 /// which is what makes it safe for test binaries that boot more than once
 /// in one process.
+// SPEC-5.181: first install wins; later calls are ignored.
 pub fn install_selection(selection: AuthProviderSelection) {
     let _ = CURRENT_SELECTION.set(selection);
 }
@@ -94,6 +95,7 @@ pub fn install_selection(selection: AuthProviderSelection) {
 /// selection (both providers enabled) when `install_selection` has never
 /// run, so a test that boots its own router without threading a selection
 /// through sees the pre-PMS-981 behaviour rather than a blanket 401.
+// SPEC-5.181: default-open selection when nothing was installed.
 pub fn current_selection() -> AuthProviderSelection {
     CURRENT_SELECTION
         .get()
@@ -121,6 +123,7 @@ pub fn current_selection() -> AuthProviderSelection {
 /// An explicit `AUTH_PROVIDERS` still enforces exactly what it names,
 /// which is the AC's other half ("a credential for a disabled provider
 /// is refused without disclosing the configured set").
+// SPEC-5.180: Profile source enables all; Explicit enforces exactly the listed kinds.
 pub fn is_enabled(kind: AuthProviderKind) -> bool {
     let selection = current_selection();
     match selection.source {
@@ -178,11 +181,13 @@ pub enum AuthProviderKind {
 impl AuthProviderKind {
     /// Every kind, in canonical priority order: Bunyip first, matching
     /// `SAAS_PROVIDER_DEFAULTS`' authentication row.
+    // SPEC-5.176: priority order Bunyip then Local.
     pub const ALL: [AuthProviderKind; 2] = [AuthProviderKind::Bunyip, AuthProviderKind::Local];
 
     /// The name an operator writes and the boot record reports. Matches
     /// [`provider::BUNYIP`] and [`provider::LOCAL`] byte-for-byte, so the
     /// two vocabularies cannot drift.
+    // SPEC-5.176: names are "bunyip" and "local".
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Bunyip => provider::BUNYIP,
@@ -198,11 +203,13 @@ impl AuthProviderKind {
     /// degrade the model exists to remove. Blank is not a name; the caller
     /// resolves an unset `AUTH_PROVIDERS` against the hosting profile's
     /// default before it gets here.
+    // SPEC-5.177: trimmed exact match; unknown name is a Configuration error.
     pub fn parse_name(raw: &str) -> AppResult<Self> {
         match raw.trim() {
             provider::BUNYIP => Ok(Self::Bunyip),
             provider::LOCAL => Ok(Self::Local),
             other => Err(AppError::Configuration(format!(
+                // SPEC-2.244
                 "AUTH_PROVIDERS name {other:?} is not a known authentication provider; \
                  expected 'bunyip' or 'local'"
             ))),
@@ -216,6 +223,7 @@ impl AuthProviderKind {
     /// A blank name inside the list (`bunyip,,local`) is refused for the
     /// same reason a blank `AUTH_PROVIDERS` falls back to the profile: an
     /// empty name is not a provider.
+    // SPEC-5.178: empty entries and duplicates are refused.
     pub fn parse_list(raw: &str) -> AppResult<Vec<Self>> {
         let mut providers: Vec<Self> = Vec::new();
         for name in raw.split(',') {
@@ -284,6 +292,7 @@ impl AuthProviderSelection {
     /// - Unknown names, duplicates and empty entries are all refused with
     ///   an error that names the legal values, so a typo is a boot failure
     ///   rather than a silent fallback.
+    // SPEC-5.179: blank uses the profile default (Profile); otherwise the parsed list (Explicit).
     pub fn resolve(profile_default: &[&str], raw: &str) -> AppResult<Self> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -345,6 +354,7 @@ impl AuthProviderChain {
     /// assumed.
     ///
     /// Never logs credential material, JWT contents, or cookie values.
+    // SPEC-5.183: one info line per provider, no credential material.
     pub fn record(&self) {
         for provider in &self.providers {
             tracing::info!(
@@ -371,6 +381,7 @@ impl AuthProviderChain {
 /// chain's selection to [`install_selection`], and calls
 /// [`AuthProviderChain::record`] for the boot log. From then on the two
 /// decision points read [`current_selection`] directly.
+// SPEC-5.182: selection errors propagate; one adapter per selected provider in order.
 pub fn from_env_with(
     profile_default: &[&str],
     bunyip_verifier_present: bool,
@@ -404,6 +415,7 @@ fn build_chain(
         .collect()
 }
 
+// SPEC-5.179: an empty or duplicated profile default is a Configuration error.
 fn parse_profile_default(profile_default: &[&str]) -> AppResult<Vec<AuthProviderKind>> {
     if profile_default.is_empty() {
         return Err(AppError::Configuration(

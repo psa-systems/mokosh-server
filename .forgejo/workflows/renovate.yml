@@ -10,6 +10,7 @@ on:
     - cron: "0 2 * * 6"
   workflow_dispatch:
 
+# SPEC-10.50 SPEC-10.51 SPEC-10.340: renovate.json is read by this reusable workflow; JSON has no comments
 jobs:
   renovate:
     name: Renovate (caller)

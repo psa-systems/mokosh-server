@@ -320,6 +320,7 @@ impl CalendarService {
                 .collect();
             return Ok((page, total));
         }
+        // SPEC-7.1081: unbounded list path (and the /calendar/appointments alias) filters and ordering.
         let mut filters = FilterClauses::new(&["tenant_id = $1"]);
         filters.add_opt("assigned_to_id =", filter.user_id.map(FilterBind::Uuid));
         filters.add_opt(
@@ -433,6 +434,7 @@ impl CalendarService {
         );
         let plain_rows = q.fetch_all(&mut *tx).await?;
 
+        // SPEC-7.1082: one-offs by overlap, masters unfiltered by time, same assignee/team filters, merged by start_time.
         // Recurring masters: no time filter (the rule decides which
         // occurrences land in the window).
         let mut rfilters = FilterClauses::new(&["tenant_id = $1", "recurrence_rule IS NOT NULL"]);
@@ -502,6 +504,7 @@ impl CalendarService {
         // Largest configured offset across the whole table bounds the
         // expansion window. NULL (no appointment has reminders) => no work.
         // SPEC-7.390: due_reminders scans across all tenants (no tenant GUC) via the migrator pool; the window end is now + the largest configured reminder_minutes across the whole table, and no appointment having reminders configured (NULL max) short-circuits to an empty result.
+        // SPEC-7.1083: no API writes appointments.reminder_minutes; reminders need rows populated elsewhere.
         let max_offset_min: Option<i32> = sqlx::query_scalar(
             r#"SELECT MAX(m) FROM appointments a, unnest(a.reminder_minutes) AS m
                WHERE a.reminder_minutes IS NOT NULL"#,
@@ -787,6 +790,7 @@ impl CalendarService {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        // SPEC-7.1080: update is COALESCE-only over a fixed field set; links, recurrence_rule and reminder_minutes are not updatable.
         // SPEC-7.388: update_appointment returns 404 when no row matches (tenant_id, id).
         if n == 0 {
             return Err(AppError::NotFound("Appointment".to_string()));
@@ -817,6 +821,7 @@ impl CalendarService {
     // ========================================================================
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.1087: readable for any user by any calendar caller.
     pub async fn get_user_availability(
         &self,
         tenant_id: TenantId,
@@ -897,6 +902,7 @@ impl CalendarService {
     // ========================================================================
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.1086: ordering, filters, pending default, 404 and absent ownership check; SPEC-7.1085 covers audit coverage.
     pub async fn list_time_off(
         &self,
         tenant_id: TenantId,
@@ -1101,6 +1107,7 @@ impl CalendarService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.1088: on-call create/update are full-body upserts; SPEC-7.1085 for audit coverage.
     pub async fn create_on_call_schedule(
         &self,
         tenant_id: TenantId,
@@ -1328,6 +1335,7 @@ impl CalendarService {
         // Approved time off overlapping the window. time_off is DATE
         // granularity, so compare against the date components of the
         // range bounds.
+        // SPEC-7.1089: assignee narrows all but on-call; time off compares UTC dates.
         let from_date = from.date_naive();
         let to_date = to.date_naive();
         // SPEC-7.402: only status = 'approved' time off rows block dispatch; pending and rejected requests never block.
@@ -1379,6 +1387,7 @@ impl CalendarService {
     // ========================================================================
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.1090: template defaults, kind filter, name ordering, 404 name.
     pub async fn list_templates(
         &self,
         tenant_id: TenantId,
@@ -1574,6 +1583,7 @@ impl CalendarService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.1085: template delete writes no audit entry.
     pub async fn delete_template(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query("DELETE FROM scheduling_templates WHERE tenant_id = $1 AND id = $2")

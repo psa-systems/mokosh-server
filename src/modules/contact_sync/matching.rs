@@ -93,6 +93,7 @@ impl IncomingKeys {
     /// Every email the source holds is compared, not only the primary one the
     /// import keeps: a Mokosh contact holding somebody's secondary address is
     /// still that person.
+    // SPEC-15.688
     pub fn from_values<'a>(
         emails: impl IntoIterator<Item = &'a str>,
         phones: impl IntoIterator<Item = &'a str>,
@@ -122,6 +123,7 @@ pub enum MatchDecision {
     Create,
 }
 
+// SPEC-15.688 to 15.691
 pub fn decide(incoming: &IncomingKeys, locals: &[LocalContact]) -> MatchDecision {
     let by_email: Vec<&LocalContact> = locals
         .iter()

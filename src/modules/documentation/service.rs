@@ -19,15 +19,25 @@ use crate::modules::knowledge_base::KbService;
 use crate::utils::error::AppResult;
 use crate::utils::pagination::PaginationParams;
 
+// SPEC-15.1149
 /// The one aggregate response. Three parallel lists, each already
 /// scoped to the one company at the service level.
+///
+/// PMS-1664 finding: the totals used to be discarded (`_total_assets`,
+/// `_total_articles`), so a company with more than `PER_LIST_LIMIT`
+/// assets or articles was silently truncated. Surface each total
+/// alongside its list so the SPA can show a "showing N of M; see the
+/// full list" affordance.
 #[derive(Debug, Serialize)]
 pub struct CompanyDocumentation {
     pub assets: Vec<AssetResponse>,
+    pub total_assets: u64,
     pub credentials: Vec<CredentialSummary>,
     pub articles: Vec<KbArticleResponse>,
+    pub total_articles: u64,
 }
 
+// SPEC-15.1150, SPEC-15.1152
 /// How many of each list the aggregate returns per request. The intent is
 /// a human reading an on-call screen, not a full-tenant export; the per-page
 /// cap keeps the response bounded. Call the owning module's list endpoints
@@ -45,6 +55,7 @@ impl DocumentationService {
         Self { assets, kb }
     }
 
+    // SPEC-15.1150, SPEC-15.1151, SPEC-15.1152, SPEC-15.1153, SPEC-15.1154
     /// Aggregate for one company. Each list is bounded at
     /// `PER_LIST_LIMIT`; totals and pagination belong on the module's
     /// own list endpoints.
@@ -71,7 +82,7 @@ impl DocumentationService {
         // query with no ordering dependency between the three, so they run
         // concurrently.
         #[rustfmt::skip]
-        let ((assets, _total_assets), credentials, (articles, _total_articles)) = tokio::try_join!(
+        let ((assets, total_assets), credentials, (articles, total_articles)) = tokio::try_join!(
             self.assets.list_assets(tenant_id, &asset_filter, &page),
             self.assets.list_credentials_for_company(tenant_id, company_id),
             self.kb.list_articles(tenant_id, &kb_filter, &page)
@@ -79,8 +90,10 @@ impl DocumentationService {
 
         Ok(CompanyDocumentation {
             assets,
+            total_assets,
             credentials,
             articles,
+            total_articles,
         })
     }
 }

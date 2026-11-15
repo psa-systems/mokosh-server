@@ -143,6 +143,8 @@ impl S3Config {
         let bucket = required(env::S3_BUCKET)?;
         validate_bucket_name(&bucket)?;
 
+        // SPEC-3.1026: path style defaults true; region defaults us-east-1; virtual-hosted is
+        // {bucket}.{host}.
         let path_style = match get(env::S3_PATH_STYLE).as_deref() {
             None => true,
             Some("true" | "1" | "yes") => true,
@@ -226,6 +228,7 @@ impl S3Provider {
 
     /// The key on the wire: the same relative path the local provider uses and
     /// the ledger records, with `/` between the segments whatever the host OS.
+    // SPEC-3.1029: key is the path segments joined by /; location is s3://{bucket}/{key}.
     pub fn object_key(key: &ObjectKey) -> AppResult<String> {
         let path = key.relative_path()?;
         let segments: Vec<&str> = path
@@ -333,6 +336,7 @@ impl S3Provider {
     /// bucket is provisioned with the credentials and the policy an operator
     /// chose, not by the application at boot with whatever rights it happens
     /// to hold. A bucket the caller already owns is not an error.
+    // SPEC-3.1028: bucket PUT: 200 and 409 are success.
     pub async fn ensure_bucket(&self) -> AppResult<()> {
         let response = self.request(Method::PUT, None, &[], Vec::new()).await?;
         match response.status() {
@@ -414,6 +418,7 @@ impl ObjectProvider for S3Provider {
         }
     }
 
+    // SPEC-3.1027: HEAD 200 true, 404 false; other statuses Err with the first 300 body characters.
     async fn exists(&self, key: &ObjectKey) -> AppResult<bool> {
         let object_key = Self::object_key(key)?;
         let response = self
@@ -569,6 +574,8 @@ pub(crate) mod sigv4 {
         value.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
+    // SPEC-3.1030: signs host, content-sha256, date and extra headers (lowercase, sorted,
+    // collapsed).
     pub(crate) fn authorization_header(input: &SigningInput<'_>) -> String {
         let mut headers: Vec<(&str, String)> = input
             .headers

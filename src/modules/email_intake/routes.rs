@@ -75,6 +75,7 @@ async fn intake(
     // SPEC-7.318: authentication is a bearer token read directly off the request, not the normal user-session/cookie auth middleware.
     let bearer = extract_bearer(&headers)?;
     let resolved = s.service.resolve_token(&bearer).await?;
+    // SPEC-7.1074: log row is written only after payload and bearer checks pass; 200 JSON on success (SPEC-7.1075).
     let response = s.service.intake(resolved.tenant_id, req).await?;
     Ok(Json(response))
 }
@@ -133,6 +134,7 @@ async fn revoke_token(
             id,
         )
         .await?;
+    // SPEC-7.1075: revoke answers {"revoked": true}.
     Ok(Json(serde_json::json!({ "revoked": true })))
 }
 

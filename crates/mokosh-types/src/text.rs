@@ -43,6 +43,7 @@ pub fn is_exotic_space(c: char) -> bool {
 /// True for a character that is stripped from the *edges* of a value: ordinary
 /// whitespace plus ZWNJ / ZWJ, which are meaningful inside a word and never at
 /// its boundary.
+// SPEC-4.1038: clean input stays borrowed; edges trim whitespace plus ZWNJ and ZWJ only.
 fn is_edge_trim(c: char) -> bool {
     c.is_whitespace() || c == '\u{200C}' || c == '\u{200D}'
 }

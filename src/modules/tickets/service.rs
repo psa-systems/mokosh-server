@@ -170,6 +170,7 @@ impl TicketService {
     /// must not be undone by a broken SLA policy. A no-op when no
     /// `SlaService` was wired (test fixtures built via `new` /
     /// `with_mailer` / `with_dispatcher`).
+    // SPEC-7.1041: failure is logged at warn and never fails the create or update.
     async fn evaluate_sla(&self, tenant_id: TenantId, ticket_id: Uuid) {
         if let Some(sla) = &self.sla {
             if let Err(e) = sla.evaluate_for_ticket(tenant_id, ticket_id).await {
@@ -303,6 +304,7 @@ impl TicketService {
 
     /// Generate next ticket number for tenant
     // SPEC-7.1: ticket_number is formatted "T{:06}" from the tenant's next sequence value.
+    // SPEC-7.1091: the sequence bump commits in its own transaction, so a failed create leaves a gap.
     async fn next_ticket_number(&self, tenant_id: TenantId) -> AppResult<String> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, (i32,)>(
@@ -375,6 +377,11 @@ impl TicketService {
         // PSA audit: every foreign id from the request body must belong to
         // this tenant before it is linked, so a request cannot point a
         // ticket at another tenant's company/contact/site/etc.
+        //
+        // PMS-1667: priority_id, queue_id and the two kb_article fields were
+        // left out of this list and the FK defeated RLS, so a request could
+        // point a ticket at another tenant's row. A missing request-supplied
+        // id now surfaces as a named 400 instead of a database FK 500.
         self.validate_fks(
             tenant_id,
             &[
@@ -388,6 +395,10 @@ impl TicketService {
                 ("contracts", request.contract_id),
                 ("sla_policies", request.sla_id),
                 ("assets", request.asset_id),
+                ("ticket_priorities", request.priority_id),
+                ("ticket_queues", request.queue_id),
+                ("kb_articles", request.source_kb_article_id),
+                ("kb_articles", request.procedure_kb_article_id),
             ],
         )
         .await?;
@@ -711,9 +722,14 @@ impl TicketService {
         // (Option<Option<Uuid>>); only the inner Some(uuid) needs an FK
         // validation. Some(None) means "clear to NULL", which is always
         // safe; None means "leave unchanged".
+        // PMS-1667: status_id was left out of the validate_fks list, and the
+        // `is_closed` lookup below (and the UPDATE after it) read from
+        // `ticket_statuses` by id alone; a foreign-tenant status id surfaced
+        // as a 404 "Record" from fetch_one rather than a named 400.
         self.validate_fks(
             tenant_id,
             &[
+                ("ticket_statuses", request.status_id),
                 ("ticket_priorities", request.priority_id),
                 ("ticket_types", request.type_id.flatten()),
                 ("ticket_categories", request.category_id.flatten()),
@@ -743,25 +759,36 @@ impl TicketService {
         .await?;
 
         // SPEC-7.7: only fields actually present in the request get an UPDATE; an omitted field is never overwritten (PATCH semantics).
-        // Build update
+        // PMS-1682: one dynamic UPDATE via QueryBuilder instead of up to 22
+        // sequential single-field statements. Each present field appends
+        // `col = $N`; the unconditional last_updated_by_id/updated_at pair
+        // and the WHERE clause are appended once at the end, so a K-field
+        // PATCH costs one round trip regardless of K.
+        let mut qb: sqlx::QueryBuilder<'_, sqlx::Postgres> =
+            sqlx::QueryBuilder::new("UPDATE tickets SET ");
+        let mut first = true;
+        let mut touched = false;
+        let push = |qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>,
+                    first: &mut bool,
+                    touched: &mut bool,
+                    col: &str| {
+            if !*first {
+                qb.push(", ");
+            }
+            qb.push(col);
+            qb.push(" = ");
+            *first = false;
+            *touched = true;
+        };
+
         if let Some(ref title) = request.title {
-            sqlx::query("UPDATE tickets SET title = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(title)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "title");
+            qb.push_bind(title.clone());
         }
 
         if let Some(ref description) = request.description {
-            sqlx::query("UPDATE tickets SET description = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(description)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "description");
+            qb.push_bind(description.clone());
         }
 
         if let Some(status_id) = request.status_id {
@@ -773,57 +800,26 @@ impl TicketService {
                     .fetch_one(&mut *tx)
                     .await?;
 
+            push(&mut qb, &mut first, &mut touched, "status_id");
+            qb.push_bind(status_id);
             if is_closed && ticket.closed_at.is_none() {
-                sqlx::query(
-                    "UPDATE tickets SET status_id = $1, closed_at = NOW(), resolved_at = COALESCE(resolved_at, NOW()), last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4",
-                )
-                .bind(status_id)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
-            } else {
-                sqlx::query(
-                    "UPDATE tickets SET status_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4",
-                )
-                .bind(status_id)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+                qb.push(", closed_at = NOW(), resolved_at = COALESCE(resolved_at, NOW())");
             }
         }
 
         if let Some(priority_id) = request.priority_id {
-            sqlx::query("UPDATE tickets SET priority_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(priority_id)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "priority_id");
+            qb.push_bind(priority_id);
         }
 
         if let Some(assigned_to_id) = request.assigned_to_id {
-            sqlx::query("UPDATE tickets SET assigned_to_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(assigned_to_id)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "assigned_to_id");
+            qb.push_bind(assigned_to_id);
         }
 
         if let Some(queue_id) = request.queue_id {
-            sqlx::query("UPDATE tickets SET queue_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(queue_id)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "queue_id");
+            qb.push_bind(queue_id);
         }
 
         // PMS-344 follow-up: PATCH-style nullable update for asset_id.
@@ -833,13 +829,8 @@ impl TicketService {
         // FK but never ran an UPDATE, so the picker's PUT round-tripped
         // with a bare "Updated" audit row and no actual mutation.
         if let Some(asset_id_opt) = request.asset_id {
-            sqlx::query("UPDATE tickets SET asset_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(asset_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "asset_id");
+            qb.push_bind(asset_id_opt);
         }
 
         // PMS-1565: the remaining `UpdateTicketRequest` fields, previously
@@ -848,143 +839,83 @@ impl TicketService {
         // `asset_id` PATCH convention just above: `Some(None)` clears the
         // column, `Some(Some(v))` sets it, `None` leaves it untouched.
         if let Some(type_id_opt) = request.type_id {
-            sqlx::query("UPDATE tickets SET type_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(type_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "type_id");
+            qb.push_bind(type_id_opt);
         }
 
         if let Some(category_id_opt) = request.category_id {
-            sqlx::query("UPDATE tickets SET category_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(category_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "category_id");
+            qb.push_bind(category_id_opt);
         }
 
         if let Some(contact_id_opt) = request.contact_id {
-            sqlx::query("UPDATE tickets SET contact_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(contact_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "contact_id");
+            qb.push_bind(contact_id_opt);
         }
 
         if let Some(site_id_opt) = request.site_id {
-            sqlx::query("UPDATE tickets SET site_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(site_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "site_id");
+            qb.push_bind(site_id_opt);
         }
 
         if let Some(team_id_opt) = request.team_id {
-            sqlx::query("UPDATE tickets SET team_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(team_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "team_id");
+            qb.push_bind(team_id_opt);
         }
 
         if let Some(contract_id_opt) = request.contract_id {
-            sqlx::query("UPDATE tickets SET contract_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(contract_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "contract_id");
+            qb.push_bind(contract_id_opt);
         }
 
         if let Some(sla_id_opt) = request.sla_id {
-            sqlx::query("UPDATE tickets SET sla_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(sla_id_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "sla_id");
+            qb.push_bind(sla_id_opt);
         }
 
         if let Some(scheduled_start_opt) = request.scheduled_start {
-            sqlx::query("UPDATE tickets SET scheduled_start = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(scheduled_start_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "scheduled_start");
+            qb.push_bind(scheduled_start_opt);
         }
 
         if let Some(scheduled_end_opt) = request.scheduled_end {
-            sqlx::query("UPDATE tickets SET scheduled_end = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(scheduled_end_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "scheduled_end");
+            qb.push_bind(scheduled_end_opt);
         }
 
         if let Some(estimated_hours_opt) = request.estimated_hours {
-            sqlx::query("UPDATE tickets SET estimated_hours = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(estimated_hours_opt)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "estimated_hours");
+            qb.push_bind(estimated_hours_opt);
         }
 
         if let Some(is_billable) = request.is_billable {
-            sqlx::query("UPDATE tickets SET is_billable = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(is_billable)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "is_billable");
+            qb.push_bind(is_billable);
         }
 
         if let Some(billing_status) = request.billing_status {
-            sqlx::query("UPDATE tickets SET billing_status = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(billing_status.as_str())
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "billing_status");
+            qb.push_bind(billing_status.as_str());
         }
 
         if let Some(ref custom_fields) = request.custom_fields {
-            sqlx::query("UPDATE tickets SET custom_fields = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(custom_fields)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "custom_fields");
+            qb.push_bind(custom_fields.clone());
         }
 
         if let Some(ref tags) = request.tags {
-            sqlx::query("UPDATE tickets SET tags = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
-                .bind(tags)
-                .bind(user_id)
-                .bind(tenant_id)
-                .bind(ticket_id)
-                .execute(&mut *tx)
-                .await?;
+            push(&mut qb, &mut first, &mut touched, "tags");
+            qb.push_bind(tags.clone());
+        }
+
+        if touched {
+            push(&mut qb, &mut first, &mut touched, "last_updated_by_id");
+            qb.push_bind(user_id);
+            qb.push(", updated_at = NOW() WHERE tenant_id = ");
+            qb.push_bind(tenant_id);
+            qb.push(" AND id = ");
+            qb.push_bind(ticket_id);
+            qb.build().execute(&mut *tx).await?;
         }
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -1207,6 +1138,7 @@ impl TicketService {
     }
 
     /// Add note to ticket
+    // SPEC-7.1096: ticket checked in tenant, note inserted, ticket touched, audit row, one transaction.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn add_note(
         &self,
@@ -1438,6 +1370,7 @@ impl TicketService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // SPEC-7.1098: content only; touches the ticket (not first_response_at); audit row has old and new.
         // `updated_at` is set explicitly: `ticket_notes` carries no trigger for
         // it, which is why the column has sat equal to `created_at` on every row
         // since migration 005.
@@ -1551,6 +1484,7 @@ impl TicketService {
                 return;
             }
         };
+        // SPEC-7.1097: ticket.note_added template via the dispatcher, else a direct send with this subject.
         let contact_line = org.contact_line("Questions about this ticket?", None);
         let subject = format!("[{ticket_number}] {title}");
         let body = format!(
@@ -1832,6 +1766,7 @@ impl TicketService {
 
     // ========================================================================
     // LOOKUP MANAGEMENT (PMS-321)
+    // SPEC-7.1104: create_* writes an audit row; update_* and delete_* write none.
     //
     // Create/update/delete for the ticket lookup tables, mirroring the
     // asset-type CRUD. All tenant-scoped; the routes admin-gate the mutations.
@@ -2549,6 +2484,7 @@ impl TicketService {
     /// contacts are not in the `users` table); the customer-visible
     /// identity is captured by `contact_id`. Returns the fully-joined
     /// response so the portal client renders names not UUIDs.
+    // SPEC-7.1093: contact-plane create forces company/contact, source portal, and a fallback admin creator.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_portal_ticket(
@@ -2778,6 +2714,7 @@ impl TicketService {
     /// renders the comment as customer-originated. Bumps the
     /// ticket's `first_response_at` like the agent-add path so SLA
     /// math sees the customer reply.
+    // SPEC-7.1099: contact note is public, fallback-admin created_by_id, stamps first_response_at.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_portal_ticket_note(
         &self,
@@ -2958,6 +2895,13 @@ impl TicketService {
 
         // Append a public audit-trail note so the agent side sees the
         // reopen (and any reason) in the same thread the SPA renders.
+        // PMS-1667: `.unwrap_or_else(Uuid::nil)` used to substitute the nil
+        // UUID when the tenant had no admin/manager user to attribute the
+        // note to, so the INSERT below would then raise 23503 on the
+        // created_by_id FK after the status flip had already written into
+        // the same open transaction. Match the sibling portal-note paths
+        // and refuse with the named Configuration error BEFORE writing,
+        // and only when a human is there to see it.
         let fallback_creator: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM users WHERE tenant_id = $1 AND status = 'active' \
              AND role IN ('super_admin', 'admin', 'manager') \
@@ -2966,12 +2910,24 @@ impl TicketService {
         .bind(tenant_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let creator_id = fallback_creator.unwrap_or_else(Uuid::nil);
+        let creator_id = fallback_creator.ok_or(AppError::Configuration(
+            "Cannot reopen ticket: tenant has no admin/manager user to attribute the audit note to"
+                .into(),
+        ))?;
+        // PMS-1667: the appended note always said "reopened by customer"
+        // even when a staff caller drove the reopen (contact_id None). Pick
+        // the actor from whose seat the call came so the thread reads
+        // truthfully for a reader.
+        let actor = if contact_id.is_some() {
+            "customer"
+        } else {
+            "staff"
+        };
         let content = match reason {
             Some(r) if !r.trim().is_empty() => {
-                format!("Ticket reopened by customer. Reason: {}", r.trim())
+                format!("Ticket reopened by {actor}. Reason: {}", r.trim())
             }
-            _ => "Ticket reopened by customer.".to_string(),
+            _ => format!("Ticket reopened by {actor}."),
         };
         sqlx::query(
             "INSERT INTO ticket_notes (id, tenant_id, ticket_id, note_type,
@@ -3124,6 +3080,7 @@ impl TicketService {
         filter: &TicketFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<TicketResponse>, u64)> {
+        // SPEC-7.1105: team_id checked against the tenant (400); q matches title, number, company, assignee.
         // PMS-406: reject a `team_id` that does not belong to this tenant
         // before binding it, so a caller cannot probe another tenant's
         // team ids; cross-tenant ids 4xx rather than silently returning an
@@ -3199,6 +3156,7 @@ impl TicketService {
 
     // ========================================================================
     // MAPPS-998: per-user saved views for the Tickets list.
+    // SPEC-7.1108: names are trimmed and unique per user (409); update is partial; list is name ASC.
     //
     // Every method scopes on `(tenant_id, user_id)`: the UNIQUE on
     // `(tenant_id, user_id, name)` is per-user, and a view id this user does
@@ -3562,6 +3520,7 @@ fn build_ticket_filter_sql(
             binds.push(TicketFilterBind::Id(caller_id));
         }
     }
+    // SPEC-7.1106: is_unassigned, is_overdue and is_open are literal SQL conditions.
     // The remaining conditions are literal SQL (no placeholders, no
     // binds), so they do not touch the indices.
     if filter.is_unassigned == Some(true) {
@@ -3584,6 +3543,7 @@ fn build_ticket_filter_sql(
     }
 }
 
+// SPEC-7.1107: the response joins every display name; unresolved person names are logged with their id.
 /// SELECT clause shared by [`TicketService::get_ticket_response`] and
 /// [`TicketService::list_ticket_responses`]. Centralised so the column
 /// list, JOIN graph, and alias names stay in sync between the two.

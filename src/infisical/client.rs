@@ -354,6 +354,8 @@ impl InfisicalClient {
         path: &str,
         name: &str,
     ) -> Result<Option<String>, AppError> {
+        // SPEC-3.1015: secrets route /api/v3/secrets/raw/{name}; name encoded; read in query, write
+        // in JSON body.
         let query = format!(
             "workspaceId={}&environment={}&secretPath={}",
             urlencoding::encode(project_id),

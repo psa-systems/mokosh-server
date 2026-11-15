@@ -24,6 +24,7 @@
 //! on an opt-out deployment behaves the same as one on a server
 //! shipped before this module.
 
+// SPEC-15.1001: whole module is gated on Feature::AssetsCatalog (enforced in routes.rs)
 #[cfg(feature = "server")]
 pub mod job;
 #[cfg(feature = "server")]

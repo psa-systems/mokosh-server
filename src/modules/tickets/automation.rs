@@ -125,6 +125,7 @@ impl AutomationEngine {
         ticket_id: Uuid,
         trigger: AutomationTrigger,
     ) -> AppResult<()> {
+        // SPEC-7.1109: active rules run in priority order; run_count and last_run_at update per rule run.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // Get active rules for this trigger type
@@ -338,6 +339,7 @@ impl AutomationEngine {
                     }
                 }
                 "add_note" => {
+                    // SPEC-7.1110: note_type defaults to internal; attributed to the fallback admin.
                     if let Some(content) = action.params.get("content").and_then(|v| v.as_str()) {
                         let note_type = action
                             .params
@@ -509,6 +511,7 @@ impl AutomationEngine {
                 subject,
                 body,
             } => match &self.notifications {
+                // SPEC-7.1111: ticket.automation.notify via the dispatcher, else a direct mailer send.
                 Some(notify) => {
                     let context = serde_json::json!({
                         "recipient_email": to,
@@ -620,6 +623,7 @@ async fn send_guarded_webhook(
     method: &str,
     payload: &serde_json::Value,
 ) -> Result<reqwest::StatusCode, WebhookError> {
+    // SPEC-7.1112: method defaults to POST; GET/DELETE send no body; non-2xx is logged by the caller.
     let mut url = target.clone();
     // SPEC-7.42: redirect-following stops and fails after WEBHOOK_MAX_HOPS (5) hops.
     for _ in 0..=WEBHOOK_MAX_HOPS {

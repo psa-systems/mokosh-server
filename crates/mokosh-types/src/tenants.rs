@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+// SPEC-4.214: three statuses, default active.
 /// Tenant status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +58,7 @@ pub struct Tenant {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-4.220: all fields default None; accent_color omitted when None.
 /// Tenant branding configuration.
 ///
 /// The full set of brand-controllable fields for a tenant. Consumed by the
@@ -127,6 +129,7 @@ pub struct TenantBranding {
     pub invoice_template: Option<String>,
 }
 
+// SPEC-4.217: every field optional so the service can refuse by name.
 /// PMS-896: the organisation record, as the onboarding flow submits it.
 ///
 /// A whole-record submission, NOT a patch: this is the one place that states
@@ -157,6 +160,7 @@ pub struct OrganizationProfileRequest {
     pub website: Option<String>,
 }
 
+// SPEC-4.221: fifteen-key merged brand.
 /// The merged brand a caller sees. Field-by-field
 /// `company.field.or(tenant.field)` (see
 /// [`crate::branding::effective_branding`]), so every non-`None` Company
@@ -184,6 +188,7 @@ pub struct EffectiveBranding {
     pub portal_domain: Option<String>,
 }
 
+// SPEC-4.215: name, slug and email limits.
 /// Create tenant request
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateTenantRequest {
@@ -210,6 +215,7 @@ pub struct CreateTenantRequest {
     pub branding: Option<TenantBranding>,
 }
 
+// SPEC-4.216: limits on present fields; branding is a raw PATCH object.
 /// Update tenant request
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateTenantRequest {
@@ -242,6 +248,7 @@ pub struct UpdateTenantRequest {
     pub branding: Option<serde_json::Value>,
 }
 
+// SPEC-4.218: resend_welcome defaults false; email validated.
 /// MAPPS-450: request body for `PUT /api/v1/tenants/{id}/admin`.
 ///
 /// Every field is optional so the caller sends only what changed; the
@@ -259,6 +266,7 @@ pub struct UpdateTenantAdminRequest {
     pub resend_welcome: bool,
 }
 
+// SPEC-4.218: status is the raw users.status string.
 /// MAPPS-450: view of the tenant's admin `users` row that the tenant
 /// management modal renders. Returned from `GET /tenants/{id}/admin` and
 /// from the PUT above. `status` is the raw column so the SPA can gate
@@ -275,6 +283,7 @@ pub struct TenantAdminInfo {
     pub status: String,
 }
 
+// SPEC-4.219: user_count reads as 0 when missing.
 /// Tenant response for API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantResponse {
@@ -297,6 +306,7 @@ pub struct TenantResponse {
     pub user_count: i64,
 }
 
+// SPEC-4.219: bare conversion sets user_count to 0.
 impl From<Tenant> for TenantResponse {
     fn from(t: Tenant) -> Self {
         Self::from_tenant(t, 0)
@@ -326,6 +336,7 @@ impl TenantResponse {
     }
 }
 
+// SPEC-4.222: usage counters as 64-bit integers.
 /// Tenant usage statistics
 #[derive(Debug, Clone, Serialize)]
 pub struct TenantUsage {

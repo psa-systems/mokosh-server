@@ -40,6 +40,7 @@ pub struct KbExecutionRouterState {
     pub service: Arc<KbExecutionService>,
 }
 
+// SPEC-15.1108
 /// Build the KB-execution router.
 ///
 /// Mounted at the top level of the `/api/v1` tree so both the per-ticket
@@ -61,6 +62,7 @@ pub fn kb_execution_routes(service: KbExecutionService) -> Router {
         .with_state(state)
 }
 
+// SPEC-15.1109
 async fn list_for_ticket(
     State(state): State<KbExecutionRouterState>,
     RequireAuth(user): RequireAuth,
@@ -74,6 +76,7 @@ async fn list_for_ticket(
     ))
 }
 
+// SPEC-15.1110
 async fn create_for_ticket(
     State(state): State<KbExecutionRouterState>,
     RequireAuth(user): RequireAuth,
@@ -95,6 +98,7 @@ async fn create_for_ticket(
     ))
 }
 
+// SPEC-15.1112
 async fn get_execution(
     State(state): State<KbExecutionRouterState>,
     RequireAuth(user): RequireAuth,
@@ -103,6 +107,7 @@ async fn get_execution(
     Ok(Json(state.service.get_execution(user.tenant(), id).await?))
 }
 
+// SPEC-15.1113
 async fn set_step_checked(
     State(state): State<KbExecutionRouterState>,
     RequireAuth(user): RequireAuth,

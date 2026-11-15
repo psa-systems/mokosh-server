@@ -104,6 +104,7 @@ impl DeploymentMode {
     /// a different set of providers. See the module doc for why the two
     /// readers disagree on purpose.
     // SPEC-4.60: provider selection's reader errors, naming the accepted values, on an unrecognized value.
+    // SPEC-6.37
     pub fn from_env_for_providers() -> AppResult<Self> {
         Self::parse_for_providers(&raw_from_env())
     }
@@ -116,6 +117,7 @@ impl DeploymentMode {
             None => {
                 tracing::warn!(
                     value = %raw.trim(),
+                    // SPEC-2.237
                     "unrecognised MOKOSH_DEPLOYMENT_MODE; falling back to self-hosted. \
                      Valid values are `self-hosted` and `saas`",
                 );
@@ -124,6 +126,7 @@ impl DeploymentMode {
         }
     }
 
+    // SPEC-2.236
     /// The pure half of [`from_env_for_providers`](Self::from_env_for_providers).
     pub fn parse_for_providers(raw: &str) -> AppResult<Self> {
         Self::recognise(raw).ok_or_else(|| {
@@ -185,6 +188,7 @@ impl DeploymentMode {
         self.default_providers()[kind.index()].providers
     }
 
+    // SPEC-2.240
     /// The kind's FIRST default, which is the provider a capability starts on
     /// when the operator configured nothing.
     ///
@@ -215,6 +219,7 @@ impl DeploymentMode {
     /// are recorded as such, which is what makes a provider left on by a
     /// default visible rather than assumed.
     // SPEC-4.62: an explicit per-capability override wins for that capability only; the source of each choice is recorded.
+    // SPEC-2.241
     pub fn resolve_providers(self, overrides: &ProviderOverrides) -> ProviderSelection {
         let choices = ProviderKind::ALL
             .iter()
@@ -309,6 +314,7 @@ impl ProviderKind {
 
     /// Every provider name this kind may name, so a table row or an override
     /// cannot quietly name a provider that does not exist.
+    // SPEC-4.1020: providers each kind may name; ProviderKind::ALL order is fixed.
     pub fn known_providers(self) -> &'static [&'static str] {
         match self {
             Self::Configuration => &[provider::ENVIRONMENT],
@@ -392,6 +398,7 @@ pub struct ProviderDefaults {
     pub providers: &'static [&'static str],
 }
 
+// SPEC-2.238
 /// The `self-hosted` defaults.
 ///
 /// Every provider here needs no external service, because the customer image
@@ -421,6 +428,7 @@ pub const SELF_HOSTED_PROVIDER_DEFAULTS: [ProviderDefaults; 5] = [
     },
 ];
 
+// SPEC-2.239
 /// The `saas` defaults.
 ///
 /// Two rows differ from `self-hosted`, and both reflect what the deployed
@@ -445,6 +453,7 @@ pub const SELF_HOSTED_PROVIDER_DEFAULTS: [ProviderDefaults; 5] = [
 /// the deployment setting either would boot-fail a deployment that sets
 /// neither, because `InfisicalSecretProvider::from_env` (and `S3Provider`)
 /// refuse to build without their variables.
+// SPEC-4.1021: self-hosted and SaaS default tables; SaaS declares the Google client pair to bunyip.
 pub const SAAS_PROVIDER_DEFAULTS: [ProviderDefaults; 5] = [
     ProviderDefaults {
         kind: ProviderKind::Configuration,
@@ -491,6 +500,7 @@ pub struct SecretProviderDefault {
 /// from, and its Google client (if it has one) is its own.
 pub const SELF_HOSTED_SECRET_PROVIDERS: [SecretProviderDefault; 0] = [];
 
+// SPEC-2.242
 /// `saas` reads the Google OAuth client pair from bunyip, which is where an
 /// operator sets it once for the whole suite (BUNYIP-983, PMS-1537). Both
 /// halves, because they are one key over there and a half-declared pair is
@@ -558,6 +568,7 @@ impl ProviderOverrides {
     /// simply not be configured. `None`, and an empty list, both mean "not
     /// configured" and leave the profile's default in place: an override that
     /// enables nothing is not an override, it is a kind nobody set.
+    // SPEC-4.1022: an empty provider list is no override.
     pub fn with_opt(mut self, kind: ProviderKind, providers: Option<Vec<&'static str>>) -> Self {
         self.per_kind[kind.index()] = providers.filter(|p| !p.is_empty());
         self
@@ -622,6 +633,7 @@ impl ProviderSelection {
     /// the source is that a provider left on by a default is visible, and a
     /// log that only mentions what was overridden leaves the defaults to be
     /// assumed, which is the state this issue exists to end.
+    // SPEC-4.1023: one info line per capability (mode, providers, source), not only deviations.
     pub fn record(&self) {
         for choice in &self.choices {
             tracing::info!(

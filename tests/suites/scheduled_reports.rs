@@ -247,3 +247,80 @@ async fn worker_tick_skips_disabled_schedule(pool: PgPool) {
     .expect("count");
     assert_eq!(pending.0, 0, "disabled schedule produces no notification");
 }
+
+/// PMS-1665: `schedule_update` and `schedule_delete` already filtered by
+/// user_id, but GET /reports/schedules/{id} used to return any schedule
+/// in the tenant, so a tenant member who could see the shared parent
+/// report could read another user's schedule - its recipient address,
+/// cron expression, last_error and is_active flag. GET by id now matches
+/// update + delete and 404s a schedule the caller does not own.
+#[mokosh_test]
+async fn get_schedule_by_id_hides_another_users_schedule(pool: PgPool) {
+    let (admin_id, email_a, password_a) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let _ = seed_ticket(&pool, company_id, admin_id, "Alpha").await;
+
+    let app = common::boot(pool.clone()).await;
+    let token_a = common::login(&app, &email_a, &password_a).await;
+    let report_id = create_shared_report(&app, &token_a).await;
+
+    // User A creates the schedule.
+    let schedule_a: Value = app
+        .client
+        .post(app.url(&format!("/api/v1/reports/saved/{report_id}/schedules")))
+        .bearer_auth(&token_a)
+        .json(&serde_json::json!({
+            "cron_expr": "0 0 0 * * * *",
+            "recipient_email": "a-private@example.com",
+        }))
+        .send()
+        .await
+        .expect("schedule POST as A")
+        .json()
+        .await
+        .expect("schedule body");
+    let schedule_id = schedule_a["id"].as_str().expect("schedule id").to_string();
+
+    // User B is a second admin in the same tenant - same role, same
+    // visibility over the parent shared report, but not the schedule's
+    // owner.
+    let (_uid_b, email_b, password_b) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "b@pms1665.example",
+        "admin",
+    )
+    .await;
+    let token_b = common::login(&app, &email_b, &password_b).await;
+
+    // Before PMS-1665 this returned 200 with the schedule's recipient
+    // email and cron; after, B 404s like update/delete already did.
+    let resp = app
+        .client
+        .get(app.url(&format!("/api/v1/reports/schedules/{schedule_id}")))
+        .bearer_auth(&token_b)
+        .send()
+        .await
+        .expect("get schedule as B");
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "another user's schedule must not leak via GET by id; body: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    // And the owner still sees it.
+    let own = app
+        .client
+        .get(app.url(&format!("/api/v1/reports/schedules/{schedule_id}")))
+        .bearer_auth(&token_a)
+        .send()
+        .await
+        .expect("get schedule as A");
+    assert_eq!(
+        own.status().as_u16(),
+        200,
+        "the owner must still see their own schedule; body: {}",
+        own.text().await.unwrap_or_default()
+    );
+}

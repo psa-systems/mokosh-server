@@ -94,6 +94,7 @@ async fn status_html(_gate: RequireAdminOrBunyipMachine) -> impl IntoResponse {
 // RefreshOutcome::Applied the response is 200 with {status:
 // "applied", generation_number}; on RefreshOutcome::Rejected it is
 // 409 with {status: "rejected", previous_generation_number, reason}.
+// SPEC-3.1035: rejected reason lists key names only; the operator actor is the staff user's email.
 async fn refresh_status(RequireAdminUser(user): RequireAdminUser) -> impl IntoResponse {
     let outcome = try_refresh(RefreshRequest::operator(user.email.clone()));
     let report = super::collect();

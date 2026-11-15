@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::auth::TenantId;
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
 pub struct ReportsService {
@@ -20,6 +20,7 @@ impl ReportsService {
         Self { db }
     }
 
+    // SPEC-15.1605: read-only tenant tx, dropped without commit
     /// Run a whitelisted custom report inside a tenant-scoped transaction
     /// so the dynamic (but fully whitelisted) query carries the RLS
     /// `app.current_tenant` GUC (PMS-256). Read-only: the tx is dropped
@@ -34,6 +35,7 @@ impl ReportsService {
     }
 
     // PMS-95 dashboard --------------------------------------------------------
+    // SPEC-15.1579, SPEC-15.1580, SPEC-15.1581
     /// `user_tz` is the active user's `users.timezone` preference (PMS-253).
     /// The 30-day ticket trend is the one server-computed per-day bucket on a
     /// `timestamptz`, so it must group by the user's local day rather than the
@@ -143,6 +145,7 @@ impl ReportsService {
     }
 
     // PMS-96 tickets ----------------------------------------------------------
+    // SPEC-15.1582, SPEC-15.1583
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn tickets(
         &self,
@@ -231,6 +234,7 @@ impl ReportsService {
     }
 
     // PMS-97 time -------------------------------------------------------------
+    // SPEC-15.1584
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn time(
         &self,
@@ -286,6 +290,22 @@ impl ReportsService {
             .map(|(id, _, _)| *id)
             .collect();
         crate::utils::unresolved_person::log_unresolved_person_names("reports.time", &unresolved);
+        // PMS-1665 finding: the user branch above logs unresolved ids,
+        // but the work-type branch rendered "Unknown work type" with
+        // no log. Mirror the shape: collect the ids whose name is
+        // None and WARN once (SPEC-15.1584).
+        let unresolved_work_types: Vec<Uuid> = by_work_type
+            .iter()
+            .filter(|(_, name, _)| name.is_none())
+            .map(|(id, _, _)| *id)
+            .collect();
+        if !unresolved_work_types.is_empty() {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                work_type_ids = ?unresolved_work_types,
+                "reports.time: work_type_ids did not resolve to names; rendering as 'Unknown work type'"
+            );
+        }
         Ok(TimeReportResponse {
             from,
             to,
@@ -309,6 +329,7 @@ impl ReportsService {
     }
 
     // PMS-98 billing ----------------------------------------------------------
+    // SPEC-15.1585, SPEC-15.1586
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn billing(
         &self,
@@ -316,6 +337,24 @@ impl ReportsService {
         company_id: Option<Uuid>,
     ) -> AppResult<BillingReportResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1665 finding: an unknown company_id used to fall through
+        // to WHERE filters that yielded zero totals + empty aging, and
+        // the doc comment below claimed the response "covers every
+        // client". A caller hitting a stale company id (deleted, wrong
+        // tenant) learned the mistake only by reading an empty report.
+        // 404 up front so the operator can tell the two apart.
+        if let Some(c) = company_id {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM companies WHERE tenant_id = $1 AND id = $2)",
+            )
+            .bind(tenant_id)
+            .bind(c)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !exists {
+                return Err(AppError::NotFound("Company".to_string()));
+            }
+        }
         let totals: Option<(Decimal, Decimal, Decimal)> = if let Some(c) = company_id {
             sqlx::query_as(
                 r#"SELECT COALESCE(SUM(total), 0), COALESCE(SUM(amount_paid), 0),
@@ -387,6 +426,7 @@ impl ReportsService {
     }
 
     // PMS-179 projects --------------------------------------------------------
+    // SPEC-15.1587
     /// Project delivery: counts by status, budget vs actual (actuals come
     /// from `time_entries` linked to a project), task completion, and
     /// overdue projects. Powers the SPA project-status / budget-tracking /
@@ -485,6 +525,7 @@ impl ReportsService {
     }
 
     // PMS-179 clients ---------------------------------------------------------
+    // SPEC-15.1588
     /// Client / CMDB summary: company counts, asset inventory by type and
     /// status, warranties expiring soon, and contract renewals. Powers the
     /// SPA client-summary / asset-inventory / contract-renewals report types.
@@ -742,6 +783,7 @@ pub(crate) fn month_start(today: NaiveDate) -> NaiveDate {
 }
 
 impl ReportsService {
+    // SPEC-15.1589, SPEC-15.1590
     /// Time tracked against tickets that came from a client request
     /// submission, grouped by the request type that produced them.
     ///
@@ -830,6 +872,7 @@ impl ReportsService {
     }
 }
 
+// SPEC-15.1580: SLA clock definition
 /// PMS-1238: the SLA clock runs only while a ticket is unresolved, unclosed
 /// and not in a closed status, the same definition the SLA worker uses.
 const SLA_CLOCK_RUNNING: &str = " AND resolved_at IS NULL AND closed_at IS NULL AND NOT COALESCE((SELECT is_closed FROM ticket_statuses s WHERE s.id = status_id), FALSE)";

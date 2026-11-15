@@ -21,6 +21,7 @@ impl SettingsService {
 
     // PMS-115 tenant settings -------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-15.2006
     pub async fn list_tenant_settings(
         &self,
         tenant_id: TenantId,
@@ -73,6 +74,7 @@ impl SettingsService {
     /// per category are small); no Paginated envelope here because
     /// the SPA wants the full category snapshot on the settings page.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-15.2009
     pub async fn list_settings_by_category(
         &self,
         tenant_id: TenantId,
@@ -92,6 +94,7 @@ impl SettingsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-15.2010
     pub async fn get_setting(
         &self,
         tenant_id: TenantId,
@@ -115,6 +118,7 @@ impl SettingsService {
     /// Upsert a single (category, key) value. Caller is expected to
     /// have already run `validate_setting_value` against `value`.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-15.2011
     pub async fn put_setting(
         &self,
         tenant_id: TenantId,
@@ -146,6 +150,7 @@ impl SettingsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-15.2012
     pub async fn delete_setting_by_key(
         &self,
         tenant_id: TenantId,
@@ -175,6 +180,7 @@ impl SettingsService {
     // PMS-21 delegate to it (no more duplicate SQL in TenantService).
     // ----------------------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-15.2014
     pub async fn list_module_configs(
         &self,
         tenant_id: TenantId,
@@ -207,6 +213,7 @@ impl SettingsService {
     /// response and a "this module hasn't been touched yet" tenant
     /// reads consistently across both API surfaces.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-15.2015
     pub async fn get_module_config(
         &self,
         tenant_id: TenantId,
@@ -229,6 +236,7 @@ impl SettingsService {
     /// Read just the `is_enabled` flag, fast path used by
     /// `RequireModuleEnabled` (PMS-113 AC3). Missing row -> `false`.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-15.2017
     pub async fn is_module_enabled(&self, tenant_id: TenantId, module: &str) -> AppResult<bool> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let enabled: Option<bool> = sqlx::query_scalar(
@@ -243,6 +251,7 @@ impl SettingsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-15.2016
     pub async fn upsert_module_config(
         &self,
         tenant_id: TenantId,
@@ -318,6 +327,7 @@ impl From<ModCfgRow> for ModuleConfigResponse {
 /// means "no default due date". Free function so the projects and tickets
 /// services can apply the default without taking a dependency on
 /// `SettingsService`.
+// SPEC-15.2027
 pub async fn read_default_due_business_days(db: &Database, tenant_id: TenantId) -> AppResult<u32> {
     let mut tx = db.begin_with_tenant(tenant_id).await?;
     let value: Option<serde_json::Value> = sqlx::query_scalar(
@@ -339,6 +349,7 @@ pub async fn read_default_due_business_days(db: &Database, tenant_id: TenantId) 
 /// `validate_setting_value`); this clamps defensively in case a row was written
 /// before validation existed. Free function so `TimeTrackingService` can read
 /// the cap without a dependency on `SettingsService`.
+// SPEC-15.2028
 pub async fn read_max_minutes_per_day(db: &Database, tenant_id: TenantId) -> AppResult<i32> {
     let mut tx = db.begin_with_tenant(tenant_id).await?;
     let value: Option<serde_json::Value> = sqlx::query_scalar(
@@ -363,6 +374,7 @@ pub async fn read_max_minutes_per_day(db: &Database, tenant_id: TenantId) -> App
 /// the two would come to disagree. Migration 049 keeps the default to one
 /// row per tenant. Takes a connection rather than the pool because the
 /// contract sweep reads it on the migrator pool, across tenants.
+// SPEC-15.2029
 pub async fn read_tenant_zone(
     conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -392,6 +404,7 @@ pub struct InvoiceReminderSettings {
 /// PMS-1037: `billing_reminders/{enabled,schedule,send_hour}` on the caller's
 /// tenant-GUC connection. Unset is off: a tenant that never turned reminders
 /// on is not mailing anybody.
+// SPEC-15.2030
 pub async fn read_invoice_reminder_settings(
     conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -434,6 +447,7 @@ pub async fn read_invoice_reminder_settings(
 /// MSP's, and a client company has none of the MSP's staff, so a per-company
 /// setting would be keyed on the wrong entity. Unset means off, so an employer
 /// that has never thought about it is not asked to.
+// SPEC-15.2031
 pub async fn read_track_breaks(db: &Database, tenant_id: TenantId) -> AppResult<bool> {
     let mut tx = db.begin_with_tenant(tenant_id).await?;
     let value: Option<serde_json::Value> = sqlx::query_scalar(
@@ -452,6 +466,7 @@ pub async fn read_track_breaks(db: &Database, tenant_id: TenantId) -> AppResult<
 /// never opened the setting keeps the behaviour it had. A stored value the
 /// parser refuses is treated the same way by the caller, which cannot happen
 /// through `PUT /settings` (validated) but can through a hand-written row.
+// SPEC-15.2032
 pub async fn read_note_editing(db: &Database, tenant_id: TenantId) -> AppResult<Option<String>> {
     let mut tx = db.begin_with_tenant(tenant_id).await?;
     let value: Option<serde_json::Value> = sqlx::query_scalar(
@@ -469,6 +484,7 @@ pub async fn read_note_editing(db: &Database, tenant_id: TenantId) -> AppResult<
 /// switch exists to turn it OFF. A stored value that is not a boolean cannot
 /// arrive through `PUT /settings` (validated) and reads as enabled, the same
 /// answer as no row.
+// SPEC-15.2033
 pub async fn read_google_contacts_enabled(db: &Database, tenant_id: TenantId) -> AppResult<bool> {
     let mut tx = db.begin_with_tenant(tenant_id).await?;
     let value: Option<serde_json::Value> = sqlx::query_scalar(
@@ -489,6 +505,7 @@ pub async fn read_google_contacts_enabled(db: &Database, tenant_id: TenantId) ->
 /// ordinary case, and one flag could not express it. Defaults to allowed, the
 /// same way the Google one does, because the gate that actually decides whether
 /// anything syncs is whether a connection exists.
+// SPEC-15.2033
 pub async fn read_icloud_contacts_enabled(db: &Database, tenant_id: TenantId) -> AppResult<bool> {
     let mut tx = db.begin_with_tenant(tenant_id).await?;
     let value: Option<serde_json::Value> = sqlx::query_scalar(
@@ -507,6 +524,7 @@ pub async fn read_icloud_contacts_enabled(db: &Database, tenant_id: TenantId) ->
 /// key (`read_icloud_contacts_enabled`) has its own: an MSP that disables one
 /// integration should not silently disable another. Defaults to allowed, the
 /// same "unset is enabled" convention as the other two.
+// SPEC-15.2033
 pub async fn read_microsoft_contacts_enabled(
     db: &Database,
     tenant_id: TenantId,
@@ -527,6 +545,7 @@ pub async fn read_microsoft_contacts_enabled(
 /// means `owner_or_admin`. A stored value the parser refuses is treated the
 /// same way by the caller, which cannot happen through `PUT /settings`
 /// (validated) but can through a hand-written row.
+// SPEC-15.2032
 pub async fn read_segment_editing(db: &Database, tenant_id: TenantId) -> AppResult<Option<String>> {
     let mut tx = db.begin_with_tenant(tenant_id).await?;
     let value: Option<serde_json::Value> = sqlx::query_scalar(
@@ -547,6 +566,7 @@ pub async fn read_segment_editing(db: &Database, tenant_id: TenantId) -> AppResu
 /// Takes the caller's tenant-GUC connection rather than the pool: the three
 /// invoice writers and the credit note read it inside the transaction that
 /// inserts the row, and `tenant_settings` is RLS-covered.
+// SPEC-15.2034
 pub async fn read_default_currency(
     conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -569,6 +589,7 @@ pub async fn read_default_currency(
 /// that as "preserve the Phase 1 422-on-unknown-sender posture".
 /// Reads off a `PgPool` so the email-intake flow does not have to
 /// thread its outer connection through.
+// SPEC-15.2035
 pub async fn read_email_intake_default_company(
     // PMS-692: takes the tenant-GUC transaction connection (like
     // `read_ci_impact_max_depth`), not a bare pool - `tenant_settings` is
@@ -595,6 +616,7 @@ pub async fn read_email_intake_default_company(
 /// the caller-supplied `depth` query param as a separate upper
 /// bound, so the effective walk depth is
 /// `min(query_depth, this_setting, hard_ceiling)`.
+// SPEC-15.2036
 pub async fn read_ci_impact_max_depth(
     tx: &mut sqlx::PgConnection,
     tenant_id: Uuid,
@@ -619,6 +641,8 @@ pub async fn read_ci_impact_max_depth(
 /// workflow executor can read it from inside its own transaction
 /// without nesting a second `begin_with_tenant` (which would deadlock
 /// on the `app.current_tenant` GUC SET).
+// SPEC-15.2036
+// SPEC-7.1053: a non-integer stored value silently falls back to the default 3.
 pub async fn read_workflow_rule_max_depth(
     tx: &mut sqlx::PgConnection,
     tenant_id: Uuid,

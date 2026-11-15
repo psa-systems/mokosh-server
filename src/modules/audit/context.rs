@@ -37,6 +37,7 @@ pub struct AuditCtx {
 impl AuditCtx {
     /// Construct a context for a non-request caller (background jobs,
     /// tests). Actor is unset; ip/user-agent are absent.
+    // SPEC-5.503: system context carries only the tenant.
     pub fn system(tenant_id: Uuid) -> Self {
         Self {
             tenant_id: Some(tenant_id),
@@ -47,6 +48,7 @@ impl AuditCtx {
     }
 }
 
+// SPEC-5.500: infallible extractor; no AuthState yields an empty actor.
 impl<S> FromRequestParts<S> for AuditCtx
 where
     S: Send + Sync,
@@ -65,6 +67,7 @@ where
         // Resolve the real client IP from the forwarded header, trusting it only
         // when the peer is a configured proxy so a spoofed header cannot poison
         // the recorded address.
+        // SPEC-5.501: forwarded chain trusted only from a configured proxy peer.
         let ip = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|ci| {
             crate::utils::client_ip::extract_client_ip(
                 ci.0.ip(),
@@ -73,6 +76,7 @@ where
             )
             .to_string()
         });
+        // SPEC-5.502: absent or non-UTF-8 header yields None.
         let user_agent = parts
             .headers
             .get(axum::http::header::USER_AGENT)
@@ -101,6 +105,7 @@ pub enum AuditAction {
     Import,
 }
 
+// SPEC-5.504: verbs must match the audit_log CHECK constraint.
 impl AuditAction {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -140,6 +145,7 @@ impl AuditAction {
 ///             Some(id), Some(json!(before)), Some(json!(after))).await?;
 /// tx.commit().await?;
 /// ```
+// SPEC-5.505: one INSERT on the caller's executor; an error propagates to the caller.
 #[allow(clippy::too_many_arguments)]
 pub async fn audit_write<'e, E>(
     exec: E,
@@ -179,6 +185,7 @@ where
 /// Convenience wrapper over [`audit_write`] for the auth module, which
 /// has no entity row to diff. Recorded against the `auth` entity_type
 /// with the acting user (when known) as `entity_id`.
+// SPEC-5.506: entity type `auth`, user id doubles as entity id.
 pub async fn audit_auth_event<'e, E>(
     exec: E,
     tenant_id: Uuid,
@@ -224,6 +231,7 @@ where
 /// instead, and includes a small `new_values` bag with the reason /
 /// event subtype so admin queries can distinguish "portal.login" from
 /// "portal.login_failed" without adding a new AuditAction variant.
+// SPEC-5.507: entity type `portal_contact`, actor in entity_id, subtype in new_values.
 pub async fn audit_portal_event<'e, E>(
     exec: E,
     tenant_id: Uuid,

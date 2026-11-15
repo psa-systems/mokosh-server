@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+// SPEC-4.212: unpriced entries serialize null rate and total.
 #[derive(Debug, Clone, Serialize)]
 pub struct MileageEntryResponse {
     pub id: Uuid,
@@ -44,6 +45,7 @@ pub struct MileageEntryResponse {
     pub task_title: Option<String>,
 }
 
+// SPEC-4.213: every filter key optional.
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct MileageEntryFilter {
     pub user_id: Option<Uuid>,
@@ -53,6 +55,7 @@ pub struct MileageEntryFilter {
     pub date_to: Option<NaiveDate>,
 }
 
+// SPEC-4.208, SPEC-4.209: create-time validation and defaults.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateMileageEntryRequest {
     /// Only super_admin / admin / manager can attribute mileage to a
@@ -80,6 +83,7 @@ pub struct CreateMileageEntryRequest {
     pub rate_per_mile: Option<Decimal>,
 }
 
+// SPEC-4.209: validators run only on present fields.
 #[derive(Debug, Clone, Default, Deserialize, Validate)]
 pub struct UpdateMileageEntryRequest {
     pub date: Option<NaiveDate>,

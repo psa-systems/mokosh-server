@@ -39,6 +39,7 @@ impl StatusService {
     /// Refuse an unknown check kind or outcome up front so the CHECK
     /// constraint is a backstop rather than a first defence. The 422 the
     /// SPA renders inline is friendlier than the raw constraint error.
+    // SPEC-15.2110
     fn validate_vocab(request: &IngestStatusRequest) -> AppResult<()> {
         if !CHECK_KINDS.contains(&request.check_kind.as_str()) {
             return Err(AppError::validation_field(
@@ -71,6 +72,7 @@ impl StatusService {
     /// device is refused with 422 so an operator can see it: silently
     /// writing observations for a system nobody has claimed yet is how a
     /// tenant ends up billing a company that does not own the box.
+    // SPEC-15.2111, SPEC-15.2112, SPEC-15.2113
     pub async fn ingest(
         &self,
         tenant_id: TenantId,
@@ -158,6 +160,7 @@ impl StatusService {
     /// observation. Missing kinds do not appear in the list; a caller
     /// that expects one and finds none knows nothing has ever been seen
     /// for that kind on this system.
+    // SPEC-15.2114
     pub async fn latest_for_system(
         &self,
         tenant_id: TenantId,
@@ -217,6 +220,7 @@ impl StatusService {
     /// "nothing to grade" rather than "everything failed"; the numerator
     /// and denominator are returned alongside the rate so the caller can
     /// distinguish the two.
+    // SPEC-15.2116
     pub async fn backup_success_rate(
         &self,
         tenant_id: TenantId,
@@ -267,6 +271,7 @@ impl StatusService {
     /// surface documents which of the two this is. `1.0` on no
     /// observations so a company with no monitored systems does not read
     /// as "totally down".
+    // SPEC-15.2117
     pub async fn uptime(
         &self,
         tenant_id: TenantId,
@@ -312,6 +317,7 @@ impl StatusService {
     /// so the delete runs on the migrator pool. Bounded by `observed_at`,
     /// which the primary index covers, and returns the count so the
     /// worker can log a size per tick.
+    // SPEC-15.2118
     pub async fn purge_older_than(&self, cutoff: DateTime<Utc>) -> AppResult<u64> {
         // SAFETY (PMS-285): cross-tenant maintenance. The delete is
         // bounded by `observed_at` and the caller is a background job,
@@ -327,6 +333,7 @@ impl StatusService {
     /// owned by that company. A system that has never carried a backup
     /// observation still appears, with `latest = None`, so the caller
     /// can render "unseen" separately from "failing".
+    // SPEC-15.2115
     pub async fn backup_for_company(
         &self,
         tenant_id: TenantId,
@@ -356,19 +363,45 @@ impl StatusService {
         let systems = rows
             .into_iter()
             .map(|r| {
-                let outcome: Option<String> = r.try_get("outcome").ok();
+                // PMS-1666 F6: `try_get.ok()` used to turn a column
+                // decode error into "no backup observation", and the
+                // observed_at/payload fall-backs invented an
+                // `Utc::now()` / empty-object for a NULL-column shape
+                // the schema does not allow (every backup observation
+                // row has observed_at set). WARN with the system id
+                // on a decode error; the shape still falls back to
+                // None/Utc::now() for the same reason as before (the
+                // page must still render).
+                let system_id: Uuid = r.get("system_id");
+                let outcome: Option<String> = match r.try_get("outcome") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            system_id = %system_id,
+                            error = %e,
+                            "status.backup_for_company: outcome column failed to decode; reading as no observation"
+                        );
+                        None
+                    }
+                };
                 let latest = outcome.map(|out| CurrentObservation {
                     check_kind: "backup".to_string(),
                     outcome: out,
                     observed_at: r
                         .get::<Option<DateTime<Utc>>, _>("observed_at")
-                        .unwrap_or_else(Utc::now),
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                system_id = %system_id,
+                                "status.backup_for_company: outcome present but observed_at is NULL; using Utc::now() placeholder"
+                            );
+                            Utc::now()
+                        }),
                     payload: r
                         .get::<Option<serde_json::Value>, _>("payload")
                         .unwrap_or_else(|| serde_json::json!({})),
                 });
                 CompanySystemBackup {
-                    monitored_system_id: r.get("system_id"),
+                    monitored_system_id: system_id,
                     system_name: r.get("system_name"),
                     latest,
                 }

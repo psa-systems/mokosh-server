@@ -23,6 +23,7 @@ use super::grant_invitations::GrantInvitationsService;
 use crate::scheduler::Job;
 use crate::utils::error::AppResult;
 
+// SPEC-5.245
 pub const GRANT_INVITATIONS_SWEEP_INTERVAL: StdDuration = StdDuration::from_secs(3600);
 
 pub struct GrantInvitationsExpirySweep {
@@ -41,6 +42,7 @@ impl Job for GrantInvitationsExpirySweep {
         "grant_invitations_expiry_sweep"
     }
 
+    // SPEC-5.245
     async fn run(&self) -> AppResult<()> {
         let expired = GrantInvitationsService::expire_stale(&self.pool).await?;
         if expired > 0 {

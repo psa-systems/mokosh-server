@@ -27,6 +27,7 @@ const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// What the SPA sends on each debounced autosave.
 #[derive(Debug, Clone, Deserialize)]
+// SPEC-7.1026: opaque payload; name lifted from payload.name; upsert 200, delete 204.
 pub struct UpsertFormDraftRequest {
     /// The definition being edited, or `None` while the form is new. This is
     /// the key the draft is stored under, so a user editing two different

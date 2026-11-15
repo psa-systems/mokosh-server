@@ -262,6 +262,7 @@ impl FormsService {
         created_by: Uuid,
         req: CreateFormDefinitionRequest,
     ) -> AppResult<FormDefinitionResponse> {
+        // SPEC-7.1015: field set, then rules, then slug uniqueness, then one insert transaction.
         check_field_set(&req.fields)?;
         check_rules(&req.rules, &req.fields)?;
 
@@ -312,6 +313,7 @@ impl FormsService {
         id: Uuid,
         req: UpdateFormDefinitionRequest,
     ) -> AppResult<FormDefinitionResponse> {
+        // SPEC-7.1014: an unknown id is a 404 before any field or rule validation.
         let existing = self.get(tenant_id, id).await?;
 
         // SPEC-7.218: rule-vs-field consistency is re-checked whenever either `fields` or
@@ -398,6 +400,7 @@ impl FormsService {
     /// form for a tenant. `portal_visible = TRUE AND is_active = TRUE`;
     /// a retired form or one flagged internal-only stays out of the
     /// picker.
+    // SPEC-7.1027: no route calls list_portal_forms or get_portal_form.
     // SPEC-7.305: returns only definitions with both is_active = TRUE and
     // portal_visible = TRUE, ordered by name ASC; a retired or internal-only form never appears.
     pub async fn list_portal_forms(
@@ -577,6 +580,7 @@ async fn insert_fields(
     definition_id: Uuid,
     fields: &[CreateFormFieldRequest],
 ) -> AppResult<()> {
+    // SPEC-7.1016: fields keep request order and their own sort_order.
     for f in fields {
         sqlx::query(
             "INSERT INTO form_fields \

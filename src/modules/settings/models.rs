@@ -77,6 +77,8 @@ pub struct PutSettingValueRequest {
 /// so we notice when this table needs a new entry. Returns
 /// `AppError::Validation` for malformed known shapes; that maps to
 /// HTTP 422 via `utils::error`.
+// SPEC-15.2018, SPEC-15.2019, SPEC-15.2020, SPEC-15.2021, SPEC-15.2022, SPEC-15.2023,
+// SPEC-15.2024, SPEC-15.2025, SPEC-15.2026: one shape table, 422 on field value.
 pub fn validate_setting_value(
     category: &str,
     key: &str,
@@ -309,6 +311,7 @@ const SENSITIVE_WORDS: &[&str] = &[
 /// The compact-JSON form of `value`, safe to log: `<redacted>` when `category`
 /// or `key` looks like a secret, otherwise the value itself, cut at
 /// [`MAX_LOGGED_SETTING_VALUE_BYTES`] with a trailing `...` when longer.
+// SPEC-15.2026
 fn loggable_setting_value(category: &str, key: &str, value: &serde_json::Value) -> String {
     let category = category.to_ascii_lowercase();
     let key = key.to_ascii_lowercase();

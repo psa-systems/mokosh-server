@@ -26,6 +26,7 @@ pub struct RmmRouterState {
     pub service: Arc<RmmService>,
 }
 
+// SPEC-15.1536, SPEC-15.1537: module gate and admin gate are per-handler extractors
 pub fn rmm_routes(service: RmmService) -> Router {
     let state = RmmRouterState {
         service: Arc::new(service),
@@ -65,6 +66,7 @@ pub fn rmm_routes(service: RmmService) -> Router {
         .with_state(state)
 }
 
+// SPEC-15.1538
 async fn list_connections(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -80,6 +82,7 @@ async fn list_connections(
     )))
 }
 
+// SPEC-15.1540, SPEC-15.1541
 async fn create_connection(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -102,6 +105,7 @@ async fn create_connection(
     ))
 }
 
+// SPEC-15.1543
 async fn delete_connection(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -111,6 +115,7 @@ async fn delete_connection(
     s.service.delete_connection(u.tenant(), id).await
 }
 
+// SPEC-15.1543, SPEC-15.1542
 async fn get_connection(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -120,6 +125,7 @@ async fn get_connection(
     Ok(Json(s.service.get_connection(u.tenant(), id).await?))
 }
 
+// SPEC-15.1544
 async fn update_connection(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -133,6 +139,7 @@ async fn update_connection(
     ))
 }
 
+// SPEC-15.1545, SPEC-15.1546, SPEC-15.1547
 async fn test_connection(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -147,6 +154,7 @@ struct ConnQuery {
     rmm_connection_id: Option<Uuid>,
 }
 
+// SPEC-15.1538, SPEC-15.1539
 async fn list_device_mappings(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -165,6 +173,7 @@ async fn list_device_mappings(
     )))
 }
 
+// SPEC-15.1548
 async fn create_device_mapping(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -180,6 +189,7 @@ async fn create_device_mapping(
     ))
 }
 
+// SPEC-15.1549
 async fn update_device_mapping(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -195,6 +205,7 @@ async fn update_device_mapping(
     ))
 }
 
+// SPEC-15.1549
 async fn delete_device_mapping(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -204,6 +215,7 @@ async fn delete_device_mapping(
     s.service.delete_device_mapping(u.tenant(), id).await
 }
 
+// SPEC-15.1538, SPEC-15.1539
 async fn list_alert_rules(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -222,6 +234,7 @@ async fn list_alert_rules(
     )))
 }
 
+// SPEC-15.1550
 async fn create_alert_rule(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -235,6 +248,7 @@ async fn create_alert_rule(
     ))
 }
 
+// SPEC-15.1551
 async fn update_alert_rule(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -248,6 +262,7 @@ async fn update_alert_rule(
     ))
 }
 
+// SPEC-15.1551
 async fn delete_alert_rule(
     State(s): State<RmmRouterState>,
     RequireRmm { user: u, .. }: RequireRmm,
@@ -257,6 +272,7 @@ async fn delete_alert_rule(
     s.service.delete_alert_rule(u.tenant(), id).await
 }
 
+// SPEC-15.1552, SPEC-15.1553, SPEC-15.1554: unauthenticated signed webhook
 /// `POST /api/v1/rmm/alerts` is callable by RMM agents (not internal
 /// users); it authenticates by verifying an HMAC-SHA256 signature in
 /// `X-Signature` against the connection's stored secret. This route

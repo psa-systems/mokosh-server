@@ -77,7 +77,7 @@ struct UpdateCheckProbe {
 static UPDATE_CHECK_PROBE: std::sync::OnceLock<Option<UpdateCheckProbe>> =
     std::sync::OnceLock::new();
 
-// SPEC-1 and 2.153: the update check makes no outbound request, and the probe is never built, when MOKOSH_UPDATE_CHECK_URL is unset or blank.
+// SPEC-2.258
 fn update_check_probe() -> Option<&'static UpdateCheckProbe> {
     UPDATE_CHECK_PROBE
         .get_or_init(|| {
@@ -86,8 +86,7 @@ fn update_check_probe() -> Option<&'static UpdateCheckProbe> {
             if trimmed.is_empty() {
                 return None;
             }
-            // SPEC-1 and 2.154: the display URL strips userinfo, query and fragment so a credential embedded in the configured URL never reaches an error message. Best-effort credential
-            // scrub for error strings, identical to the Infisical probe. A value that does not parse as a URL has no leak path, but stay defensive and fall back to the literal.
+            // SPEC-2.261
             let display = match url::Url::parse(&trimmed) {
                 Ok(mut u) => {
                     let _ = u.set_username("");
@@ -100,6 +99,7 @@ fn update_check_probe() -> Option<&'static UpdateCheckProbe> {
             };
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
+                // SPEC-2.264
                 .build()
                 .ok()?;
             Some(UpdateCheckProbe {
@@ -123,10 +123,10 @@ struct CachedResult {
 static RESULT_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedResult>>> =
     std::sync::OnceLock::new();
 
+// SPEC-2.262
 /// Reuse window for a successful check. Update info changes rarely, so a
 /// generous window collapses dashboard polling (and abuse) to one upstream
 /// request per window.
-// SPEC-1 and 2.155: a successful result is cached and reused for 15 minutes; a failed one for 60 seconds.
 const SUCCESS_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// Shorter reuse window for a failed check, so a transient upstream outage
 /// recovers on the next poll instead of being pinned for the success window.
@@ -173,6 +173,7 @@ async fn run_update_check() -> UpdateCheck {
     result
 }
 
+// SPEC-2.260
 /// Perform the manifest fetch + version comparison with no caching. Split out
 /// so `run_update_check` owns the cache policy and this stays a straight-line
 /// network path that is easy to unit-test.
@@ -223,6 +224,7 @@ async fn fetch_update_check(client: &reqwest::Client, url: &str, display: &str) 
     }
 }
 
+// SPEC-2.259
 /// `GET /api/v1/version/check`. Returns 200 with the check result, except a
 /// failed remote check returns 502 Bad Gateway (the upstream manifest server,
 /// not this server, is at fault). A disabled check is a normal 200.
@@ -262,6 +264,7 @@ fn parse_version(v: &str) -> Vec<u64> {
         .collect()
 }
 
+// SPEC-2.263
 /// True when `latest` is a strictly higher release than `current`. Missing
 /// trailing components compare as `0`, so `0.2` ranks equal to `0.2.0`.
 ///

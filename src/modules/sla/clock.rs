@@ -149,9 +149,23 @@ impl BusinessSchedule {
     /// malformed schedule yields an all-closed schedule, which the engine
     /// degrades to 24x7 via [`BusinessSchedule::has_any_window`].
     // SPEC-7.115: an unparseable or unknown IANA timezone string maps
-    // to UTC rather than erroring.
+    // to UTC rather than erroring. PMS-1667: write-time validation in
+    // `UpsertBusinessHoursRequest` now rejects the bad value as 422, so
+    // reaching this fallback at read time means a row that predates the
+    // validator or was written through SQL directly; log it loudly so an
+    // operator who inherited the data knows the evaluator is computing
+    // against UTC and not the zone the row claims.
     pub fn parse(timezone: &str, schedule: &serde_json::Value) -> Self {
-        let tz: Tz = timezone.parse().unwrap_or(Tz::UTC);
+        let tz: Tz = match timezone.parse() {
+            Ok(tz) => tz,
+            Err(_) => {
+                tracing::warn!(
+                    stored_timezone = %timezone,
+                    "business_hours.timezone is not a known IANA zone; SLA clock is evaluating in UTC",
+                );
+                Tz::UTC
+            }
+        };
         let mut by_weekday: HashMap<Weekday, Vec<Window>> = HashMap::new();
 
         if let Some(map) = schedule.as_object() {

@@ -121,6 +121,8 @@ const DEV_ENCRYPTION_KEY: &str = "32-byte-key-for-dev-only-change!";
 /// service-wide `WebhookService` signing secret (BUNYIP-332), or boot fails.
 const DEV_BUNYIP_WEBHOOK_SECRET: &str = "development-bunyip-webhook-secret-change";
 
+// SPEC-2.27
+// SPEC-6.35
 /// True for the environments that may use the hardcoded dev fallbacks.
 /// Anything else (staging, production, or an unrecognized value) fails
 /// safe: it must supply real secrets. Mirrors [`AppConfig::is_dev_or_test`]
@@ -134,6 +136,8 @@ fn env_allows_dev_secrets(environment: &str) -> bool {
 /// security margin (PMS-497).
 const MIN_JWT_SECRET_LEN: usize = 32;
 
+// SPEC-2.29
+// SPEC-6.40
 /// Outside dev/test, reject a `JWT_SECRET` below the HS256 32-byte security
 /// margin. `resolve_secret` already rejected the unset / dev-default cases
 /// (PMS-499); this adds the length floor (PMS-497).
@@ -148,6 +152,7 @@ fn check_jwt_secret_len(secret: &str, environment: &str) -> Result<(), Box<dyn s
     Ok(())
 }
 
+// SPEC-2.30
 /// True when `s` is exactly 64 ASCII hex characters - the canonical
 /// `ENCRYPTION_KEY` form (32 bytes, hex-encoded) required outside dev/test
 /// (PMS-498). A raw 32-byte key is ambiguous and weaker to mistype, so it is
@@ -190,6 +195,8 @@ struct DeploymentRequirement {
     example: &'static str,
 }
 
+// SPEC-2.25
+// SPEC-6.43
 /// The six deployment-shape variables mokosh-server refuses to start without
 /// outside dev/test (PMS-1160). The list is ORDERED by consequence: the first
 /// one that fails at boot is the first one printed, so an operator who lands
@@ -268,6 +275,8 @@ const ESSENTIAL_DEPLOYMENT_REQUIREMENTS: &[DeploymentRequirement] = &[
     },
 ];
 
+// SPEC-2.25
+// SPEC-6.43
 /// Refuse to start when any essential deployment-shape variable is unset
 /// outside dev/test (PMS-1160). Runs after `AppConfig::from_env` returns so
 /// the resolved `ENVIRONMENT` decides whether the check gates.
@@ -303,6 +312,8 @@ fn check_deployment_requirements(environment: &str) -> Result<(), Box<dyn std::e
     }
 }
 
+// SPEC-2.26
+// SPEC-6.44
 /// One requirement's failure block. Named to match the shape `resolve_secret`
 /// uses so operators reading two different startup errors see the same layout.
 fn format_missing_requirement(req: &DeploymentRequirement, environment: &str) -> String {
@@ -339,6 +350,8 @@ fn resolve_secret(
     resolve_secret_value(key.name(), config::get(key), environment, dev_value)
 }
 
+// SPEC-2.28
+// SPEC-6.39
 /// The rule itself, over a value the caller already has.
 fn resolve_secret_value(
     var_name: &str,
@@ -373,10 +386,12 @@ fn resolve_secret_value(
 }
 
 impl AppConfig {
+    // SPEC-6.42 SPEC-6.45 SPEC-6.46
     /// PMS-982: every value below comes from the configuration provider, which
     /// `main` has already initialised. Each field's own emptiness, trimming and
     /// default rule is unchanged; only where the string comes from moved.
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        // SPEC-2.27
         let environment =
             config::get(&keys::ENVIRONMENT).unwrap_or_else(|| "development".to_string());
 
@@ -384,15 +399,18 @@ impl AppConfig {
         // secrets outside dev/test. Resolved before the struct is built so a
         // production/staging/unknown environment fails loud at boot rather than
         // silently serving with a publicly-known JWT_SECRET / ENCRYPTION_KEY.
+        // SPEC-2.28
         let jwt_secret = resolve_secret(&keys::JWT_SECRET, &environment, DEV_JWT_SECRET)?;
         check_jwt_secret_len(&jwt_secret, &environment)?;
         let encryption_key =
             resolve_secret(&keys::ENCRYPTION_KEY, &environment, DEV_ENCRYPTION_KEY)?;
+        // SPEC-2.233
         let client_origin = config::get(&keys::CLIENT_ORIGIN)
             .unwrap_or_else(|| "http://localhost:4301".to_string());
         // MAPPS-425: falls back to `client_origin` so a single-origin dev
         // stack is unaffected. Deployed environments MUST set it, because
         // there `CLIENT_ORIGIN` is the apex and the SPA is a subdomain.
+        // SPEC-2.233
         let spa_base_url = config::get(&keys::SPA_BASE_URL)
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
@@ -400,9 +418,11 @@ impl AppConfig {
         // PMS-748: optional on purpose. An unset value removes the line rather
         // than defaulting to the SMTP from-address, which is a noreply on every
         // deployed environment and would send abuse reports into a black hole.
+        // SPEC-2.235
         let abuse_contact_email = config::get(&keys::ABUSE_CONTACT_EMAIL)
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        // SPEC-2.235
         let public_api_base_url = config::get(&keys::PUBLIC_API_BASE_URL)
             .map(|v| v.trim().trim_end_matches('/').to_string())
             .filter(|v| !v.is_empty());
@@ -412,6 +432,7 @@ impl AppConfig {
         // secret. Matches bunyip-api's `BUNYIP_WEBHOOK_SIGNING_SECRET`
         // (BUNYIP-332); bunyip signs every outbound webhook with a single
         // service-wide secret, not a per-Application value.
+        // SPEC-2.28
         let bunyip_webhook_secret = resolve_secret(
             &keys::BUNYIP_WEBHOOK_SECRET,
             &environment,
@@ -422,6 +443,8 @@ impl AppConfig {
         // unambiguous 64-hex form. resolve_secret already refuses an unset var
         // or the dev sentinel here; this additionally rejects a raw-ASCII or
         // mistyped key so production/staging cannot boot on a weak at-rest key.
+        // SPEC-2.30
+        // SPEC-6.41
         if !env_allows_dev_secrets(&environment) && !is_hex64(&encryption_key) {
             return Err(format!(
                 "ENCRYPTION_KEY must be a 64-character hex string in the '{environment}' \
@@ -438,6 +461,8 @@ impl AppConfig {
         // documented default has always had; everywhere else an unset value
         // is left empty for `check_deployment_requirements` (PMS-1160) to
         // name and refuse before anything tries to connect.
+        // SPEC-2.31
+        // SPEC-6.45
         let database_url = config::get(&keys::DATABASE_URL)
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| {
@@ -451,12 +476,15 @@ impl AppConfig {
         // itself already resolved above) so a dev box without the split
         // still boots (RLS stays inert until the app role is a NOBYPASSRLS
         // one).
+        // SPEC-2.31
         let app_database_url = config::get(&keys::MOKOSH_APP_DATABASE_URL)
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| database_url.clone());
 
+        // SPEC-2.230
         let port =
             config::parse::parse_optional(&keys::PORT, config::get(&keys::PORT))?.unwrap_or(8080);
+        // SPEC-2.231
         let run_migrations = config::parse::parse_optional(
             &keys::RUN_MIGRATIONS,
             config::get(&keys::RUN_MIGRATIONS),
@@ -466,6 +494,7 @@ impl AppConfig {
         // None (uncapped, as documented); set and a positive integer ->
         // Some(N); set and malformed or non-positive is now a boot error
         // naming the variable and value rather than a silent "uncapped".
+        // SPEC-2.232
         let max_tenants = config::parse::parse_positive(
             &keys::MOKOSH_MAX_TENANTS,
             config::get(&keys::MOKOSH_MAX_TENANTS),
@@ -475,9 +504,11 @@ impl AppConfig {
             database_url,
             app_database_url,
             jwt_secret,
+            // SPEC-2.230
             host: config::get(&keys::HOST).unwrap_or_else(|| "0.0.0.0".to_string()),
             port,
             environment,
+            // SPEC-2.233
             base_url: config::get(&keys::BASE_URL)
                 .unwrap_or_else(|| "http://localhost:8080".to_string()),
             run_migrations,
@@ -486,6 +517,7 @@ impl AppConfig {
             spa_base_url,
             abuse_contact_email,
             public_api_base_url,
+            // SPEC-2.234
             cors_origins: config::get(&keys::CORS_ORIGIN)
                 .map(|raw| {
                     raw.split(',')
@@ -497,10 +529,12 @@ impl AppConfig {
                 .unwrap_or_else(|| vec![client_origin.clone()]),
             bunyip_webhook_secret,
             // PMS-657: optional IP2Location DB path for login-location alerts.
+            // SPEC-2.235
             ip2location_db_path: config::get(&keys::IP2LOCATION_DB_PATH)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
             // BUNYIP-475: optional IP2Proxy PX DB path for ASN / VPN enrichment.
+            // SPEC-2.235
             ip2proxy_db_path: config::get(&keys::IP2PROXY_DB_PATH)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
@@ -509,6 +543,7 @@ impl AppConfig {
             // a login; enable per deployment for a staged rollout. Read
             // through `config::flags::LOGIN_APPROVAL_ENABLED` so the parse
             // rule and the default live with the flag rather than here.
+            // SPEC-2.235
             login_approval_enabled: config::flags::LOGIN_APPROVAL_ENABLED.read(),
             // MAPPS-457: optional cap parsed from MOKOSH_MAX_TENANTS above.
             // Unset or empty -> None (uncapped, as documented). The value is
@@ -518,6 +553,7 @@ impl AppConfig {
             // PMS-902: self-hosted (default) or saas. Unset and unrecognised
             // both resolve to self-hosted, so a typo cannot silently stop a
             // self-hosted deployment's account email.
+            // SPEC-2.235
             deployment_mode: DeploymentMode::from_env(),
         })
     }
@@ -535,23 +571,28 @@ impl AppConfig {
     }
 
     // PMS-262: single-tenant mode removed. Multi-tenant is the only mode.
+    // SPEC-1.1
     pub fn is_multi_tenant(&self) -> bool {
         true
     }
 }
 
+// SPEC-2.58
+// SPEC-1.9
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // PMS-494: operator subcommands fold into this binary. When argv's first
     // token selects one (`mokosh-server bootstrap-infisical|clients|qa-seed|
     // qa-teardown`), run that one-shot task and exit instead of starting the
     // long-running HTTP server. The server path continues below otherwise.
+    // SPEC-2.15
     let args: Vec<String> = std::env::args().collect();
     if args
         .get(1)
         .map(String::as_str)
         .is_some_and(mokosh_server::cli::is_subcommand)
     {
+        // SPEC-1.10
         return run_cli(&args).await;
     }
 
@@ -560,6 +601,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // back to `info` when it is unset so production runs at info, not debug.
     // This also stops tower_http from logging request URIs (query strings can
     // carry OAuth `code`/`state`) at info by default (PMS-504 L13).
+    // SPEC-2.16
+    // SPEC-11.1 SPEC-6.64
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -567,8 +610,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // SPEC-2.17
     tracing::info!("Starting {}", VersionInfo::current().banner());
 
+    // SPEC-1.1
     tracing::info!("Running in multi-tenant mode");
 
     // The env file has to land before ANYTHING reads a variable: the hosting
@@ -577,6 +622,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // PMS-1577: a missing `.env` is the documented default (nothing to load);
     // a malformed one silently discarded every variable it defined, with
     // nothing logged, so only the not-found case is ignored here.
+    // SPEC-2.18
+    // SPEC-6.36
     if let Err(e) = dotenvy::dotenv() {
         if !matches!(e, dotenvy::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
         {
@@ -589,6 +636,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ends startup before the database is touched, with a message naming the
     // legal values, instead of surfacing from whichever provider resolved
     // first. `config.deployment_mode` keeps the lenient reading for mail.
+    // SPEC-2.19
+    // SPEC-6.37
     let hosting_profile = DeploymentMode::from_env_for_providers()?;
 
     // PMS-1443: the alias grace period for storage names is over. If a
@@ -597,6 +646,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // can edit the compose file. This runs before any config read so a
     // half-migrated deployment fails loud at startup instead of silently
     // using a stale default.
+    // SPEC-2.20
+    // SPEC-6.38
     if let Err(msg) = mokosh_server::storage::env::check_boot_env_from_process() {
         eprintln!("{msg}");
         return Err(msg.into());
@@ -606,12 +657,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // generation, before `AppConfig` or any feature asks for a value. An
     // unrecognised CONFIG_BACKEND ends startup here naming the legal values,
     // rather than silently serving from the default.
+    // SPEC-1.6 SPEC-2.21
     let config_selection =
         config::init_from_env(hosting_profile.default_provider_for(ProviderKind::Configuration)?)?;
 
     // PMS-1577: a set-but-unparseable feature flag is a boot error naming the
     // flag and value, not a silent fallback to its default. Runs once every
     // declared flag has a resolved generation to read.
+    // SPEC-2.22
+    // SPEC-6.32
     config::flags::check_boot()?;
 
     // PMS-1577: OIDC_DEFAULT_TENANT_ID is read as a UUID by both the Bunyip
@@ -620,8 +674,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // neither of which goes through `AppConfig`. A typo there must still fail
     // startup naming the variable and value, not silently resolve to the
     // hardcoded default tenant on the first request.
+    // SPEC-2.23
     config::parse::check_boot::<uuid::Uuid>(&config::registry::OIDC_DEFAULT_TENANT_ID)?;
 
+    // SPEC-2.24
+    // SPEC-6.46
     let config = AppConfig::from_env().expect("Failed to load configuration");
 
     // PMS-1160: refuse to start when an essential deployment-shape variable
@@ -631,6 +688,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // deployments, 2026-09-11) leaves the request pool falling back to the
     // BYPASSRLS migrator role so every RLS policy is inert. Runs after
     // AppConfig::from_env so ENVIRONMENT decides whether the check gates.
+    // SPEC-2.25
     check_deployment_requirements(&config.environment)?;
 
     // PMS-489: self-provision the split DB roles (mokosh_migrator / mokosh_app)
@@ -639,8 +697,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so prod can drop the admin credentials after the first start. Supersedes
     // scripts/pg-init.sh and the removed `mokosh-bootstrap provision-roles`
     // step - one mechanism, identical in dev and prod, env-driven.
+    // SPEC-2.32
     mokosh_server::db::provision::provision_roles(&config.database_url).await?;
 
+    // SPEC-2.33
     let db = Database::new(&config.app_database_url, &config.database_url).await?;
 
     // A migration failure is fatal: exit non-zero rather than serve a
@@ -651,7 +711,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // consistent with the other startup checks (SMTP/ENCRYPTION_KEY/CORS
     // all hard-fail). `RUN_MIGRATIONS=false` still skips the step entirely for
     // operators who manage migrations out of band.
+    // SPEC-2.34
     if config.run_migrations {
+        // SPEC-6.48
         if let Err(e) = db.run_migrations().await {
             tracing::error!("Failed to run database migrations: {e}");
             return Err(e.into());
@@ -659,8 +721,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Database migrations complete");
     }
 
+    // SPEC-2.35
     tracing::info!("Database connected");
 
+    // SPEC-2.36
+    // SPEC-6.82
     if let Err(e) = mokosh_server::modules::auth::bootstrap::maybe_bootstrap_admin(&db).await {
         tracing::warn!("Admin bootstrap failed: {}", e);
     }
@@ -670,10 +735,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Resource-Server path (OIDC_ISSUER / OIDC_AUDIENCE, wired below) and the
     // legacy HS256 cookie path. There is no second OP and no /oauth2/* surface
     // hosted by mokosh; bunyip is the sole OP.
+    // SPEC-1.5 SPEC-2.37
     tracing::info!(
         "Auth: bunyip-as-OP Resource-Server + legacy HS256 cookie (mokosh-auth removed)"
     );
 
+    // SPEC-2.38
     let encryption_key = mokosh_server::utils::crypto::parse_encryption_key(&config.encryption_key)
         .expect("ENCRYPTION_KEY must be 32 bytes (or 64 hex chars)");
 
@@ -696,9 +763,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // PMS-1537: the profile's per-secret declarations travel with the
     // process-wide one. On `saas` that is the Google client pair, which bunyip
     // serves for the whole suite.
+    // SPEC-2.39
     let per_secret = mokosh_server::app_secrets::per_secret_defaults(
         hosting_profile.default_secret_providers(),
     )?;
+    // SPEC-2.39
+    // SPEC-6.50
     mokosh_server::app_secrets::init_from_env(
         hosting_profile.default_provider_for(ProviderKind::Secrets)?,
         &per_secret,
@@ -713,6 +783,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // id and forgot its secret must not discover it when a customer presses
     // Connect. Both unset is a deployment that cannot connect Google Contacts,
     // which the app-secret survey has already warned about by name.
+    // SPEC-2.40
     let google_client = match mokosh_server::app_secrets::current() {
         Some(secrets) => {
             mokosh_server::modules::contact_sync::OauthClient::from_app_secrets(secrets.as_ref())?
@@ -723,6 +794,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // here for the same reason the Google pair is. A host holding one half of
     // a pair is a boot error naming the missing key, raised where an operator
     // is present to read it rather than at a customer's first click.
+    // SPEC-2.40
     let issuer_apps = std::sync::Arc::new(match mokosh_server::app_secrets::current() {
         Some(secrets) => {
             mokosh_server::modules::billing::invoice_issuer_app::IssuerApps::from_app_secrets(
@@ -739,6 +811,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // mailer. Separate values per service would have made the write take effect
     // in the API and not in the worker, which is the worst of the three
     // outcomes.
+    // SPEC-2.41
     let google_client = std::sync::Arc::new(
         mokosh_server::modules::contact_sync::SharedGoogleClient::new(google_client),
     );
@@ -747,6 +820,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // boot error naming the missing half. One shared handle swapped at
     // runtime so a Settings write takes effect in both the router and the
     // worker without a restart.
+    // SPEC-2.40
     let microsoft_client = match mokosh_server::app_secrets::current() {
         Some(secrets) => {
             mokosh_server::modules::contact_sync::microsoft_oauth::OauthClient::from_app_secrets(
@@ -764,6 +838,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // through these. `init_from_env` above installed them, so `current()` is
     // Some; the error path exists because an `expect` in `main` would be a
     // panic with no sentence for an operator.
+    // SPEC-2.42
     let app_secrets = mokosh_server::app_secrets::current().ok_or_else(|| {
         anyhow::anyhow!(
             "the application-tier secret providers were not installed, so no deployment-wide \
@@ -775,6 +850,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // before anything can render it. Warn-and-continue rather than hard-fail:
     // the consumers are display strings with a working default, and refusing to
     // boot over one would be a worse failure than showing "Mokosh".
+    // SPEC-2.43
     if let Err(e) = mokosh_server::modules::settings::app_name::resolve_and_cache(&db).await {
         tracing::warn!(error = %e, "could not load the app-name setting; using the default");
     }
@@ -793,7 +869,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // boot (the class of misconfiguration this seam exists to catch), and the
     // selected kind is recorded so `rebuild_and_swap` cannot silently change
     // it at runtime.
+    // SPEC-2.248
     let mail_profile_default = hosting_profile.default_provider_for(ProviderKind::Email)?;
+    // SPEC-2.44
+    // SPEC-6.51
     let mail_config = mokosh_server::utils::email::EmailConfig::from_env(mail_profile_default)?;
     let mail_provider_explicit = mail_config.explicit_providers();
     mokosh_server::utils::email::init_selected_kind(mail_config.provider);
@@ -802,12 +881,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         source = mail_config.source.as_str(),
         "email provider selected"
     );
+    // SPEC-2.45
     let mailer_config =
         mokosh_server::modules::settings::email::resolve_mailer_config(&db, &encryption_key)
             .await
             .expect(
                 "Failed to load Mailer config from DB settings / SMTP_* env (see .env.example)",
             );
+    // SPEC-2.45
     let initial_mailer =
         mokosh_server::utils::email::build_mailer(mail_config.provider, mailer_config).expect(
             "Failed to build Mailer for the selected MAIL_PROVIDER; see the error above and \
@@ -818,6 +899,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // first send is the failure mode PMS-1013 exists to remove. `LogMailer`'s
     // verify is trivially Ok(()), so this line adds a NOOP round-trip on the
     // SMTP path and nothing otherwise.
+    // SPEC-2.46
+    // SPEC-6.51
     if let Err(e) = initial_mailer.verify().await {
         tracing::error!(error = %e, "email provider verify failed");
         return Err(e.into());
@@ -831,6 +914,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // OIDC_AUDIENCE are set; otherwise the middleware falls back to the legacy
     // HS256 cookie path. See
     // docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md.
+    // SPEC-2.47
     let bunyip_verifier = match mokosh_server::modules::auth::oidc_rs::VerifierConfig::from_env() {
         Ok(cfg) => {
             tracing::info!(issuer = %cfg.issuer, audience = %cfg.audience, "Bunyip RS verifier mounted");
@@ -851,11 +935,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // skip that provider as if its underlying capability were not
     // configured, so a rejected credential reads exactly like an
     // invalid one and never discloses the configured set.
+    // SPEC-1.4
     let auth_profile_default = hosting_profile.default_providers_for(ProviderKind::Authentication);
+    // SPEC-2.48
     let auth_chain = mokosh_server::modules::auth::providers::from_env_with(
         auth_profile_default,
         bunyip_verifier.is_some(),
     )?;
+    // SPEC-2.48
     auth_chain.record();
     mokosh_server::modules::auth::providers::install_selection(auth_chain.selection().clone());
 
@@ -935,6 +1022,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The hosting profile's default is resolved HERE and handed in as a name
     // (PMS-1011). `secrets` never holds the deployment shape, which is what
     // keeps PMS-904's boundary intact.
+    // SPEC-2.49
     let (secrets, secrets_config) = mokosh_server::secrets::provider_from_env(
         db.clone(),
         encryption_key,
@@ -954,6 +1042,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage_default = hosting_profile
         .default_provider_for(ProviderKind::Storage)
         .expect("storage profile default");
+    // SPEC-2.50
     let (storage_provider, storage_source) = mokosh_server::storage::init_from_env(storage_default)
         .expect("storage provider configuration");
 
@@ -966,6 +1055,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // re-read of their variables: each owns the one reader of its own setting,
     // and a second reader here is how two parts of one process come to
     // disagree about what is serving a capability.
+    // SPEC-2.51
     let provider_selection = hosting_profile.resolve_providers(
         &ProviderOverrides::new()
             .with_opt(
@@ -983,6 +1073,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // behind it until PMS-981 deprecates it.
             .with_opt(
                 ProviderKind::Authentication,
+                // SPEC-2.249
                 bunyip_verifier.is_some().then(|| {
                     vec![
                         mokosh_server::utils::deployment::provider::BUNYIP,
@@ -992,6 +1083,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .with_opt(ProviderKind::Email, mail_provider_explicit),
     );
+    // SPEC-2.51
     provider_selection.record();
 
     // PMS-1414: ONE feature-toggle snapshot, shared by the refresh job and both
@@ -1002,10 +1094,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // It starts every feature off, which is also what a database with no rows
     // means, and the scheduler fires each job once immediately at startup, so the
     // first real load happens before the port is bound rather than a minute in.
+    // SPEC-2.52
     let features = mokosh_server::modules::features::FeatureSnapshot::default();
 
+    // SPEC-1.11
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
     scheduler.register(
+        // SPEC-2.131
         mokosh_server::modules::features::FeatureToggleRefresh::new(db.clone(), features.clone()),
         std::time::Duration::from_secs(
             mokosh_server::modules::features::job::REFRESH_INTERVAL_SECS,
@@ -1016,6 +1111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // signature banner surfaces hot patterns without a per-request COUNT
     // on the full assets table.
     scheduler.register(
+        // SPEC-2.132
         mokosh_server::modules::asset_catalog::AssetSignatureDetectorRefresh::new(db.clone()),
         std::time::Duration::from_secs(
             mokosh_server::modules::asset_catalog::job::REFRESH_INTERVAL_SECS,
@@ -1024,7 +1120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // PMS-198: the notifications dispatcher (5s) and RMM sync (60s) workers
     // now run on the Scheduler too; the intervals match their former raw
     // `tokio::spawn(run_forever(..))` cadences.
+    // SPEC-2.133
     scheduler.register(dispatcher, std::time::Duration::from_secs(5));
+    // SPEC-2.134
     scheduler.register(rmm_worker, std::time::Duration::from_secs(60));
 
     // PMS-1215: Google Contacts import runs. Every 60s the worker resumes runs
@@ -1060,6 +1158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is committed; the request still does not run the import, so a closed tab
     // still cannot stop one.
     let contact_sync_wake = mokosh_server::scheduler::JobWake::new();
+    // SPEC-2.135
     scheduler.register_wakeable(
         mokosh_server::modules::contact_sync::runs::ContactSyncRunner::new(
             db.clone(),
@@ -1074,11 +1173,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::time::Duration::from_secs(60),
         &contact_sync_wake,
     );
+    // SPEC-2.136 SPEC-1.15
     scheduler.register(contract_worker, std::time::Duration::from_secs(3600));
     scheduler.register(
+        // SPEC-2.137
         recurring_invoicing_worker,
         std::time::Duration::from_secs(3600),
     );
+    // SPEC-7.130: the SLA sweep runs on a fixed 60-second interval.
+    // SPEC-2.138
     scheduler.register(sla_worker, std::time::Duration::from_secs(60));
 
     // Appointment-reminder worker (PMS-58 follow-up). Each 60s tick
@@ -1102,6 +1205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             calendar_notifications,
         ),
     );
+    // SPEC-2.139
     scheduler.register(calendar_reminder_worker, std::time::Duration::from_secs(60));
 
     // PMS-1208: hourly expiry sweep for pending grant invitations. The
@@ -1117,6 +1221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::sync::Arc::new(db.pool().clone()),
         );
     scheduler.register(
+        // SPEC-2.140 SPEC-1.15
         grant_invitations_sweep,
         mokosh_server::modules::auth::grant_invitations_worker::GRANT_INVITATIONS_SWEEP_INTERVAL,
     );
@@ -1133,6 +1238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mokosh_server::modules::saved_reports::SavedReportsService::new(db.clone()),
             ),
         );
+    // SPEC-2.141
     scheduler.register(scheduled_reports_worker, std::time::Duration::from_secs(60));
 
     // PMS-471: scheduled-dashboard worker. Same shape as the
@@ -1146,6 +1252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         );
     scheduler.register(
+        // SPEC-2.142
         scheduled_dashboards_worker,
         std::time::Duration::from_secs(60),
     );
@@ -1176,6 +1283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // given up against the old hourly tick is retrying a transient failure an
     // hour later instead of at the next restart, against a WARN line either
     // way.
+    // SPEC-2.128
     use mokosh_server::scheduler::one_shot::spawn_once;
 
     // PMS-960: a KB attachment used to be stored at a flat `kb-articles/{id}`
@@ -1243,6 +1351,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
     scheduler.register(
+        // SPEC-2.143
         invoice_reminder_worker,
         std::time::Duration::from_secs(3600),
     );
@@ -1256,15 +1365,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mokosh_server::modules::status::StatusService::new(db.clone()),
     );
     scheduler.register(
+        // SPEC-2.144 SPEC-1.15
         status_retention_worker,
         std::time::Duration::from_secs(6 * 3600),
     );
 
+    // SPEC-2.130
     let _scheduler_handles = scheduler.start();
 
     // PMS-657: build the IP -> country resolver for login-location alerts.
     // Optional: an unset path or a failed .BIN load leaves it None and the
     // alerts stay disabled (login is never affected).
+    // SPEC-2.53
     let geoip = match config.ip2location_db_path.as_deref() {
         Some(path) => match mokosh_server::utils::geoip::GeoIpService::new(path) {
             Ok(svc) => {
@@ -1286,6 +1398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dunite-ipenrich crate). Optional and independent of geoip: an unset path or
     // a failed .BIN load leaves it None and the admin enrichment lookup reports
     // nothing (never fatal, mirroring geoip).
+    // SPEC-2.54
     let ip_enrich: Option<std::sync::Arc<dunite_ipenrich::IpEnrichService>> = match config
         .ip2proxy_db_path
         .as_deref()
@@ -1306,6 +1419,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // SPEC-2.55
     let psa_router = create_api_router(
         db.clone(),
         config.jwt_secret,
@@ -1333,12 +1447,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let router = psa_router;
 
+    // SPEC-1.12 SPEC-2.56
+    // SPEC-6.47
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
+    // SPEC-1.9
     let listener = TcpListener::bind(addr).await?;
+    // SPEC-2.56
     tracing::info!("Server listening on http://{}", addr);
 
+    // SPEC-1.2 SPEC-1.8
     axum::serve(
         listener,
+        // SPEC-2.57
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await?;
@@ -1346,6 +1466,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// SPEC-2.59
 /// Run an operator subcommand folded into this binary (PMS-494) and exit,
 /// mapping any error to a non-zero process exit. Mirrors the old
 /// `mokosh-bootstrap` CLI: load `.env.infisical` then `.env` so credentials can
@@ -1364,6 +1485,7 @@ async fn run_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // SPEC-2.59
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1371,6 +1493,7 @@ async fn run_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // SPEC-2.60
     if let Err(e) = mokosh_server::cli::run(args).await {
         eprintln!("error: {e:#}");
         std::process::exit(1);

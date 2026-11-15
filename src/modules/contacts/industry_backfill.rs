@@ -28,6 +28,7 @@ use crate::utils::error::AppResult;
 /// `(normalized variant, canonical)` pairs. The variant is matched against
 /// `lower(btrim(industry))`. Each canonical also appears as its own lower-cased
 /// variant so an existing value that differs only in case is normalized too.
+// SPEC-15.129: variants lower-case, trimmed, unique; canonical is a variant
 const INDUSTRY_MAP: &[(&str, &str)] = &[
     ("accounting", "Accounting"),
     ("accountancy", "Accounting"),
@@ -126,6 +127,7 @@ pub struct IndustryBackfillReport {
     pub unmapped: Vec<(Uuid, String, i64)>,
 }
 
+// SPEC-15.128: operator report format
 impl std::fmt::Display for IndustryBackfillReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(
@@ -161,6 +163,7 @@ impl std::fmt::Display for IndustryBackfillReport {
 /// every tenant. Uses the privileged (BYPASSRLS) pool because it is a
 /// cross-tenant operator task. Idempotent: rows already at the canonical value
 /// are skipped.
+// SPEC-15.126: cross-tenant, idempotent rewrite to canonical spelling
 pub async fn normalize_company_industries(db: &Database) -> AppResult<IndustryBackfillReport> {
     let variants: Vec<String> = INDUSTRY_MAP.iter().map(|(v, _)| v.to_string()).collect();
     let canonicals: Vec<String> = INDUSTRY_MAP.iter().map(|(_, c)| c.to_string()).collect();
@@ -194,6 +197,7 @@ pub async fn normalize_company_industries(db: &Database) -> AppResult<IndustryBa
     // Anything whose normalized form is not a known variant is left as-is and
     // surfaced for review. Already-canonical values are excluded because each
     // canonical's lower-cased form is itself a variant key.
+    // SPEC-15.127: unmatched values reported, not changed
     let unmapped: Vec<(Uuid, String, i64)> = sqlx::query_as(
         r#"
         SELECT c.tenant_id, c.industry, count(*) AS n

@@ -223,6 +223,7 @@ One line per rule, or per group of rules answering one subject, linking its full
 - A database test is `#[mokosh_test]` ([PMS-1254](docs/invariants/ci-release.md#test-databases-pms-1254))
 - The SPA repository is `mokosh-apps` ([PMS-856](docs/invariants/ci-release.md#client-repo-pms-856))
 - Docker resources carry the app prefix ([details](docs/invariants/ci-release.md#docker-naming))
+- `docs/specification.md` is the normative requirement set; code cites it as `// SPEC-<section>.<n>` ([specification](docs/specification.md))
 
 ### Knowledge base
 

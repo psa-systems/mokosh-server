@@ -205,6 +205,7 @@ pub const CONTACTS_MANAGE_SUB_USER: &str = "contacts:manage_sub_user";
 ///
 /// Order matches the mokosh-workspace sidebar grouping so the checkbox
 /// picker's default layout reads naturally.
+// SPEC-5.419
 pub const ALL_CAPABILITIES: &[&str] = &[
     TICKETS_READ,
     TICKETS_WRITE,
@@ -243,6 +244,7 @@ pub const ALL_CAPABILITIES: &[&str] = &[
 /// it here, and `tests/suites/tenants.rs` pins a freshly created tenant against
 /// the default tenant's rows. A new built-in capability is added in a NEW
 /// migration (the 179 shape) AND here, in the same change.
+// SPEC-5.421
 pub const BUILTIN_BILLING_CONTACT: &[&str] = &[
     INVOICES_READ,
     INVOICES_PAY,
@@ -257,6 +259,7 @@ pub const BUILTIN_BILLING_CONTACT: &[&str] = &[
 ];
 
 /// See [`BUILTIN_BILLING_CONTACT`].
+// SPEC-5.422
 pub const BUILTIN_SUPPORT_CONTACT: &[&str] = &[
     TICKETS_READ,
     TICKETS_WRITE,
@@ -273,6 +276,7 @@ pub const BUILTIN_SUPPORT_CONTACT: &[&str] = &[
 ];
 
 /// See [`BUILTIN_BILLING_CONTACT`].
+// SPEC-5.423
 pub const BUILTIN_READ_ONLY: &[&str] = &[
     TICKETS_READ,
     INVOICES_READ,
@@ -296,6 +300,7 @@ pub const BUILTIN_READ_ONLY_KEY: &str = "read_only";
 /// The three built-in roles by the name the migrations seeded, in the
 /// order the seed inserts them. The third element is the `builtin_key`
 /// the runtime lookups use in preference to the display name.
+// SPEC-5.423
 pub const BUILTIN_ROLES: &[(&str, &[&str], &str)] = &[
     (
         "Billing Contact",
@@ -340,6 +345,7 @@ pub struct AccessArea {
 /// `kb` is deliberately absent: a contact holding any role reaches the
 /// knowledge base through `Read-Only` and `Support Contact` alike, so an
 /// access request for it would be a question nobody needs to answer.
+// SPEC-5.424
 pub const ACCESS_AREAS: &[AccessArea] = &[
     AccessArea {
         key: "invoices",
@@ -398,6 +404,7 @@ pub const ACCESS_AREAS: &[AccessArea] = &[
 ];
 
 /// The area `key` names, or `None` for anything outside the closed set.
+// SPEC-5.425
 pub fn access_area(key: &str) -> Option<&'static AccessArea> {
     ACCESS_AREAS.iter().find(|a| a.key == key)
 }
@@ -405,6 +412,7 @@ pub fn access_area(key: &str) -> Option<&'static AccessArea> {
 /// Predicate for validating a role's capability set at write time.
 /// Returns `Ok(())` when every entry in `caps` appears in
 /// [`ALL_CAPABILITIES`]; returns the first offending value otherwise.
+// SPEC-5.420
 pub fn validate_capabilities(caps: &[String]) -> Result<(), String> {
     for cap in caps {
         if !ALL_CAPABILITIES.iter().any(|k| k == cap) {

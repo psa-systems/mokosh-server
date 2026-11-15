@@ -43,6 +43,7 @@ use uuid::Uuid;
 use super::models::QuoteStatus;
 use crate::utils::error::AppResult;
 
+// SPEC-13.1393
 /// What a decision does to a quote in `current`, given how its other
 /// staff-addressed approvals stand.
 ///
@@ -72,6 +73,7 @@ pub(crate) fn outcome(current: QuoteStatus, pending: i64, rejected: i64) -> Opti
     None
 }
 
+// SPEC-13.1394
 /// Apply a decision on `quote_id` to the quote's own status, inside the
 /// caller's transaction. Returns the status it moved to, or `None`.
 ///
@@ -123,6 +125,7 @@ pub(crate) async fn apply_decision(
     Ok(Some(next))
 }
 
+// SPEC-13.1395, SPEC-13.1370
 /// Whether a staff-addressed approval on `quote_id` is still awaiting a
 /// decision.
 ///

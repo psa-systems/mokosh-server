@@ -22,6 +22,7 @@ use crate::utils::error::AppResult;
 /// staging and looked at, so a minute of staleness between containers costs
 /// nothing, and shortening it would buy a cache-invalidation protocol nobody
 /// asked for.
+// SPEC-15.2107
 pub const REFRESH_INTERVAL_SECS: u64 = 60;
 
 pub struct FeatureToggleRefresh {
@@ -43,6 +44,7 @@ impl Job for FeatureToggleRefresh {
         Self::JOB_NAME
     }
 
+    // SPEC-15.2107
     async fn run(&self) -> AppResult<()> {
         let loaded = service::load(&self.db).await?;
         let before = self.snapshot.current();

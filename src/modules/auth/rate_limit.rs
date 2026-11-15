@@ -43,6 +43,7 @@ pub struct AuthRateLimiter {
 }
 
 impl AuthRateLimiter {
+    // SPEC-5.100: zero quota panics at construction; one instance per endpoint.
     /// Build a limiter that allows `ip_per_min` attempts per source IP and
     /// `email_per_min` attempts per lowercased email each minute. Both must be
     /// non-zero (callers pass compile-time literals).
@@ -59,6 +60,7 @@ impl AuthRateLimiter {
         })
     }
 
+    // SPEC-5.101 SPEC-5.102: both buckets always charged; email trimmed, lowercased, skipped when empty.
     /// Returns `Err(retry_after_seconds)` if either bucket is empty.
     /// The seconds value is the larger of the two refill waits and is
     /// always at least 1, so a client honouring `Retry-After` never
@@ -82,6 +84,7 @@ impl AuthRateLimiter {
     }
 }
 
+// SPEC-5.103: whole seconds rounded up, minimum 1; shared by the governor-backed limiters.
 fn seconds_until(
     n: &governor::NotUntil<<DefaultClock as Clock>::Instant>,
     clock: &DefaultClock,
@@ -122,6 +125,7 @@ pub struct PayInvoiceRateLimiter {
 }
 
 impl PayInvoiceRateLimiter {
+    // SPEC-5.104: zero quota panics; check charges both buckets on every call.
     /// Build a limiter that allows `caller_per_min` mints per caller id and
     /// `invoice_per_min` mints per invoice id each minute. Both must be
     /// non-zero (callers pass compile-time literals).
@@ -206,6 +210,7 @@ struct Window {
 }
 
 impl ReauthRateLimiter {
+    // SPEC-5.105: zero quota panics; fixed 60 second window.
     /// Build a limiter allowing `ip_per_min` failed re-auths per source IP and
     /// `account_per_min` per user id each minute. Both must be non-zero
     /// (callers pass compile-time literals).
@@ -226,6 +231,7 @@ impl ReauthRateLimiter {
         })
     }
 
+    // SPEC-5.106: read-only; blocks only after quota failures inside an unexpired window.
     /// Returns `Err(retry_after_seconds)` when either bucket has already spent
     /// its quota of failures in the current window, with the larger of the two
     /// remaining waits and always at least 1. Records nothing: call
@@ -247,6 +253,7 @@ impl ReauthRateLimiter {
         }
     }
 
+    // SPEC-5.107: sweeps expired windows, then bumps both buckets.
     /// Charge one failed re-auth to both buckets.
     pub fn record_failure(&self, ip: IpAddr, account: Uuid) {
         let now = Instant::now();
@@ -276,6 +283,7 @@ impl ReauthRateLimiter {
         Some((left.as_nanos().div_ceil(1_000_000_000) as u64).max(1))
     }
 
+    // SPEC-5.108: poisoned lock recovers the counters with a warning, never fails open.
     fn buckets(&self) -> MutexGuard<'_, Buckets> {
         // A panic while this lock is held can only leave failure counters
         // behind, and failing open on the path this guards is worse than

@@ -67,6 +67,7 @@ impl ClientSecretCleanup {
     /// A failure on one tenant does not stop the rest: the pass runs again at
     /// the next restart, and the alternative is one unreachable secret blocking
     /// the cleanup of every other.
+    // SPEC-15.675
     pub async fn run_tick(&self) -> AppResult<CleanupOutcome> {
         // SAFETY (PMS-285): a cross-tenant sweep with no `app.current_tenant` to
         // set, the shape every mover and worker here uses. It reads ids only.

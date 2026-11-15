@@ -63,6 +63,7 @@ pub struct CreateWorkflowRuleRequest {
     /// header for the full shape. Empty object matches every new
     /// ticket of that tenant.
     // SPEC-7.149: conditions defaults to {} when omitted from the create request.
+    // SPEC-7.1048: conditions and actions JSON are not validated on write.
     #[serde(default = "default_empty_object")]
     pub conditions: serde_json::Value,
     /// Applied in iteration order. See the migration header for the

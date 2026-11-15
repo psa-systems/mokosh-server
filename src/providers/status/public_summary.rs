@@ -56,6 +56,7 @@ use super::ProviderStatusReport;
 // no numeric or boolean leaf may appear anywhere in the summary; this
 // whitelist is the security boundary for the endpoint being
 // unauthenticated.
+// SPEC-3.1034: summary is {schema_version, hosting_profile, providers{5 name lists}}.
 pub fn summarize(report: &ProviderStatusReport) -> PublicProviderSummary {
     let names_for = |kind: &str| -> Vec<String> {
         report

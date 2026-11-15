@@ -58,6 +58,7 @@ impl ContactAuthMiddleware {
     }
 }
 
+// SPEC-5.428, SPEC-5.429, SPEC-5.430, SPEC-5.431, SPEC-5.432, SPEC-5.433
 pub async fn portal_contact_middleware(
     State(state): State<ContactAuthMiddleware>,
     mut request: Request,
@@ -141,6 +142,7 @@ pub async fn portal_contact_middleware(
     next.run(request).await
 }
 
+// SPEC-5.428
 fn bearer(req: &Request) -> Option<&str> {
     req.headers()
         .get("Authorization")?
@@ -152,6 +154,7 @@ fn bearer(req: &Request) -> Option<&str> {
 /// mokosh-contact-login prompt 004: parse `mokosh:contact_token=<value>`
 /// out of the Cookie header. Same shape the staff Google-OAuth path
 /// uses; no cookie crate dep.
+// SPEC-5.428
 fn cookie(req: &Request) -> Option<&str> {
     let raw = req
         .headers()
@@ -190,6 +193,7 @@ where
             .get::<ContactAuthState>()
             .cloned()
             .unwrap_or_default();
+        // SPEC-5.434
         match auth_state.session {
             Some(s) => Ok(RequireContactAuth(s)),
             None => Err(AppError::Unauthorized),

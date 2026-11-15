@@ -82,6 +82,7 @@ impl FormsService {
         req: &IssueRequestLinkRequest,
         app_url: &str,
     ) -> AppResult<RequestLinkResponse> {
+        // SPEC-7.1023: an unknown definition id is 404 "Form definition"; the email uses forms.request_link.
         let definition = self.get(tenant_id, req.form_definition_id).await?;
         // SPEC-7.261: issuing a link against a retired (is_active = false) definition
         // fails with Conflict and this exact message.
@@ -305,6 +306,7 @@ impl FormsService {
         contact_id: Option<Uuid>,
         people: i32,
     ) -> AppResult<(Uuid, String)> {
+        // SPEC-7.1022: SLA fields are cleared after creation; the parent exists before the token row.
         let Some(tickets) = self.tickets.as_ref() else {
             return Err(AppError::Internal(
                 "no ticket service wired into the forms service".to_string(),
@@ -538,6 +540,7 @@ impl FormsService {
         // PMS-776: framed either way. The form-supplied branch used to be
         // returned raw, so only one of the two branches of this one field told
         // the client who was asking.
+        // SPEC-7.1020: both branches are framed with the organisation name.
         let contact_info = org.phrase_with(definition.contact_info.as_deref());
         // SPEC-7.282: the public response carries only name, description, org identity,
         // people/person_number, rules and field metadata; never internal ids, author or KB id.
@@ -615,6 +618,7 @@ impl FormsService {
 
         // SPEC-7.285: validated with the same validate_submission as the authenticated
         // surface, so a client and an agent get identical rules and per-field errors.
+        // SPEC-7.1018: a 422 here happens before any write, so the link keeps all its uses.
         let normalised = super::validation::validate_submission(
             &definition.fields,
             &definition.rules,
@@ -622,6 +626,7 @@ impl FormsService {
             Utc::now().date_naive(),
         )?;
 
+        // SPEC-7.1019: the stored payload is the normalised map; ticket_id and request_token_id are stamped later.
         let submission_id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
@@ -680,6 +685,7 @@ impl FormsService {
 
         // SPEC-7.290: company_id and contact_id come from the resolved TOKEN, never the
         // payload, so a forwarded link cannot file a request against another company.
+        // SPEC-7.1021: source Portal, empty custom_fields, system audit context.
         let request = mokosh_types::tickets::CreateTicketRequest {
             title: format!(
                 "{}: {}",
@@ -909,6 +915,7 @@ struct LinkRow {
     parent_ticket_number: Option<String>,
 }
 
+// SPEC-7.1025: the list row carries the audit fields and the parent ticket number.
 impl From<LinkRow> for RequestLinkResponse {
     fn from(r: LinkRow) -> Self {
         Self {

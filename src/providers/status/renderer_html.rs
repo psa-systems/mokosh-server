@@ -20,6 +20,8 @@ use super::{KindEnumerationStatus, ProviderStatusReport};
 // every dynamically inserted value passes through HTML escaping, so
 // no raw markup from a provider name or reason string ever reaches
 // the page unescaped.
+// SPEC-3.1036: overview, refresh form to /api/v1/admin/providers/status/refresh, deviations or none
+// text.
 pub fn render_html(report: &ProviderStatusReport) -> String {
     let mut out = String::with_capacity(4096);
     out.push_str("<!doctype html>\n<html lang=\"en\"><head>\n");

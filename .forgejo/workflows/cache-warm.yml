@@ -42,11 +42,13 @@ on:
 
 # PMS-1633: back-to-back merges only need the newest warm; drop in-flight runs
 # against the same ref so the shared cache reflects the latest main.
+# SPEC-10.334
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # SPEC-10.335
   warm-check:
     name: warm check.yml cache
     # Same label as check.yml itself (the dev image carries cc / gcc / ld
@@ -95,6 +97,7 @@ jobs:
           cargo test --no-run --workspace --lib
           cargo test --workspace --doc
 
+  # SPEC-10.336
   warm-integration:
     name: warm integration.yml cache
     # Same label as integration.yml itself (compiles natively on the
@@ -126,6 +129,7 @@ jobs:
           shared-key: integration
           cache-on-failure: true
 
+      # SPEC-10.329
       - name: Cache cargo-nextest tarball
         # PMS-1641: see check.yml's matching step for the rationale.
         # Key literal MUST match the three cargo-nextest sites across

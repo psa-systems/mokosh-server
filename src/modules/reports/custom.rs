@@ -56,6 +56,7 @@ struct Source {
     filters: &'static [Filter],
 }
 
+// SPEC-15.1598, SPEC-15.1604: tickets catalog
 const TICKETS: Source = Source {
     key: "tickets",
     label: "Tickets",
@@ -111,6 +112,7 @@ const TICKETS: Source = Source {
     ],
 };
 
+// SPEC-15.1598: time_entries catalog
 const TIME: Source = Source {
     key: "time_entries",
     label: "Time entries",
@@ -216,6 +218,7 @@ const TIME: Source = Source {
     }],
 };
 
+// SPEC-15.1598: assets catalog, no date range
 const ASSETS: Source = Source {
     key: "assets",
     label: "Assets",
@@ -285,6 +288,7 @@ pub struct SourceSchema {
     pub has_date_range: bool,
 }
 
+// SPEC-15.1598
 /// The full catalog, for `GET /reports/custom/schema`.
 pub fn schema() -> Vec<SourceSchema> {
     SOURCES
@@ -358,6 +362,7 @@ enum Bind {
     Date(NaiveDate),
 }
 
+// SPEC-15.1599, SPEC-15.1600, SPEC-15.1601, SPEC-15.1602, SPEC-15.1604
 /// Validate `spec` against the catalog, build a parameterized SELECT, and
 /// run it tenant-scoped. Returns the generic columns / rows / totals
 /// envelope. Every unknown key is a 400 before any SQL is built.
@@ -375,6 +380,40 @@ pub async fn run(
         return Err(AppError::BadRequest(
             "At least one measure is required".into(),
         ));
+    }
+
+    // Out-of-range `limit` used to be silently clamped to 1..=1000, so
+    // a caller asking for 2000 rows got 1000 back with no signal that
+    // the cap moved. Refuse up front naming the bound.
+    if let Some(n) = spec.limit {
+        if !(1..=1000).contains(&n) {
+            return Err(AppError::BadRequest(format!(
+                "Limit must be between 1 and 1000; got {n}"
+            )));
+        }
+    }
+
+    // Unknown `format` used to silently render JSON (the route only
+    // routes CSV; anything else fell through). A caller that asked for
+    // "pdf" got JSON and was left to wonder why their export tool
+    // refused to open it.
+    if let Some(ref f) = spec.format {
+        if !matches!(f.as_str(), "json" | "csv") {
+            return Err(AppError::BadRequest(format!(
+                "Format must be \"json\" or \"csv\"; got \"{f}\""
+            )));
+        }
+    }
+
+    // `from`/`to` on a source that has no date column (today: `assets`)
+    // used to be silently dropped. The caller then got the whole table
+    // and thought their filter had applied. Refuse up front naming the
+    // source that does not take a date range.
+    if src.date_col.is_none() && (spec.from.is_some() || spec.to.is_some()) {
+        return Err(AppError::BadRequest(format!(
+            "Source {} does not support a date range",
+            src.key
+        )));
     }
 
     let mut dims = Vec::new();
@@ -470,6 +509,9 @@ pub async fn run(
         sql.push_str(&format!(" GROUP BY {joined} ORDER BY {joined}"));
     }
 
+    // Range already enforced above as a 400, so an out-of-range value
+    // cannot reach here; the clamp is kept as a safety net against a
+    // future field type bump.
     let limit = spec.limit.unwrap_or(100).clamp(1, 1000);
     sql.push_str(&format!(" LIMIT {limit}"));
 
@@ -532,6 +574,7 @@ pub async fn run(
     })
 }
 
+// SPEC-15.1602
 /// Render a totals number without a needless `.0` on whole values.
 fn fmt_num(n: f64) -> String {
     if n.fract().abs() < 1e-9 {
@@ -541,6 +584,7 @@ fn fmt_num(n: f64) -> String {
     }
 }
 
+// SPEC-15.1603
 /// Serialise a result as CSV (header row + data rows).
 pub fn to_csv(r: &CustomReportResponse) -> String {
     let mut s = r
@@ -562,11 +606,65 @@ pub fn to_csv(r: &CustomReportResponse) -> String {
     s
 }
 
+// SPEC-15.1595
 /// Quote a CSV cell if it contains a comma, quote, or newline.
+///
+/// PMS-1665: cells whose first character is `=`, `+`, `-` or `@` are
+/// neutralised with a leading `'` (apostrophe) so Excel, LibreOffice
+/// Calc and Google Sheets treat them as literal text instead of a
+/// formula. Without this, a report row carrying a hostile value such
+/// as `=HYPERLINK("https://evil", ...)` or `=cmd|' /c calc'!A1` would
+/// open and execute on a reader's machine the moment they clicked the
+/// cell. Applied before the quote decision so a comma-containing
+/// hostile value still gets both treatments.
 pub(super) fn csv_cell(v: &str) -> String {
-    if v.contains([',', '"', '\n']) {
-        format!("\"{}\"", v.replace('"', "\"\""))
+    let neutralised = match v.chars().next() {
+        Some('=' | '+' | '-' | '@') => format!("'{v}"),
+        _ => v.to_string(),
+    };
+    if neutralised.contains([',', '"', '\n']) {
+        format!("\"{}\"", neutralised.replace('"', "\"\""))
     } else {
-        v.to_string()
+        neutralised
+    }
+}
+
+#[cfg(test)]
+mod csv_cell_tests {
+    use super::csv_cell;
+
+    #[test]
+    fn plain_text_is_passed_through() {
+        assert_eq!(csv_cell("Alice"), "Alice");
+        assert_eq!(csv_cell(""), "");
+    }
+
+    #[test]
+    fn a_comma_newline_or_quote_still_triggers_quoting() {
+        assert_eq!(csv_cell("a, b"), "\"a, b\"");
+        assert_eq!(csv_cell("a\nb"), "\"a\nb\"");
+        assert_eq!(csv_cell("he said \"hi\""), "\"he said \"\"hi\"\"\"");
+    }
+
+    /// PMS-1665: a cell starting with a formula-trigger character must be
+    /// neutralised so a spreadsheet client does not execute it.
+    #[test]
+    fn a_formula_prefix_is_neutralised() {
+        assert_eq!(csv_cell("=1+1"), "'=1+1");
+        assert_eq!(csv_cell("+1"), "'+1");
+        assert_eq!(csv_cell("-1"), "'-1");
+        assert_eq!(csv_cell("@SUM(A1:A2)"), "'@SUM(A1:A2)");
+    }
+
+    /// PMS-1665: a hostile value that both opens with `=` AND carries a
+    /// comma must get BOTH the apostrophe prefix AND the surrounding
+    /// quotes, so parse-time neither the spreadsheet nor the CSV reader
+    /// misinterprets it.
+    #[test]
+    fn a_formula_with_a_comma_is_both_neutralised_and_quoted() {
+        assert_eq!(
+            csv_cell("=HYPERLINK(\"https://evil\",\"click\")"),
+            "\"'=HYPERLINK(\"\"https://evil\"\",\"\"click\"\")\""
+        );
     }
 }

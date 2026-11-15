@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+// SPEC-5.307
 /// `POST /api/v1/platform/login` body.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct PlatformLoginRequest {
@@ -22,6 +23,7 @@ pub struct PlatformLoginRequest {
     pub recovery_code: Option<String>,
 }
 
+// SPEC-5.315
 /// `POST /api/v1/platform/login` response. Mirrors the shape of
 /// `LoginResponse` for the identity-plane path so the client's
 /// install_session closures can be reused.
@@ -43,6 +45,7 @@ pub struct PlatformAdminProfile {
     pub mfa_enabled: bool,
 }
 
+// SPEC-5.318
 /// `PUT /api/v1/platform/me/password` body.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct PlatformChangePasswordRequest {
@@ -54,6 +57,7 @@ pub struct PlatformChangePasswordRequest {
     pub confirm_password: String,
 }
 
+// SPEC-5.320
 /// `POST /api/v1/platform/me/mfa/setup` body. Current password is
 /// re-verified inline so a stolen access token cannot enrol an attacker's
 /// authenticator.
@@ -72,6 +76,7 @@ pub struct PlatformMfaSetupResponse {
     pub provisioning_uri: String,
 }
 
+// SPEC-5.320, SPEC-5.322
 /// `POST /api/v1/platform/me/mfa/enable` body. The live TOTP code the
 /// operator sees on their authenticator, plus the same current-password
 /// re-auth as setup.
@@ -91,6 +96,7 @@ pub struct PlatformMfaEnableResponse {
     pub recovery_codes: Vec<String>,
 }
 
+// SPEC-5.320, SPEC-5.323
 /// `POST /api/v1/platform/me/mfa/disable` body. Needs the current password
 /// AND a live second factor (TOTP or an unspent recovery code), so a
 /// stolen access token cannot quietly weaken the account.

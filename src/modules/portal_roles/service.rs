@@ -50,6 +50,7 @@ impl PortalRoleService {
     /// inside each band. The `company_id NULLS FIRST` clause is a no-op
     /// when `company_id = None` but keeps the shape symmetrical for the
     /// Some branch.
+    // SPEC-5.403, SPEC-5.404, SPEC-5.405, SPEC-5.417
     pub async fn list_roles(
         &self,
         tenant_id: TenantId,
@@ -108,6 +109,7 @@ impl PortalRoleService {
             .collect())
     }
 
+    // SPEC-5.406, SPEC-5.417
     pub async fn get_role(&self, tenant_id: TenantId, role_id: Uuid) -> AppResult<PortalRole> {
         // Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
         #[allow(clippy::type_complexity)]
@@ -151,6 +153,7 @@ impl PortalRoleService {
     /// insert. Uniqueness collision (case-insensitive, within the same
     /// scope) surfaces as 409 with a scope-agnostic message so the
     /// caller cannot infer whether a same-name tenant-wide role exists.
+    // SPEC-5.407, SPEC-5.408, SPEC-5.409, SPEC-5.410, SPEC-5.411, SPEC-5.417
     pub async fn create_role(
         &self,
         tenant_id: TenantId,
@@ -279,6 +282,7 @@ impl PortalRoleService {
     /// layer is silently dropped there; this method never accepts a
     /// scope input, so a defensive caller reaching for it cannot rewire
     /// scope through the service either.
+    // SPEC-5.412, SPEC-5.413, SPEC-5.414, SPEC-5.415, SPEC-5.417
     pub async fn update_role(
         &self,
         tenant_id: TenantId,
@@ -422,6 +426,7 @@ impl PortalRoleService {
         self.get_role(tenant_id, role_id).await
     }
 
+    // SPEC-5.416, SPEC-5.417
     pub async fn delete_role(
         &self,
         tenant_id: TenantId,
@@ -491,6 +496,7 @@ impl PortalRoleService {
     /// separately. Both call sites resolve capabilities from
     /// `portal_roles` per request (fresh reads, no JWT caps trust) so a
     /// revoke lands on the very next request.
+    // SPEC-5.418
     pub async fn load_contact_capabilities(
         &self,
         tenant_id: TenantId,

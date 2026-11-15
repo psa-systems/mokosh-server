@@ -51,6 +51,7 @@ use crate::utils::error::AppResult;
 /// just emailed makes that decision coherent rather than widening it, and the
 /// assignment is audited and shows up in the role editor, so it can be seen
 /// and undone.
+// SPEC-15.112: grant the Billing Contact role only when needed
 pub(crate) async fn ensure_can_read_invoices(
     tx: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -107,6 +108,7 @@ pub(crate) async fn ensure_can_read_invoices(
         // admin renamed them. Warned rather than failed: the caller is
         // updating a company or sending an invoice, and neither should be
         // refused over a role that is not there to grant.
+        // SPEC-15.113: a missing built-in role warns, never fails the caller
         tracing::warn!(
             target: "mokosh_server.contacts",
             %contact_id,

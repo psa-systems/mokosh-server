@@ -32,6 +32,7 @@ pub struct TicketRef<'a> {
 /// colon when neither is. The first line of the notes only, cut at
 /// [`MAX_NOTES_CHARS`] with an ellipsis, so a long write-up cannot turn a
 /// line into a paragraph.
+// SPEC-13.441, SPEC-13.442: line shape and ticket part.
 pub fn time_entry_line(
     date: NaiveDate,
     work_type: &str,
@@ -69,6 +70,7 @@ pub fn time_entry_line(
 /// and the quantity beside it is the overage alone. The rate is the line's
 /// unit price and is not repeated here. Hours print without trailing zeros
 /// (`2h`, `1.5h`).
+// SPEC-13.444: overage suffix wording.
 pub fn time_entry_overage_line(
     date: NaiveDate,
     work_type: &str,
@@ -90,6 +92,7 @@ pub fn time_entry_overage_line(
 }
 
 /// The first non-blank line of a note, cut to [`MAX_NOTES_CHARS`].
+// SPEC-13.443: first non-blank line, cut at 120 characters.
 fn first_line(notes: &str) -> Option<String> {
     let line = notes.lines().map(str::trim).find(|l| !l.is_empty())?;
     let mut chars = line.chars();

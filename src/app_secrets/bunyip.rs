@@ -134,6 +134,8 @@ fn read_var(name: &str) -> String {
 /// environment provider already insists on (PMS-988), because a plain
 /// `NAME=value` in a compose `environment:` block is visible to
 /// `docker inspect` and to every child process.
+// SPEC-3.1008: credential read file-first ({NAME}_FILE), unreadable file logged at error then plain
+// var.
 fn read_secret_var(name: &str) -> String {
     let from_file = std::env::var(format!("{name}_FILE"))
         .ok()
@@ -275,6 +277,7 @@ impl BunyipProvider {
 
     /// The cache, built from a pair. Split from the fetch so the unit tests
     /// exercise the mapping without a bunyip.
+    // SPEC-3.1009: each half trimmed; a blank half is left out of the cache (reads as unheld).
     fn from_pair(client_id: &str, client_secret: &str) -> Self {
         let mut values: HashMap<&'static str, String> = HashMap::new();
         for (secret, value) in [

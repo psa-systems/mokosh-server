@@ -20,6 +20,7 @@ pub struct AssetTypeResponse {
     pub itil_category: Option<String>,
 }
 
+// SPEC-15.1023, SPEC-15.1024
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertAssetTypeRequest {
     #[validate(length(min = 1, max = 100))]
@@ -40,6 +41,7 @@ fn default_true() -> bool {
     true
 }
 
+// SPEC-15.1030
 #[derive(Debug, Clone, Serialize)]
 pub struct AssetResponse {
     pub id: Uuid,
@@ -109,6 +111,7 @@ pub struct AssetResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-15.1026, SPEC-15.1080
 /// PMS-1061: what a contact receives for an asset, on the dual-plane
 /// reads. The purchase price, the network identity (`ip_address`,
 /// `hostname`, `mac_address`), the assignee, the licence terms, the RMM
@@ -152,6 +155,7 @@ impl From<AssetResponse> for ContactAssetResponse {
     }
 }
 
+// SPEC-15.1027
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct AssetFilter {
     pub company_id: Option<Uuid>,
@@ -195,6 +199,7 @@ pub struct AssetFilter {
 // the `search_haystack` column migration 267 adds. See
 // docs/mokosh-assets/02-search-redesign.md for the design.
 
+// SPEC-15.1059
 /// A single filter pill. One field, one operator, one or more values.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FacetFilter {
@@ -271,6 +276,7 @@ pub enum SortDirection {
     Desc,
 }
 
+// SPEC-15.1060
 /// The POST body for `/api/v1/assets/search`.
 #[derive(Debug, Clone, Deserialize, Default, Validate)]
 pub struct AssetSearchRequest {
@@ -302,6 +308,7 @@ pub struct FacetValueCount {
     pub count: i64,
 }
 
+// SPEC-15.1061
 /// The facets endpoint's response. One key per facet the SPA renders in
 /// its sidebar. Keys the current filter has already pinned (e.g. a
 /// `status` pill is applied) return the top values AMONG THE REMAINING
@@ -320,6 +327,7 @@ pub struct AssetFacetsResponse {
     pub end_of_life_passed: i64,
 }
 
+// SPEC-15.1031
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateAssetRequest {
     pub asset_tag: Option<String>,
@@ -373,6 +381,7 @@ fn default_active() -> String {
     "active".into()
 }
 
+// SPEC-15.1035
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateAssetRequest {
     pub asset_tag: Option<String>,
@@ -419,6 +428,7 @@ pub struct UpdateAssetRequest {
     pub license_expiry: Option<NaiveDate>,
 }
 
+// SPEC-15.1038, SPEC-15.1039
 /// PMS-1487: partial-update body for `PATCH /api/v1/assets/{id}`.
 ///
 /// Three states per nullable field, which is what the SPA drawer needs:
@@ -515,6 +525,7 @@ pub struct PatchAssetRequest {
 // Cap at 500 serials per call so the transaction stays bounded. The SPA
 // (`AssetBulkCreateModal`) blocks at the client side as well.
 
+// SPEC-15.1065
 /// One serial in a bulk-create request. Only `serial_number` is required;
 /// the other fields let the operator distinguish rows that share a model
 /// but differ on a hostname or network identifier.
@@ -537,6 +548,7 @@ pub struct BulkSerial {
     pub ip_address: Option<String>,
 }
 
+// SPEC-15.1065, SPEC-15.1066
 /// `POST /api/v1/assets/bulk-create` body.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct BulkCreateAssetsRequest {
@@ -587,6 +599,7 @@ pub struct AssetRelationshipResponse {
     pub relationship_type: String,
 }
 
+// SPEC-15.1044
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateAssetRelationshipRequest {
     pub child_asset_id: Uuid,
@@ -615,6 +628,7 @@ pub struct AssetImpactNode {
     pub depth: u32,
 }
 
+// SPEC-15.1046
 #[derive(Debug, Clone, Serialize)]
 pub struct AssetImpactResponse {
     /// The asset that the traversal anchored on.
@@ -639,6 +653,7 @@ pub struct ConfigurationItemResponse {
     pub created_at: DateTime<Utc>,
 }
 
+// SPEC-15.1048
 /// List view of a configuration item. Deliberately omits the secret
 /// `value` so the encrypted payload is never leaked in a list; fetch the
 /// single-item reveal endpoint (audited) to decrypt it.
@@ -652,6 +667,7 @@ pub struct ConfigurationItemSummary {
     pub created_at: DateTime<Utc>,
 }
 
+// SPEC-15.1050
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertConfigurationItemRequest {
     #[validate(length(min = 1, max = 100))]
@@ -676,6 +692,7 @@ pub struct CredentialResponse {
     pub created_at: DateTime<Utc>,
 }
 
+// SPEC-15.1052
 /// List view of a vault credential. Deliberately omits `username`,
 /// `password`, and `notes` (all encrypted at rest) so secrets are never
 /// leaked in a list; fetch the single-credential reveal endpoint
@@ -692,6 +709,7 @@ pub struct CredentialSummary {
     pub created_at: DateTime<Utc>,
 }
 
+// SPEC-15.1055
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateCredentialRequest {
     #[validate(length(min = 1, max = 100))]
@@ -708,6 +726,7 @@ pub struct CreateCredentialRequest {
     pub notes: Option<String>,
 }
 
+// SPEC-15.1057
 #[derive(Debug, Clone, Serialize)]
 pub struct AssetAuditLogResponse {
     pub id: Uuid,
@@ -726,6 +745,7 @@ pub struct AssetAuditLogResponse {
 
 // -- PMS-1490 (bulk-create pre-flight) --------------------------------------
 
+// SPEC-15.1063
 /// `POST /api/v1/assets/exists` body. Given a company and a serial list,
 /// returns the subset already present on an asset at that company so the
 /// bulk-create modal can trim or warn before firing the fan-out whose

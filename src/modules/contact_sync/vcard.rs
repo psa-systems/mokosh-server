@@ -84,6 +84,7 @@ pub struct Limits {
 }
 
 impl Limits {
+    // SPEC-15.618
     pub const DEFAULT: Self = Self {
         max_file_bytes: 10 * 1024 * 1024,
         max_cards: 5_000,
@@ -101,6 +102,7 @@ pub enum ReadError {
     Unreadable(String),
 }
 
+// SPEC-15.619
 impl std::fmt::Display for ReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -171,6 +173,7 @@ pub struct GroupCard {
 }
 
 /// Read a `.vcf` file.
+// SPEC-15.619, SPEC-15.620
 pub fn read_vcards<R: Read>(reader: R, limits: Limits) -> Result<VcardFile, ReadError> {
     let mut input = BufReader::new(reader.take(limits.max_file_bytes + 1));
     let head = input
@@ -204,6 +207,7 @@ pub fn read_vcards<R: Read>(reader: R, limits: Limits) -> Result<VcardFile, Read
 }
 
 /// Split the byte stream into cards and convert each.
+// SPEC-15.619 to 15.621
 fn frame<B: BufRead>(mut input: B, limits: Limits, file: &mut VcardFile) -> Result<(), ReadError> {
     let mut open: Option<CardBuilder> = None;
     let mut buf = Vec::new();
@@ -306,6 +310,7 @@ impl BinaryProperty {
 
     /// What this property says about the contact's photo. `None` for an empty
     /// value.
+    // SPEC-15.623
     fn classify(&self) -> Option<SourcePhoto> {
         let value = self.head.trim();
         if value.is_empty() {
@@ -404,6 +409,7 @@ impl CardBuilder {
         }
     }
 
+    // SPEC-15.622, SPEC-15.623
     fn push_line(&mut self, line: &[u8], limits: Limits) {
         let continuation = line.first().is_some_and(|b| *b == b' ' || *b == b'\t');
         if let Some(binary) = self.binary.as_mut() {
@@ -461,6 +467,7 @@ impl CardBuilder {
         self.append(line, limits);
     }
 
+    // SPEC-15.622
     fn append(&mut self, line: &[u8], limits: Limits) {
         if self.over_cap {
             return;
@@ -473,6 +480,7 @@ impl CardBuilder {
         self.text.extend_from_slice(b"\r\n");
     }
 
+    // SPEC-15.623
     fn end_binary(&mut self, limits: Limits) {
         let Some(binary) = self.binary.take() else {
             return;
@@ -488,6 +496,7 @@ impl CardBuilder {
         }
     }
 
+    // SPEC-15.633
     fn problem(&self, reason: &str) -> CardProblem {
         CardProblem {
             card: self.ordinal,
@@ -502,6 +511,7 @@ impl CardBuilder {
 }
 
 /// Decode, parse and convert one complete card.
+// SPEC-15.622, SPEC-15.623, SPEC-15.627, SPEC-15.628
 fn finish(mut card: CardBuilder, limits: Limits, file: &mut VcardFile) {
     card.end_binary(limits);
     if card.over_cap {
@@ -559,6 +569,7 @@ fn finish(mut card: CardBuilder, limits: Limits, file: &mut VcardFile) {
 
 /// A card's bytes as text: UTF-8 when they are, else the card's own
 /// `CHARSET`, else Windows-1252.
+// SPEC-15.624
 fn decode_card(bytes: &[u8]) -> String {
     if let Ok(text) = std::str::from_utf8(bytes) {
         return text.to_string();
@@ -589,6 +600,7 @@ fn charset_label(bytes: &[u8]) -> Option<String> {
 /// A digest of what a card says, stable across the things that do not change
 /// what it says: property order, line folding, and the `REV` / `PRODID` an
 /// exporter stamps on every export.
+// SPEC-15.625
 pub fn content_hash(text: &str) -> String {
     let unfolded = text
         .replace("\r\n ", "")
@@ -720,6 +732,7 @@ fn type_word(t: &VCardType) -> &'static str {
 }
 
 /// A phone's label in the words `mapping::MappedPhoneType::from_label` reads.
+// SPEC-15.630
 fn phone_label(types: &[String]) -> Option<String> {
     let has = |w: &str| types.iter().any(|t| t == w);
     if has("fax") {
@@ -746,6 +759,7 @@ fn phone_label(types: &[String]) -> Option<String> {
 /// Apple might put there is kept verbatim rather than guessed at, because a
 /// member this cannot resolve should show up as a member nobody is in, not as a
 /// silently dropped line.
+// SPEC-15.628
 fn read_group_card(card: &VCard) -> GroupCard {
     let mut group = GroupCard::default();
     for entry in &card.entries {
@@ -773,6 +787,7 @@ fn read_group_card(card: &VCard) -> GroupCard {
     group
 }
 
+// SPEC-15.628
 fn is_group_card(card: &VCard) -> bool {
     card.entries.iter().any(|e| match &e.name {
         VCardProperty::Kind => e
@@ -786,6 +801,7 @@ fn is_group_card(card: &VCard) -> bool {
     })
 }
 
+// SPEC-15.626, SPEC-15.627, SPEC-15.629 to 15.631
 fn convert(card: &VCard, text: &str, raw: &CardBuilder) -> Converted {
     if is_group_card(card) {
         return Converted::GroupCard(Box::new(read_group_card(card)));
@@ -923,6 +939,7 @@ fn convert(card: &VCard, text: &str, raw: &CardBuilder) -> Converted {
 /// One spelling per category across the file (the first seen), so `Client`
 /// on one card and `client` on another are one group with one count, and
 /// every contact names it the way the group list does.
+// SPEC-15.632
 fn canonicalise_groups(file: &mut VcardFile) {
     let mut spelling: BTreeMap<String, String> = BTreeMap::new();
     let mut counts: BTreeMap<String, u32> = BTreeMap::new();

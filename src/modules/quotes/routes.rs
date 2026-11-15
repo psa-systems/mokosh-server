@@ -38,6 +38,7 @@ pub struct QuotesRouterState {
     pub service: Arc<QuotesService>,
 }
 
+// SPEC-13.1351, SPEC-13.1352
 pub fn quotes_routes(service: QuotesService) -> Router {
     let state = QuotesRouterState {
         service: Arc::new(service),
@@ -52,12 +53,8 @@ pub fn quotes_routes(service: QuotesService) -> Router {
         // sign-off stays on the existing `/quotes/{id}/approvals`
         // surface, which this module does not touch.
         .route("/quotes/{quote_id}/send", post(send_quote))
-        // parity record 2026-10-08: `/quotes/{quote_id}/delivery-options`
-        // mirrors `/invoices/{id}/delivery-options` (PMS-1462). The MAPPS-1014
-        // SPA Send dialog pre-fetches options on invoices only in the first
-        // slice and does not call this one yet; the endpoint ships here so the
-        // next slice (quote-side pre-fetch) is a client-only change. Review
-        // again if the quote slice has not landed by 2026-11-30.
+        // `/quotes/{quote_id}/delivery-options` mirrors
+        // `/invoices/{id}/delivery-options` (PMS-1462).
         .route(
             "/quotes/{quote_id}/delivery-options",
             get(quote_delivery_options),
@@ -89,6 +86,7 @@ fn today_for(user_tz: &str) -> chrono::NaiveDate {
     mokosh_types::datetime::user_today(chrono::Utc::now(), user_tz)
 }
 
+// SPEC-13.1351, SPEC-13.1353, SPEC-13.1354
 async fn list_quotes(
     State(state): State<QuotesRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -127,6 +125,7 @@ async fn list_quotes(
     )))
 }
 
+// SPEC-13.1351, SPEC-13.1355, SPEC-13.1356
 async fn get_quote(
     State(state): State<QuotesRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -158,6 +157,7 @@ async fn get_quote(
     Ok(Json(quote))
 }
 
+// SPEC-13.1351
 /// mokosh-contact-login prompt 008: reproduce the RequireBilling +
 /// RequireFinance staff gate inline for a handler that now takes
 /// `RequireCallerContext`. Mirrors the same helper on the billing
@@ -172,6 +172,7 @@ fn assert_staff_billing_finance(auth: &crate::modules::auth::AuthState) -> AppRe
     Ok(())
 }
 
+// SPEC-13.1359, SPEC-13.1351
 /// PMS-936: dual-plane quote PDF endpoint. Contact caller gates on
 /// `quotes:download_pdf` + Company scope; staff caller keeps the
 /// RequireBilling + RequireFinance inline check. Actual PDF rendering
@@ -218,9 +219,16 @@ async fn get_quote_pdf(
 /// Gates on quotes:accept, then delegates to the shared decision
 /// path so the state-machine invariants (valid_until check, single-
 /// decision guard) live in one place.
-#[derive(Debug, Clone, serde::Deserialize)]
+///
+/// `notes` is bounded to 2000 characters, matching the (otherwise
+/// unused) `PortalQuoteDecisionRequest` that models.rs carried for the
+/// same shape. An unbounded free-text field on an auth-gated route is
+/// an easy amplification channel for a malicious contact; the limit
+/// is the same as other long-form note fields in this codebase.
+#[derive(Debug, Clone, serde::Deserialize, validator::Validate)]
 struct QuoteDecisionBody {
     #[serde(default)]
+    #[validate(length(max = 2000))]
     notes: Option<String>,
 }
 
@@ -246,6 +254,7 @@ async fn decline_quote(
     contact_decide(&state, &caller, &db, quote_id, false, body, &ctx).await
 }
 
+// SPEC-13.1384
 async fn contact_decide(
     state: &QuotesRouterState,
     caller: &CallerContext,
@@ -268,7 +277,14 @@ async fn contact_decide(
         }
     };
     caller.require_capability(caps::QUOTES_ACCEPT, db).await?;
-    let notes = body.and_then(|Json(b)| b.notes);
+    let notes = match body {
+        Some(Json(b)) => {
+            use validator::Validate;
+            b.validate()?;
+            b.notes
+        }
+        None => None,
+    };
     let decision = ClientDecision {
         company_id: session.company_id,
         accept,
@@ -288,6 +304,7 @@ async fn contact_decide(
     Ok(Json(quote))
 }
 
+// SPEC-13.1360
 async fn create_quote(
     State(state): State<QuotesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -396,6 +413,7 @@ async fn delete_line(
     Ok(Json(quote))
 }
 
+// SPEC-13.1377
 /// Send an approved quote to the client (PMS-673, PMS-1462). 409 unless
 /// the quote is internally `approved`; see [`QuotesService::send_quote`].
 ///
@@ -423,6 +441,7 @@ async fn send_quote(
     Ok(Json(quote))
 }
 
+// SPEC-13.1383
 /// PMS-1462: see [`QuotesService::quote_delivery_options`].
 async fn quote_delivery_options(
     State(state): State<QuotesRouterState>,
@@ -451,6 +470,7 @@ async fn convert_quote(
     Path(quote_id): Path<Uuid>,
     body: Option<Json<ConvertQuoteRequest>>,
 ) -> AppResult<Json<QuoteResponse>> {
+    // SPEC-13.1392
     let request = body.map(|Json(b)| b).unwrap_or_default();
     request.validate()?;
     let quote = state

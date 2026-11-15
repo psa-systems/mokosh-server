@@ -108,9 +108,17 @@ impl PaginationParams {
     /// Maximum allowed items per page
     pub const MAX_PER_PAGE: u32 = 100;
 
-    /// Calculate the offset for database queries
+    /// Calculate the offset for database queries.
+    ///
+    /// PMS-1657: `page` is an unbounded `u32`, and the old
+    /// `(page - 1) * per_page` would overflow for a large `page` - panic
+    /// in dev, wrap in release (overflow-checks are off in
+    /// `[profile.release]`) - and serve the wrong rows. `per_page` is
+    /// clamped to `MAX_PER_PAGE` before multiplying so `saturating_mul`
+    /// caps the offset at `u32::MAX`, which simply returns an empty
+    /// page instead of wrapping to the start.
     pub fn offset(&self) -> u32 {
-        (self.page.saturating_sub(1)) * self.per_page()
+        self.page.saturating_sub(1).saturating_mul(self.per_page())
     }
 
     /// Get the per_page value, clamped to MAX_PER_PAGE
@@ -177,6 +185,8 @@ impl PaginationParams {
     /// page for a whole page. `per_page` below 1 keeps its silent clamp to 1
     /// (a request for zero rows is a different class of mistake), and a
     /// request that omits `per_page` keeps the default.
+    // SPEC-4.1012: defaults 1/25/desc; offset (page-1)*per_page; over-cap per_page is a 422 on sort
+    // helpers.
     pub fn reject_over_cap_per_page(&self) -> AppResult<()> {
         if self.per_page > Self::MAX_PER_PAGE {
             return Err(AppError::validation_field(
@@ -204,6 +214,8 @@ impl PaginationParams {
     /// A `sort` that is absent is unchanged - it uses `default_field` - so a
     /// caller that never asks to sort can never see a 422.
     // SPEC-4.51: reject an unlisted sort field; None sort keeps the default field.
+    // SPEC-4.1013: only the first token of the default field is used, so a direction is never
+    // doubled.
     pub fn order_by(&self, default_field: &str, allowed_fields: &[&str]) -> AppResult<String> {
         self.reject_over_cap_per_page()?;
         let default_field = default_field
@@ -296,6 +308,7 @@ impl<T> PaginatedResponse<T> {
     }
 
     /// Create from pagination params
+    // SPEC-4.1014: uses the clamped per_page(); map keeps meta unchanged.
     pub fn from_params(data: Vec<T>, params: &PaginationParams, total: u64) -> Self {
         Self::new(data, params.page, params.per_page(), total)
     }

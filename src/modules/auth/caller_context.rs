@@ -48,6 +48,7 @@ use crate::utils::error::{AppError, AppResult};
 // Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
+// SPEC-5.11: exactly two variants; dual-plane extractor resolves Staff first, then Contact.
 pub enum CallerContext {
     /// Staff bearer: the full auth state populated by
     /// `auth_middleware` (identity, active membership, memberships).
@@ -61,6 +62,7 @@ impl CallerContext {
     /// Tenant the caller is scoped to. Every service call downstream of
     /// this is tenant-scoped, so surface it as a typed [`TenantId`] the
     /// handler can pass straight through.
+    // SPEC-5.14: nil-tenant fallback fails closed downstream (nil matches no real row), not open.
     pub fn tenant(&self) -> TenantId {
         match self {
             Self::Staff(state) => {
@@ -80,6 +82,7 @@ impl CallerContext {
     /// gives capabilities: `ContactSession` is rebuilt per request by the
     /// middleware, so this never outlives the request and a timezone change
     /// on the contact record lands on the contact's next request.
+    // SPEC-5.15: contact zone resolved through RLS-aware begin_with_tenant; NULL/missing collapse to UTC.
     pub async fn today(&self, db: &Database) -> AppResult<chrono::NaiveDate> {
         let now = chrono::Utc::now();
         let zone = match self {
@@ -130,6 +133,7 @@ impl CallerContext {
     /// as staff (create/void/send invoice, create/send/revise quote,
     /// every Companies + Contacts CRM route) stays closed to the
     /// contact plane. Staff callers pass through.
+    // SPEC-5.16: refusal text is observable; do not change.
     pub fn require_staff(&self) -> AppResult<()> {
         match self {
             Self::Staff(_) => Ok(()),
@@ -151,6 +155,7 @@ impl CallerContext {
     ///   `caps` claim is deliberately NOT consulted so a role revoke via
     ///   `PUT /api/v1/contacts/{id}/portal-roles` lands on the next
     ///   request, not after the 15-min access-token TTL.
+    // SPEC-5.17 SPEC-5.19: staff bypass; JWT caps never consulted so revokes land next request.
     pub async fn require_capability(&self, cap: &str, db: &Database) -> AppResult<()> {
         let session = match self {
             Self::Staff(_) => return Ok(()),
@@ -169,6 +174,7 @@ impl CallerContext {
     /// endpoints to say `partial_payment_allowed: bool` in the response body
     /// rather than refusing the whole read; a staff caller always answers
     /// `true`, matching the staff bypass in `require_capability`.
+    // SPEC-5.21: mirrors require_capability as bool; staff always true.
     pub async fn has_capability(&self, cap: &str, db: &Database) -> AppResult<bool> {
         let session = match self {
             Self::Staff(_) => return Ok(true),
@@ -182,6 +188,7 @@ impl CallerContext {
 /// PMS-1247: how many times `load_contact_capabilities` has hit the database
 /// in this process. A test reads the delta around one request to prove the
 /// per-request cache holds.
+// SPEC-5.22: process-global counter increments once per actual DB load, proving per-request cache held.
 pub static CAPABILITY_LOADS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -206,6 +213,7 @@ async fn session_capabilities<'a>(
 /// Uses the migrator pool because `contact_role_assignments` +
 /// `portal_roles` are RLS-covered and the belt-and-braces `WHERE
 /// tenant_id = $1` keeps the query safe even if the GUC drifts.
+// SPEC-5.18: migrator pool (RLS-exempt) plus belt-and-braces WHERE tenant_id = $1.
 pub async fn load_contact_capabilities(
     db: &Database,
     tenant_id: Uuid,
@@ -232,6 +240,7 @@ pub async fn load_contact_capabilities(
 /// PMS-1382: how many times `load_contact_timezone` has hit the database in
 /// this process. A test reads the delta around one request to prove the
 /// per-request cache holds, mirroring `CAPABILITY_LOADS`.
+// SPEC-5.22: process-global timezone load counter mirrors CAPABILITY_LOADS.
 pub static TIMEZONE_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// PMS-1382: load a contact's `contacts.timezone` on its own tenant-GUC
@@ -264,6 +273,7 @@ async fn load_contact_timezone(
 /// human-facing name for a capability; falling back to the bare key
 /// only covers a capability that has no descriptor yet, which
 /// `capability_labels`'s own test already refuses to let happen.
+// SPEC-5.20: lowercased label phrase; no `:` or raw cap key so error strings do not enumerate capabilities.
 pub(crate) fn capability_refusal_message(cap: &str) -> String {
     let phrase = capability_labels::descriptors()
         .into_iter()
@@ -324,6 +334,7 @@ where
 {
     type Rejection = AppError;
 
+    // SPEC-5.11 SPEC-5.12 SPEC-5.13: staff plane first; tombstoned staff is 410 Gone before contact fallback; neither = 401.
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         state: &S,

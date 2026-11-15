@@ -319,6 +319,7 @@ impl BootstrapClient {
         Self::parse_json(path, resp).await
     }
 
+    // SPEC-3.1018: non-success text is 'Infisical bootstrap call {path} returned {status}: {body}'.
     async fn parse_json<Resp: for<'de> Deserialize<'de>>(
         path: &str,
         resp: reqwest::Response,
@@ -364,8 +365,20 @@ impl BootstrapClient {
         {
             Ok(_) => Ok(()),
             Err(e) => {
+                // PMS-1657: `msg.contains("409")` could match "line 409"
+                // or a value that happens to contain the digits. Narrow
+                // to the status prefix the HTTP client renders ("status 409",
+                // "HTTP 409", "status: 409"), the server's own
+                // "AlreadyExists" error code string and the English
+                // "already exists" fallback. A real error that uses
+                // none of those still propagates.
                 let msg = e.to_string();
-                if msg.contains("already exists") || msg.contains("409") {
+                let already = msg.contains("already exists")
+                    || msg.contains("AlreadyExists")
+                    || msg.contains("status 409")
+                    || msg.contains("status: 409")
+                    || msg.contains("HTTP 409");
+                if already {
                     Ok(())
                 } else {
                     Err(e)
@@ -392,6 +405,8 @@ pub async fn bootstrap_infisical(
 
     info!("Bootstrapping Infisical at {}", base_url);
 
+    // SPEC-3.1016: not idempotent: a re-run on an initialized instance fails here with the server
+    // error.
     // 1. Admin signup (no auth).
     info!("Creating admin user {}", input.admin_email);
     let signup: AdminSignupResp = client
@@ -517,6 +532,8 @@ pub async fn bootstrap_infisical(
         )
         .await?;
 
+    // SPEC-3.1017: project template default/type secret-manager; identity not delete-protected; ttl
+    // 0, uses 0.
     // 7. Create the client secret.
     info!("Creating client secret for identity {}", identity_id);
     let secret: CreateClientSecretResp = client

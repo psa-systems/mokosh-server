@@ -18,8 +18,7 @@
 //! Migration `157_identities_and_memberships.sql` created both tables; its
 //! header's "neither table is RLS-enabled" predates 191.
 
-// SPEC-1 and 2.116: every read in this file must run on the migrator (BYPASSRLS) pool; identities carries no tenant_id and no
-// RLS, and tenant_memberships' fail-closed tenant_isolation policy is the backstop if a caller passes the app pool instead.
+// SPEC-2.166
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -56,6 +55,7 @@ pub struct IdentityRow {
 pub struct IdentityRepo;
 
 impl IdentityRepo {
+    // SPEC-2.167
     pub async fn find_by_email(
         pool: &PgPool,
         email: &str,
@@ -139,6 +139,7 @@ struct OwnerArmRow {
 }
 
 impl MembershipRepo {
+    // SPEC-2.168
     /// Every active membership for an identity, ordered by joined_at so
     /// the picker in phase 3 renders "your longest-standing tenant first".
     pub async fn list_active_for_identity(
@@ -178,6 +179,7 @@ impl MembershipRepo {
         .await
     }
 
+    // SPEC-2.167
     /// MAPPS-491: resolve `tenant_memberships.id` from an email + tenant
     /// pair. Used as the fallback for legacy tokens minted before phase 2
     /// (no `mid` claim) and in `generate_tokens` at mint time.
@@ -268,8 +270,7 @@ impl MembershipRepo {
         // decode either case; the switcher's bunyip-mint path hides
         // the "Switch" affordance when the id is None, consistent with
         // how it reads a revoked grant.
-        // SPEC-1 and 2.118: grant-arm rows are collected before owner-arm rows, and an owner-arm row whose
-        // tenant_id already appeared from a grant is skipped, so a grantee's seat keeps its grant designation.
+        // SPEC-2.169 SPEC-2.170
         let grant_rows: Vec<GrantArmRow> = sqlx::query_as(
             r#"
             SELECT g.id, g.bunyip_grant_id, t.id AS tenant_id, t.name, t.slug, t.kind, g.role
@@ -364,6 +365,7 @@ impl MembershipRepo {
 }
 
 impl IdentityRepo {
+    // SPEC-2.167
     /// MAPPS-491: resolve `identities.id` from an email. Convenience
     /// used by the middleware to enrich `AuthState` with `identity_id`
     /// when only the user row is in scope.
@@ -374,6 +376,7 @@ impl IdentityRepo {
             .await
     }
 
+    // SPEC-2.171
     /// MAPPS-497 item 4 (PMS-502 identity extension): burn the
     /// just-accepted TOTP step on the identity plane. Compare-and-set:
     /// only advances the watermark when the new step is strictly
@@ -381,8 +384,6 @@ impl IdentityRepo {
     /// on replay (0 rows affected). Called from
     /// `authenticate_identity_first` on TOTP success; the caller must
     /// fail closed on `false`.
-    // SPEC-1 and 2.117: compare-and-set on mfa_last_totp_step; zero rows affected
-    // means replay.
     pub async fn record_identity_mfa_success(
         pool: &PgPool,
         identity_id: Uuid,

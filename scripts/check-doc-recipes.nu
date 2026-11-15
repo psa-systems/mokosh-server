@@ -32,6 +32,8 @@ const DOCS = [
 
 const JUSTFILE = "justfile"
 
+# SPEC-10.365: known-recipe set
+
 # Recipe names `just --list` prints: every non-private recipe header. A header
 # is `name[ params][: deps]` at column 0; `:=` is a variable assignment.
 #
@@ -100,6 +102,8 @@ def invoked-recipe [command: string] {
     if ($first | str starts-with "-") { return null }
     if ($first =~ '^[a-z][a-z0-9-]*$') { $first } else { null }
 }
+
+# SPEC-10.364: where recipes are read from
 
 # Every `just <recipe>` a doc tells the reader to run: a command line inside a
 # fenced block, or an inline code span that is itself a `just` command.

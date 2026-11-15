@@ -27,6 +27,7 @@ use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 use mokosh_types::auth::MembershipView;
 
 /// Application state for auth routes
+// SPEC-5.23 SPEC-5.24: three limiters live for the router lifetime; reauth is shared across change_password and disable_mfa.
 #[derive(Clone)]
 pub struct AuthRouterState {
     pub auth_service: Arc<AuthService>,
@@ -67,6 +68,7 @@ pub fn auth_routes(auth_service: AuthService) -> Router {
         reauth_limiter: rate_limit::ReauthRateLimiter::new(10, 5),
     };
 
+    // SPEC-5.25 SPEC-5.26: complete public and authenticated route sets mounted on /api/v1/auth.
     Router::new()
         // Public routes. Rate limit for `/login` runs inline at the top
         // of the handler (see `login` below) so the limiter can key on
@@ -138,6 +140,7 @@ pub fn auth_routes(auth_service: AuthService) -> Router {
 /// at 20/min per IP + 5/min per email; over-quota returns 429 with
 /// a `Retry-After` header. The check has to run inline because tower
 /// middleware cannot read the JSON body without buffering it.
+// SPEC-5.27 SPEC-5.28 SPEC-5.29 SPEC-5.30 SPEC-5.31: validate; limiter key (ip,email); IP via extract_client_ip; branch on hint; map known_retry_after.
 async fn login(
     State(state): State<AuthRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -257,6 +260,7 @@ async fn select_tenant(
 ///
 /// Returns the same `LoginResponse` shape as the login handler so the
 /// client's install_session path handles the response unchanged.
+// SPEC-5.71: verifies target against AuthState.memberships (enriched pass) then mint_session_for_membership.
 async fn switch_tenant(
     State(state): State<AuthRouterState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -300,6 +304,7 @@ async fn switch_tenant(
 }
 
 /// Logout endpoint
+// SPEC-5.69 SPEC-5.70: decode bearer best-effort; audit row on own tenant-scoped tx; both paths return 200.
 async fn logout(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -365,6 +370,7 @@ async fn logout(
 /// path: `logout` sheds one device, this sheds all of them.
 ///
 /// The caller's own bearer dies with the rest, which is the point.
+// SPEC-5.70: audit row on own tenant-scoped tx; commit failure logged at warn but never fails response.
 async fn logout_all(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -487,6 +493,7 @@ struct SetPasswordContext {
     tenant_slug: String,
 }
 
+// SPEC-5.76: 404 for every failure mode (invalid/unknown/expired/redeemed/mismatch); does not mark token used.
 async fn set_password_context(
     State(state): State<AuthRouterState>,
     axum::extract::Path(token): axum::extract::Path<String>,
@@ -499,6 +506,7 @@ async fn set_password_context(
 }
 
 /// Get current user endpoint
+// SPEC-5.81: projects loaded row to UserResponse.
 async fn get_current_user(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -515,6 +523,7 @@ async fn get_current_user(
 /// `AuthState.memberships`; no query runs in the handler. Client's
 /// `use_memberships_loader` (mokosh-apps/src/hooks/auth.rs:299)
 /// calls this endpoint on login and on switcher open.
+// SPEC-5.82: pure projection over AuthState.memberships; no DB query.
 async fn list_my_memberships(
     RequireAuthState(state): RequireAuthState,
 ) -> AppResult<Json<Vec<MembershipView>>> {
@@ -522,6 +531,7 @@ async fn list_my_memberships(
 }
 
 /// Update current user endpoint
+// SPEC-5.81: role and status forced None so caller cannot change their own role or status via /me.
 async fn update_current_user(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -556,6 +566,7 @@ async fn update_current_user(
 /// original timestamp rather than moving it. Nothing here trusts a body: the
 /// only thing being asserted is "this user has been through onboarding", and
 /// the caller is the user.
+// SPEC-5.83: accepts empty body (Option<Json<_>>) and delegates to mark_profile_completed.
 async fn complete_onboarding(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -609,6 +620,7 @@ fn is_wrong_current_password(err: &AppError) -> bool {
 /// Change password endpoint. The current-password re-auth is rate limited per
 /// IP and per user (PMS-881, audit F6), sharing one budget with
 /// `disable_mfa`, so a stolen session cannot grind the password at full rate.
+// SPEC-5.80: reauth limiter by (ip,user.id) before service; only wrong current_password spends budget.
 async fn change_password(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -642,6 +654,7 @@ async fn change_password(
 }
 
 /// Get user sessions
+// SPEC-5.72: reject_unsupported_sort first; bearer best-effort decoded for current_session_id (Uuid::nil fallback).
 async fn get_sessions(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -681,6 +694,7 @@ async fn get_sessions(
 }
 
 /// Delete a session
+// SPEC-5.73: 200 even when the row was absent; no 404 surface.
 async fn delete_session(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -696,6 +710,7 @@ async fn delete_session(
 /// Begin TOTP enrollment. Generates and persists a fresh secret;
 /// `mfa_enabled` is not flipped until the user confirms via
 /// `POST /me/mfa/enable`.
+// SPEC-5.39: delegates to start_mfa_enrollment; does NOT flip mfa_enabled.
 async fn start_mfa_enrollment(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -711,6 +726,7 @@ async fn start_mfa_enrollment(
 /// and returns 10 single-use recovery codes shown ONCE to the user
 /// (PMS-4 AC3). The client is responsible for displaying them
 /// somewhere durable; the server only persists their hashes.
+// SPEC-5.41: delegates to enable_mfa; returns 10 recovery codes exactly once.
 async fn enable_mfa(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -729,6 +745,7 @@ async fn enable_mfa(
 /// recovery-code set. The re-auth is rate limited per IP and per user out of
 /// the same budget as `change_password` (PMS-881, audit F6): the two check the
 /// same credential, so failures on one count against the other.
+// SPEC-5.42: shared reauth limiter with change_password; only Unauthorized records a failure.
 async fn disable_mfa(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -823,6 +840,7 @@ async fn revoke_api_key(
 /// role, status, MFA state, login history and phone numbers, so it would have
 /// handed every technician a colleague's security posture to solve a name
 /// lookup. That gate stays exactly where it is.
+// SPEC-5.89: RequireAuth (not Manager); projects {id, name, handle} only; email never enters response.
 async fn list_directory(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -845,6 +863,7 @@ async fn list_directory(
 /// plus optional filters: `q` (substring across email + names),
 /// `role`, and `status`. Filter struct derives `Validate` (F9
 /// closeout for the auth module).
+// SPEC-5.90: RequireManager gated; excludes system+%@mokosh.local; broader UserResponse projection.
 async fn list_users(
     State(state): State<AuthRouterState>,
     manager: RequireManager,
@@ -868,6 +887,7 @@ async fn list_users(
 }
 
 /// Create user (admin only)
+// SPEC-5.84: is_admin() then can_grant(role) ceiling before body validation and service call.
 async fn create_user(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -903,6 +923,7 @@ async fn create_user(
 /// Get user by ID (admin or self). PMS-4 AC6: the service binds
 /// `tenant_id` so a cross-tenant `user_id` returns 404 here instead
 /// of leaking a row.
+// SPEC-5.86: admin OR self; service binds tenant so cross-tenant user_id returns NotFound, not a leak.
 async fn get_user(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -923,6 +944,7 @@ async fn get_user(
 }
 
 /// Update user (admin only)
+// SPEC-5.87: admin gate then can_grant(role) ceiling before body validation.
 async fn update_user(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
@@ -975,6 +997,7 @@ mod tests {
     /// Routing a miss never touches the database, so the lazy pool is never
     /// connected.
     #[tokio::test]
+    // SPEC-5.1: pins the deliberate absence of /google and /google/callback mounts.
     async fn google_oauth_routes_stay_unmounted() {
         let pool = PgPool::connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
             .expect("lazy pool builds without connecting");

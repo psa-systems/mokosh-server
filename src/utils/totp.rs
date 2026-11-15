@@ -73,6 +73,7 @@ pub fn base32_decode(s: &str) -> Result<Vec<u8>, TotpError> {
 /// Build the canonical `otpauth://` provisioning URI per the Google Auth
 /// spec. `label` is typically `"Mokosh:alice@example.com"`. The URI is
 /// what gets encoded into the QR.
+// SPEC-4.1007: otpauth URI with SHA1, 6 digits, 30s; label and issuer percent-encoded.
 pub fn provisioning_uri(secret_b32: &str, label: &str, issuer: &str) -> String {
     let label_enc = urlencode(label);
     let issuer_enc = urlencode(issuer);

@@ -78,6 +78,7 @@ impl MembersFilter {
     /// Reject bad enum literals before the service runs any query. Called
     /// from the route handler so the API answers 422 on the typo rather
     /// than returning an empty list.
+    // SPEC-5.527: closed vocabularies for kind and role.
     pub fn validate_enums(&self) -> AppResult<()> {
         if let Some(kind) = self.kind.as_deref() {
             if !ALLOWED_KINDS.contains(&kind) {
@@ -129,6 +130,7 @@ impl MembersService {
     /// `COUNT(*)`, matching the count-then-page convention `list_assets`
     /// uses. `kind` / `team_id` narrow which arms run and what they select
     /// so `total` reflects the filtered set, not the pre-filter one.
+    // SPEC-5.537: bunyip_reachable is constant true in standalone mode.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list(
         &self,
@@ -143,6 +145,7 @@ impl MembersService {
 
         // Tenant slug is the join key for `mokosh_bunyip_grants`, which is
         // keyed by text (`mokosh_account_id`) rather than tenant UUID.
+        // SPEC-5.538: a failed slug read fails the request.
         let tenant_slug: String = sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
             .bind(*tenant_id)
             .fetch_one(&mut *tx)
@@ -177,6 +180,7 @@ impl MembersService {
                 .await?
         };
 
+        // SPEC-5.535: ordering and paging are pushed into the union query below.
         let per_page = pagination.limit();
         let page = pagination.page;
 
@@ -207,6 +211,7 @@ impl MembersService {
             .fetch_all(self.db.migrator_pool())
             .await?;
 
+        // SPEC-5.536: active teams only, for the returned page's users.
         // --- team chips, batched for exactly the returned page ----------
         let page_user_ids: Vec<Uuid> = merged_rows
             .iter()
@@ -293,6 +298,8 @@ impl MembersService {
 /// drops `arm_b`; `kind = "guest"` restricts `arm_a` to placed rows only.
 /// Both arms expose `sort_last`/`sort_first`/`sort_email`/`sort_id` so the
 /// caller can `ORDER BY` the union without re-deriving the sort key in Rust.
+// SPEC-5.528, SPEC-5.529, SPEC-5.530, SPEC-5.531, SPEC-5.532, SPEC-5.533, SPEC-5.534:
+// the shared row set; SPEC-5.538: both arms bound to the caller's tenant.
 fn push_union(
     qb: &mut QueryBuilder<'_, sqlx::Postgres>,
     tenant_id: Uuid,

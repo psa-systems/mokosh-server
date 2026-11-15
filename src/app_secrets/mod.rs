@@ -258,6 +258,8 @@ impl std::fmt::Display for GovernedSecret {
 /// what needs them, and the trait not carrying them is what made an external
 /// migration tool the operator's only option.
 #[async_trait]
+// SPEC-3.1000: empty value reads as None; default has/is_writable; default set/delete refuse by
+// name.
 pub trait AppSecretProvider: Send + Sync {
     /// The provider's canonical name, as an operator writes it and as the
     /// boot record reports it.
@@ -379,6 +381,7 @@ impl AppSecretProviderKind {
             provider::INFISICAL => Ok(Self::Infisical),
             provider::BUNYIP => Ok(Self::Bunyip),
             other => Err(AppError::Configuration(format!(
+                // SPEC-2.247
                 "APP_SECRET_BACKEND {other:?} is not a known application-tier secret provider; \
                  expected one of: {}",
                 Self::LEGAL_VALUES
@@ -393,6 +396,7 @@ impl AppSecretProviderKind {
     /// and find out which inputs that means; an operator reading the variable
     /// names can act. The environment and database providers are always built,
     /// so their text says so rather than inventing an input.
+    // SPEC-3.1003: names the build inputs; the Unavailable and Misplaced refusals embed it.
     pub fn construction_inputs(self) -> &'static str {
         match self {
             Self::Environment => "nothing: the environment provider is always built",
@@ -518,6 +522,8 @@ impl AppSecrets {
     /// The declared provider's value for `secret`, or `None` when the
     /// declared provider holds none. This is the read path every feature
     /// uses; the survey/enforce path walks every provider separately.
+    // SPEC-3.1005: reads only the provider declared for this secret; no fallback to another
+    // provider.
     pub fn get(&self, secret: GovernedSecret) -> Option<String> {
         self.provider(self.declared_for(secret))
             .and_then(|provider| provider.get(secret))
@@ -762,6 +768,7 @@ pub fn classify_built(
 /// contract.
 // SPEC-3.4: Used/Shadowed log at info/warn; Missing warns with feature();
 // Misplaced/Unavailable accumulate into a fatal AppError::Configuration.
+// SPEC-6.50
 pub fn enforce(survey: &AppSecretsSurvey) -> AppResult<()> {
     let mut fatal: Vec<String> = Vec::new();
     for row in &survey.rows {
@@ -895,6 +902,8 @@ pub struct AppSecretsStatus {
 
 /// Build the status report from a survey. Pure, so the redaction test can
 /// drive it against a fixture and assert the shape carries only names.
+// SPEC-3.1004: names-only report; served_by is Some only when declared provider is built and holds
+// it.
 pub fn status(survey: &AppSecretsSurvey) -> AppSecretsStatus {
     let secrets = survey
         .rows
@@ -922,6 +931,7 @@ static CURRENT: OnceLock<Arc<AppSecrets>> = OnceLock::new();
 /// that never reach `main` behave exactly as they did before this module
 /// existed. Once initialised, the reference is stable for the life of the
 /// process.
+// SPEC-3.1001: None until init_from_env succeeded; a second init keeps the installed handle.
 pub fn current() -> Option<Arc<AppSecrets>> {
     CURRENT.get().cloned()
 }
@@ -935,6 +945,7 @@ pub fn current() -> Option<Arc<AppSecrets>> {
 /// rather than a silently skipped row: a typo in that table would otherwise
 /// leave a secret reading from the process provider while the deployment
 /// believed it came from somewhere else.
+// SPEC-3.1002: unknown secret or provider name in a profile declaration is a boot error.
 pub fn per_secret_defaults(
     declarations: &[crate::utils::deployment::SecretProviderDefault],
 ) -> AppResult<Vec<(GovernedSecret, &'static str)>> {

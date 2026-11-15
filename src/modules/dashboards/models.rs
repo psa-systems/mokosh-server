@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+fn default_empty_layout() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
 /// One saved dashboard row returned to the SPA. The `layout` blob is
 /// passed through verbatim - shape is owned by the SPA so a UI change
 /// can ship without a server migration.
@@ -18,13 +22,20 @@ pub struct SavedDashboardResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-15.1638, SPEC-15.1639
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateSavedDashboardRequest {
     #[validate(length(min = 1, max = 200))]
     pub name: String,
     /// SPA-owned layout blob. Defaults to `{}` so the SPA can create an
     /// empty dashboard first and populate widgets in a follow-up PATCH.
-    #[serde(default)]
+    ///
+    /// PMS-1665 finding: `#[serde(default)]` on a bare `serde_json::Value`
+    /// deserializes a missing key as `null`, not `{}`, so the stored
+    /// row and the response carried `null` rather than the empty object
+    /// the doc promises (SPEC-15.1638). Use `default_empty_layout` so
+    /// a missing layout lands as `{}`.
+    #[serde(default = "default_empty_layout")]
     pub layout: serde_json::Value,
     /// When true, the create handler clears any existing default for
     /// the same (tenant, user) inside the same transaction before
@@ -34,6 +45,7 @@ pub struct CreateSavedDashboardRequest {
     pub is_default: bool,
 }
 
+// SPEC-15.1640, SPEC-15.1639
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateSavedDashboardRequest {
     #[validate(length(min = 1, max = 200))]
@@ -46,6 +58,7 @@ pub struct UpdateSavedDashboardRequest {
     pub is_default: Option<bool>,
 }
 
+// SPEC-15.1645
 /// PMS-471: one scheduled delivery for a saved dashboard. The owner
 /// (`user_id`) is the visibility identity for the materialise call,
 /// and the default recipient when `recipient_email` is null.
@@ -65,6 +78,7 @@ pub struct ScheduledDashboardResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-15.1642
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateScheduledDashboardRequest {
     #[validate(length(min = 1, max = 100), custom(function = crate::utils::validation::validate_cron))]
@@ -77,6 +91,7 @@ pub struct CreateScheduledDashboardRequest {
     pub is_active: bool,
 }
 
+// SPEC-15.1646
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateScheduledDashboardRequest {
     #[validate(length(min = 1, max = 100), custom(function = crate::utils::validation::validate_cron))]

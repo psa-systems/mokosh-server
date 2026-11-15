@@ -24,6 +24,8 @@ def member-manifest [member: string]: nothing -> string {
     if $member == '.' { $ROOT_MANIFEST } else { $'($member)/Cargo.toml' }
 }
 
+# SPEC-10.363: tables read
+
 # Every dependency a member declares, flagged by whether it inherits the
 # workspace pin. A spec is either a bare version string or a table.
 def member-deps [manifest_path: string] {

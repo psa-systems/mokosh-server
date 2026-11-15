@@ -87,6 +87,7 @@ async fn load_stored(db: &Database) -> AppResult<Option<String>> {
 /// edited straight in the database, and a control character in it would reach
 /// an email `Subject` header. Dropping it falls back to the default, which is
 /// the same posture as having no row.
+// SPEC-15.2004
 pub async fn resolve_and_cache(db: &Database) -> AppResult<()> {
     let stored = load_stored(db).await?;
     let usable = stored.and_then(|raw| match sanitize(&raw) {
@@ -105,6 +106,7 @@ pub async fn resolve_and_cache(db: &Database) -> AppResult<()> {
 }
 
 /// Current stored name plus what consumers render for it.
+// SPEC-15.2000
 pub async fn get_app_name_settings(db: &Database) -> AppResult<AppNameView> {
     Ok(AppNameView::from_stored(load_stored(db).await?))
 }
@@ -112,6 +114,7 @@ pub async fn get_app_name_settings(db: &Database) -> AppResult<AppNameView> {
 /// Persist the name for the system tenant and refresh the cache, so the change
 /// takes effect on the next mail sent and the next 404 rendered, with no
 /// restart.
+// SPEC-15.2001, SPEC-15.2002, SPEC-15.2003
 pub async fn put_app_name_settings(db: &Database, input: AppNameInput) -> AppResult<AppNameView> {
     // An explicit empty string is "clear the override", not "render nothing".
     let stored: Option<String> = if input.app_name.trim().is_empty() {

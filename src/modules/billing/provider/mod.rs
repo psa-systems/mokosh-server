@@ -41,9 +41,11 @@ pub use stripe::StripeProvider;
 /// three, because the column predates any implementation. This is the narrower,
 /// honest list, and it is what the config write path validates against so a
 /// tenant cannot activate a gateway that will never mint a checkout session.
+// SPEC-13.700
 pub const SUPPORTED: &[&str] = &["stripe", "paypal"];
 
 /// Whether [`build`] can produce a provider for this discriminator.
+// SPEC-13.700
 pub fn is_supported(provider: &str) -> bool {
     SUPPORTED.contains(&provider)
 }
@@ -73,6 +75,7 @@ pub fn is_supported(provider: &str) -> bool {
 /// The path is `/api/v1/{provider}/webhooks/{tenant_id}` and must stay in step
 /// with where `create_api_router` nests the two receivers;
 /// `the_url_matches_the_route_the_receiver_is_mounted_at` is the guard.
+// SPEC-13.701, SPEC-13.702
 pub fn webhook_url(base: Option<&str>, provider: &str, tenant_id: Uuid) -> Option<String> {
     let base = base.map(str::trim).filter(|b| !b.is_empty())?;
     if !is_supported(provider) {
@@ -110,6 +113,7 @@ pub struct CredentialSpec {
 ///
 /// Empty for a provider this build cannot serve, which is the same answer
 /// [`build`] gives: there is no credential set to describe.
+// SPEC-13.703
 pub fn credential_specs(provider: &str) -> &'static [CredentialSpec] {
     match provider {
         "stripe" => &[
@@ -159,6 +163,7 @@ pub fn credential_specs(provider: &str) -> &'static [CredentialSpec] {
 /// secret is most of it.
 ///
 /// `None` means nothing is stored.
+// SPEC-13.704, SPEC-13.705
 pub fn shown_value(spec: &CredentialSpec, value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -196,6 +201,7 @@ pub enum CheckOutcome {
 }
 
 impl CheckOutcome {
+    // SPEC-13.706
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Passed => "passed",
@@ -250,6 +256,7 @@ impl GatewayCheck {
 /// itself ready and could not transact - MAPPS-759's defect with the server
 /// half left open. Each `from_config` calls this and refuses rather than
 /// constructing one.
+// SPEC-13.707
 pub(crate) fn blank_required_fields(values: &[(&'static str, &str)]) -> Vec<&'static str> {
     values
         .iter()
@@ -259,6 +266,7 @@ pub(crate) fn blank_required_fields(values: &[(&'static str, &str)]) -> Vec<&'st
 }
 
 /// The error a `from_config` returns for blank required fields.
+// SPEC-13.707
 pub(crate) fn incomplete_credentials(provider: &str, missing: &[&'static str]) -> AppError {
     AppError::Configuration(format!(
         "stored {provider} config is missing {}",
@@ -275,6 +283,7 @@ pub(crate) fn incomplete_credentials(provider: &str, missing: &[&'static str]) -
 /// Parsing the credential blob belongs to the provider module, not here: each
 /// provider's config is its own shape, so the alternative is one struct that is
 /// the union of every provider's fields with everything optional.
+// SPEC-13.708
 pub fn build(
     provider: &str,
     plaintext: &str,
@@ -425,6 +434,7 @@ pub trait PaymentProvider: Send + Sync {
     /// nobody else's: PayPal signs across five headers and its supported
     /// verification is a call to PayPal, so the provider picks its own headers
     /// out and may do I/O to check them.
+    // SPEC-13.710
     async fn verify_and_parse_webhook(
         &self,
         raw_body: &[u8],
@@ -444,6 +454,7 @@ pub trait PaymentProvider: Send + Sync {
     /// a malformed base URL); a provider that answered and refused us is a
     /// failed check, not an error, because the admin needs to see the other
     /// checks beside it.
+    // SPEC-13.711
     async fn check(&self) -> AppResult<Vec<GatewayCheck>>;
 
     /// Charge an approved checkout (PMS-969). Only meaningful for a provider
@@ -466,6 +477,7 @@ pub trait PaymentProvider: Send + Sync {
     /// Providers that do not support the surface answer
     /// [`AppError::BadRequest`], matching how [`Self::capture`] refuses; that
     /// keeps the wrong-provider-for-the-call detection uniform.
+    // SPEC-13.712
     async fn create_setup_intent_session(
         &self,
         params: &SetupIntentParams<'_>,
@@ -486,6 +498,7 @@ pub trait PaymentProvider: Send + Sync {
     /// Same "provider does not support" refusal as
     /// [`Self::create_setup_intent_session`] for providers that never
     /// implement the surface.
+    // SPEC-13.713
     async fn detach_payment_method(&self, provider_pm_id: &str) -> AppResult<()> {
         let _ = provider_pm_id;
         Err(AppError::BadRequest(format!(

@@ -88,6 +88,7 @@ pub enum MappedPhoneType {
 }
 
 impl MappedPhoneType {
+    // SPEC-15.685
     pub fn from_label(label: Option<&str>) -> Self {
         match label.map(str::to_lowercase).as_deref() {
             Some("mobile") => Self::Mobile,
@@ -144,6 +145,7 @@ const NOTES_MAX: usize = 10_000;
 
 /// Sanitize, trim, and cut at a character boundary so a multi-byte name is
 /// never split mid-character.
+// SPEC-15.682
 fn fit(value: Option<&str>, max: usize) -> Option<String> {
     let clean = sanitize_invisible(value?);
     let trimmed = clean.trim();
@@ -157,6 +159,7 @@ fn fit(value: Option<&str>, max: usize) -> Option<String> {
 /// `mokosh_types::contacts` validates a phone with - an optional `+`, then 2
 /// to 15 digits, the first of them 1 to 9. Pinned against that validator by a
 /// test rather than trusted to agree.
+// SPEC-15.684
 pub fn storable_phone(raw: &str) -> Option<String> {
     let stripped: String = raw
         .chars()
@@ -172,6 +175,7 @@ pub fn storable_phone(raw: &str) -> Option<String> {
     (valid && stripped.len() <= PHONE_MAX).then_some(stripped)
 }
 
+// SPEC-15.681 to 15.683, SPEC-15.686, SPEC-15.687
 pub fn map_contact(source: &SourceContact) -> MappedContact {
     let mut dropped = Vec::new();
 

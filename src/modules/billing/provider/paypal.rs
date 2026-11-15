@@ -50,6 +50,7 @@ use crate::utils::error::{AppError, AppResult};
 /// PayPal REST API base. Overridable via `PAYPAL_API_BASE` so an integration
 /// test can point every call at a stub, exactly as `STRIPE_API_BASE` does for
 /// Stripe. When unset, the credential's `sandbox` flag picks the host.
+// SPEC-13.734
 fn api_base(sandbox: bool) -> String {
     if let Some(base) = crate::config::get(&crate::config::registry::PAYPAL_API_BASE)
         .filter(|s| !s.trim().is_empty())
@@ -97,6 +98,7 @@ struct PaypalCredentials {
 }
 
 /// Build a provider from the decrypted config blob.
+// SPEC-13.735, SPEC-13.707
 pub fn from_config(plaintext: &str, http: reqwest::Client) -> AppResult<PaypalProvider> {
     let creds: PaypalCredentials = serde_json::from_str(plaintext).map_err(|_| {
         AppError::Configuration("stored PayPal config is not valid JSON".to_string())
@@ -165,6 +167,7 @@ impl PaypalProvider {
     /// Client-credentials grant against the tenant's app. A 401 here means the
     /// tenant's credentials are wrong, surfaced as an external-service error
     /// that names the provider and never the credential.
+    // SPEC-13.736, SPEC-13.737
     async fn access_token(&self) -> AppResult<String> {
         {
             let cached = self.token.read().await;
@@ -222,6 +225,7 @@ impl PaypalProvider {
     /// verify call has to send PayPal's own body back unchanged, so it builds
     /// the request as a string and hands it over here. Everything else about
     /// the call is the same, including that the token is never echoed.
+    // SPEC-13.738
     async fn post_raw_json(
         &self,
         path: &str,
@@ -252,6 +256,7 @@ impl PaypalProvider {
 
     /// One authenticated JSON POST, with PayPal's error message surfaced and the
     /// request (which carried the tenant's token) never echoed.
+    // SPEC-13.738
     async fn post_json(&self, path: &str, body: &Value) -> AppResult<(reqwest::StatusCode, Value)> {
         let token = self.access_token().await?;
         let url = format!("{}{}", self.base(), path);
@@ -290,6 +295,7 @@ impl PaypalProvider {
 /// `raw` is checked to be valid JSON by the caller before it gets here, so the
 /// result is valid JSON; the envelope's other six values are escaped through
 /// `Value::String`, which is the only place a header value could carry a quote.
+// SPEC-13.743
 fn verify_request_body(
     transmission_id: &str,
     transmission_time: &str,
@@ -319,10 +325,12 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 #[async_trait]
 impl PaymentProvider for PaypalProvider {
+    // SPEC-13.709
     fn id(&self) -> &'static str {
         "paypal"
     }
 
+    // SPEC-13.739, SPEC-13.740
     async fn create_checkout_session(
         &self,
         params: &CheckoutParams<'_>,
@@ -393,6 +401,7 @@ impl PaymentProvider for PaypalProvider {
         Ok(CheckoutSession { session_id, url })
     }
 
+    // SPEC-13.741, SPEC-13.742, SPEC-13.743, SPEC-13.744, SPEC-13.745, SPEC-13.710
     async fn verify_and_parse_webhook(
         &self,
         raw_body: &[u8],
@@ -475,6 +484,7 @@ impl PaymentProvider for PaypalProvider {
     /// Sandbox or live follows the stored `sandbox` flag, so the check runs
     /// against the same PayPal the payments do. An app's credentials do not
     /// work across the two, which is itself a failure this surfaces.
+    // SPEC-13.750
     async fn check(&self) -> AppResult<Vec<GatewayCheck>> {
         let token = match self.access_token().await {
             Ok(token) => token,
@@ -523,6 +533,7 @@ impl PaymentProvider for PaypalProvider {
         Ok(checks)
     }
 
+    // SPEC-13.751
     async fn capture(&self, order_id: &str) -> AppResult<()> {
         let path = format!(
             "/v2/checkout/orders/{}/capture",
@@ -569,6 +580,7 @@ fn parse_amount(amount: &Value) -> Option<(Decimal, String)> {
 ///
 /// Anything not acted on becomes [`PaymentEvent::Ignored`] so the receiver
 /// answers 200 and PayPal stops retrying.
+// SPEC-13.746
 fn parse_paypal_event(event: &Value) -> AppResult<PaymentEvent> {
     let kind = event["event_type"]
         .as_str()
@@ -578,6 +590,7 @@ fn parse_paypal_event(event: &Value) -> AppResult<PaymentEvent> {
 
     match kind.as_str() {
         // The buyer approved; nothing has been charged. The receiver captures.
+        // SPEC-13.747
         "CHECKOUT.ORDER.APPROVED" => {
             if parse_custom_id(resource["purchase_units"][0]["custom_id"].as_str()).is_none() {
                 return Ok(PaymentEvent::Ignored { kind });
@@ -591,6 +604,7 @@ fn parse_paypal_event(event: &Value) -> AppResult<PaymentEvent> {
         }
         // Money moved. The capture id is the payment's provider reference and
         // what a later refund names.
+        // SPEC-13.748
         "PAYMENT.CAPTURE.COMPLETED" => {
             if resource["status"].as_str() != Some("COMPLETED") {
                 return Ok(PaymentEvent::Ignored { kind });
@@ -618,6 +632,7 @@ fn parse_paypal_event(event: &Value) -> AppResult<PaymentEvent> {
         // it reverses is under `links` as the `up` relation
         // (`.../v2/payments/captures/{id}`), which is the documented place and
         // the only one present on every refund event.
+        // SPEC-13.749
         "PAYMENT.CAPTURE.REFUNDED" => {
             let Some(capture_id) = resource["links"]
                 .as_array()

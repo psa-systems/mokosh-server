@@ -256,6 +256,7 @@ pub mod tickets;
 pub mod time_tracking;
 pub mod timesheet_history;
 pub mod timesheets_feature_flag;
+pub mod update_ticket_query_budget;
 pub mod upload_body_limit_branding;
 pub mod upload_body_limit_kb_attachment;
 pub mod upload_body_limit_tenant_logo;

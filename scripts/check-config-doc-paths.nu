@@ -21,6 +21,8 @@ def strip-trailing [token: string] {
     $token | str replace --regex '[.,;:)\]}"`]+$' ''
 }
 
+# SPEC-10.366: path token shape
+
 # Every `docs/...` path a file names, with the line it sits on.
 def referenced-paths [file: string] {
     open --raw $file

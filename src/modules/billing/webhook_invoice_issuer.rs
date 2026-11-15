@@ -27,6 +27,7 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
+// SPEC-13.1082
 /// Verify a Xero webhook delivery.
 ///
 /// Xero sends the `x-xero-signature` header carrying `base64(hmac_sha256(body, webhook_signing_key))`.
@@ -38,6 +39,7 @@ pub fn verify_xero_signature(body: &[u8], signature_header: &str, signing_key: &
     verify_hmac_sha256_base64(body, signature_header.trim(), signing_key)
 }
 
+// SPEC-13.1082
 /// Verify a QuickBooks webhook delivery.
 ///
 /// QuickBooks sends the `intuit-signature` header carrying
@@ -55,6 +57,7 @@ pub fn verify_quickbooks_signature(
     verify_hmac_sha256_base64(body, signature_header.trim(), verifier_token)
 }
 
+// SPEC-13.1082
 /// Shared HMAC-SHA256 + base64 verifier used by both providers. Private
 /// because it names no provider: a caller that wants to add a third
 /// provider on this scheme goes through [`verify_xero_signature`] or
@@ -248,6 +251,7 @@ struct QuickBooksEntity {
     id: String,
 }
 
+// SPEC-13.1086
 /// The document ids one delivery names, in the order the provider sent
 /// them.
 ///
@@ -342,6 +346,7 @@ fn verify(provider: InvoiceProviderKind, body: &[u8], signature: &str, key: &str
     }
 }
 
+// SPEC-13.1083, SPEC-13.1092: actual mount is /api/v1/webhooks/<provider>
 /// `POST /api/v1/{xero,quickbooks}/webhooks/{tenant_id}`.
 ///
 /// The tenant is in the path, which is the shape the payment receivers
@@ -365,6 +370,7 @@ pub async fn invoice_issuer_webhook_handler(
 ) -> AppResult<impl IntoResponse> {
     let provider = state.provider;
 
+    // SPEC-13.1084: signature checked before the body is read
     // MAPPS-1139: the key belongs to the deployment, because the webhook
     // subscription belongs to the application and the application is the
     // deployment's. A host that connects and issues but never subscribed has
@@ -389,6 +395,7 @@ pub async fn invoice_issuer_webhook_handler(
         return Err(AppError::Unauthorized);
     }
 
+    // SPEC-13.1085
     // Verified, so the body can be read. Each event names the organisation
     // it is about and is resolved on its own: Xero batches events into one
     // POST and the batch is not guaranteed to be about one organisation,
@@ -396,6 +403,7 @@ pub async fn invoice_issuer_webhook_handler(
     // this route must not make.
     let events = invoice_events(provider, &body)?;
     for event in events {
+        // SPEC-13.1087
         let Some(tenant_id) = state
             .billing
             .tenant_for_external_organisation(provider.as_str(), &event.organisation_id)
@@ -415,6 +423,7 @@ pub async fn invoice_issuer_webhook_handler(
             continue;
         };
         let scoped = TenantId::from_trusted(tenant_id);
+        // SPEC-13.1091: a failed event stops the batch
         let result = apply_one(&state, scoped, &event).await;
         match &result {
             Ok(outcome) => record(&state, tenant_id, outcome.as_str(), None, None).await,
@@ -453,6 +462,7 @@ impl Outcome {
     }
 }
 
+// SPEC-13.1089
 /// One event that was not an invoice, tried as a bill (PMS-1543).
 ///
 /// The MSP's accountant works in the provider, so the provider is where a
@@ -490,6 +500,7 @@ async fn apply_bill_event(
         // cannot tell apart on its own.
         return Ok(Outcome::Ignored);
     };
+    // SPEC-13.1090
     if settlement.voided {
         // A bill the provider voided is a disagreement worth a human, not
         // a local void: voiding here would discard the MSP's own record of
@@ -525,6 +536,7 @@ async fn apply_bill_event(
     })
 }
 
+// SPEC-13.1088
 /// One event, for the tenant it resolved to.
 async fn apply_one(
     state: &InvoiceIssuerWebhookState,
@@ -613,6 +625,7 @@ async fn apply_one(
     Ok(outcome)
 }
 
+// SPEC-13.1091
 /// PMS-1182's row, written on every path.
 ///
 /// `payment_webhook_deliveries` rather than a table of its own: its

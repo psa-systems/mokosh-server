@@ -53,6 +53,7 @@ pub struct AppointmentResponse {
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
+// SPEC-7.1079: defaults other/UTC/false; appointment_type, status, timezone not validated by the service.
 pub struct CreateAppointmentRequest {
     #[validate(length(min = 1, max = 255))]
     pub title: String,

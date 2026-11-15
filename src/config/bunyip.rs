@@ -61,8 +61,10 @@ const HOST_CONFIG_PREFIX: &str = "/v1/host/config/";
 /// per build and an instant 429 against its per-app cap. A key bunyip starts
 /// serving joins this list, and its `--config-key` goes on the deployment's
 /// registration over there.
-// SPEC-1 and 2.139: the Bunyip provider serves only this declared allowlist, to
+// the Bunyip provider serves only this declared allowlist, to
 // respect bunyip's per-app rate cap, not the whole registry.
+// SPEC-6.25
+// SPEC-2.211
 const SERVED_KEYS: &[(&str, &str)] = &[("ABUSE_CONTACT_EMAIL", "mokosh/abuse_contact_email")];
 /// Bunyip's per-request budget. Sized like the PayPal token call and long
 /// enough that a slow probe does not silently swallow a real timeout.
@@ -87,8 +89,10 @@ impl BunyipConfig {
     /// Direct env reads (not through [`crate::config::get`]) because the
     /// three variables are construction inputs for THIS provider; see
     /// `src/config/guard.rs` for the exemption.
-    // SPEC-1 and 2.140: reads BUNYIP_CONFIG_URL/_CLIENT_ID/_CLIENT_SECRET directly
+    // reads BUNYIP_CONFIG_URL/_CLIENT_ID/_CLIENT_SECRET directly
     // as this provider's own construction input, per the guard.rs exemption.
+    // SPEC-6.24
+    // SPEC-2.212
     pub fn from_env() -> AppResult<Option<Self>> {
         let base = std::env::var("BUNYIP_CONFIG_URL")
             .ok()
@@ -107,6 +111,7 @@ impl BunyipConfig {
     }
 }
 
+// SPEC-6.24: the {NAME}_FILE form wins over the plain variable.
 /// A credential half, read file-first: `{NAME}_FILE` is the compose-secret
 /// form, because a plain value in a compose `environment:` block is visible to
 /// `docker inspect` and to every child process (PMS-1537 reads the host-secret
@@ -135,6 +140,7 @@ fn required(name: &'static str) -> AppResult<String> {
     match std::env::var(name).ok().map(|s| s.trim().to_string()) {
         Some(v) if !v.is_empty() => Ok(v),
         _ => Err(AppError::Configuration(format!(
+            // SPEC-2.213
             "BUNYIP_CONFIG_URL is set, so {name} must be set too; the Bunyip \
              configuration provider needs both halves of its machine \
              credential"
@@ -230,10 +236,12 @@ impl ConfigProvider for BunyipProvider {
     /// Bunyip's `PUT /v1/config/{KEY}` is a follow-up ticket; today the
     /// Bunyip provider stays read-only, so an operator asking to migrate
     /// TO it gets a named refusal rather than a silent success.
-    // SPEC-1 and 2.142: set is a stub that always refuses; the provider is
+    // set is a stub that always refuses; the provider is
     // read-only until bunyip's write endpoint exists.
+    // SPEC-6.26
     async fn set(&self, _key: &str, _value: &str) -> AppResult<()> {
         Err(AppError::Configuration(
+            // SPEC-2.216
             "bunyip provider write is not implemented".to_string(),
         ))
     }
@@ -245,8 +253,9 @@ impl ConfigProvider for BunyipProvider {
 /// key it does serve. A refused credential and a refused key are errors
 /// naming their own remedy, because they are fixed in bunyip and in two
 /// different places.
-// SPEC-1 and 2.141: a 404 is an unheld key (Ok(None)); 401/403 are hard provider
+// a 404 is an unheld key (Ok(None)); 401/403 are hard provider
 // errors naming their own remedy, since they are fixed in two different places.
+// SPEC-6.25: each status maps to its own error text.
 async fn fetch_value(
     http: &reqwest::Client,
     config: &BunyipConfig,
@@ -269,9 +278,11 @@ async fn fetch_value(
             )
         })?;
     let status = resp.status();
+    // SPEC-2.214
     if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
+    // SPEC-2.215
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(AppError::external_service(
             "bunyip-config",

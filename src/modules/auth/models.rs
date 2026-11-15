@@ -1,3 +1,4 @@
+// SPEC-5.2: shim keeps `super::models::*` paths resolving; no behavior here.
 //! Re-export of the shared auth DTOs from `mokosh-types`.
 //!
 //! The actual type definitions live in the workspace `mokosh-types`

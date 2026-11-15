@@ -107,6 +107,7 @@ fn client_ip(addr: SocketAddr, headers: &HeaderMap) -> IpAddr {
 /// refusal: the caller is an external client mid-form with no account, and
 /// several of them can share one NAT address.
 fn rate_limited(retry_after: u64) -> Response {
+    // SPEC-7.1024: shared 429 with Retry-After, logged as a warning.
     tracing::warn!(retry_after, "public request-form surface rate limited");
     rate_limited_response(retry_after, "Too many requests, please try again shortly")
 }

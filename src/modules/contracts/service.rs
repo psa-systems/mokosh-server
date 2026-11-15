@@ -67,6 +67,7 @@ impl ContractsService {
     }
 
     // PMS-66 contracts CRUD ---------------------------------------------------
+    // SPEC-13.1304
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_contracts(
         &self,
@@ -131,6 +132,7 @@ impl ContractsService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-13.1309
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contract(
         &self,
@@ -190,6 +192,7 @@ impl ContractsService {
         self.get_contract(tenant_id, id).await
     }
 
+    // SPEC-13.1305
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_contract(&self, tenant_id: TenantId, id: Uuid) -> AppResult<ContractResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -207,6 +210,7 @@ impl ContractsService {
         Ok(row.into())
     }
 
+    // SPEC-13.1310
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_contract(
         &self,
@@ -225,6 +229,29 @@ impl ContractsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+
+        // PMS-1661 F14: the create path validates `end_date >= start_date`
+        // via `validate_contract_date_range` on `CreateContractRequest`,
+        // but `UpdateContractRequest` carries no `start_date`, so PUT
+        // could set `end_date` before the stored `start_date`. Reject
+        // that here, matching the create-time cross-field check and the
+        // PMS-306 shape.
+        if let Some(end) = request.end_date {
+            let start: Option<NaiveDate> = sqlx::query_scalar(
+                "SELECT start_date FROM contracts WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(start) = start {
+                if end < start {
+                    return Err(AppError::BadRequest(
+                        "end_date must be on or after start_date".to_string(),
+                    ));
+                }
+            }
+        }
 
         let n = sqlx::query(
             r#"UPDATE contracts SET
@@ -284,6 +311,7 @@ impl ContractsService {
         self.get_contract(tenant_id, id).await
     }
 
+    // SPEC-13.1311
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_contract(
         &self,
@@ -326,6 +354,7 @@ impl ContractsService {
     }
 
     // PMS-67 contract items ---------------------------------------------------
+    // SPEC-13.1312
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_contract_items(
         &self,
@@ -360,6 +389,7 @@ impl ContractsService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-13.1313, SPEC-13.1314, SPEC-13.1316
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contract_item(
         &self,
@@ -438,6 +468,7 @@ impl ContractsService {
         })
     }
 
+    // SPEC-13.1313, SPEC-13.1314, SPEC-13.1317
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_contract_item(
         &self,
@@ -447,9 +478,14 @@ impl ContractsService {
         ctx: &AuditCtx,
     ) -> AppResult<ContractItemResponse> {
         let total = request.quantity * request.unit_price;
-        let billing_rule = request
-            .billing_rule
-            .unwrap_or_else(|| BillingRule::derive(&request.item_type));
+        // PMS-1661 F7: on UPDATE, an omitted `billing_rule` must preserve
+        // the stored one, not re-derive from `item_type`. The create path
+        // still derives (nothing to preserve). The old code did
+        // `unwrap_or_else(|| BillingRule::derive(...))` here too, which
+        // silently clobbered an explicit rule the caller wasn't restating;
+        // a product set to `every_period` would snap back to `manual` on
+        // any edit that did not re-send the field.
+        let billing_rule = request.billing_rule.map(|r| r.as_str().to_string());
         // Mutation + audit row in one transaction: snapshot before and
         // after, write the audit entry on the same tx. PMS-117.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -463,13 +499,18 @@ impl ContractsService {
         // PMS-956: `billed_at` comes back from the UPDATE rather than being
         // assumed. An edit to a `once` item that has already billed must not
         // report it as unbilled, or the record would say it is still owed.
-        let updated: Option<(Uuid, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
+        //
+        // PMS-1661 F7: `billing_rule` also comes back from the UPDATE so the
+        // response reflects the stored value when COALESCE kept the prior
+        // one.
+        let updated: Option<(Uuid, Option<chrono::DateTime<Utc>>, String)> = sqlx::query_as(
             r#"UPDATE contract_items SET
                 name=$3, description=$4, item_type=$5, quantity=$6, unit_price=$7,
                 total_price=$8, billing_frequency=$9, work_type_id=$10, included_hours=$11,
                 overage_rate=$12, rollover_enabled=$13, max_rollover_hours=$14,
-                sort_order=$15, product_id=$16, billing_rule=$17, updated_at = NOW()
-               WHERE tenant_id = $1 AND id = $2 RETURNING contract_id, billed_at"#,
+                sort_order=$15, product_id=$16,
+                billing_rule=COALESCE($17, billing_rule), updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2 RETURNING contract_id, billed_at, billing_rule"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -487,12 +528,14 @@ impl ContractsService {
         .bind(request.max_rollover_hours)
         .bind(request.sort_order)
         .bind(request.product_id)
-        .bind(billing_rule.as_str())
+        .bind(billing_rule.as_deref())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((cid, billed_at)) = updated else {
+        let Some((cid, billed_at, stored_billing_rule)) = updated else {
             return Err(AppError::NotFound("Contract item".to_string()));
         };
+        let billing_rule = BillingRule::from_str(&stored_billing_rule)
+            .unwrap_or_else(|| BillingRule::derive(&request.item_type));
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM contract_items t WHERE tenant_id = $1 AND id = $2",
@@ -535,6 +578,7 @@ impl ContractsService {
         })
     }
 
+    // SPEC-13.1318
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_contract_item(
         &self,
@@ -577,6 +621,7 @@ impl ContractsService {
     }
 
     // PMS-68 hour balances ----------------------------------------------------
+    // SPEC-13.1320
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_hour_balance(
         &self,
@@ -610,6 +655,7 @@ impl ContractsService {
     }
 
     // PMS-69 rate cards -------------------------------------------------------
+    // SPEC-13.1321
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rate_cards(
         &self,
@@ -636,6 +682,7 @@ impl ContractsService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-13.1322
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_rate_card(
         &self,
@@ -655,6 +702,7 @@ impl ContractsService {
         Ok(row.into())
     }
 
+    // SPEC-13.1323
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_rate_card(
         &self,
@@ -713,6 +761,7 @@ impl ContractsService {
         })
     }
 
+    // SPEC-13.1324
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_rate_card(
         &self,
@@ -785,6 +834,7 @@ impl ContractsService {
         })
     }
 
+    // SPEC-13.1325
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_rate_card(
         &self,
@@ -827,6 +877,7 @@ impl ContractsService {
     }
 
     // PMS-70 rate card items --------------------------------------------------
+    // SPEC-13.1326
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_rate_card_items(
         &self,
@@ -865,6 +916,7 @@ impl ContractsService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-13.1327
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn upsert_rate_card_item(
         &self,
@@ -902,6 +954,7 @@ impl ContractsService {
         .bind(request.work_type_id)
         .fetch_optional(&mut *tx)
         .await?;
+        // SPEC-13.1328
         let action = if before.is_some() {
             AuditAction::Update
         } else {
@@ -961,6 +1014,7 @@ impl ContractsService {
         })
     }
 
+    // SPEC-13.1329
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_rate_card_item(
         &self,
@@ -1011,6 +1065,7 @@ impl ContractsService {
 
     // PMS-64 hour consumption -------------------------------------------------
 
+    // SPEC-13.1338
     /// Draw `hours` against a contract's block-hours allotment for the
     /// period covering `when`, returning how much landed inside the
     /// included allotment versus overage.
@@ -1046,6 +1101,7 @@ impl ContractsService {
         Ok(outcome)
     }
 
+    // SPEC-13.1338
     /// The draw half of [`Self::consume_hours`], against a transaction the
     /// caller already holds open (PMS-1220).
     ///
@@ -1064,6 +1120,7 @@ impl ContractsService {
         hours: Decimal,
         when: DateTime<Utc>,
     ) -> AppResult<ConsumeOutcome> {
+        // SPEC-13.1331
         if hours < Decimal::ZERO {
             return Err(AppError::BadRequest(
                 "consume_hours: hours must be non-negative".to_string(),
@@ -1071,6 +1128,7 @@ impl ContractsService {
         }
 
         // 1. block-hours contract item + the contract's billing cycle / start.
+        // SPEC-13.1332
         let item = sqlx::query_as::<_, BlockItemRow>(
             r#"SELECT ci.id, ci.included_hours, ci.overage_rate,
                       ci.rollover_enabled, ci.max_rollover_hours,
@@ -1102,6 +1160,7 @@ impl ContractsService {
         // covering the entry's date, so this refuses rather than papering
         // over a `contract_id` that is stale or was moved outside its
         // contract's coverage some other way.
+        // SPEC-13.1333
         if when_date < item.start_date || item.end_date.is_some_and(|end| when_date > end) {
             return Err(AppError::BadRequest(format!(
                 "Date {when_date} is outside contract {contract_id}'s coverage.",
@@ -1111,6 +1170,7 @@ impl ContractsService {
             Self::period_for(item.start_date, billing_cycle, when_date);
 
         // 2. find or create the balance row for this period.
+        // SPEC-13.1337
         let existing = sqlx::query_as::<_, BalanceMutRow>(
             r#"SELECT id, hours_used, hours_remaining
                FROM contract_hour_balances
@@ -1129,6 +1189,7 @@ impl ContractsService {
         let balance = match existing {
             Some(b) => b,
             None => {
+                // SPEC-13.1335
                 // Seed a fresh period. `hours_included` is the item's
                 // included hours (rollover from a closed prior period is
                 // applied separately by roll_to_next_period, which seeds
@@ -1158,6 +1219,7 @@ impl ContractsService {
         };
 
         // 3. split request into applied (against remaining) + overage.
+        // SPEC-13.1336
         let remaining = balance.hours_remaining.max(Decimal::ZERO);
         let hours_applied = hours.min(remaining);
         let overage_hours = hours - hours_applied;
@@ -1186,6 +1248,7 @@ impl ContractsService {
         })
     }
 
+    // SPEC-13.1339, SPEC-13.1340
     /// PMS-951: give back hours a time entry had drawn.
     ///
     /// The counterpart to [`Self::consume_hours`], and the reason an edit to a
@@ -1215,6 +1278,7 @@ impl ContractsService {
         Ok(())
     }
 
+    // SPEC-13.1339, SPEC-13.1340
     /// The give-back half of [`Self::release_hours`], against a transaction
     /// the caller already holds open (PMS-1220), for the same reason
     /// [`Self::consume_hours_in_tx`] exists: `TimeTrackingService::release_for_entry`
@@ -1263,6 +1327,7 @@ impl ContractsService {
         Ok(())
     }
 
+    // SPEC-13.1341
     /// Roll the unused hours of the period ending `closing_period_end`
     /// into the next period's balance row, capped at the item's
     /// `max_rollover_hours`. No-op (returns `Decimal::ZERO`) when the
@@ -1309,6 +1374,7 @@ impl ContractsService {
     ) -> AppResult<Decimal> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
+        // SPEC-13.1341
         let item = sqlx::query_as::<_, BlockItemRow>(
             r#"SELECT ci.id, ci.included_hours, ci.overage_rate,
                       ci.rollover_enabled, ci.max_rollover_hours,
@@ -1332,6 +1398,7 @@ impl ContractsService {
         }
 
         // Unused hours from the closing period.
+        // SPEC-13.1342
         let closing = sqlx::query_as::<_, BalanceMutRow>(
             r#"SELECT id, hours_used, hours_remaining
                FROM contract_hour_balances
@@ -1367,6 +1434,7 @@ impl ContractsService {
         // `DO UPDATE` applied: a conflicting row that already carries
         // rollover fails the `WHERE` and Postgres returns no row at all,
         // which is this roll having already happened.
+        // SPEC-13.1343
         let applied: Option<Uuid> = sqlx::query_scalar(
             r#"INSERT INTO contract_hour_balances
                (id, tenant_id, contract_id, contract_item_id, period_start, period_end,
@@ -1393,6 +1461,7 @@ impl ContractsService {
         .await?;
 
         tx.commit().await?;
+        // SPEC-13.1344
         if applied.is_none() {
             tracing::debug!(
                 %contract_id,
@@ -1404,6 +1473,7 @@ impl ContractsService {
         Ok(rolled)
     }
 
+    // SPEC-13.1334
     /// Derive the `[period_start, period_end]` inclusive date range that
     /// contains `when`, anchored on the contract's `start_date` and
     /// stepped by `billing_cycle`.
@@ -1468,6 +1538,7 @@ impl ContractsService {
 
     // PMS-64 rate resolution --------------------------------------------------
 
+    // SPEC-13.1330
     /// Resolve the effective hourly rate for a `work_type` on a rate card.
     ///
     /// Precedence: `emergency` wins, then `after_hours`, else the base
@@ -1510,6 +1581,7 @@ impl ContractsService {
 
     // PMS-64 lifecycle --------------------------------------------------------
 
+    // SPEC-13.1349
     /// Transition `active` contracts whose `end_date` has passed as of
     /// `now`:
     ///   * `auto_renew = true` with a non-empty `renewal_terms` (or a
@@ -1548,6 +1620,7 @@ impl ContractsService {
         // routing every statement through that pool.
         // Tenants with at least one due contract. Resolved up front so the
         // per-tenant drain below never holds a lock spanning all tenants.
+        // SPEC-13.1345
         let tenants: Vec<Uuid> = sqlx::query_scalar(
             r#"SELECT DISTINCT tenant_id
                FROM contracts
@@ -1574,6 +1647,7 @@ impl ContractsService {
             // 'active'), so a batch returning no rows means the tenant is
             // done and the loop terminates.
             loop {
+                // SPEC-13.1348
                 let mut tx = self.db.migrator_pool().begin().await?;
                 // PMS-779: `to_jsonb(contracts)` rides along on the locked
                 // batch read, so the audit `before` snapshot costs no extra
@@ -1610,6 +1684,7 @@ impl ContractsService {
                     // `RETURNING to_jsonb(contracts)` yields the post-update
                     // row, so the audit `after` snapshot rides on the write
                     // instead of a follow-up read (PMS-779).
+                    // SPEC-13.1346, SPEC-13.1347
                     let after: Option<serde_json::Value> = if c.auto_renew.unwrap_or(false) {
                         // Renewal length: explicit term_months override, else
                         // the span of the closing term in whole months (>= 1).
@@ -1679,6 +1754,7 @@ impl ContractsService {
 
     // PMS-33 billing feed -----------------------------------------------------
 
+    // SPEC-13.1319
     /// Return a contract's recurring billing line items (the
     /// `recurring_service` / `retainer` items that carry a billing
     /// frequency) for the downstream billing engine (PMS-33) to turn
@@ -1804,6 +1880,7 @@ impl From<ContractItemRow> for ContractItemResponse {
             product_id: r.product_id,
             // An unrecognised value can only come from a row this build did
             // not write. `Manual` is the reading that cannot bill somebody.
+            // SPEC-13.1315
             billing_rule: BillingRule::from_str(&r.billing_rule).unwrap_or(BillingRule::Manual),
             billed_at: r.billed_at,
         }

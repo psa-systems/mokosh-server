@@ -132,6 +132,7 @@ impl fmt::Display for ShowcaseReport {
 /// - tenant row does not exist,
 /// - `settings` is null / missing the `is_showcase` key / it is not `true`,
 /// - `settings->>'environment'` is `production`.
+// SPEC-15.2076
 pub async fn confirm_showcase_tenant(db: &Database, tenant_id: Uuid) -> AppResult<()> {
     // `tenants` is the RLS-exempt isolation root (migration 038), so reading the
     // marker on the migrator pool is correct and avoids needing a tenant GUC
@@ -179,6 +180,7 @@ pub async fn confirm_showcase_tenant(db: &Database, tenant_id: Uuid) -> AppResul
 
 /// Seed the showcase dataset into `tenant_id`. Confirms the showcase marker
 /// first (fail closed) and is idempotent: a no-op if the dataset is present.
+// SPEC-15.2076, SPEC-15.2077
 pub async fn showcase_seed(db: &Database, tenant_id: Uuid) -> AppResult<ShowcaseReport> {
     confirm_showcase_tenant(db, tenant_id).await?;
     ShowcaseSeeder::new(db.clone()).seed(tenant_id).await
@@ -186,6 +188,7 @@ pub async fn showcase_seed(db: &Database, tenant_id: Uuid) -> AppResult<Showcase
 
 /// Reset the showcase dataset for a fresh recording take: tear it down (if
 /// present) and seed it again, in one call. Confirms the showcase marker first.
+// SPEC-15.2076, SPEC-15.2080
 pub async fn showcase_refresh(db: &Database, tenant_id: Uuid) -> AppResult<ShowcaseReport> {
     confirm_showcase_tenant(db, tenant_id).await?;
     teardown(db, tenant_id).await?;
@@ -194,6 +197,7 @@ pub async fn showcase_refresh(db: &Database, tenant_id: Uuid) -> AppResult<Showc
 
 /// Remove the showcase dataset (and the lookup rows it created) from
 /// `tenant_id`. Confirms the showcase marker first. Safe to run repeatedly.
+// SPEC-15.2076, SPEC-15.2080
 pub async fn showcase_teardown(db: &Database, tenant_id: Uuid) -> AppResult<ShowcaseReport> {
     confirm_showcase_tenant(db, tenant_id).await?;
     teardown(db, tenant_id).await
@@ -220,6 +224,7 @@ impl ShowcaseSeeder {
         }
     }
 
+    // SPEC-15.2077, SPEC-15.2078, SPEC-15.2079
     async fn seed(&self, tid: Uuid) -> AppResult<ShowcaseReport> {
         // Idempotency: any pre-existing SHOWCASE- company means we have already
         // seeded this tenant. Bail without writing so re-runs never duplicate.
@@ -346,6 +351,7 @@ impl ShowcaseSeeder {
         Ok(exists)
     }
 
+    // SPEC-15.2077
     async fn first_user(&self, tid: Uuid) -> AppResult<Uuid> {
         let mut tx = self.db.begin_with_tenant(tid).await?;
         let id: Option<Uuid> = sqlx::query_scalar(
@@ -430,6 +436,7 @@ impl ShowcaseSeeder {
 /// Remove the showcase dataset for `tenant_id` in FK-dependency order. Runs in
 /// a single tenant-scoped transaction so it is all-or-nothing. Returns counts
 /// of the primary entities removed.
+// SPEC-15.2080
 async fn teardown(db: &Database, tid: Uuid) -> AppResult<ShowcaseReport> {
     let like = format!("{SHOWCASE_PREFIX}%");
     let companies = "SELECT id FROM companies WHERE tenant_id = $1 AND name LIKE $2";

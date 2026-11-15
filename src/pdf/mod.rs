@@ -172,6 +172,8 @@ impl Template {
     /// The keys a tenant may store, in the order an error message lists them.
     pub const KEYS: [&'static str; 3] = ["classic", "modern", "compact"];
 
+    // SPEC-4.1030: classic/modern/compact; None for any other key; modern adds band, stripes,
+    // footer.
     pub fn from_key(key: &str) -> Option<Self> {
         match key {
             "classic" => Some(Self::Classic),
@@ -711,6 +713,7 @@ fn subset_face(weight: Weight, face: &ParsedFont, used: &BTreeSet<char>) -> Opti
     // Glyph 0 (.notdef) first and no duplicates: allsorts documents both as
     // requirements, and omitting .notdef renumbers the first real glyph onto 0,
     // where every reader draws it as the missing-glyph box.
+    // SPEC-4.1037: glyph 0 (.notdef) first, each other glyph id once.
     let mut ids: Vec<u16> = vec![0];
     ids.extend(
         used.iter()
@@ -796,6 +799,7 @@ fn document_date(date: NaiveDate) -> PdfOffsetDateTime {
 /// blocking pool via `spawn_blocking` (PMS-1245) rather than inline on the
 /// Tokio worker thread handling the request. The document is taken by value
 /// because the blocking closure needs `'static` data to move into the pool.
+// SPEC-4.1031: layout runs on a blocking task; a panicked task is AppError::Internal.
 pub async fn render(document: Document, generated_on: NaiveDate) -> AppResult<Vec<u8>> {
     tokio::task::spawn_blocking(move || render_sync(&document, generated_on))
         .await
@@ -803,6 +807,7 @@ pub async fn render(document: Document, generated_on: NaiveDate) -> AppResult<Ve
 }
 
 // SPEC-4.75: a pure function of document and generated_on; no system clock read, so output is byte-identical across renders.
+// SPEC-4.1032: Generated {date} line, midnight-UTC metadata dates, at least one page.
 fn render_sync(document: &Document, generated_on: NaiveDate) -> AppResult<Vec<u8>> {
     let faces = faces()?;
     let theme = Theme::resolve(document.template, document.accent.as_deref());
@@ -1004,6 +1009,7 @@ fn place_logo(doc: &mut PdfDocument, layout: &mut Layout, logo: &Logo) -> Result
     // `rendering_is_deterministic` caught. A digest of the image is
     // deterministic AND collision-free, so two documents carrying the same
     // logo agree and two carrying different ones do not.
+    // SPEC-4.1036: right-aligned logo; resource name IMG + first 12 digest bytes in hex.
     let digest = <Sha256 as Digest>::digest(&logo.bytes);
     let name: String = digest.iter().take(12).map(|b| format!("{b:02X}")).collect();
     let id = XObjectId(format!("IMG{name}"));
@@ -1151,6 +1157,7 @@ impl Layout {
 
     /// PMS-1006: the Modern band, filled in the tenant's accent, carrying the
     /// document's name and number in whichever ink reads on it.
+    // SPEC-4.1033: 34 mm accent band, uppercased title; footer only for templates that have one.
     fn band(&mut self, title: &str, subtitle: Option<&str>) {
         let accent = self.theme.accent;
         self.fill_rect(
@@ -1396,6 +1403,7 @@ impl Layout {
         }
     }
 
+    // SPEC-4.1034: page break repeats the header; empty header list renders nothing; closing rule.
     fn table(&mut self, headers: &[String], rows: &[Vec<String>], align: &[Align]) {
         if headers.is_empty() {
             return;
@@ -1496,6 +1504,8 @@ impl Layout {
 /// How many millimetres a string of `n` characters occupies at a given size.
 /// PMS-1006 made the size a parameter, because Compact sets its body at 8 pt
 /// and a width estimated at 9 pt would truncate cells that fit.
+// SPEC-4.1035: width is 0.56 em per character, not measured; truncate_to keeps fits-3 chars plus
+// ...
 fn text_width_mm(chars: usize, size_pt: f32) -> f32 {
     chars as f32 * AVERAGE_CHAR_EM * size_pt * MM_PER_PT
 }

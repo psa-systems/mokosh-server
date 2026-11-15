@@ -33,6 +33,7 @@ pub struct Database {
 }
 
 impl Database {
+    // SPEC-2.146
     /// Create the two connection pools.
     ///
     /// `app_url` is the request-serving connection string (role
@@ -59,8 +60,7 @@ impl Database {
         })
     }
 
-    // SPEC-1 and 2.102: each pool is capped at 20 connections (min 2), with a 30s
-    // acquire timeout, 600s idle timeout and 1800s max connection lifetime.
+    // SPEC-1.14 SPEC-2.145
     async fn connect(database_url: &str, label: &str) -> AppResult<PgPool> {
         PgPoolOptions::new()
             .max_connections(20)
@@ -75,14 +75,13 @@ impl Database {
             })
     }
 
+    // SPEC-2.153
     /// Wrap an existing `PgPool` as BOTH pools. Used by the integration-test
     /// harness (`tests/common/`) where `#[mokosh_test]` provisions a single
     /// superuser pool against a per-test database; without the role split
     /// the app and migrator connections coincide and RLS does not bite.
     /// Suites that exercise RLS through the app role build the app pool
     /// separately via [`Self::from_pools`].
-    // SPEC-1 and 2.108: wraps one pool as both app_pool and migrator_pool, so RLS
-    // never bites (the single role used is whichever one connected it).
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             app_pool: pool.clone(),
@@ -90,12 +89,11 @@ impl Database {
         }
     }
 
+    // SPEC-2.154
     /// Wrap two distinct pools. Used by the RLS-exercising integration
     /// harness, which builds `app_pool` connecting as the unprivileged
     /// `mokosh_app` role and passes the `#[mokosh_test]` superuser pool as
     /// `migrator_pool`.
-    // SPEC-1 and 2.109: wraps two distinct pools, so a test can connect app_pool as
-    // the unprivileged mokosh_app role and exercise RLS against it.
     pub fn from_pools(app_pool: PgPool, migrator_pool: PgPool) -> Self {
         Self {
             app_pool,
@@ -103,28 +101,27 @@ impl Database {
         }
     }
 
+    // SPEC-1.13 SPEC-2.147
     /// Get a reference to the request-serving (`mokosh_app`, NOBYPASSRLS)
     /// connection pool. Serving queries must either set the
     /// `app.current_tenant` GUC (via [`Self::begin_with_tenant`]) or accept
     /// that RLS fail-closes them to zero rows.
-    // SPEC-1 and 2.103: returns the unprivileged app_pool; a serving query that
-    // bypasses begin_with_tenant fail-closes to zero rows under RLS.
     pub fn pool(&self) -> &PgPool {
         &self.app_pool
     }
 
+    // SPEC-2.148
     /// Get a reference to the privileged (`mokosh_migrator`, BYPASSRLS)
     /// connection pool. Reserved for migrations, bootstrap, the
     /// cross-tenant background workers, and the explicitly-justified
     /// pre-auth / cross-tenant / system-shared paths. Every call site must
     /// carry a `// SAFETY:` note explaining why it legitimately bypasses
     /// per-tenant RLS.
-    // SPEC-1 and 2.104: the BYPASSRLS accessor; scripts/check-pool-safety.nu requires
-    // every bare .pool() call site elsewhere to carry a SAFETY (PMS-285) note.
     pub fn migrator_pool(&self) -> &PgPool {
         &self.migrator_pool
     }
 
+    // SPEC-2.152
     /// Run database migrations on the privileged migrator pool.
     ///
     /// `set_ignore_missing(true)` is required because mokosh-auth's
@@ -133,8 +130,6 @@ impl Database {
     /// `20260506000001` as "applied but missing in the resolved
     /// source" and refuses to run. Auth migrations live under their
     /// own range so version collisions are impossible.
-    // SPEC-1 and 2.107: runs on migrator_pool; a migration failure returns
-    // AppError::Database, which ends startup (section 2's boot sequence).
     pub async fn run_migrations(&self) -> AppResult<()> {
         let mut migrator = sqlx::migrate!("./migrations");
         migrator.set_ignore_missing(true);
@@ -147,8 +142,7 @@ impl Database {
         Ok(())
     }
 
-    // SPEC-1 and 2.106: runs against app_pool, never migrator_pool, so a readiness
-    // probe exercises the same connection serving requests.
+    // SPEC-2.151
     /// Health check for the database (request-serving pool).
     pub async fn health_check(&self) -> AppResult<()> {
         sqlx::query("SELECT 1")
@@ -159,6 +153,7 @@ impl Database {
         Ok(())
     }
 
+    // SPEC-2.149
     /// Begin a transaction with the RLS tenant GUC set.
     ///
     /// The `tenant_isolation` RLS policy keys off `app.current_tenant`. It
@@ -186,8 +181,7 @@ impl Database {
         let tenant_id = tenant_id.into();
         let mut tx = self.app_pool.begin().await?;
 
-        // SPEC-1 and 2.105: the `true` argument makes set_config transaction-local (SET LOCAL semantics),
-        // so the tenant GUC never leaks to the next request that reuses this pooled connection.
+        // SPEC-2.149
         sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
             .bind(tenant_id.to_string())
             .execute(&mut *tx)
@@ -197,6 +191,7 @@ impl Database {
     }
 }
 
+// SPEC-2.150
 /// A database transaction with tenant context set
 #[cfg(feature = "multi-tenant")]
 pub struct TenantTransaction<'a> {

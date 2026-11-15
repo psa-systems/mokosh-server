@@ -31,6 +31,7 @@
 /// dropped rather than sent: the client would refuse it anyway, and a link
 /// that silently loses its destination is better than one that carries
 /// something the client treats as hostile.
+// SPEC-5.426, SPEC-5.427
 pub fn portal_login_link(
     origin: &str,
     portal_id: Option<i64>,
@@ -53,6 +54,7 @@ pub fn portal_login_link(
 /// An absolute path within this app: one leading slash, not two (which a
 /// browser reads as another host), and nothing that would end or split the
 /// query value it is placed in.
+// SPEC-5.427
 fn is_in_app_path(path: &str) -> bool {
     path.starts_with('/') && !path.starts_with("//") && !path.contains(['?', '#', '&', ' ', '\\'])
 }

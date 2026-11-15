@@ -51,6 +51,7 @@ pub fn app_name() -> Arc<str> {
 /// Replace the cached name. `None` restores the default. Takes effect on the
 /// next read by every consumer in the process, which is what makes the setting
 /// editable without a restart.
+// SPEC-4.1003: None clears the cache so app_name reads the default again.
 pub fn set_app_name(name: Option<&str>) {
     *APP_NAME.write().expect("app name lock poisoned") = name.map(Arc::from);
 }

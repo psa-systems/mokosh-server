@@ -1,3 +1,4 @@
+# SPEC-10.351: proc-macro crate, macros only
 [package]
 name = "mokosh-test-macros"
 version = "0.1.0"
@@ -6,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [lib]
+# SPEC-2.5
 proc-macro = true
 path = "src/lib.rs"
 

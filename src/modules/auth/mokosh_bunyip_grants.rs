@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use mokosh_types::auth::UserRole;
 
+// SPEC-5.217
 /// BUNYIP-674 option B: project a grant role from Bunyip's PMS-1162
 /// vocabulary (`admin` / `manager` / `technician` / `finance` /
 /// `read_only`) onto Mokosh's [`UserRole`]. `None` on an unknown
@@ -111,6 +112,7 @@ struct GrantRow {
 pub struct MokoshBunyipGrantService;
 
 impl MokoshBunyipGrantService {
+    // SPEC-5.218, SPEC-5.219
     /// Whether the caller (`grantee_bunyip_user_id`) currently holds an
     /// active grant to the named Mokosh tenant. `false` covers both
     /// "no grant row" and "row present but revoked".
@@ -174,6 +176,7 @@ impl MokoshBunyipGrantService {
         Ok(active)
     }
 
+    // SPEC-5.219, SPEC-5.220
     /// BUNYIP-674 option B (phase 2): the ROLE the grant carries when
     /// it is active, `None` otherwise. Consults the same 30s cache
     /// [`Self::is_grant_active`] populates and never re-queries when
@@ -227,6 +230,7 @@ impl MokoshBunyipGrantService {
         Ok(if active { role } else { None })
     }
 
+    // SPEC-5.221: delegates to upsert_with_email
     /// Idempotent UPSERT called from the webhook receiver. `role` is
     /// `Some` on a `granted` event and `None` on a `revoked` one; the
     /// CHECK constraint on the table pins the role-vs-revoked_at
@@ -269,6 +273,7 @@ impl MokoshBunyipGrantService {
         .await
     }
 
+    // SPEC-5.221, SPEC-5.222, SPEC-5.223
     /// PMS-1208 finding 3: 9-arg variant that also records the grantee's
     /// `grantee_email` (case-insensitively indexed on the mirror in
     /// migration 269). The accept path and the webhook receiver's granted
@@ -388,6 +393,7 @@ pub enum GranteeLeaveOutcome {
 }
 
 impl MokoshBunyipGrantService {
+    // SPEC-5.224, SPEC-5.225
     /// PMS-1210: the caller leaves an account they were granted access to.
     ///
     /// Identifies the row by the mokosh-side `id` AND the caller's

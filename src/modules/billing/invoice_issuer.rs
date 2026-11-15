@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
+// SPEC-13.1000: closed provider set
 /// The set of external invoice-issuer providers Mokosh will delegate to
 /// (MAPPS-1099). The string form is what the `invoices.external_provider`
 /// column stores and what `integrations.provider` carries, so the two
@@ -102,6 +103,7 @@ pub struct ExternalSettlement {
     pub voided: bool,
 }
 
+// SPEC-13.1001, SPEC-13.1002: truncating parse; unreadable part reads as 0
 /// A provider's decimal amount (`"120.50"`, or a JSON number rendered as
 /// one) in minor units, truncating rather than rounding.
 ///
@@ -149,6 +151,7 @@ pub enum IssuerSelection {
     Delegated { provider: InvoiceProviderKind },
 }
 
+// SPEC-13.1003, SPEC-13.1004: Xero wins the tie-break
 /// Phase 2 dispatch helper. Pure logic over the two inputs it reads:
 /// the deployment-wide feature toggle (gates the whole delegated path,
 /// so the merge is a no-op on every environment until operations flips

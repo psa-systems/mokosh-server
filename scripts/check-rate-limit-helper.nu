@@ -19,6 +19,8 @@
 # SPEC-10.174: let _ = retry_after is banned even inside this helper file.
 const HELPER_FILE = 'src/utils/error.rs'
 
+# SPEC-10.357: reason precedence
+
 def main [] {
     let violations = (
         glob src/**/*.rs

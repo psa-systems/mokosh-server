@@ -33,6 +33,7 @@ pub struct ContractResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-13.1303
 /// PMS-1061: what a contact receives for a contract, on the dual-plane
 /// reads. The MSP's `notes` are agent scratch and never reach the customer;
 /// `sla_id`, `signed_by_contact_id`, `auto_renew` and the timestamps are
@@ -74,6 +75,7 @@ impl From<ContractResponse> for ContactContractResponse {
     }
 }
 
+// SPEC-13.1304
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct ContractFilter {
     pub company_id: Option<Uuid>,
@@ -83,6 +85,7 @@ pub struct ContractFilter {
     pub status: Option<String>,
 }
 
+// SPEC-13.1307
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[validate(schema(function = validate_contract_date_range))]
 pub struct CreateContractRequest {
@@ -116,6 +119,7 @@ fn default_monthly() -> String {
     "monthly".into()
 }
 
+// SPEC-13.1308
 /// Cross-field check: a contract may not end before it starts (PMS-306). An
 /// inverted range (`end_date < start_date`) was previously accepted and
 /// persisted; reject it with a 422 at the request layer. A `None` `end_date`
@@ -137,6 +141,7 @@ fn validate_contract_date_range(
     Ok(())
 }
 
+// SPEC-13.1310
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateContractRequest {
     pub contract_number: Option<String>,
@@ -188,6 +193,7 @@ pub struct ContractItemResponse {
     pub billed_at: Option<DateTime<Utc>>,
 }
 
+// SPEC-13.1313, SPEC-13.1314
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertContractItemRequest {
     #[validate(length(min = 1, max = 255))]
@@ -254,6 +260,7 @@ impl BillingRule {
         }
     }
 
+    // SPEC-13.1314
     /// What an item bills when the caller does not say.
     ///
     /// One function rather than a rule spread across call sites, and it
@@ -299,6 +306,7 @@ pub struct RateCardResponse {
     pub default_per_mile_rate: Option<Decimal>,
 }
 
+// SPEC-13.1323
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertRateCardRequest {
     #[validate(length(min = 1, max = 100))]
@@ -459,6 +467,7 @@ mod tests {
     }
 }
 
+// SPEC-13.1336
 /// Outcome of [`ContractsService::consume_hours`].
 ///
 /// `hours_applied` is the portion of the requested hours drawn from the

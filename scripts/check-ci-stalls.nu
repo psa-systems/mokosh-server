@@ -86,6 +86,8 @@ def workflow-bound [bounds: record, workflow: string]: nothing -> any {
     if ($mine | is-empty) { null } else { $mine | get minutes | math min }
 }
 
+# SPEC-10.369: paging and API failure
+
 def fetch-runs [token: string]: nothing -> list {
     mut all = []
     for page in 1..$MAX_PAGES {
@@ -106,6 +108,8 @@ def fetch-runs [token: string]: nothing -> list {
     }
     $all
 }
+
+# SPEC-10.370: duration and bound
 
 # One row per run, with the wall clock the API implies and the bound it should
 # have respected.
@@ -139,6 +143,8 @@ def classify [runs: list, bounds: record, since: datetime] {
     }
     | compact
 }
+
+# SPEC-10.371: report and exit
 
 def report [rows: list, days: int] {
     let unbounded = ($rows | where bound == null | get workflow | uniq)

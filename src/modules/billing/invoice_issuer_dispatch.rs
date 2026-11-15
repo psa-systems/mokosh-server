@@ -185,6 +185,7 @@ impl IssuerDispatcher {
         }
     }
 
+    // SPEC-13.1055, SPEC-13.1056, SPEC-13.1057, SPEC-13.1058
     /// Raise one bill in the provider the tenant delegated Bills and
     /// expenses to (MAPPS-1155).
     ///
@@ -370,6 +371,7 @@ impl IssuerDispatcher {
         }
     }
 
+    // SPEC-13.1059, SPEC-13.1060, SPEC-13.1061, SPEC-13.1062
     /// Record one reimbursed claim in the provider the tenant delegated
     /// Bills and expenses to (PMS-1541).
     ///
@@ -568,6 +570,7 @@ impl IssuerDispatcher {
         }
     }
 
+    // SPEC-13.1043
     /// Whether the deployment has delegated BILLS switched on
     /// (MAPPS-1155). Its own switch, for the reason the feature registry
     /// gives: the invoice flag names the invoice issuer.
@@ -576,6 +579,7 @@ impl IssuerDispatcher {
             .is_enabled(crate::modules::features::Feature::DelegatedBills)
     }
 
+    // SPEC-13.1043
     /// Whether the deployment-wide toggle is on, with no query and no
     /// await (MAPPS-1134).
     ///
@@ -590,6 +594,7 @@ impl IssuerDispatcher {
             .is_enabled(crate::modules::features::Feature::DelegatedInvoiceIssuer)
     }
 
+    // SPEC-13.1044, SPEC-13.1047
     /// Decide and (if delegated) carry out the external issue for one
     /// invoice. Returns `IssuerPlan::Local` for every path that leaves
     /// `create_invoice`'s current body unchanged:
@@ -627,6 +632,7 @@ impl IssuerDispatcher {
         let quickbooks_delegated = self
             .delegates(tenant_id, IntegrationProvider::Quickbooks)
             .await?;
+        // SPEC-13.1046: Xero first
         let selection = select_issuer_with(true, || xero_delegated, || quickbooks_delegated);
 
         match selection {
@@ -646,6 +652,7 @@ impl IssuerDispatcher {
         }
     }
 
+    // SPEC-13.1045: error counts as live on purpose
     /// Whether this tenant's invoices go through `provider`.
     ///
     /// The capability AND a live connection, which MAPPS-1145 made two
@@ -684,6 +691,7 @@ impl IssuerDispatcher {
                 .any(|c| c == Capability::Invoicing.as_str()))
     }
 
+    // SPEC-13.1048
     async fn issue_through_xero(
         &self,
         tenant_id: TenantId,
@@ -748,6 +756,7 @@ impl IssuerDispatcher {
         self.xero.issue_invoice(&credentials, &xero_request).await
     }
 
+    // SPEC-13.1049
     async fn issue_through_quickbooks(
         &self,
         tenant_id: TenantId,
@@ -831,6 +840,7 @@ impl IssuerDispatcher {
     /// up-to-date state and `refreshed` is true iff a refresh ran
     /// (used by callers that want to log a telemetry event on
     /// rotation).
+    // SPEC-13.1071
     /// The key this tenant's provider signs webhook deliveries with
     /// (MAPPS-1136), or `None` when they connected without one.
     ///
@@ -858,6 +868,7 @@ impl IssuerDispatcher {
     /// receiver comes and looks, through the same credential load and
     /// near-expiry refresh an issue goes through, because a webhook can
     /// easily be the first call after a token has aged out.
+    // SPEC-13.1063
     /// Tell the provider a bill it holds has been paid (PMS-1545).
     ///
     /// The outbound mirror of PMS-1543: that one records what the provider
@@ -949,6 +960,7 @@ impl IssuerDispatcher {
         }
     }
 
+    // SPEC-13.1064: read before write
     /// Void the provider's copy of an invoice Mokosh has replaced
     /// (PMS-1544).
     ///
@@ -1018,6 +1030,7 @@ impl IssuerDispatcher {
         }
     }
 
+    // SPEC-13.1065, SPEC-13.1066, SPEC-13.1067: creation fatal, application not
     /// Issue a credit note in the provider that holds the invoice it
     /// corrects, and apply it there (PMS-1546).
     ///
@@ -1183,6 +1196,7 @@ impl IssuerDispatcher {
         }
     }
 
+    // SPEC-13.1068
     /// Void the provider's copy of a credit note (PMS-1546).
     ///
     /// PMS-1544's rule in a second place: a document the customer holds
@@ -1282,6 +1296,7 @@ impl IssuerDispatcher {
         })
     }
 
+    // SPEC-13.1069
     /// What the provider says has been settled against one delegated bill
     /// (PMS-1543).
     ///
@@ -1314,6 +1329,7 @@ impl IssuerDispatcher {
         }
     }
 
+    // SPEC-13.1070
     pub async fn external_status(
         &self,
         tenant_id: TenantId,
@@ -1359,6 +1375,7 @@ impl IssuerDispatcher {
         }
     }
 
+    // SPEC-13.1052, SPEC-13.1053, SPEC-13.1054
     async fn load_and_refresh_blob(
         &self,
         tenant_id: TenantId,
@@ -1477,13 +1494,23 @@ pub struct CreateInvoiceRequestShape<'a> {
     pub lines: &'a [CreateInvoiceLineRequest],
 }
 
+// SPEC-13.1050, SPEC-13.1051
 /// Convert a positive-or-negative `Decimal` to minor units (hundredths
 /// of a major unit, so `12.34` -> `1234`). The Xero and QuickBooks
 /// clients both take `i64` minor units in; this is the one place the
 /// decimal-to-integer conversion lives.
+///
+/// PMS-1660: `round_dp(0)` defaults to `MidpointNearestEven` (banker's
+/// rounding), so a midpoint rounded to the nearest EVEN integer. The
+/// `invoice_lines` writer rounds half-away-from-zero (and the sibling
+/// test below pins that rule as the contract), so a `122.5` minor-unit
+/// value stored as `12.25 * 100 = 1225` tenths would land on `122`
+/// here and `123` in the row that was already sent to the customer,
+/// causing the dispatched provider total to diverge from the issued
+/// invoice. Use `MidpointAwayFromZero` explicitly.
 fn decimal_to_minor(d: Decimal) -> i64 {
     (d * Decimal::from(100))
-        .round_dp(0)
+        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
         .to_i64()
         .unwrap_or_default()
 }
@@ -1516,5 +1543,20 @@ mod tests {
     fn decimal_to_minor_rounds_half_away_from_zero() {
         assert_eq!(decimal_to_minor(Decimal::new(1235, 3)), 124); // 1.235 -> 1.24
         assert_eq!(decimal_to_minor(Decimal::new(-1235, 3)), -124);
+    }
+
+    /// PMS-1660: the old `round_dp(0)` defaulted to banker's rounding,
+    /// which agreed with half-away-from-zero at `.235` (last-rounded
+    /// digit was odd either way) but disagreed on even-digit midpoints:
+    /// `1.225` landed on `122` under banker's and `123` under
+    /// half-away-from-zero, so the dispatched total drifted from the
+    /// row the customer already holds. Pin both cases so a future
+    /// regression trips here.
+    #[test]
+    fn decimal_to_minor_rounds_even_midpoints_away_from_zero() {
+        assert_eq!(decimal_to_minor(Decimal::new(1225, 3)), 123); // 1.225 -> 1.23
+        assert_eq!(decimal_to_minor(Decimal::new(-1225, 3)), -123);
+        assert_eq!(decimal_to_minor(Decimal::new(1245, 3)), 125); // 1.245 -> 1.25
+        assert_eq!(decimal_to_minor(Decimal::new(-1245, 3)), -125);
     }
 }

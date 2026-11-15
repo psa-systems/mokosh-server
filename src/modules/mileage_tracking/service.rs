@@ -24,6 +24,7 @@ impl MileageTrackingService {
         Self { db }
     }
 
+    // SPEC-14.50: filtered page and a count over the same filter.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_mileage_entries(
         &self,
@@ -115,6 +116,7 @@ impl MileageTrackingService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-14.51, SPEC-14.52, SPEC-14.53, SPEC-14.54: distance 400, tenant checks, pricing, status, audit.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_mileage_entry(
         &self,
@@ -216,6 +218,7 @@ impl MileageTrackingService {
         self.get_mileage_entry(tenant_id, id).await
     }
 
+    // SPEC-14.50, SPEC-14.55: 404 "Mileage entry" when absent.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_mileage_entry(
         &self,
@@ -246,6 +249,7 @@ impl MileageTrackingService {
         Ok(row.into())
     }
 
+    // SPEC-14.56: ticket_id and project_id bind as given (null when omitted); billing status is untouched.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_mileage_entry(
         &self,
@@ -267,6 +271,16 @@ impl MileageTrackingService {
         } else {
             None
         };
+        // PMS-1662 F11: flipping `is_billable` used to leave the stored
+        // `billing_status` alone, so a mileage entry made non-billable
+        // stayed `ready_to_bill` and would bill anyway. Mirror what
+        // PMS-944 did for time entries: resolve the status from the
+        // post-update billability, keeping `billed` sticky through the
+        // same helper time uses.
+        let billing_status = crate::modules::time_tracking::resolve_billing_status(
+            is_billable,
+            Some(current.billing_status),
+        );
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Write-side tenant validation on update, mirroring create: the UPDATE
@@ -291,6 +305,7 @@ impl MileageTrackingService {
                 rate_per_mile = $11,
                 total_amount  = $12,
                 task_id       = COALESCE($13, task_id),
+                billing_status = $14,
                 updated_at    = NOW()
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -308,6 +323,7 @@ impl MileageTrackingService {
         .bind(rate)
         .bind(total)
         .bind(request.task_id)
+        .bind(billing_status)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -318,6 +334,7 @@ impl MileageTrackingService {
         self.get_mileage_entry(tenant_id, id).await
     }
 
+    // SPEC-14.55: 404 "Mileage entry" when absent.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_mileage_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -341,6 +358,7 @@ impl MileageTrackingService {
 
 /// The tenant default rate card's per-mile rate, if a default card exists and
 /// carries one. `None` => the entry is unpriced unless an explicit rate is set.
+// SPEC-14.53: the default rate card's per-mile rate, if any.
 async fn default_rate_card_per_mile<'e, E>(
     exec: E,
     tenant_id: TenantId,
@@ -363,6 +381,7 @@ where
 }
 
 /// Assert a ticket belongs to the tenant. `NotFound` cross-tenant.
+// SPEC-14.52, SPEC-14.56: 404 "Ticket" outside the tenant.
 async fn assert_ticket_in_tenant<'e, E>(
     exec: E,
     tenant_id: TenantId,
@@ -383,6 +402,7 @@ where
 }
 
 /// Assert a company belongs to the tenant. `NotFound` cross-tenant.
+// SPEC-14.52: 404 "Company" outside the tenant.
 async fn assert_company_in_tenant<'e, E>(
     exec: E,
     tenant_id: TenantId,
@@ -431,6 +451,39 @@ struct MileageEntryRow {
 
 impl From<MileageEntryRow> for MileageEntryResponse {
     fn from(r: MileageEntryRow) -> Self {
+        // PMS-1662 F5: same "unparseable enum maps to default silently"
+        // shape as time entries. Keep the default fallback, WARN with
+        // the entry id + stored value so a drift is findable.
+        let billing_status = r
+            .billing_status
+            .as_deref()
+            .and_then(|s| {
+                let parsed = BillingStatus::from_str(s);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        entry_id = %r.id,
+                        stored = %s,
+                        "mileage_entries.billing_status is not one of the known values; reading as default"
+                    );
+                }
+                parsed
+            })
+            .unwrap_or_default();
+        let approval_status = r
+            .approval_status
+            .as_deref()
+            .and_then(|s| {
+                let parsed = ApprovalStatus::from_str(s);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        entry_id = %r.id,
+                        stored = %s,
+                        "mileage_entries.approval_status is not one of the known values; reading as default"
+                    );
+                }
+                parsed
+            })
+            .unwrap_or_default();
         Self {
             id: r.id,
             user_id: r.user_id,
@@ -445,18 +498,10 @@ impl From<MileageEntryRow> for MileageEntryResponse {
             contract_id: r.contract_id,
             notes: r.notes,
             is_billable: r.is_billable.unwrap_or(true),
-            billing_status: r
-                .billing_status
-                .as_deref()
-                .and_then(BillingStatus::from_str)
-                .unwrap_or_default(),
+            billing_status,
             rate_per_mile: r.rate_per_mile,
             total_amount: r.total_amount,
-            approval_status: r
-                .approval_status
-                .as_deref()
-                .and_then(ApprovalStatus::from_str)
-                .unwrap_or_default(),
+            approval_status,
             created_at: r.created_at,
             updated_at: r.updated_at,
             ticket_number: r.ticket_number,

@@ -26,6 +26,7 @@ use crate::utils::error::{AppError, AppResult};
 /// `contacts.company_id` scalar (which PMS-806 keeps as the mirror of the
 /// primary link) and a `contact_companies` row for a contact who works at
 /// several companies.
+// SPEC-15.114: recipient must be a contact of this company
 pub async fn assert_for_company(
     tx: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -60,6 +61,7 @@ pub async fn assert_for_company(
 /// answer, and `None` means the company has nobody: the caller decides whether
 /// that is a refusal (a send) or simply a document that names nobody yet (a
 /// draft).
+// SPEC-15.115: named contact validated, else the company default
 pub async fn resolve(
     tx: &mut sqlx::PgConnection,
     tenant_id: TenantId,

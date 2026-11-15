@@ -8,9 +8,11 @@ use validator::Validate;
 /// The four check kinds recognised on the wire. Open enum: unknown kinds
 /// arriving at the ingest handler are refused with 422 rather than mapped
 /// to a bucket, and the schema CHECK constraint is the ultimate guard.
+// SPEC-15.2110
 pub const CHECK_KINDS: &[&str] = &["backup", "disk", "patch", "antivirus"];
 
 /// The four outcomes recognised on the wire.
+// SPEC-15.2110
 pub const OUTCOMES: &[&str] = &["success", "warning", "failure", "unknown"];
 
 /// Body for the RMM status ingest.

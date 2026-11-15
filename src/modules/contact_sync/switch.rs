@@ -37,6 +37,7 @@ use super::service::{GOOGLE, MICROSOFT};
 /// switch (an uploaded file is one import, gated by the upload), and a provider
 /// name this build does not know is a caller bug, not a reason to answer for
 /// Google.
+// SPEC-15.674
 pub async fn contacts_enabled(
     db: &Database,
     tenant_id: TenantId,

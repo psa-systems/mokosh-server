@@ -37,6 +37,7 @@ pub struct PortalRole {
 /// tenant-wide role (existing shape), `Some(id)` mints a role scoped to
 /// that Company. Validated server-side that the Company belongs to the
 /// caller's tenant.
+// SPEC-5.407
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreatePortalRoleRequest {
     #[validate(length(min = 1, max = 64))]
@@ -56,6 +57,7 @@ pub struct CreatePortalRoleRequest {
 /// A DTO-level omission means a request body carrying that field
 /// silently drops it at deserialization; the service also never touches
 /// `company_id` on the UPDATE.
+// SPEC-5.412, SPEC-5.413
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdatePortalRoleRequest {
     #[validate(length(min = 1, max = 64))]

@@ -55,6 +55,7 @@ impl ScheduledDashboardsWorker {
         Self { db, dashboards }
     }
 
+    // SPEC-15.1647, SPEC-15.1651, SPEC-15.1652
     /// Process up to `limit` due schedules in a single transaction.
     /// Exposed publicly so the integration test can drive the
     /// worker deterministically (no sleep / no spawn).
@@ -155,6 +156,7 @@ impl ScheduledDashboardsWorker {
         Ok(stats)
     }
 
+    // SPEC-15.1648, SPEC-15.1650
     /// Run one schedule end-to-end: pull the dashboard, render a
     /// text snapshot of its layout, look up the recipient, and
     /// INSERT into `notifications` so the DispatcherWorker sends
@@ -218,6 +220,7 @@ impl ScheduledDashboardsWorker {
 
 #[async_trait]
 impl Job for ScheduledDashboardsWorker {
+    // SPEC-15.1647: job name
     fn name(&self) -> &'static str {
         "scheduled_dashboards"
     }
@@ -230,6 +233,7 @@ impl Job for ScheduledDashboardsWorker {
     }
 }
 
+// SPEC-15.1648
 /// Render the dashboard's layout JSONB into a text snapshot suitable
 /// for the email body. v1 surfaces the dashboard name + the widget
 /// keys the SPA stored - enough for the recipient to know what got
@@ -250,6 +254,7 @@ fn render_snapshot(name: &str, layout: &serde_json::Value) -> String {
     out
 }
 
+// SPEC-15.1649
 /// Pull a flat list of widget keys / labels out of the SPA-owned
 /// `layout` blob. The blob is opaque to the server; the shape the SPA
 /// actually writes (PMS-453) is
@@ -269,6 +274,7 @@ fn extract_widget_keys(layout: &serde_json::Value) -> Vec<String> {
     out
 }
 
+// SPEC-15.1649
 fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
     match v {
         serde_json::Value::Object(map) => {

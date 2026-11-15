@@ -60,6 +60,8 @@ def recent-runs [workflow?: string]: nothing -> table {
 	$runs | select id workflow_id status started commit_sha prettyref
 }
 
+# SPEC-10.372: run and job selection
+
 def main [
 	--run: int			# a run id, used as-is whatever its status
 	--sha: string		# a commit sha (any prefix); picks that commit's run

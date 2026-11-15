@@ -112,6 +112,7 @@ pub fn public_config_routes(snapshot: FeatureSnapshot) -> Router {
 }
 
 /// Every registered feature with its stored state, in registry order.
+// SPEC-15.2103
 async fn list_features(
     State(s): State<FeatureRouterState>,
     _operator: DeploymentOperator,
@@ -142,6 +143,7 @@ async fn list_features(
 /// upsert, so the table cannot grow a row for a feature that does not exist. A
 /// 400 would be wrong here: the client named a resource, and the resource is not
 /// there.
+// SPEC-15.2104, SPEC-15.2106
 async fn set_feature(
     State(s): State<FeatureRouterState>,
     _operator: DeploymentOperator,
@@ -181,6 +183,7 @@ async fn set_feature(
 /// The unauthenticated probe. Reads the snapshot, never the database: it is on
 /// the public path and a probe that queried per request would be a free way to
 /// make the deployment do work.
+// SPEC-15.2108
 async fn public_config(State(snapshot): State<FeatureSnapshot>) -> Json<PublicConfig> {
     Json(PublicConfig {
         features: snapshot.current().as_map(),

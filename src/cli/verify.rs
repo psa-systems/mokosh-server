@@ -152,6 +152,8 @@ pub async fn run(args: &[String]) -> AppResult<()> {
         Mode::Text => print_text(&envelope),
     }
 
+    // SPEC-3.1043: Err (non-zero exit) when any row failed; report is hosting_profile, rows,
+    // deviations, ok.
     if envelope.ok {
         Ok(())
     } else {
@@ -326,6 +328,7 @@ fn merge_email_row(existing: &mut ProviderRow, verify_row: ProviderRow) {
 /// Ok; `SmtpMailer::verify` issues a NOOP against the relay so the NOOP is
 /// the whole interactive check. The timeout keeps a black-holed relay from
 /// stalling a CI job.
+// SPEC-3.1044: build refusal, verify error and 10s timeout each give a distinct Fail detail.
 async fn verify_email(cfg: EmailConfig, mailer_config: MailerConfig) -> ProviderRow {
     let kind = "email".to_string();
     let serving = Some(cfg.provider.as_str().to_string());

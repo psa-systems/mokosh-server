@@ -45,6 +45,7 @@ pub fn check_inline_image_mime(raw: &str) -> AppResult<&'static str> {
         .iter()
         .find(|m| **m == base)
         .copied()
+        // SPEC-4.1001: refusal is BadRequest naming the lowercased, parameter-stripped type.
         .ok_or_else(|| {
             AppError::BadRequest(format!(
                 "Unsupported image type `{base}`; use PNG, JPEG, WebP or GIF"

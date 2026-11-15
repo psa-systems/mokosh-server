@@ -217,6 +217,7 @@ impl DispatcherWorker {
     /// dying: no other worker touches the row until the claim expires, and
     /// once it does the row is due again. `FOR UPDATE SKIP LOCKED` inside the
     /// CTE keeps two live workers from claiming the same row.
+    // SPEC-7.1008: claim and settle run across tenants on the migrator pool.
     async fn claim(&self, limit: i64) -> AppResult<Vec<ClaimedRow>> {
         // SAFETY (PMS-285): the dispatcher drains pending `notifications` across
         // EVERY tenant in one `FOR UPDATE SKIP LOCKED` batch (the worker owns the
@@ -349,6 +350,7 @@ impl DispatcherWorker {
                 }
                 Ok(())
             }
+            // SPEC-7.1009: email and in_app delivery semantics.
             "email" => {
                 let to = match (row.user_id, row.recipient.as_deref()) {
                     (Some(uid), _) => match addresses.get(&(row.tenant_id, uid)) {
@@ -422,6 +424,7 @@ impl DispatcherWorker {
     /// Phase three: write every outcome of the tick back in one transaction,
     /// at most two statements, both independent of the batch size.
     // SPEC-7.625: writes every tick's outcomes in one transaction using at most two statements regardless of batch size, each skipped entirely if its input list is empty.
+    // SPEC-7.1010, SPEC-7.1011, SPEC-7.1012: settled-row columns, worker log levels, settle-failure re-send.
     async fn settle(&self, sent_ids: &[Uuid], settlements: &[Settlement]) -> AppResult<()> {
         if sent_ids.is_empty() && settlements.is_empty() {
             return Ok(());

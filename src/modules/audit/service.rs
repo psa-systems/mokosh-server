@@ -44,6 +44,7 @@ impl AuditService {
         // The same `where_clause` is reused by the count query, which has
         // no JOIN, but `al.<col>` resolves fine there too because the count
         // query also aliases `audit_log` as `al`.
+        // SPEC-5.510: exact-match and inclusive range filters, ANDed, shared by page and count.
         let mut conditions: Vec<String> = vec![];
         let mut idx = 1;
         if tenant_id.is_some() {
@@ -93,6 +94,7 @@ impl AuditService {
         // compose `first_name || ' ' || last_name` with NULLIF on the
         // trimmed result so empty/whitespace-only rows surface as NULL
         // rather than a lone separator string.
+        // SPEC-5.511, SPEC-5.512, SPEC-5.513: newest first; names resolved in SQL.
         let query = format!(
             r#"SELECT al.id, al.tenant_id, al.user_id, al.action, al.entity_type, al.entity_id,
                       al.old_values, al.new_values, al.ip_address, al.user_agent, al.timestamp,
@@ -165,6 +167,7 @@ impl AuditService {
         // $limit_ph / $offset_ph; the count query binds neither.
         q = q.bind(limit).bind(offset);
 
+        // SPEC-5.511: tenant GUC transaction when scoped; privileged pool only for None.
         // When a tenant is in scope, route both reads through a tenant-scoped
         // transaction so the `app.current_tenant` GUC is set. The cross-tenant
         // admin path (`tenant_id == None`) has no tenant value to set.
@@ -183,6 +186,7 @@ impl AuditService {
             let total = cq.fetch_one(self.db.migrator_pool()).await?;
             (rows, total)
         };
+        // SPEC-5.514: INFO line with ids for unresolved actors and person entities.
         let unresolved: Vec<Uuid> = rows
             .iter()
             .filter(|r| r.user_id.is_some() && r.user_name.is_none())
@@ -231,6 +235,7 @@ impl AuditService {
         entity_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<EntityHistoryEntry>, u64)> {
+        // SPEC-5.520: tenant-scoped page and count share HISTORY_WHERE.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(&format!(
             "SELECT COUNT(*) FROM audit_log al WHERE {HISTORY_WHERE}"
@@ -242,6 +247,7 @@ impl AuditService {
         .fetch_one(&mut *tx)
         .await?;
 
+        // SPEC-5.522: same-tenant user join, email fallback for a blank name.
         // `u` is joined on `id` AND `tenant_id` (not RLS alone) so a user in
         // another tenant is never resolved, and the name falls back to the
         // email when the profile name is still blank (a JIT-provisioned
@@ -264,6 +270,7 @@ impl AuditService {
         .fetch_all(&mut *tx)
         .await?;
 
+        // SPEC-5.522: Some user_id with no resolved name is logged by id.
         let entries: Vec<EntityHistoryEntry> = rows.into_iter().map(Into::into).collect();
         // A `Some` user_id with no resolved name means the user row is gone
         // (or cross-tenant, impossible given the join above), which an absent
@@ -289,6 +296,7 @@ impl AuditService {
 /// child arm compares the ticket id inside the JSONB snapshot as text, which
 /// migration 205 indexes; the id is bound twice rather than cast in SQL so
 /// the parameter's type is never inferred two ways.
+// SPEC-5.520, SPEC-5.521: own rows plus a ticket's non-create note rows.
 const HISTORY_WHERE: &str = "al.tenant_id = $1 AND ( \
        (al.entity_type = $2 AND al.entity_id = $3) \
     OR ($2 = 'tickets' AND al.entity_type = 'ticket_notes' AND al.action <> 'create' \
@@ -301,6 +309,7 @@ const HISTORY_WHERE: &str = "al.tenant_id = $1 AND ( \
 /// should not browse, while covering the record types whose detail pages
 /// surface a change history (PMS-182/184/185). `kb_articles` joined in
 /// PMS-1126, when its update, restore and delete started writing rows.
+// SPEC-5.519: the whitelist behind the 404 for other types.
 pub const HISTORY_ENTITY_TYPES: &[&str] =
     &["tickets", "tasks", "projects", "assets", "kb_articles"];
 
@@ -319,6 +328,7 @@ const HISTORY_NOISE_FIELDS: &[&str] = &[
 /// display order. An empty result (e.g. a create with no `old_values`) means
 /// the action label alone carries the information. Shared by the history read
 /// path and the asset audit writer (PMS-204).
+// SPEC-5.523: noise columns dropped, sorted by field, keys only in old are not reported.
 pub fn field_changes(
     old: &Option<serde_json::Value>,
     new: &Option<serde_json::Value>,
@@ -350,6 +360,7 @@ pub fn field_changes(
 /// (PMS-349) to keep the change history free of checkbox noise. Any other
 /// changed field, a non-marker text change, or adding/removing the description
 /// (null <-> text) makes this `false`, so the edit is audited normally.
+// SPEC-5.525: checkbox flips alone are not an audited edit.
 pub fn is_task_marker_only_change(
     old: &Option<serde_json::Value>,
     new: &Option<serde_json::Value>,
@@ -385,6 +396,7 @@ fn normalize_task_markers(s: &str) -> String {
 /// `_id` suffix as `Status id` / `Priority id` / `Assigned to id` (PMS-370,
 /// follow-up to PMS-359). Centralising it here means any future FK field
 /// inherits the cleanup without a client change.
+// SPEC-5.524: strip one trailing `_id`, underscores to spaces.
 fn humanize_field(field: &str) -> String {
     field.strip_suffix("_id").unwrap_or(field).replace('_', " ")
 }
@@ -408,6 +420,7 @@ impl From<HistoryRow> for EntityHistoryEntry {
         // keep the exact column (`status_id`, `priority_id`, `assigned_to_id`)
         // for fidelity, but the history feed renders the FK suffix stripped so
         // the SPA shows `Status` / `Priority` / `Assigned to` (PMS-370).
+        // SPEC-5.524: humanized names; changed_fields mirrors changes.
         let changes: Vec<FieldChange> = field_changes(&r.old_values, &r.new_values)
             .into_iter()
             .map(|c| FieldChange {

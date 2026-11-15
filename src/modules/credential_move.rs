@@ -29,6 +29,7 @@ use crate::utils::error::{AppError, AppResult};
 ///
 /// The caller has already done the write; this is the invariant that decides
 /// whether to trust it.
+// SPEC-5.300, SPEC-5.301
 pub fn verify_readback(readback: Option<&str>, expected: &str) -> AppResult<()> {
     if readback == Some(expected) {
         Ok(())
@@ -62,6 +63,7 @@ pub fn verify_readback(readback: Option<&str>, expected: &str) -> AppResult<()> 
 /// followed by a `read_back` that returns anything other than `Some(value)`
 /// returns an `AppError::Configuration` whose message names the failure
 /// mode and never the value.
+// SPEC-5.302
 pub async fn move_value_with_readback<'a, Write, WriteFut, ReadBack, ReadBackFut>(
     value: &'a str,
     write: Write,

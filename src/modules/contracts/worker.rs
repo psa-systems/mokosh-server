@@ -38,6 +38,7 @@ impl Job for ContractLifecycleWorker {
         "contract_lifecycle"
     }
 
+    // SPEC-13.1350
     async fn run(&self) -> AppResult<()> {
         let (renewed, expired) = self
             .service

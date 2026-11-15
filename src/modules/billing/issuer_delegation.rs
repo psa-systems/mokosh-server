@@ -8,6 +8,7 @@
 
 use crate::utils::error::{AppError, AppResult};
 
+// SPEC-13.1005
 /// The external provider for one tenant's Invoicing delegation.
 ///
 /// `Xero` and `Quickbooks` are the two providers whose registry entries
@@ -126,6 +127,7 @@ impl DelegationDispatch {
         Self { delegated }
     }
 
+    // SPEC-13.1006, SPEC-13.1007: more than one delegation is a 409
     /// Which provider the next issuance picks, or `Err(..)` naming the
     /// disagreement. `None` means the local path is chosen (the current
     /// system of record is Mokosh, which is also the Phase 0 default).
@@ -145,6 +147,7 @@ impl DelegationDispatch {
     }
 }
 
+// SPEC-13.1008
 /// The only impl of [`ExternalIssuer`] in the repo, for every variant of
 /// [`ExternalInvoicingProvider`]. The shipped Xero and QuickBooks clients
 /// (`provider_invoice::xero`, `provider_invoice::quickbooks`) issue

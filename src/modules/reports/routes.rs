@@ -70,6 +70,7 @@ struct ReportDescriptor {
     parameters: &'static [ParamSpec],
 }
 
+// SPEC-15.1577: the one registry served by GET /reports and resolved by export
 /// The one list of reports (PMS-839). `GET /reports` serves it verbatim and
 /// `GET /reports/{key}/export` resolves its path segment through it, so the
 /// registry, the export switch and the 404 all read from the same array.
@@ -142,6 +143,7 @@ const REPORTS: &[ReportDescriptor] = &[
     },
 ];
 
+// SPEC-15.1576: every handler takes RequireReports (404 when the module is off)
 pub fn reports_routes(service: ReportsService) -> Router {
     let state = ReportsRouterState {
         service: Arc::new(service),
@@ -168,6 +170,7 @@ struct DateRange {
     to: Option<NaiveDate>,
 }
 
+// SPEC-15.1577
 /// Registry of available report types and their parameter schemas, so a
 /// client can discover what it can run (PMS-93 AC1).
 async fn list_reports(
@@ -183,6 +186,7 @@ struct DashboardQ {
     team_id: Option<Uuid>,
 }
 
+// SPEC-15.1579
 async fn dashboard(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
@@ -195,6 +199,7 @@ async fn dashboard(
     ))
 }
 
+// SPEC-15.1582
 async fn tickets_report(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
@@ -207,6 +212,7 @@ async fn tickets_report(
     ))
 }
 
+// SPEC-15.1584
 async fn time_report(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
@@ -224,6 +230,7 @@ struct BillingQ {
     company_id: Option<Uuid>,
 }
 
+// SPEC-15.1578, SPEC-15.1585
 async fn billing_report(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
@@ -233,6 +240,7 @@ async fn billing_report(
     Ok(Json(s.service.billing(u.tenant(), q.company_id).await?))
 }
 
+// SPEC-15.1587
 async fn projects_report(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
@@ -240,6 +248,7 @@ async fn projects_report(
     Ok(Json(s.service.projects(u.tenant()).await?))
 }
 
+// SPEC-15.1578, SPEC-15.1588
 async fn clients_report(
     State(s): State<ReportsRouterState>,
     RequireReports { user: u, .. }: RequireReports,
@@ -253,6 +262,7 @@ async fn clients_report(
     Ok(Json(s.service.clients(u.tenant()).await?))
 }
 
+// SPEC-15.1598
 /// Catalog the custom-report builder draws from (PMS-180): sources and
 /// their whitelisted dimensions / measures / filters.
 async fn custom_schema(
@@ -261,6 +271,7 @@ async fn custom_schema(
     Ok(Json(custom::schema()))
 }
 
+// SPEC-15.1603
 /// Run a whitelisted custom report. Returns the generic columns / rows /
 /// totals envelope as JSON, or CSV when the spec sets `"format": "csv"`.
 async fn custom_run(
@@ -295,6 +306,7 @@ fn default_csv() -> String {
     "csv".into()
 }
 
+// SPEC-15.1591, SPEC-15.1592, SPEC-15.1593, SPEC-15.1578: format is parsed before the key; finance gate above the format switch
 /// Generic export. `:report` selects which report to serialise; `csv` and
 /// `pdf` are the implemented formats (PMS-876). Every other value is a 400 and
 /// not a 501: one branch serves them all, so an unsupported `format` is an
@@ -424,6 +436,7 @@ enum ExportFormat {
 }
 
 impl ExportFormat {
+    // SPEC-15.1591: csv or pdf, else 400
     fn parse(raw: &str) -> AppResult<Self> {
         if raw.eq_ignore_ascii_case("csv") {
             Ok(Self::Csv)
@@ -438,6 +451,7 @@ impl ExportFormat {
     }
 }
 
+// SPEC-15.1593, SPEC-15.1594
 /// Serialize one report's data in the requested format.
 ///
 /// The two writers travel together in one call rather than in two arms of a
@@ -503,6 +517,7 @@ async fn emit<T>(
     }
 }
 
+// SPEC-15.1595
 fn csv_for_dashboard(r: &DashboardResponse) -> String {
     let mut s = String::from("priority,open_count\n");
     for b in &r.open_by_priority {
@@ -517,6 +532,7 @@ fn csv_for_dashboard(r: &DashboardResponse) -> String {
     s
 }
 
+// SPEC-15.1595
 fn csv_for_tickets(r: &TicketsReportResponse) -> String {
     let mut s = format!("from,to\n{},{}\n\nstatus,opened\n", r.from, r.to);
     for b in &r.opened_by_status {
@@ -538,6 +554,7 @@ fn csv_for_tickets(r: &TicketsReportResponse) -> String {
     s
 }
 
+// SPEC-15.1595
 fn csv_for_time(r: &TimeReportResponse) -> String {
     let mut s = format!("from,to\n{},{}\n\nuser_id,minutes\n", r.from, r.to);
     for i in &r.minutes_by_user {
@@ -550,6 +567,7 @@ fn csv_for_time(r: &TimeReportResponse) -> String {
     s
 }
 
+// SPEC-15.1596
 /// PMS-772. `count` is the grouped-count header every other export uses.
 /// A request type with no tracked time in the period leaves the three
 /// measurement cells empty rather than writing 0: no data is not a zero
@@ -575,6 +593,7 @@ fn csv_for_request_types(r: &RequestTypeDurationsResponse) -> String {
     s
 }
 
+// SPEC-15.1595
 fn csv_for_billing(r: &BillingReportResponse) -> String {
     let mut s = String::from("metric,amount\n");
     s.push_str(&format!("invoiced,{}\n", r.invoiced));
@@ -587,6 +606,7 @@ fn csv_for_billing(r: &BillingReportResponse) -> String {
     s
 }
 
+// SPEC-15.1595
 fn csv_for_projects(r: &ProjectsReportResponse) -> String {
     let mut s = String::from("status,count\n");
     for b in &r.by_status {
@@ -603,6 +623,7 @@ fn csv_for_projects(r: &ProjectsReportResponse) -> String {
     s
 }
 
+// SPEC-15.1595
 fn csv_for_clients(r: &ClientsReportResponse) -> String {
     let mut s = String::from("metric,value\n");
     s.push_str(&format!("companies_total,{}\n", r.companies_total));
@@ -669,6 +690,7 @@ fn pdf_for_dashboard(r: &DashboardResponse, title: &str) -> pdf::Document {
         )
 }
 
+// SPEC-15.1597, SPEC-15.1583
 fn pdf_for_tickets(r: &TicketsReportResponse, title: &str) -> pdf::Document {
     // PMS-1491: `assignee_name` is `None` both for a legitimately unassigned
     // ticket (`assignee_id` is also `None`) and for an id whose name failed
@@ -732,6 +754,7 @@ fn pdf_for_time(r: &TimeReportResponse, title: &str) -> pdf::Document {
         )
 }
 
+// SPEC-15.1596
 /// A request type with no tracked time in the period leaves its three
 /// measurement cells empty rather than writing 0, exactly as the CSV does: no
 /// data is not a zero measurement (PMS-732).
@@ -766,6 +789,7 @@ fn pdf_for_request_types(r: &RequestTypeDurationsResponse, title: &str) -> pdf::
         )
 }
 
+// SPEC-15.1597
 fn pdf_for_billing(r: &BillingReportResponse, title: &str) -> pdf::Document {
     pdf::Document::new(title)
         .subtitle(match &r.company_name {
@@ -842,6 +866,7 @@ fn pdf_for_clients(r: &ClientsReportResponse, title: &str) -> pdf::Document {
         )
 }
 
+// SPEC-15.1589
 /// PMS-732: how long each client-request type actually takes, measured from
 /// the time tracked against the tickets those requests produced.
 async fn request_types_report(

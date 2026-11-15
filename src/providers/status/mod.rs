@@ -156,6 +156,7 @@ pub fn collect() -> ProviderStatusReport {
 // from config::check_staleness(); staleness_state_name maps the four
 // staleness states to exactly the wire strings unchanged, appeared,
 // disappeared and changed_provider.
+// SPEC-3.1031: enabled is the installed chain in priority order, else one environment slot.
 fn collect_configuration_kind(
     installed_chain: Option<&ConfigProviderChain>,
     generation: &Generation,
@@ -321,6 +322,7 @@ fn collect_secrets_application_kind(secrets: Option<Arc<AppSecrets>>) -> Provide
 // SPEC-3.63: never enumerates per-key rows (keys is always empty),
 // because enumerating a tenant secret would require a tenant scope
 // the collector does not hold.
+// SPEC-3.1032: tenant, storage and email kinds report one provider at priority 0, equal to serving.
 fn collect_secrets_tenant_kind(
     hosting_profile: DeploymentMode,
 ) -> (ProviderKindReport, Option<Vec<&'static str>>) {
@@ -429,6 +431,7 @@ fn collect_storage_kind(
 // is approximated as "OIDC_ISSUER and OIDC_AUDIENCE are both
 // non-empty," matching the verifier's own construction check, with a
 // distinct reason string when not reachable.
+// SPEC-3.1033: enabled is the resolved AuthProviderSelection in order; serving is the first.
 fn collect_authentication_kind(
     hosting_profile: DeploymentMode,
 ) -> (ProviderKindReport, Option<Vec<&'static str>>) {

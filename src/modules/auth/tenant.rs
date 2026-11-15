@@ -46,6 +46,7 @@ use super::CurrentUser;
 /// fn scoped(_t: TenantId) {}
 /// scoped(uuid::Uuid::nil()); // error[E0308]: expected `TenantId`, found `Uuid`
 /// ```
+// SPEC-5.5: transparent sqlx binding + Deref/From keep begin_with_tenant and leaf call sites polymorphic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type)]
 #[sqlx(transparent)]
 pub struct TenantId(Uuid);
@@ -55,6 +56,7 @@ impl TenantId {
     /// is [`TenantScoped::tenant`], so within the server a `TenantId` can only
     /// be produced from an authenticated [`CurrentUser`]. External crates
     /// (and the cross-tenant escape hatch) go through [`TenantId::from_trusted`].
+    // SPEC-5.3: sole in-crate caller is TenantScoped::tenant on CurrentUser.
     pub(crate) fn new(id: Uuid) -> Self {
         Self(id)
     }
@@ -77,6 +79,7 @@ impl TenantId {
     ///
     /// It is deliberately verbose and greppable: a reviewer should be able to
     /// audit every call. Never pass unvalidated request input here.
+    // SPEC-5.4: verbosely named so a reviewer can grep every cross-tenant escape hatch call.
     pub fn from_trusted(id: Uuid) -> Self {
         Self(id)
     }

@@ -24,6 +24,7 @@ use crate::utils::error::AppResult;
 
 /// Default retention window: 13 months, expressed in days so the value
 /// stays constant across leap years.
+// SPEC-15.2118
 pub const DEFAULT_RETENTION_DAYS: i64 = 395;
 
 /// Deletes `status_observations` older than the retention cutoff.
@@ -50,6 +51,7 @@ impl StatusRetentionWorker {
 
     /// One tick, exposed as a plain method so a test can drive it
     /// deterministically without going through the Scheduler.
+    // SPEC-15.2118
     pub async fn run_tick(&self) -> AppResult<u64> {
         let cutoff = Utc::now() - chrono::Duration::from_std(self.retention).unwrap_or_default();
         let removed = self.service.purge_older_than(cutoff).await?;

@@ -142,6 +142,7 @@ impl NotificationsService {
 
     // PMS-87 channels CRUD ----------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.1001: list ordering and sort rejection for channels, templates and rules.
     pub async fn list_channels(
         &self,
         tenant_id: TenantId,
@@ -187,6 +188,7 @@ impl NotificationsService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    // SPEC-7.1000: create/update validation and defaults for channels, templates and rules.
     pub async fn create_channel(
         &self,
         tenant_id: TenantId,
@@ -530,6 +532,7 @@ impl NotificationsService {
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     // SPEC-7.586: upserts on the unique (user_id, event_type) constraint; the caller can only ever write their own preferences.
+    // SPEC-7.1007: preference values are stored unvalidated.
     pub async fn upsert_user_preference(
         &self,
         tenant_id: TenantId,
@@ -659,6 +662,7 @@ impl NotificationsService {
             .await
     }
 
+    // SPEC-7.1006: mark-read and inbox row semantics.
     async fn mark_read_for(
         &self,
         tenant_id: TenantId,
@@ -991,6 +995,7 @@ impl NotificationsService {
         // PMS-1171: the whole sentence, because the renderer cannot express
         // "only if there is an address". `msp_support_email` stays supplied
         // for a tenant who has customised their own template around it.
+        // SPEC-7.1005: the footer line uses the tenant's stored support email.
         ensure_key(
             "msp_footer_line",
             serde_json::Value::String(footer_line(&effective_name, &support_email)),
@@ -1056,6 +1061,7 @@ impl NotificationsService {
     ) -> AppResult<u64> {
         // SPEC-7.559: dispatch opens exactly one begin_with_tenant transaction per call, covering rule lookup, template load, preference reads and every insert, and commits it before returning.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // SPEC-7.1013: no matching rule queues nothing; any failure rolls back the whole dispatch.
         let messages = self
             .render_event(&mut tx, tenant_id, event_type, context)
             .await?;
@@ -1263,6 +1269,7 @@ impl NotificationsService {
         .fetch_all(&mut *conn)
         .await?;
 
+        // SPEC-7.1003: dispatch does not check recipient user existence or status.
         let ctx_user_id: Option<Uuid> = context
             .get("recipient_user_id")
             .and_then(|v| v.as_str())
@@ -1535,6 +1542,7 @@ impl NotificationsService {
     /// tenant-scoped read, keyed by `user_id`. Used by
     /// [`preview`](Self::preview) to show a user fan-out as the address
     /// the worker would actually mail.
+    // SPEC-7.1004: no status = 'active' filter here, unlike the worker lookup.
     async fn load_user_emails(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -1667,6 +1675,7 @@ struct RenderedNotification {
 /// matching it, since a rule cannot be scoped by a field the event never
 /// carries.
 // SPEC-7.564: a missing context key never matches, an array expected value matches by containment ("in"), a scalar expected value requires exact equality; absent conditions or {} match unconditionally.
+// SPEC-7.1002: a non-object conditions value matches every context.
 fn rule_conditions_match(conditions: &serde_json::Value, context: &serde_json::Value) -> bool {
     let Some(map) = conditions.as_object() else {
         return true;

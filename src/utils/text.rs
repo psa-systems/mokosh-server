@@ -257,13 +257,16 @@ mod server_impl {
     /// which removes the second `serde_json` parse every JSON request used
     /// to pay for.
     // SPEC-4.38: skip raw-body/non-JSON/oversized paths; else stash parsed tree, empty the body.
+    // SPEC-4.1010: only application/json and +json bodies; undeclared-length overflow is 413.
     pub async fn sanitize_json_body(request: Request, next: Next) -> Response {
         let path = request.uri().path();
+        // SPEC-2.67
         if RAW_BODY_PATHS.iter().any(|p| path.starts_with(p)) {
             return next.run(request).await;
         }
         let is_json =
             header_str(request.headers(), header::CONTENT_TYPE).is_some_and(is_json_content_type);
+        // SPEC-2.68
         if !is_json {
             return next.run(request).await;
         }
@@ -278,6 +281,7 @@ mod server_impl {
                 })
                 .ok()
         });
+        // SPEC-2.69
         if declared_len.is_some_and(|len| len > MAX_SANITIZED_JSON_BYTES) {
             return next.run(request).await;
         }
@@ -294,6 +298,7 @@ mod server_impl {
                     error = %err,
                     "could not buffer JSON request body for invisible-character sanitization",
                 );
+                // SPEC-2.70
                 return AppError::PayloadTooLarge(
                     "The request body could not be read.".to_string(),
                 )
@@ -308,6 +313,7 @@ mod server_impl {
         let parsed = (!bytes.is_empty())
             .then(|| parse_and_sanitize(&bytes, &path))
             .flatten();
+        // SPEC-2.71
         let Some((value, _)) = parsed else {
             return next
                 .run(Request::from_parts(parts, Body::from(bytes)))
@@ -322,6 +328,7 @@ mod server_impl {
         parts
             .extensions
             .insert(crate::utils::json::ParsedJsonBody(value));
+        // SPEC-2.72
         parts.headers.remove(header::CONTENT_LENGTH);
         next.run(Request::from_parts(parts, Body::empty())).await
     }
@@ -537,6 +544,34 @@ mod server_impl {
     }
 }
 
+/// Escape the two SQL LIKE / ILIKE wildcards in `needle` so a user-typed
+/// `%` or `_` matches literally instead of expanding across every row.
+///
+/// Callers wrap the returned string with their own `%...%` on either side
+/// (substring) or `...` (prefix) and bind with `ESCAPE '\'`: the backslash
+/// is the SQL-standard escape char and does not collide with any
+/// Postgres-standard meta character inside the pattern.
+///
+/// PMS-1664: typeahead endpoints that did `format!("%{needle}%")` on a
+/// user-typed string matched `%` as "anything" and `_` as "any single
+/// character", so a user who searched for literal `100%` or `a_b` got
+/// the wrong rows and leaked some intent to the next read. This escapes
+/// the wildcards so the query asks what the user actually typed.
+#[inline]
+pub fn escape_like_wildcards(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len());
+    for c in needle.chars() {
+        match c {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(c);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,5 +605,20 @@ mod tests {
         ] {
             assert!(!is_secret_field(ordinary), "{ordinary} should be sanitized");
         }
+    }
+
+    #[test]
+    fn like_escape_passes_text_through_untouched() {
+        assert_eq!(escape_like_wildcards(""), "");
+        assert_eq!(escape_like_wildcards("acme"), "acme");
+        assert_eq!(escape_like_wildcards("Acme Co."), "Acme Co.");
+    }
+
+    #[test]
+    fn like_escape_prefixes_percent_underscore_and_backslash() {
+        assert_eq!(escape_like_wildcards("100%"), "100\\%");
+        assert_eq!(escape_like_wildcards("a_b"), "a\\_b");
+        assert_eq!(escape_like_wildcards(r"c:\path"), r"c:\\path");
+        assert_eq!(escape_like_wildcards("%_"), "\\%\\_");
     }
 }

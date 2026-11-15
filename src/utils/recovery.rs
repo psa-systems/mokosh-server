@@ -22,6 +22,7 @@ pub fn generate_code() -> String {
     format!("{}-{}", &raw[..8], &raw[8..])
 }
 
+// SPEC-4.1002: RECOVERY_CODE_COUNT independent codes; hash_code_hex is lowercase hex.
 pub fn generate_set() -> Vec<String> {
     (0..RECOVERY_CODE_COUNT).map(|_| generate_code()).collect()
 }

@@ -32,6 +32,7 @@ use sqlx::PgConnection;
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
 
+// SPEC-15.1535: connected only via an integrations row with status connected
 /// What a serving read joins to decide that a gateway is connected.
 ///
 /// The gateway row is `g` and the integration row is `i`, so a caller's `WHERE`
@@ -51,6 +52,7 @@ pub const GATEWAY_INTEGRATION_LEFT_JOIN: &str = "LEFT JOIN integrations i \
                                                  ON i.tenant_id = g.tenant_id \
                                                 AND i.provider = g.provider";
 
+// SPEC-15.1535: no integrations row reads as not connected
 /// The connected flag, derived, for a read that uses
 /// [`GATEWAY_INTEGRATION_LEFT_JOIN`].
 ///
@@ -60,6 +62,7 @@ pub const GATEWAY_INTEGRATION_LEFT_JOIN: &str = "LEFT JOIN integrations i \
 /// migration 256 ran.
 pub const CONNECTED_GATEWAY_FLAG: &str = "COALESCE(i.status = 'connected', FALSE)";
 
+// SPEC-15.1531, SPEC-15.1532, SPEC-15.1533: single writer of payment connected state
 /// Record whether `provider` is connected for `tenant_id`, inside the caller's
 /// transaction.
 ///
@@ -97,6 +100,7 @@ pub async fn set_payment_connection(
     // activation: `upsert_payment_gateway` refuses to activate any provider
     // outside `billing::provider::SUPPORTED` before reaching this call, and a
     // provider with no row is never connected by `CONNECTED_GATEWAY_JOIN`.
+    // SPEC-15.1534: no integrations entry for this provider, nothing written
     if mokosh_types::integrations::IntegrationProvider::from_str(provider).is_none() {
         tracing::debug!(
             provider,

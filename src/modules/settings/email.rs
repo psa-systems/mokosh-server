@@ -102,6 +102,7 @@ impl EmailSettingsView {
 }
 
 /// Read the stored config object for the system tenant, if present.
+// SPEC-15.2042
 async fn load_stored(db: &Database) -> AppResult<Option<StoredEmailConfig>> {
     let mut tx = db.begin_with_tenant(system_tenant()).await?;
     let value: Option<serde_json::Value> = sqlx::query_scalar(
@@ -126,6 +127,7 @@ async fn load_stored(db: &Database) -> AppResult<Option<StoredEmailConfig>> {
 /// stored config object. Mirrors `from_env`'s invariant that a username with no
 /// password is a hard error (an unauthenticated SMTP send is a misconfiguration,
 /// not a silent fallback) - the override path must not weaken it.
+// SPEC-15.2040: env baseline plus non-empty stored fields; username needs password
 fn config_from_stored(stored: &StoredEmailConfig, enc_key: &[u8; 32]) -> AppResult<MailerConfig> {
     let mut cfg = MailerConfig::from_env()?;
     if let Some(host) = stored.host.as_deref().filter(|s| !s.is_empty()) {
@@ -176,6 +178,7 @@ pub async fn resolve_mailer_config(db: &Database, enc_key: &[u8; 32]) -> AppResu
 /// DB clears the host. Changing the provider itself is a boot decision (see
 /// [`EmailConfig::from_env`]), matching how the bootstrap tier keys in
 /// [`crate::config::registry::Tier::Bootstrap`] behave.
+// SPEC-15.2041
 pub async fn rebuild_and_swap(
     db: &Database,
     enc_key: &[u8; 32],
@@ -199,6 +202,7 @@ pub async fn rebuild_and_swap(
 }
 
 /// Current stored email settings (password masked). No row => all-empty view.
+// SPEC-15.2037
 pub async fn get_email_settings(db: &Database) -> AppResult<EmailSettingsView> {
     let stored = load_stored(db).await?.unwrap_or_default();
     Ok(EmailSettingsView::from_stored(stored))
@@ -206,6 +210,7 @@ pub async fn get_email_settings(db: &Database) -> AppResult<EmailSettingsView> {
 
 /// Persist the email settings for the system tenant, encrypting a new password,
 /// then return the masked view. Callers rebuild + swap the live mailer after.
+// SPEC-15.2038, SPEC-15.2039, SPEC-15.2040
 pub async fn put_email_settings(
     db: &Database,
     enc_key: &[u8; 32],

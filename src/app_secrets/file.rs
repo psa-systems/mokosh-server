@@ -91,6 +91,8 @@ impl AppSecretProvider for FileProvider {
     /// called when `APP_SECRETS_DIR` is set. `write` creates the file if it
     /// is missing and replaces it atomically enough for the CLI's purposes
     /// (a partial write is caught by the migrate command's read-back).
+    // SPEC-3.1006: writes without creating the directory; write and non-NotFound delete errors name
+    // the path.
     async fn set(&self, secret: GovernedSecret, value: &str) -> AppResult<()> {
         let path = self.path_for(secret);
         std::fs::write(&path, value).map_err(|e| {

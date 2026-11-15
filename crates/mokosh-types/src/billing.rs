@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 /// Invoice status; mirrors the CHECK constraint on `invoices.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// SPEC-4.1041: seven snake_case statuses and seven line types; from_str is None otherwise.
 pub enum InvoiceStatus {
     Draft,
     Pending,

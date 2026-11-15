@@ -2,8 +2,7 @@
 //!
 //! Axum-based REST API for Mokosh Server.
 
-// SPEC-1 and 2.172: the crate root wires every top-level module (api/app_secrets/cli/config/db/infisical/modules/pdf/providers/scheduler/ secrets/storage/utils/version/version_check) and re-exports
-// `Database`, `AuthState`, `CurrentUser`, `AppError`, `AppResult`, `VersionInfo` at the crate root below, so downstream code can reach them as `mokosh_server::X` rather than through the full module path.
+// SPEC-2.283
 pub mod api;
 pub mod app_secrets;
 pub mod cli;
@@ -59,12 +58,11 @@ mod repo_hygiene {
         "tmp",
     ];
 
+    // SPEC-2.284
     /// The client repository is `mokosh-apps`; its former name resolves to
     /// nothing. Three doc audits reported the same stale set before PMS-856
     /// swept it, so the ban is enforced here rather than restated in prose. The
     /// needle is assembled at runtime so this file is not itself a hit.
-    // SPEC-1 and 2.173: this test is the enforcement site. It walks every tracked file under `CARGO_MANIFEST_DIR` (skipping `SKIP_DIRS` and any `.env*` file except `.env.example`)
-    // and fails if the runtime-assembled needle (the former client repo name, built as `mokosh-` plus the word this test's name alludes to) appears as a byte substring anywhere.
     #[test]
     fn the_former_client_repo_name_stays_gone() {
         let needle = format!("mokosh-{}", "clients");
@@ -105,6 +103,7 @@ mod repo_hygiene {
         );
     }
 
+    // SPEC-2.285
     /// PMS-1254: a database-backed integration test is `#[mokosh_test]`.
     ///
     /// The attribute clones each test's database from one migrated template
@@ -119,8 +118,6 @@ mod repo_hygiene {
     /// elsewhere naming the old attribute is history rather than a call site.
     ///
     /// The needle is assembled at runtime so this file is not itself a hit.
-    // SPEC-1 and 2.174: this test is the enforcement site. It scans every `.rs` file under `tests/` line by line for the runtime-assembled
-    // needle `#[sqlx::test` and fails if any line contains it, since a database-backed test must instead carry `#[mokosh_test]`.
     #[test]
     fn every_database_backed_test_takes_the_template_attribute() {
         let needle = format!("#[sq{}::test", "lx");
@@ -157,6 +154,7 @@ mod repo_hygiene {
         );
     }
 
+    // SPEC-2.286
     /// PMS-1394: the supported and unsupported test profiles are complements.
     ///
     /// `.config/nextest.toml` splits the Postgres-backed suite in two: the `ci`
@@ -173,8 +171,6 @@ mod repo_hygiene {
     /// and the convention that keeps the check meaningful is that the pair is
     /// written as `X` and `not X` rather than as two expressions that happen to
     /// mean the same thing.
-    // SPEC-1 and 2.175: this test is the enforcement site. It reads `.config/nextest.toml`, extracts each of `[profile.ci]`'s and `[profile.unsupported]`'s `default-filter`
-    // string, and fails unless the unsupported filter equals `"not "` prepended to the ci filter (a literal text comparison, not an expression-equivalence check).
     #[test]
     fn the_supported_and_unsupported_test_profiles_are_complements() {
         let config = std::fs::read_to_string(
@@ -220,6 +216,7 @@ mod repo_hygiene {
         );
     }
 
+    // SPEC-2.287
     /// PMS-1010: a selectable implementation is a PROVIDER, and the two words
     /// it replaced do not come back.
     ///
@@ -238,8 +235,6 @@ mod repo_hygiene {
     ///
     /// The needles are assembled rather than written, because this file would
     /// otherwise be a hit on itself.
-    // SPEC-1 and 2.176: this test is the enforcement site. It walks every `.rs` file under `src/secrets/` and `src/storage/`, and for every non-comment line containing a declaration keyword (`mod`/`struct`/`enum`/`trait`/`type`/`fn`/`union`/`const`/`static`)
-    // extracts the identifier that follows and fails if it contains the runtime-assembled substring `store` or `backend`; it does not scan prose or the `SECRET_BACKEND` / `STORAGE_BACKEND` env var names.
     #[test]
     fn the_provider_seams_declare_no_store_and_no_backend() {
         let retired = [format!("st{}", "ore"), format!("back{}", "end")];

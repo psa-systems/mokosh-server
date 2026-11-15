@@ -27,6 +27,7 @@ pub struct Person {
 }
 
 impl Person {
+    // SPEC-15.1087
     /// Every handle this person answers to, lowercased, the client's rule.
     fn handles(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
@@ -54,6 +55,7 @@ fn is_handle_char(c: char) -> bool {
     c.is_alphanumeric() || c == '.' || c == '_' || c == '-'
 }
 
+// SPEC-15.1086
 /// Every `@handle` token in `body`, lowercased, unique, in order of first
 /// appearance.
 pub fn tokens(body: &str) -> Vec<String> {
@@ -87,6 +89,7 @@ pub fn tokens(body: &str) -> Vec<String> {
     out
 }
 
+// SPEC-15.1088
 /// The one person `token` names, or `None` when it names nobody or more
 /// than one.
 pub fn resolve(token: &str, people: &[Person]) -> Option<Uuid> {
@@ -106,6 +109,7 @@ pub fn resolve(token: &str, people: &[Person]) -> Option<Uuid> {
     found
 }
 
+// SPEC-15.1089
 /// Every person `body` mentions, unique, in order of first mention.
 pub fn mentioned(body: &str, people: &[Person]) -> Vec<Uuid> {
     let unresolved: Vec<Uuid> = people

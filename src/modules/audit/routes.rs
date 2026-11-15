@@ -26,6 +26,7 @@ pub fn audit_routes(service: AuditService) -> Router {
     let state = AuditRouterState {
         service: Arc::new(service),
     };
+    // SPEC-5.508: GET-only surface; the API has no audit update or delete.
     Router::new()
         .route("/audit-log", get(list_audit_log))
         .route("/audit-log/export.csv", get(export_audit_log_csv))
@@ -41,6 +42,7 @@ pub fn audit_routes(service: AuditService) -> Router {
 /// limited to the whitelisted entity types, so a user can review the edit
 /// history of a record they can already see (PMS-182/184/185) without gaining
 /// the full tenant audit trail. An unknown entity type is a 404.
+// SPEC-5.519, SPEC-5.520: any member, whitelisted types only, tenant-scoped.
 async fn list_entity_history(
     State(s): State<AuditRouterState>,
     RequireAuth(u): RequireAuth,
@@ -62,6 +64,7 @@ async fn list_entity_history(
     )))
 }
 
+// SPEC-5.508, SPEC-5.509: admin gate, own tenant, 422 on sort or over-long filters.
 async fn list_audit_log(
     State(s): State<AuditRouterState>,
     RequireAuth(u): RequireAuth,
@@ -92,6 +95,7 @@ async fn list_audit_log(
 /// inside a single filter scope is large enough that the operator
 /// should narrow the date range, and the cap keeps a runaway request
 /// from holding a DB connection for minutes.
+// SPEC-5.508, SPEC-5.515, SPEC-5.518: admin gate, same filters, attachment response.
 async fn export_audit_log_csv(
     State(s): State<AuditRouterState>,
     RequireAuth(u): RequireAuth,
@@ -99,6 +103,7 @@ async fn export_audit_log_csv(
     Query(filter): Query<AuditLogFilter>,
 ) -> AppResult<axum::response::Response> {
     filter.validate()?;
+    // SPEC-5.518: intended 50,000-row ceiling.
     let pagination = PaginationParams {
         page: 1,
         per_page: 50_000,
@@ -112,6 +117,7 @@ async fn export_audit_log_csv(
     // Header row. Matches the column order an operator typically wants
     // when reviewing the export in a spreadsheet (when -> who -> what
     // -> target -> network metadata).
+    // SPEC-5.516: fixed header then one row per entry.
     buf.push_str(
         "timestamp,actor,actor_id,action,entity_type,entity_id,entity_name,ip_address,user_agent\n",
     );
@@ -163,6 +169,7 @@ async fn export_audit_log_csv(
 /// Append `value` to the CSV buffer, quoting it when it contains a
 /// comma, quote, or newline. The doubled-quote convention is the
 /// standard CSV escape (RFC 4180).
+// SPEC-5.517: RFC 4180 quoting.
 fn push_csv_field(buf: &mut String, value: &str) {
     let needs_quoting = value.contains([',', '"', '\n', '\r']);
     if needs_quoting {

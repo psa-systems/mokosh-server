@@ -38,6 +38,8 @@ def slug [heading: string] {
     | str replace --all ' ' '-'
 }
 
+# SPEC-10.367: anchor slug and self-test
+
 # Every heading anchor a Markdown file defines.
 def anchors-in [text: string] {
     prose-lines $text

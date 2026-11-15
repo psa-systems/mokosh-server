@@ -80,6 +80,7 @@ pub enum JsonRejection {
     Deserialize(serde_json::Error),
 }
 
+// SPEC-4.1006: pre-parsed deserialize failure is 422 with a fixed-prefix text body.
 impl IntoResponse for JsonRejection {
     fn into_response(self) -> Response {
         match self {

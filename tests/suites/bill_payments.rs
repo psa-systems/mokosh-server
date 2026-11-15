@@ -318,7 +318,15 @@ async fn an_unknown_payment_method_is_refused_by_name(pool: PgPool) {
     );
 
     // And the set the server does accept all work.
-    for method in ["check", "credit_card", "ach", "wire", "cash", "other"] {
+    for method in [
+        "check",
+        "credit_card",
+        "ach",
+        "wire",
+        "cash",
+        "paypal",
+        "other",
+    ] {
         let mut request = payment(10_00);
         request.payment_method = method.to_string();
         // 70.00 total, so seven payments of 10.00 fit exactly.

@@ -14,6 +14,7 @@ use crate::utils::error::AppResult;
 /// commits to 60 seconds; a shorter interval buys nothing because the
 /// SPA's banner is a "hey, you have a new hot pattern" nudge, not an
 /// instant-feedback surface.
+// SPEC-15.1019
 pub const REFRESH_INTERVAL_SECS: u64 = 60;
 
 pub struct AssetSignatureDetectorRefresh {
@@ -34,6 +35,7 @@ impl Job for AssetSignatureDetectorRefresh {
         Self::JOB_NAME
     }
 
+    // SPEC-15.1019: concurrent refresh; a failure is returned to the scheduler
     async fn run(&self) -> AppResult<()> {
         // CONCURRENTLY so readers hitting the view mid-refresh see the
         // previous contents rather than an exclusive lock. Needs the

@@ -17,6 +17,7 @@ use crate::db::Database;
 use crate::utils::crypto::hash_password;
 use crate::utils::error::AppResult;
 
+// SPEC-5.6: skip bootstrap silently when env vars absent or blank.
 pub async fn maybe_bootstrap_admin(db: &Database) -> AppResult<()> {
     let (email, password) = match (
         crate::config::get(&crate::config::registry::ADMIN_EMAIL),
@@ -34,6 +35,7 @@ pub async fn maybe_bootstrap_admin(db: &Database) -> AppResult<()> {
         .fetch_one(db.migrator_pool())
         .await?;
 
+    // SPEC-5.8: idempotent short-circuit when any platform admin already exists.
     if platform_count > 0 {
         tracing::info!(
             platform_admins = platform_count,
@@ -54,6 +56,7 @@ pub async fn maybe_bootstrap_admin(db: &Database) -> AppResult<()> {
     let admin_id = Uuid::new_v4();
     let (first_name, last_name) = derive_name(&email);
 
+    // SPEC-5.7: writes platform_admins (not users) on migrator pool; ON CONFLICT (id) DO NOTHING.
     sqlx::query(
         r#"
         INSERT INTO platform_admins (
@@ -72,6 +75,7 @@ pub async fn maybe_bootstrap_admin(db: &Database) -> AppResult<()> {
     .execute(db.migrator_pool())
     .await?;
 
+    // SPEC-5.9: explicit DEV-ONLY warn-level log with admin_id/email fields on successful insert.
     tracing::warn!(
         admin_id = %admin_id,
         email = %email,
@@ -81,6 +85,7 @@ pub async fn maybe_bootstrap_admin(db: &Database) -> AppResult<()> {
     Ok(())
 }
 
+// SPEC-5.10: splits local-part on . _ - +, titlecases pieces; shape rules pinned by unit tests below.
 fn derive_name(email: &str) -> (String, String) {
     let local = email.split('@').next().unwrap_or("");
     let parts: Vec<String> = local

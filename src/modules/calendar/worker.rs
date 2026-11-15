@@ -52,6 +52,7 @@ impl CalendarReminderWorker {
             return Ok(0);
         };
 
+        // SPEC-7.1084: due_reminders/claim_reminder errors abort the tick; only dispatch failures are logged and skipped.
         let candidates = self.calendar.due_reminders(now).await?;
         let mut dispatched = 0u64;
         for c in candidates {

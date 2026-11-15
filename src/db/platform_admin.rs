@@ -7,8 +7,7 @@
 //! Table is RLS-exempt (cross-cutting on the pre-auth login path); all
 //! reads/writes run on the migrator pool.
 
-// SPEC-1 and 2.119: platform_admins is RLS-exempt and every read/write here runs on the migrator
-// pool; its credential lifecycle is independent of users/identities/tenant_memberships.
+// SPEC-2.172
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -45,6 +44,7 @@ impl PlatformAdminRepo {
         notification_preferences, settings, \
         status, created_at, updated_at";
 
+    // SPEC-2.173
     pub async fn find_by_email(
         pool: &PgPool,
         email: &str,
@@ -88,6 +88,7 @@ impl PlatformAdminRepo {
         Ok(())
     }
 
+    // SPEC-2.174
     /// Anti-replay watermark: advances `mfa_last_totp_step` only to a step
     /// strictly greater than the stored one, so two logins presenting the same
     /// code cannot both win. Returns whether this call won it.
@@ -117,11 +118,10 @@ impl PlatformAdminRepo {
         Ok(())
     }
 
+    // SPEC-2.175
     /// Stage a sealed TOTP secret WITHOUT flipping `mfa_enabled`. Enable is
     /// a second call after a live code proves the authenticator works, so a
     /// mis-set app cannot lock the operator out of the platform.
-    // SPEC-1 and 2.120: stages the secret without flipping mfa_enabled, so a misconfigured
-    // authenticator cannot lock an operator out before enable_mfa confirms it with a live code.
     pub async fn stage_mfa_secret(
         pool: &PgPool,
         admin_id: Uuid,
@@ -140,6 +140,7 @@ impl PlatformAdminRepo {
         Ok(())
     }
 
+    // SPEC-2.176
     /// Flip `mfa_enabled` and store the recovery-code hashes in one write,
     /// after the live code confirmed the staged secret. Resets the
     /// anti-replay watermark so the code the operator just proved against
@@ -182,12 +183,11 @@ impl PlatformAdminRepo {
         Ok(())
     }
 
+    // SPEC-2.177
     /// Spend one recovery code by removing its hash from the array. Returns
     /// true when the row's set actually changed (the code was live and is
     /// now gone), false when the hash was already absent (an unknown code,
     /// or a replay after a concurrent login spent it).
-    // SPEC-1 and 2.121: rows_affected == 1 distinguishes a genuine spend from a
-    // replay or unknown code.
     pub async fn spend_recovery_code(
         pool: &PgPool,
         admin_id: Uuid,

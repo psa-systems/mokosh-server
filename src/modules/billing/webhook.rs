@@ -71,6 +71,7 @@ pub struct ProviderWebhookState {
 /// trace of having received anything, and "they never called", "we refused it"
 /// and "we took it and it matched no invoice" were one indistinguishable
 /// symptom - the customer paid and the invoice is still outstanding.
+// SPEC-13.752, SPEC-13.753, SPEC-13.754, SPEC-13.755, SPEC-13.756, SPEC-13.757
 pub async fn provider_webhook_handler(
     State(state): State<Arc<ProviderWebhookState>>,
     Path(tenant_id): Path<Uuid>,
@@ -176,6 +177,7 @@ struct Handled {
 /// call the id `id`, which is what their dashboards key their own logs on, so
 /// it is the one field that lets an admin find the same delivery on their
 /// side.
+// SPEC-13.758
 fn identify(raw: &[u8]) -> (Option<String>, Option<String>) {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(raw) else {
         return (None, None);
@@ -185,6 +187,7 @@ fn identify(raw: &[u8]) -> (Option<String>, Option<String>) {
     (event_type, text(&value["id"]))
 }
 
+// SPEC-13.759
 async fn dispatch(
     state: &ProviderWebhookState,
     provider: Box<dyn crate::modules::billing::provider::PaymentProvider>,
@@ -209,6 +212,7 @@ async fn dispatch(
     let mut invoice = None;
     let mut outcome = "accepted";
     match event {
+        // SPEC-13.760
         PaymentEvent::PaymentSucceeded {
             provider_reference,
             tenant_id: event_tenant,
@@ -238,6 +242,7 @@ async fn dispatch(
             outcome = if recorded { "accepted" } else { "unreconciled" };
             invoice = Some(invoice_id);
         }
+        // SPEC-13.761
         PaymentEvent::Refunded {
             provider_reference,
             currency,
@@ -256,6 +261,7 @@ async fn dispatch(
                 )
                 .await?;
         }
+        // SPEC-13.762
         PaymentEvent::RequiresCapture { order_id } => {
             // The buyer approved; charge them. The provider's completed-capture
             // event follows and records the payment, so nothing is written
@@ -263,6 +269,7 @@ async fn dispatch(
             // the approval delivery.
             provider.capture(&order_id).await?;
         }
+        // SPEC-13.763
         PaymentEvent::PaymentMethodAttached {
             provider_pm_id,
             provider_customer_id,
@@ -296,6 +303,7 @@ async fn dispatch(
                 )
                 .await?;
         }
+        // SPEC-13.764
         PaymentEvent::Ignored { kind } => {
             tracing::debug!(
                 target: "mokosh_server.billing",

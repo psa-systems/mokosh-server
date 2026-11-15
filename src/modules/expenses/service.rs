@@ -38,8 +38,30 @@ fn field_error(field: &str, message: &str) -> AppError {
     }
 }
 
+/// PMS-1662 F16: serialize a snapshot for an audit row, logging the error
+/// if the serialize ever fails rather than writing `null` with no trace.
+///
+/// Every mutation in this module snapshots a row to JSON via
+/// `audit_json("expense_category", &row)`; a single helper
+/// keeps the call sites short and the warn log consistent. Only the
+/// `label` goes into the log so the audit payload itself does not leak.
+fn audit_json<T: Serialize>(label: &str, value: &T) -> Value {
+    match serde_json::to_value(value) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target = label,
+                error = %e,
+                "expense audit snapshot failed to serialize; writing Null"
+            );
+            Value::Null
+        }
+    }
+}
+
 /// Create / update body for a vendor. Name is required and bounded; the
 /// optional fields mirror the schema columns one-to-one.
+// SPEC-14.59: field length bounds; currency is exactly 3 characters.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertVendorRequest {
     #[validate(length(min = 1, max = 200))]
@@ -58,6 +80,7 @@ pub struct UpsertVendorRequest {
 }
 
 /// Create / update body for an expense category.
+// SPEC-14.61: name 1..=100 characters, is_active defaults to true.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertExpenseCategoryRequest {
     #[validate(length(min = 1, max = 100))]
@@ -128,6 +151,7 @@ impl ExpensesService {
 
     // ── Vendors ──────────────────────────────────────────────────────────
 
+    // SPEC-14.58: ordered by lower-cased name.
     pub async fn list_vendors(
         &self,
         tenant_id: TenantId,
@@ -154,6 +178,7 @@ impl ExpensesService {
         Ok((rows, total as u64))
     }
 
+    // SPEC-14.58: 404 "Vendor" when absent.
     pub async fn get_vendor(&self, tenant_id: TenantId, id: Uuid) -> AppResult<Vendor> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<Vendor> = sqlx::query_as(
@@ -168,6 +193,7 @@ impl ExpensesService {
         row.ok_or_else(|| AppError::NotFound("Vendor".to_string()))
     }
 
+    // SPEC-14.59, SPEC-14.60: trimmed fields, upper-cased currency, audited insert.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_vendor(
         &self,
@@ -197,7 +223,7 @@ impl ExpensesService {
         .bind(request.notes.as_deref())
         .fetch_one(&mut *tx)
         .await?;
-        let after: Option<Value> = Some(serde_json::to_value(&row).unwrap_or(Value::Null));
+        let after: Option<Value> = Some(audit_json("expense_category", &row));
         audit_write(
             &mut *tx,
             tenant_id,
@@ -213,6 +239,7 @@ impl ExpensesService {
         Ok(row)
     }
 
+    // SPEC-14.59, SPEC-14.60: full overwrite, audited update; 404 "Vendor" when absent.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, vendor_id = %id))]
     pub async fn update_vendor(
         &self,
@@ -256,7 +283,7 @@ impl ExpensesService {
         .bind(request.notes.as_deref())
         .fetch_one(&mut *tx)
         .await?;
-        let after: Option<Value> = Some(serde_json::to_value(&row).unwrap_or(Value::Null));
+        let after: Option<Value> = Some(audit_json("expense_category", &row));
         audit_write(
             &mut *tx,
             tenant_id,
@@ -272,6 +299,7 @@ impl ExpensesService {
         Ok(row)
     }
 
+    // SPEC-14.60: FK violation maps to 409; audited delete.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, vendor_id = %id))]
     pub async fn delete_vendor(
         &self,
@@ -322,6 +350,7 @@ impl ExpensesService {
 
     // ── Expense categories ───────────────────────────────────────────────
 
+    // SPEC-14.61: ordered by lower-cased name.
     pub async fn list_expense_categories(
         &self,
         tenant_id: TenantId,
@@ -348,6 +377,7 @@ impl ExpensesService {
         Ok((rows, total as u64))
     }
 
+    // SPEC-14.60, SPEC-14.61: duplicate name maps to 409; audited insert.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_expense_category(
         &self,
@@ -400,6 +430,7 @@ impl ExpensesService {
         Ok(row)
     }
 
+    // SPEC-14.60, SPEC-14.61: 404 when absent, 409 on duplicate name; audited update.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, category_id = %id))]
     pub async fn update_expense_category(
         &self,
@@ -487,6 +518,7 @@ impl ExpensesService {
     /// it, and that name lives on `vendors`, so it is reached through an
     /// EXISTS rather than a join, which keeps the count query and the
     /// page query the same shape.
+    // SPEC-14.68: status and q narrowing; the count shares the predicate.
     pub async fn list_bills(
         &self,
         tenant_id: TenantId,
@@ -591,6 +623,7 @@ impl ExpensesService {
         Ok((rows, total as u64))
     }
 
+    // SPEC-14.69: 404 "Bill" when absent.
     pub async fn get_bill(&self, tenant_id: TenantId, id: Uuid) -> AppResult<BillWithLines> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let bill: Bill = sqlx::query_as(
@@ -623,6 +656,7 @@ impl ExpensesService {
     /// The vendor must belong to this tenant. FK + the RLS GUC enforce it,
     /// but the explicit lookup gives a clear 404 instead of a generic
     /// FK-violation 500 on a wrong id.
+    // SPEC-14.65: 404 "Vendor" before any provider call.
     async fn assert_vendor_exists(&self, tenant_id: TenantId, vendor_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let found = sqlx::query_scalar::<_, Uuid>(
@@ -638,6 +672,7 @@ impl ExpensesService {
             .ok_or_else(|| AppError::NotFound("Vendor".to_string()))
     }
 
+    // SPEC-14.60, SPEC-14.62, SPEC-14.63, SPEC-14.64, SPEC-14.65: validation, totals, provider push, audited insert.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_bill(
         &self,
@@ -759,7 +794,7 @@ impl ExpensesService {
 
         let lines = insert_bill_lines(&mut tx, tenant_id, id, &request.lines).await?;
 
-        let after: Option<Value> = Some(serde_json::to_value(&bill).unwrap_or(Value::Null));
+        let after: Option<Value> = Some(audit_json("bill", &bill));
         audit_write(
             &mut *tx,
             tenant_id,
@@ -775,6 +810,7 @@ impl ExpensesService {
         Ok(BillWithLines { bill, lines })
     }
 
+    // SPEC-14.66: draft to approved.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, bill_id = %id))]
     pub async fn approve_bill(
         &self,
@@ -786,6 +822,7 @@ impl ExpensesService {
             .await
     }
 
+    // SPEC-14.66: draft or approved to void.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, bill_id = %id))]
     pub async fn void_bill(
         &self,
@@ -797,6 +834,7 @@ impl ExpensesService {
             .await
     }
 
+    // SPEC-14.60, SPEC-14.66, SPEC-14.67: row lock, 409 outside the allowed sources, audited update.
     async fn transition_bill(
         &self,
         tenant_id: TenantId,
@@ -844,8 +882,8 @@ impl ExpensesService {
             AuditAction::Update,
             "bills",
             Some(id),
-            Some(serde_json::to_value(&before).unwrap_or(Value::Null)),
-            Some(serde_json::to_value(&after).unwrap_or(Value::Null)),
+            Some(audit_json("bill_before", &before)),
+            Some(audit_json("bill_after", &after)),
         )
         .await?;
         tx.commit().await?;
@@ -871,6 +909,7 @@ impl ExpensesService {
     ///
     /// The insert and the recompute share one transaction, so a reader can
     /// never see a payment row that `paid_minor` does not include.
+    // SPEC-14.60, SPEC-14.70, SPEC-14.71: validation, status and balance refusals, insert plus recompute.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, bill_id = %bill_id))]
     pub async fn record_bill_payment(
         &self,
@@ -889,7 +928,7 @@ impl ExpensesService {
         if !BILL_PAYMENT_METHODS.contains(&method.as_str()) {
             return Err(field_error(
                 "payment_method",
-                "payment_method is one of check, credit_card, ach, wire, cash, other",
+                "payment_method is one of check, credit_card, ach, wire, cash, paypal, other",
             ));
         }
 
@@ -957,7 +996,7 @@ impl ExpensesService {
             "bill_payments",
             Some(payment.id),
             None,
-            Some(serde_json::to_value(&payment).unwrap_or(Value::Null)),
+            Some(audit_json("bill_payment", &payment)),
         )
         .await?;
         tx.commit().await?;
@@ -974,6 +1013,7 @@ impl ExpensesService {
     /// same way: tenant, provider and the provider's own id. Returns the
     /// three figures reconciliation needs rather than the whole row,
     /// because the receiver's job is arithmetic.
+    // SPEC-14.73: lookup by tenant, provider and external id.
     pub async fn delegated_bill(
         &self,
         tenant_id: TenantId,
@@ -1016,6 +1056,7 @@ impl ExpensesService {
     /// person is typing; here the provider has already committed the
     /// payment, and refusing it would leave the two ledgers disagreeing,
     /// which is the thing this path exists to stop.
+    // SPEC-14.73: records only the unrecorded difference, capped at the remaining balance.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, external_bill_id = %report.external_bill_id))]
     pub async fn reconcile_external_bill_payment(
         &self,
@@ -1100,6 +1141,7 @@ impl ExpensesService {
     /// subsystem: a provider that refuses leaves no local payment row, so
     /// the operator sees a failure and retries rather than ending up with
     /// a payment Mokosh believes in and the provider does not.
+    // SPEC-14.72: provider payment first, then the local record with the provider id in the notes.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, bill_id = %bill_id))]
     pub async fn pay_bill(
         &self,
@@ -1121,10 +1163,27 @@ impl ExpensesService {
                     bill.external_bill_id.as_deref(),
                 ) {
                     (Some(provider), Some(external_id)) => {
-                        crate::modules::billing::invoice_issuer::InvoiceProviderKind::parse(
-                            provider,
-                        )
-                        .map(|kind| (kind, external_id.to_string(), bill.vendor_id))
+                        // PMS-1662 F17: a provider string the current
+                        // build does not know used to silently fall
+                        // through to the local path, so a bill issued
+                        // through a provider that was later removed from
+                        // this build's enum would take a payment
+                        // locally with no record going out. WARN with
+                        // the bill id and the stored value; keep the
+                        // local fallback so a pay request does not 500,
+                        // but the drift is now findable.
+                        let kind =
+                            crate::modules::billing::invoice_issuer::InvoiceProviderKind::parse(
+                                provider,
+                            );
+                        if kind.is_none() {
+                            tracing::warn!(
+                                bill_id = %bill.id,
+                                stored = %provider,
+                                "bills.external_provider is not one of the providers this build knows; recording the payment locally"
+                            );
+                        }
+                        kind.map(|kind| (kind, external_id.to_string(), bill.vendor_id))
                     }
                     // A bill no provider holds: the local path unchanged,
                     // which is every bill on a deployment that has not
@@ -1178,6 +1237,7 @@ impl ExpensesService {
     }
 
     /// Every payment against one bill, newest first.
+    // SPEC-14.74: unknown bill is 404, not an empty list.
     pub async fn list_bill_payments(
         &self,
         tenant_id: TenantId,
@@ -1232,6 +1292,7 @@ impl ExpensesService {
     /// it was for, and that is written on the lines. The submitter scope
     /// from PMS-1535 applies first, so a filter can only narrow what that
     /// caller could already see.
+    // SPEC-14.76: submitter scope, status and q narrowing; the count shares the predicate.
     pub async fn list_expenses(
         &self,
         tenant_id: TenantId,
@@ -1347,6 +1408,7 @@ impl ExpensesService {
         Ok((rows, total as u64))
     }
 
+    // SPEC-14.77: 404 "Expense" when absent.
     pub async fn get_expense(&self, tenant_id: TenantId, id: Uuid) -> AppResult<ExpenseWithLines> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let expense: Expense = sqlx::query_as(
@@ -1378,6 +1440,7 @@ impl ExpensesService {
 
     /// A new expense always lands as `draft` and belongs to `user_id`
     /// (the submitter). Approval and reimbursement are later transitions.
+    // SPEC-14.60, SPEC-14.75: draft claim owned by the submitter, totals from lines, audited insert.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, user_id = %user_id))]
     pub async fn create_expense(
         &self,
@@ -1430,13 +1493,14 @@ impl ExpensesService {
             "expenses",
             Some(id),
             None,
-            Some(serde_json::to_value(&expense).unwrap_or(Value::Null)),
+            Some(audit_json("expense", &expense)),
         )
         .await?;
         tx.commit().await?;
         Ok(ExpenseWithLines { expense, lines })
     }
 
+    // SPEC-14.78: draft to submitted.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, expense_id = %id))]
     pub async fn submit_expense(
         &self,
@@ -1457,6 +1521,7 @@ impl ExpensesService {
         .await
     }
 
+    // SPEC-14.79: submitted to approved, approver recorded.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, expense_id = %id))]
     pub async fn approve_expense(
         &self,
@@ -1478,6 +1543,7 @@ impl ExpensesService {
         .await
     }
 
+    // SPEC-14.79: submitted to rejected.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, expense_id = %id))]
     pub async fn reject_expense(
         &self,
@@ -1514,6 +1580,7 @@ impl ExpensesService {
     /// claim `approved`, which is the state somebody can retry from, and
     /// an HTTP round trip inside a write transaction holds its locks for
     /// the length of somebody else's outage.
+    // SPEC-14.79, SPEC-14.81: approved to reimbursed; provider recorded before the local write.
     pub async fn reimburse_expense(
         &self,
         tenant_id: TenantId,
@@ -1591,6 +1658,7 @@ impl ExpensesService {
     /// is what a concurrent caller's own call to this helper blocks on
     /// (PMS-1547), not a plain unlocked read that could still see the
     /// pre-transition status.
+    // SPEC-14.79, SPEC-14.80: row lock and the 409 refusal for a disallowed source status.
     async fn lock_and_assert_status(
         &self,
         tx: &mut TenantTransaction<'_>,
@@ -1631,6 +1699,7 @@ impl ExpensesService {
         Ok(before)
     }
 
+    // SPEC-14.60, SPEC-14.79, SPEC-14.81: audited transition; COALESCE keeps an existing provider pair.
     #[allow(clippy::too_many_arguments)]
     async fn transition_expense(
         &self,
@@ -1693,8 +1762,8 @@ impl ExpensesService {
             AuditAction::Update,
             "expenses",
             Some(id),
-            Some(serde_json::to_value(&before).unwrap_or(Value::Null)),
-            Some(serde_json::to_value(&after).unwrap_or(Value::Null)),
+            Some(audit_json("expense_before", &before)),
+            Some(audit_json("expense_after", &after)),
         )
         .await?;
         tx.commit().await?;
@@ -1704,6 +1773,7 @@ impl ExpensesService {
 
 // ── Bill + Expense request/response shapes ──────────────────────────────
 
+// SPEC-14.62: 1..=200 lines, 3-character currency, length bounds.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateBillRequest {
     pub vendor_id: Uuid,
@@ -1723,6 +1793,7 @@ pub struct CreateBillRequest {
     pub lines: Vec<BillLineInput>,
 }
 
+// SPEC-14.62: description 1..=500, quantity at least 1, amounts at least 0.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct BillLineInput {
     #[serde(default)]
@@ -1743,6 +1814,7 @@ pub struct BillLineInput {
     pub position: i32,
 }
 
+// SPEC-14.75: 1..=200 lines, 3-character currency, notes up to 2000.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateExpenseRequest {
     pub incurred_on: NaiveDate,
@@ -1756,6 +1828,7 @@ pub struct CreateExpenseRequest {
     pub lines: Vec<ExpenseLineInput>,
 }
 
+// SPEC-14.75: description 1..=500, amounts at least 0.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct ExpenseLineInput {
     #[serde(default)]
@@ -1798,6 +1871,7 @@ pub struct DelegatedBillRow {
 }
 
 /// `POST /bills/{id}/payments` (PMS-1536).
+// SPEC-14.70: payment_method 1..=20 characters here, closed set in the service.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct RecordBillPaymentRequest {
     pub paid_on: NaiveDate,
@@ -1851,6 +1925,7 @@ pub struct ExpenseWithLines {
 /// Pure and shared, so the one other place that pre-checks this state
 /// (`reimburse_expense`, before it reaches a provider) cannot drift into a
 /// second wording.
+// SPEC-14.67: the 409 wording per source status.
 fn bill_transition_refusal(from: &str, to: &str) -> String {
     match from {
         // Both terminal, and for different reasons, so they get different
@@ -1878,6 +1953,7 @@ fn bill_transition_refusal(from: &str, to: &str) -> String {
 /// Each arm names the step that is missing rather than the step that
 /// failed, because the caller is holding a claim and wants to know what to
 /// press next.
+// SPEC-14.80: the 409 wording per source status.
 fn expense_transition_refusal(from: &str, to: &str) -> String {
     match from {
         "rejected" => {
@@ -1918,6 +1994,7 @@ fn expense_transition_refusal(from: &str, to: &str) -> String {
 /// `q=` left on the URL by a cleared search box would otherwise be a
 /// filter that matches everything by accident, and the first wildcard
 /// somebody escapes would change that silently.
+// SPEC-14.68, SPEC-14.76: a blank q means no filter.
 fn search_pattern(q: Option<&str>) -> Option<String> {
     let q = q?.trim();
     if q.is_empty() {
@@ -1929,7 +2006,16 @@ fn search_pattern(q: Option<&str>) -> Option<String> {
 
 /// The payment methods `bill_payments`' CHECK allows, in one place so the
 /// service refuses a bad one with a message instead of a 23514.
-const BILL_PAYMENT_METHODS: [&str; 6] = ["check", "credit_card", "ach", "wire", "cash", "other"];
+// SPEC-14.70: the closed set of payment methods.
+const BILL_PAYMENT_METHODS: [&str; 7] = [
+    "check",
+    "credit_card",
+    "ach",
+    "wire",
+    "cash",
+    "paypal",
+    "other",
+];
 
 /// The ONE writer of `bills.paid_minor` and of `bills.status` on the paid
 /// edge (PMS-1536, the rule PMS-953 states for invoices).
@@ -1943,6 +2029,7 @@ const BILL_PAYMENT_METHODS: [&str; 6] = ["check", "credit_card", "ach", "wire", 
 /// `partially_paid` and `total_minor - paid_minor` answers "what do we
 /// owe" without one; adding a status value is a migration plus every
 /// consumer that matches on it.
+// SPEC-14.71: the only writer of paid_minor and of the move to paid.
 async fn recompute_bill_payment_state(
     conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -1986,6 +2073,7 @@ impl BillTotals {
     /// `unit_price_minor * quantity_hundredths / 100` (truncated), the
     /// same per-line rounding the invoice path uses so a bill mirrors
     /// what a vendor's own invoice would print.
+    // SPEC-14.63: per-line truncating division by 100, tax added separately.
     fn from_lines(lines: &[BillLineInput]) -> Self {
         let mut subtotal: i64 = 0;
         let mut tax: i64 = 0;
@@ -2012,6 +2100,7 @@ struct ExpenseTotals {
 }
 
 impl ExpenseTotals {
+    // SPEC-14.75: subtotal, tax and total are plain sums of the lines.
     fn from_lines(lines: &[ExpenseLineInput]) -> Self {
         let mut subtotal: i64 = 0;
         let mut tax: i64 = 0;
@@ -2027,6 +2116,7 @@ impl ExpenseTotals {
     }
 }
 
+// SPEC-14.63: stored line total includes tax; position 0 becomes the index.
 async fn insert_bill_lines(
     conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -2069,6 +2159,7 @@ async fn insert_bill_lines(
     Ok(rows)
 }
 
+// SPEC-14.75: position 0 becomes the index.
 async fn insert_expense_lines(
     conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,

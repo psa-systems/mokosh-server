@@ -27,6 +27,7 @@ use crate::app_secrets::{AppSecrets, GovernedSecret};
 use crate::modules::billing::invoice_issuer::InvoiceProviderKind;
 use crate::utils::error::{AppError, AppResult};
 
+// SPEC-13.1010
 /// One provider's application, as this deployment holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuerApp {
@@ -47,6 +48,7 @@ pub struct IssuerApps {
 }
 
 impl IssuerApps {
+    // SPEC-13.1009
     /// Read both pairs through the application-tier secret seam.
     ///
     /// Three outcomes per provider, and the third is why this returns a
@@ -83,6 +85,7 @@ impl IssuerApps {
         }
     }
 
+    // SPEC-13.1013
     /// The application, or the refusal an operator can act on.
     ///
     /// Named as a conflict rather than an internal error: the deployment is
@@ -101,6 +104,7 @@ impl IssuerApps {
     }
 }
 
+// SPEC-13.1009, SPEC-13.1010, SPEC-13.1011, SPEC-13.1012: id and secret are a pair
 fn resolve(
     secrets: &AppSecrets,
     provider: InvoiceProviderKind,
@@ -126,6 +130,7 @@ fn resolve(
     }
 }
 
+// SPEC-13.1012: names the missing key
 /// The boot error for a host holding one half of a pair.
 ///
 /// Names the MISSING key rather than the present one, because the

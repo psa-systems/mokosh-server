@@ -71,6 +71,8 @@ where
         // fallback to inspect.
         if let Some(header) = parts.headers.get(axum::http::header::AUTHORIZATION) {
             if let Ok(text) = header.to_str() {
+                // SPEC-3.1037: only the case-sensitive 'Basic ' scheme is inspected; other schemes
+                // go to the staff check.
                 if let Some(encoded) = text.strip_prefix("Basic ") {
                     let configured = configured_credential();
                     let expected = configured

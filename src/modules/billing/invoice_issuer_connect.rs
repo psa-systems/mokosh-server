@@ -48,6 +48,7 @@ use std::sync::Arc;
 /// The same number contact sync uses, for the same reason.
 const STATE_TTL_MINUTES: i64 = 10;
 
+// SPEC-13.1022
 /// The two consent endpoints.
 ///
 /// Assembled from parts until MAPPS-1153, for the reason the clients'
@@ -65,6 +66,7 @@ fn quickbooks_auth_endpoint() -> String {
     "https://appcenter.intuit.com/connect/oauth2".to_string()
 }
 
+// SPEC-13.1023
 /// What Mokosh asks each provider for.
 ///
 /// `offline_access` is what makes a refresh token come back, and without
@@ -122,6 +124,7 @@ impl InvoiceIssuerConnectService {
         }
     }
 
+    // SPEC-13.1020
     /// The address the provider returns the browser to.
     pub fn redirect_uri(&self, provider: InvoiceProviderKind) -> AppResult<String> {
         let base = self
@@ -142,6 +145,7 @@ impl InvoiceIssuerConnectService {
         ))
     }
 
+    // SPEC-13.1021
     /// Start a connection: mint the state, answer the consent URL.
     pub async fn begin(
         &self,
@@ -186,6 +190,7 @@ impl InvoiceIssuerConnectService {
         ))
     }
 
+    // SPEC-13.1027, SPEC-13.1030
     /// Finish a connection.
     ///
     /// SAFETY (PMS-285): runs with no session, so the tenant comes from the
@@ -204,6 +209,7 @@ impl InvoiceIssuerConnectService {
         let tenant_id = TenantId::from_trusted(tenant_uuid);
         let app = self.apps.require(provider)?;
 
+        // SPEC-13.1028, SPEC-13.1029: Xero asks for the organisation; Intuit sends the realm
         let (blob, organisation_id) = match provider {
             InvoiceProviderKind::Xero => {
                 let tokens = self
@@ -295,6 +301,7 @@ impl InvoiceIssuerConnectService {
         ))
     }
 
+    // SPEC-13.1033: credential goes first; capabilities stay
     /// Stop delegating to a provider, and forget how to reach it
     /// (MAPPS-1145).
     ///
@@ -333,6 +340,7 @@ impl InvoiceIssuerConnectService {
         Ok(())
     }
 
+    // SPEC-13.1034
     /// Delegate, or stop delegating, this tenant's bills to the provider
     /// (MAPPS-1155).
     ///
@@ -392,6 +400,7 @@ impl InvoiceIssuerConnectService {
         Ok(())
     }
 
+    // SPEC-13.1035
     /// Set the provider account a reimbursement is paid from (PMS-1541).
     ///
     /// One value per tenant per provider, so it sits on the integration
@@ -443,6 +452,7 @@ impl InvoiceIssuerConnectService {
         Ok(())
     }
 
+    // SPEC-13.1036
     /// What a settings page for one provider reads (MAPPS-1143).
     ///
     /// Four facts, and three of them the integrations catalog cannot
@@ -478,6 +488,7 @@ impl InvoiceIssuerConnectService {
             .features
             .is_enabled(crate::modules::features::Feature::DelegatedBills);
         let Some(row) = row else {
+            // SPEC-13.1037
             // Never connected is an offer, not an error.
             return Ok(InvoiceIssuerOverview {
                 provider: provider.as_str().to_string(),
@@ -495,6 +506,7 @@ impl InvoiceIssuerConnectService {
         Ok(InvoiceIssuerOverview {
             provider: provider.as_str().to_string(),
             configured,
+            // SPEC-13.1038
             // A status the enum does not know means the CHECK constraint and
             // the enum have drifted, which is a deployment running a schema
             // this build does not understand. Reading it as `error` is the
@@ -516,6 +528,7 @@ impl InvoiceIssuerConnectService {
         })
     }
 
+    // SPEC-13.1024
     /// Verify the state, consume it, and answer what the exchange needs.
     ///
     /// Consumed BEFORE the exchange, so a slow or failing exchange cannot
@@ -553,6 +566,7 @@ impl InvoiceIssuerConnectService {
             return Err(invalid());
         };
         let not_consumed_and_fresh = row.consumed_at.is_none() && row.expires_at > Utc::now();
+        // SPEC-13.1025
         // PMS-1577: a verification error (corrupt stored hash, Argon2
         // failure) is not the same answer as a genuine wrong secret, so it
         // is logged distinctly before falling through to the same refusal.
@@ -568,6 +582,7 @@ impl InvoiceIssuerConnectService {
             return Err(invalid());
         }
 
+        // SPEC-13.1026: conditional update: one racing callback wins
         let consumed = sqlx::query(
             "UPDATE invoice_issuer_oauth_states SET consumed_at = NOW() \
              WHERE id = $1 AND consumed_at IS NULL",
@@ -586,6 +601,7 @@ impl InvoiceIssuerConnectService {
         Ok((row.tenant_id, row.code_verifier, row.redirect_uri))
     }
 
+    // SPEC-13.1031
     /// Record the connection the way the rest of the subsystem reads it.
     ///
     /// `invoicing` is enabled because connecting a provider through this
@@ -627,6 +643,7 @@ impl InvoiceIssuerConnectService {
         .bind(organisation_id)
         .execute(&mut *tx)
         .await;
+        // SPEC-13.1032: 23505 is the cross-tenant organisation index
         match insert {
             Ok(_) => {}
             // Deliberate suppression (`docs/invariants/error-visibility.md`
@@ -649,6 +666,7 @@ impl InvoiceIssuerConnectService {
     }
 }
 
+// SPEC-13.1036
 /// What a per-provider settings page renders (MAPPS-1143).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct InvoiceIssuerOverview {
@@ -716,6 +734,7 @@ struct OauthStateRow {
     expires_at: chrono::DateTime<Utc>,
 }
 
+// SPEC-13.1022: challenge only, never the verifier
 /// The consent URL to send an admin to.
 fn authorization_url(
     provider: InvoiceProviderKind,
@@ -842,6 +861,7 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
+// SPEC-13.1039
 /// Admin-only, under `/api/v1/integrations`.
 pub fn invoice_issuer_connect_routes(service: Arc<InvoiceIssuerConnectService>) -> Router {
     Router::new()
@@ -865,6 +885,7 @@ pub fn invoice_issuer_connect_routes(service: Arc<InvoiceIssuerConnectService>) 
         .with_state(InvoiceIssuerConnectRouterState { service })
 }
 
+// SPEC-13.1041
 /// The public half. Unauthenticated by construction: a browser arriving
 /// from a consent screen carries no session, and the single-use state is
 /// the only identity it has.
@@ -874,6 +895,7 @@ pub fn invoice_issuer_public_routes(service: Arc<InvoiceIssuerConnectService>) -
         .with_state(InvoiceIssuerConnectRouterState { service })
 }
 
+// SPEC-13.1040
 /// The path segment, parsed against the enum rather than passed through.
 fn parse_provider(raw: &str) -> AppResult<InvoiceProviderKind> {
     InvoiceProviderKind::parse(raw).ok_or_else(|| {
@@ -963,6 +985,7 @@ async fn set_bills_delegation(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+// SPEC-13.1041, SPEC-13.1042
 /// Always a redirect, never a JSON body: the caller is a browser.
 ///
 /// The failure reason is a flag rather than the provider's own text,

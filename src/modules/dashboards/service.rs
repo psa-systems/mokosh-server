@@ -49,6 +49,7 @@ impl DashboardsService {
         Self { db }
     }
 
+    // SPEC-15.1635
     /// List the caller's own saved dashboards. Default-first so the
     /// SPA's dashboard switcher can render the pinned row at the top
     /// without re-sorting client-side.
@@ -71,6 +72,7 @@ impl DashboardsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    // SPEC-15.1637
     pub async fn get(
         &self,
         tenant_id: Uuid,
@@ -92,6 +94,7 @@ impl DashboardsService {
         Ok(row.into())
     }
 
+    // SPEC-15.1638, SPEC-15.1639
     pub async fn create(
         &self,
         tenant_id: Uuid,
@@ -128,6 +131,7 @@ impl DashboardsService {
         Ok(row.into())
     }
 
+    // SPEC-15.1640, SPEC-15.1639
     pub async fn update(
         &self,
         tenant_id: Uuid,
@@ -185,6 +189,7 @@ impl DashboardsService {
         Ok(row.into())
     }
 
+    // SPEC-15.1641
     pub async fn delete(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query(
@@ -204,6 +209,7 @@ impl DashboardsService {
         Ok(())
     }
 
+    // SPEC-15.1636
     /// Fast path used by the SPA on app boot: returns the caller's
     /// default dashboard if one is pinned, otherwise `None`. Pulled
     /// into its own method so the client can `GET
@@ -229,6 +235,7 @@ impl DashboardsService {
 
     // PMS-471: schedule machinery ------------------------------------------
 
+    // SPEC-15.1642
     /// Create a schedule for the dashboard. Re-uses the `get`
     /// visibility rule so a user can only schedule their own
     /// dashboards (saved dashboards are private by design).
@@ -259,9 +266,10 @@ impl DashboardsService {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        self.schedule_get(tenant_id, id).await
+        self.schedule_get(tenant_id, user_id, id).await
     }
 
+    // SPEC-15.1644
     pub async fn schedule_list(
         &self,
         tenant_id: Uuid,
@@ -283,9 +291,15 @@ impl DashboardsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// PMS-1665: owner-only. Same shape as the saved_reports fix: update
+    /// and delete already filter by `user_id` but GET-by-id used to leak
+    /// another user's schedule (recipient, cron, last_error, is_active)
+    /// to any viewer of the parent dashboard.
+    // SPEC-15.1645
     pub async fn schedule_get(
         &self,
         tenant_id: Uuid,
+        user_id: Uuid,
         id: Uuid,
     ) -> AppResult<ScheduledDashboardResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -294,16 +308,18 @@ impl DashboardsService {
                     recipient_email, is_active, last_run_at, next_run_at, \
                     last_error, created_at, updated_at \
              FROM scheduled_dashboards \
-             WHERE tenant_id = $1 AND id = $2",
+             WHERE tenant_id = $1 AND id = $2 AND user_id = $3",
         )
         .bind(tenant_id)
         .bind(id)
+        .bind(user_id)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(AppError::NotFound("Scheduled dashboard".into()))?;
         Ok(row.into())
     }
 
+    // SPEC-15.1646
     pub async fn schedule_update(
         &self,
         tenant_id: Uuid,
@@ -339,9 +355,10 @@ impl DashboardsService {
         if rows == 0 {
             return Err(AppError::NotFound("Scheduled dashboard".into()));
         }
-        self.schedule_get(tenant_id, id).await
+        self.schedule_get(tenant_id, user_id, id).await
     }
 
+    // SPEC-15.1646
     pub async fn schedule_delete(&self, tenant_id: Uuid, user_id: Uuid, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query(
@@ -397,6 +414,7 @@ impl From<ScheduleRow> for ScheduledDashboardResponse {
     }
 }
 
+// SPEC-15.1643
 /// PMS-471: parse + advance a cron expression. Returns the next
 /// firing strictly after `anchor`. Mirrors
 /// `saved_reports::service::compute_next_run` but is kept module-local

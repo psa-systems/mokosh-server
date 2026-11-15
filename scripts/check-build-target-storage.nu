@@ -31,6 +31,8 @@ const MEMORY_BACKED = ["tmpfs" "ramfs"]
 # guards. It warns rather than failing so the reason stays visible in the log.
 const ALLOW_VAR = "MOKOSH_ALLOW_TMPFS_TARGET"
 
+# SPEC-10.368: resolution order and verdicts
+
 # SPEC-10.184: resolves the target directory in cargo's own precedence order.
 # `CARGO_TARGET_DIR`, then `CARGO_BUILD_TARGET_DIR` (the environment form of
 # `build.target-dir`), then `build.target-dir` from the nearest config file, then

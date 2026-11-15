@@ -75,16 +75,14 @@ impl DatabaseProvider {
             .iter()
             .map(|secret| secret.name())
             .collect();
-        // The table is application-scope (no RLS), so the migrator pool is
-        // the right one to reach for: it has no tenant GUC to set and never
-        // will. `db.pool()` here is the request-serving pool, which is
-        // still fine because the table has no RLS policy that would refuse
-        // it; using `db.pool()` avoids opening a second connection kind for
-        // a single-row-per-secret read.
+        // The table is application-scope (no RLS). `db.pool()` is the
+        // request-serving pool, which is fine here because the table has no
+        // RLS policy that would refuse it and using it avoids opening a
+        // second connection kind for a single-row-per-secret read.
         // SAFETY (PMS-285): app-tier is not tenant scoped and the table
         // carries no RLS; there is no GUC to set.
-        // SPEC-3.11: load and writes both use a pool exempt from tenant RLS,
-        // never the tenant-scoped request pool.
+        // SPEC-3.11: the table carries no RLS; load and writes go through
+        // the request pool, and the pool's tenant GUC state does not apply.
         let rows: Vec<(String, Vec<u8>)> =
             sqlx::query_as("SELECT name, ciphertext FROM app_secrets WHERE name = ANY($1)")
                 .bind(&names)
@@ -215,6 +213,7 @@ impl AppSecretProvider for DatabaseProvider {
     /// cache. A row that is already gone is not an error: the caller
     /// (`provider-purge`) has already checked the interlock and either the
     /// row was never there or another writer got to it first.
+    // SPEC-3.1007: row removed via migrator pool, then cache entry dropped; zero rows is success.
     async fn delete(&self, secret: GovernedSecret) -> AppResult<()> {
         let db = match &self.writer {
             WriteBackend::Real { db, .. } => db,

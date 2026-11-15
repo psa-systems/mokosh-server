@@ -23,6 +23,7 @@ use mokosh_types::tenants::{EffectiveBranding, TenantBranding};
 /// that is `None` on both sides stays `None` in the result.
 ///
 /// Pure; no I/O.
+// SPEC-15.2081
 pub fn effective_branding(tenant: &TenantBranding, company: &CompanyBranding) -> EffectiveBranding {
     EffectiveBranding {
         logo_url: company.logo_url.clone().or_else(|| tenant.logo_url.clone()),
@@ -103,6 +104,7 @@ pub fn effective_branding(tenant: &TenantBranding, company: &CompanyBranding) ->
 /// Only for what a customer sees. The brand editor keeps [`effective_branding`]
 /// for its preview, because a synthesized name there would read as a value
 /// somebody configured.
+// SPEC-15.2082
 pub fn customer_branding(
     tenant: &TenantBranding,
     company: &CompanyBranding,

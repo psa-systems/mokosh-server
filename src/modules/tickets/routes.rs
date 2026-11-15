@@ -1,10 +1,4 @@
 //! Ticket API routes
-//!
-//! parity record 2026-10-05: `/saved-views` and `/saved-views/{id}` have no
-//! SPA caller yet. They land first (slice 1 of MAPPS-998) so the mokosh-apps
-//! pin can pick them up; the SPA Views Select, save modal and per-view
-//! rename/delete controls land in slice 2 under the same ticket as soon as
-//! this merges and the pin bumps. Note covers ONLY the saved-views routes.
 
 use crate::utils::json::Json;
 use axum::{
@@ -91,6 +85,7 @@ pub fn ticket_routes(
         approvals_service: Some(Arc::new(approvals_service)),
     };
 
+    // SPEC-7.1095: ticket and note routes need any authenticated user; only delete needs the manager role.
     Router::new()
         // Tickets
         .route("/", get(list_tickets))
@@ -278,6 +273,7 @@ async fn get_ticket_sla(
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(ticket_id): Path<Uuid>,
 ) -> AppResult<Json<TicketSlaResponse>> {
+    // SPEC-7.1101: staff read any ticket's SLA; a contact only its own company's, else 404.
     let tenant = caller.tenant();
     let company_scope = match &caller {
         CallerContext::Staff(_) => None,
@@ -340,6 +336,7 @@ async fn patch_ticket(
                 .await?;
         }
         CallerContext::Contact(session) => {
+            // SPEC-7.1094: contact PATCH keeps only title/description on the contact's own ticket.
             // Cap gate first so a contact without `tickets:edit_own`
             // cannot learn whether the ticket exists.
             caller
@@ -433,6 +430,7 @@ async fn request_approval_on_ticket(
     Path(ticket_id): Path<Uuid>,
     Json(body): Json<RequestApprovalBody>,
 ) -> AppResult<Json<ApprovalResponse>> {
+    // SPEC-7.1102: note of 1-2000 chars; contacts need TICKETS_REQUEST_APPROVAL and company scope.
     body.validate()?;
     let approvals = state
         .approvals_service
@@ -539,6 +537,7 @@ async fn get_ticket_notes(
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketNoteResponse>>> {
     pagination.reject_unsupported_sort()?;
+    // SPEC-7.1100: staff see all note types, contacts public only; can_edit is false for a contact.
     // PMS-935: staff branch keeps the full note stream (public,
     // internal, resolution, time_entry) - agent back-channel
     // discussion belongs on the internal notes. Contact branch must
@@ -777,6 +776,7 @@ async fn portal_attach_file(
         .attachment_service
         .as_ref()
         .ok_or_else(|| AppError::Configuration("Attachment service not configured".to_string()))?;
+    // SPEC-7.1114: JSON base64 upload on the ticket (no note); contacts need TICKETS_ATTACH_FILE.
     let tenant = caller.tenant();
     let tenant_uuid = tenant.get();
 
@@ -899,6 +899,7 @@ async fn get_types(
 // ----------------------------------------------------------------------------
 // Lookup management (PMS-321). Mutations require admin (`RequireAdmin`),
 // matching the asset-type write routes; reads stay on `RequireAuth`.
+// SPEC-7.1103: lists page by sort_order (types: active only); mutations need the admin role.
 // ----------------------------------------------------------------------------
 
 async fn create_status(

@@ -63,6 +63,12 @@ impl InfisicalSecretsConfig {
     // SPEC-3.23: fixed folder /mokosh/integrations; requires 4 variables
     // (blank counts as missing); INFISICAL_ENVIRONMENT defaults to "dev".
     pub fn from_env() -> AppResult<Self> {
+        // PMS-1657: the message used to name `SECRET_BACKEND`, which is
+        // the tenant-tier variable; this builder is also called by the
+        // app-tier Infisical provider (`APP_SECRET_BACKEND`), so an
+        // operator who missed one of the INFISICAL_* vars on the app
+        // tier was told to set a knob that does not select app-tier
+        // secrets. Name the two legal selections instead.
         fn required(name: &str) -> AppResult<String> {
             std::env::var(name)
                 .ok()
@@ -70,7 +76,7 @@ impl InfisicalSecretsConfig {
                 .filter(|v| !v.is_empty())
                 .ok_or_else(|| {
                     AppError::Configuration(format!(
-                        "SECRET_BACKEND=infisical requires {name} to be set"
+                        "SECRET_BACKEND=infisical or APP_SECRET_BACKEND=infisical requires {name} to be set"
                     ))
                 })
         }

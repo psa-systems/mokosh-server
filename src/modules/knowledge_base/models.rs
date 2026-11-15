@@ -16,6 +16,7 @@ pub struct KbCategoryResponse {
     pub sort_order: i32,
 }
 
+// SPEC-15.1116
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertKbCategoryRequest {
     #[validate(length(min = 1, max = 100))]
@@ -35,6 +36,7 @@ fn default_internal() -> String {
     "internal".into()
 }
 
+// SPEC-15.1123
 /// One declared template variable on a KB article. The render endpoint
 /// accepts a `{name: value}` map that must be a subset of these names;
 /// an unknown name is a 400. A variable with no `allowed_values` is
@@ -50,6 +52,7 @@ pub struct KbTemplateVariable {
     pub default: Option<String>,
 }
 
+// SPEC-15.1139
 /// Body of POST /kb/articles/{id}/render. An absent or empty `values`
 /// is `{}`.
 #[derive(Debug, Clone, Default, Deserialize, Validate)]
@@ -66,6 +69,7 @@ pub struct RenderKbArticleResponse {
     pub content: String,
 }
 
+// SPEC-15.1126
 #[derive(Debug, Clone, Serialize)]
 pub struct KbArticleResponse {
     pub id: Uuid,
@@ -119,6 +123,7 @@ pub struct KbArticleResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-15.1119
 /// PMS-1082: the customer's projection of an article, what the contact
 /// arm of `GET /kb/articles` and `GET /kb/articles/{id}` answers with.
 /// Deliberately NOT `KbArticleResponse` (the PMS-1061 rule): a contact
@@ -165,6 +170,7 @@ impl From<KbArticleResponse> for ContactKbArticleResponse {
     }
 }
 
+// SPEC-15.1120
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateKbArticleRequest {
     #[validate(length(min = 1, max = 255))]
@@ -203,6 +209,7 @@ fn default_draft() -> String {
     "draft".into()
 }
 
+// SPEC-15.1127, SPEC-15.1129
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateKbArticleRequest {
     #[validate(length(min = 1, max = 255))]
@@ -251,6 +258,7 @@ where
     Ok(Some(Option::<Uuid>::deserialize(deserializer)?))
 }
 
+// SPEC-15.1132
 /// PMS-1126: the body of `POST /kb/articles/{id}/versions/{n}/restore`.
 /// Optional, and an empty body is the same as `{}`.
 #[derive(Debug, Clone, Default, Deserialize, Validate)]
@@ -261,6 +269,7 @@ pub struct RestoreKbArticleVersionRequest {
     pub change_note: Option<String>,
 }
 
+// SPEC-15.1130
 /// PMS-922: the in-progress body an author has not saved yet.
 ///
 /// Deliberately NOT `UpdateKbArticleRequest`. A draft holds the two fields the
@@ -284,6 +293,7 @@ pub struct KbDraftResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-15.1118
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct KbArticleFilter {
     pub category_id: Option<Uuid>,
@@ -329,6 +339,7 @@ pub struct KbArticleVersionResponse {
     pub created_at: DateTime<Utc>,
 }
 
+// SPEC-15.1140
 /// PMS-1128: one comment on an article, with its replies nested when it is
 /// a root. Names ride along and ids never stand alone on the page. A
 /// deleted comment keeps its place with `deleted: true` and an empty body,
@@ -355,6 +366,7 @@ pub struct KbCommentResponse {
     pub replies: Vec<KbCommentResponse>,
 }
 
+// SPEC-15.1141
 /// PMS-1128: the body of `POST /kb/articles/{id}/comments`.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateKbCommentRequest {
@@ -368,6 +380,7 @@ pub struct CreateKbCommentRequest {
     pub anchor: Option<serde_json::Value>,
 }
 
+// SPEC-15.1142
 /// PMS-1128: the body of `PUT /kb/comments/{id}`. Only the text moves; the
 /// anchor is immutable and the thread shape is not something an edit
 /// changes.
@@ -377,6 +390,7 @@ pub struct UpdateKbCommentRequest {
     pub body: String,
 }
 
+// SPEC-15.1136
 /// PMS-1127: a ticket that references an article, one row of
 /// `GET /kb/articles/{id}/tickets`. `relation` says how: `source` for a
 /// ticket opened FROM the article (`tickets.source_kb_article_id`,
@@ -397,6 +411,7 @@ pub struct KbArticleTicketRow {
     pub updated_at: DateTime<Utc>,
 }
 
+// SPEC-15.1137
 /// PMS-485: row in the "Top ticket-driving articles" widget. One row
 /// per published KB article, ordered by descending `ticket_count` over
 /// the configurable `since` window.
@@ -423,6 +438,7 @@ pub struct KbExecutionStepResponse {
     pub checked_by_name: Option<String>,
 }
 
+// SPEC-15.1110, SPEC-15.1112
 /// The full KB article execution with its step list: what the create
 /// route and the single-get route answer with. `article_version_id` is
 /// NULL for the historic case where no `kb_article_versions` row exists
@@ -470,12 +486,14 @@ pub struct CreateKbExecutionRequest {
     pub values: std::collections::BTreeMap<String, String>,
 }
 
+// SPEC-15.1113
 /// `PATCH /api/v1/kb-executions/{id}/steps/{index}`.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CheckKbExecutionStepRequest {
     pub checked: bool,
 }
 
+// SPEC-15.1133
 /// Returned by the helpful / not_helpful feedback endpoints so the portal
 /// (or agent UI) can render the updated tallies without a follow-up GET.
 ///

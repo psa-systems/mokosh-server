@@ -28,6 +28,7 @@ const DISTANCE_MILES_MAX_EXCLUSIVE: i64 = 1_000_000;
 /// (largest holdable value `9_999.9999`).
 const RATE_PER_MILE_MAX_EXCLUSIVE: i64 = 10_000;
 
+// SPEC-4.211: error codes and messages, checked sign then scale then range.
 /// Shared non-negative numeric rule: reject negatives, more than `max_scale`
 /// decimal places, and magnitudes that would overflow the backing column.
 /// `noun` / `column` tailor the human-readable message.
@@ -58,9 +59,6 @@ fn validate_nonneg(
     Ok(())
 }
 
-/// Validate a money rate stored in a `DECIMAL(10, 2)` column (`default_rate`,
-/// `hourly_rate`): non-negative, at most 2 decimal places, magnitude `< 1e8`.
-/// A zero rate is allowed (free / non-billable work).
 /// A URL slug: lowercase alphanumerics in hyphen-separated groups, with no
 /// leading, trailing or doubled hyphen. Grammar `^[a-z0-9]+(-[a-z0-9]+)*$`.
 ///
@@ -87,6 +85,9 @@ pub fn validate_slug(slug: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Validate a money rate stored in a `DECIMAL(10, 2)` column (`default_rate`,
+/// `hourly_rate`): non-negative, at most 2 decimal places, magnitude `< 1e8`.
+/// A zero rate is allowed (free / non-billable work).
 // SPEC-4.80: DECIMAL(10,2), zero allowed.
 pub fn validate_rate(value: &Decimal) -> Result<(), ValidationError> {
     validate_nonneg(
@@ -128,6 +129,7 @@ pub fn validate_rate_per_mile(value: &Decimal) -> Result<(), ValidationError> {
 /// is not a trip; the column carries a `distance_miles > 0` CHECK), so it is
 /// validated separately rather than via [`validate_rate`].
 // SPEC-4.80: NUMERIC(8,2), strictly positive, zero rejected.
+// SPEC-4.210: error codes and messages, checked sign then scale then range.
 pub fn validate_distance_miles(value: &Decimal) -> Result<(), ValidationError> {
     if !value.is_sign_positive() || value.is_zero() {
         let mut error = ValidationError::new("distance_not_positive");

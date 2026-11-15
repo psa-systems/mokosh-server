@@ -127,6 +127,7 @@ pub struct BillLine {
 /// bills list needs and none it does not: `status` is one of the four the
 /// CHECK allows, and a value outside it answers an empty page rather than
 /// a 400, which is what `InvoiceFilter` does with an unknown status.
+// SPEC-14.68: status up to 20 characters and q up to 200.
 #[derive(Debug, Clone, Default, Deserialize, Validate)]
 pub struct BillFilter {
     #[validate(length(max = 20))]
@@ -137,6 +138,7 @@ pub struct BillFilter {
 
 /// What narrows `GET /expenses` (PMS-1539). The claims half of
 /// [`BillFilter`]; `status` is one of the five an expense moves through.
+// SPEC-14.76: status up to 20 characters and q up to 200.
 #[derive(Debug, Clone, Default, Deserialize, Validate)]
 pub struct ExpenseFilter {
     #[validate(length(max = 20))]

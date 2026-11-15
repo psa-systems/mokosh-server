@@ -39,6 +39,7 @@
 # docs/dev-docs/local-vs-ci-checks.md (PMS-851).
 name: Check
 
+# SPEC-10.2: no push trigger for main; the pull_request run is the merge gate
 on:
   # PMS-825: an allow-listed publishing branch (PMS-733) is long-lived, so no
   # pull_request into main ever covers it, and without a `push:` entry staging
@@ -58,15 +59,18 @@ on:
 # PMS-1633: supersede obsolete PR runs. `github.ref` is unique per PR on
 # pull_request events (refs/pull/<N>/merge), so two open PRs never share a
 # group.
+# SPEC-10.300: one run per pull request ref, older runs cancelled
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# SPEC-10.301: classify gates cargo and guards; secrets always runs
 jobs:
   classify:
     name: classify diff
     # PMS-1652: only diffs file paths and comment/whitespace lines, no
     # compile.
+    # SPEC-10.302: base-medium, fetch-depth 0, run_gate output
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
     outputs:
       result: ${{ steps.classify.outputs.result }}
@@ -74,6 +78,7 @@ jobs:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
 
+      # SPEC-10.303: verdict to run_gate; unknown verdict or fetch failure never skips silently
       - name: Classify diff
         id: classify
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/classify-diff@main
@@ -85,6 +90,7 @@ jobs:
     # Dev label: this job compiles Rust natively on the runner, and only the
     # dev image carries `cc` / `gcc` / `ld` plus the OpenSSL headers openssl-sys
     # probes. Base fails at `linker cc not found` (PMS-705, CLAUDE-203).
+    # SPEC-10.1 SPEC-10.304: pull_request on main, heavy label; cargo job bound is 45 minutes
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # Backstop, not a target (PMS-829): 38 green runs between 2026-08-22 and
@@ -96,6 +102,7 @@ jobs:
     # cache-hit path (~3.5m) comfortably ahead of the bound.
     # No step here has a reporting block to protect, so this is the job bound
     # only, with no inner `timeout` wrapper.
+    # SPEC-10.304
     timeout-minutes: 45
 
     steps:
@@ -106,6 +113,7 @@ jobs:
         # guards job below, which checks out deep + submodules on purpose.
         uses: https://code.forgejo.org/actions/checkout@v5
 
+      # SPEC-10.5: half the host's cores
       - name: Cap build parallelism
         # nproc/2 cap: never claim more than half the host (see "Concurrency
         # cap" in CI.md of dev.a8n.run/niceguyit/governance; not a file in
@@ -115,6 +123,7 @@ jobs:
         if: needs.classify.outputs.result == 'code'
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
+      # SPEC-10.6: shared-key must equal cache-warm.yml's warm-check key
       - name: Cache Rust build
         # PMS-1252: `shared-key` MUST match `cache-warm.yml`'s warm-check
         # job so a pull-request run restores what the post-merge warm
@@ -145,6 +154,7 @@ jobs:
         run: |
           nu scripts/check-build-target-storage.nu
 
+      # SPEC-10.9 SPEC-10.305: fmt, clippy, unit and doc tests, in this order
       - name: Check formatting
         # PMS-1652: runs on `code` and `comments-only` alike (STD-3.2); only
         # `non-code` skips it, via the job-level `if:` above.
@@ -174,6 +184,7 @@ jobs:
         if: needs.classify.outputs.result == 'code'
         run: cargo test --workspace --doc
 
+      # SPEC-10.306
       - name: Cache cargo-machete tarball
         # PMS-1641: version-keyed tarball cache. A hit skips the ~5s
         # download; a version bump misses the key, downloads once, and
@@ -186,6 +197,7 @@ jobs:
           path: /tmp/machete.tar.gz
           key: cargo-machete-tarball-0.9.2-linux
 
+      # SPEC-10.8: pinned, checksum-verified cargo-machete
       - name: Unused dependencies
         # PMS-780: `pulldown-cmark` and `minijinja` were declared with no call
         # site and compiled on every cold build. The manifest is clean now, so
@@ -221,6 +233,7 @@ jobs:
           install -m 755 "/tmp/cargo-machete-v${MACHETE_VERSION}-x86_64-unknown-linux-musl/cargo-machete" "${cargo_bin}/cargo-machete"
           cargo machete
 
+  # SPEC-10.7 SPEC-10.309: the guard steps below run in this order
   guards:
     # PMS-1652: ungated. Several guards exist to run on doc changes (see
     # integration.yml's own comment on this), so `guards` does not depend on
@@ -237,9 +250,11 @@ jobs:
     # Backstop, not a target. The guard set is ~20 shell / nu invocations that
     # each take seconds; the full job runs in well under a minute on a warm
     # runner. The budget below absorbs a cold clone + submodule init.
+    # SPEC-10.307
     timeout-minutes: 15
 
     steps:
+      # SPEC-10.3: fetch-depth 0 and submodules for migration diff and justfile import
       - name: Clone the repository
         # fetch-depth: 0 so the migration-immutability check can diff against
         # origin/main's history (its merge-base with this branch). DEV-395.
@@ -255,6 +270,7 @@ jobs:
           # immutability and is unrelated.
           submodules: true
 
+      # SPEC-10.308
       - name: Detect routing-relevant changes
         # PMS-1637: the mokosh-apps clone + route-consumers check below
         # cost 5-15s on every PR but only matter when THIS repo changes
@@ -275,6 +291,7 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # SPEC-10.4: shallow SPA clone for the route-consumers check, only when routes changed
       - name: Clone the mokosh-apps sibling
         # check-route-consumers.nu compares mounted routes against the SPA
         # source. Without this checkout the guard skips loudly and drift
@@ -490,6 +507,7 @@ jobs:
         run: |
           nu scripts/check-route-consumers.nu
 
+  # SPEC-10.10: kingfisher secrets scan, always runs
   secrets:
     name: secrets scan
     # Base label: this job only invokes a composite action; nothing on the

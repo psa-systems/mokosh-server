@@ -13,6 +13,7 @@
 /// attribute or an element. Not a general-purpose sanitiser: the values passed
 /// through it are operator configuration and tenant-set names, not documents.
 // SPEC-4.18: escape & before <, > and " so an entity is never double-escaped.
+// SPEC-4.1000: single quote is not escaped: safe in element text and double-quoted attributes only.
 pub fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")

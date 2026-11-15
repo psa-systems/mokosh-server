@@ -69,6 +69,7 @@ pub struct InvoiceIssuerMappingRouterState {
     pub features: FeatureSnapshot,
 }
 
+// SPEC-13.1077: no DELETE route by design
 /// Build the invoice-issuer mapping router.
 pub fn invoice_issuer_mapping_routes(state: InvoiceIssuerMappingRouterState) -> Router {
     Router::new()
@@ -167,6 +168,7 @@ pub struct ListProductMappingsResponse {
     pub mappings: Vec<ProductMapping>,
 }
 
+// SPEC-13.1079
 /// Flag check: 404 when `Feature::DelegatedInvoiceIssuer` is off. 404
 /// (not 403) so a probe cannot tell the mapping surface exists at all;
 /// matches the `require_search_v2` posture `assets/routes.rs` uses.
@@ -183,6 +185,7 @@ fn require_delegated_issuer(state: &InvoiceIssuerMappingRouterState) -> AppResul
     }
 }
 
+// SPEC-13.1079
 /// Flag check for the bill half (MAPPS-1155): 404 when
 /// `Feature::DelegatedBills` is off, same posture and same reason as
 /// [`require_delegated_issuer`], a different switch.
@@ -199,6 +202,7 @@ fn require_delegated_bills(state: &InvoiceIssuerMappingRouterState) -> AppResult
     }
 }
 
+// SPEC-13.1081
 fn parse_provider(raw: &str) -> AppResult<InvoiceProviderKind> {
     InvoiceProviderKind::parse(raw).ok_or_else(|| {
         AppError::BadRequest(format!(
@@ -207,6 +211,7 @@ fn parse_provider(raw: &str) -> AppResult<InvoiceProviderKind> {
     })
 }
 
+// SPEC-13.1078: auth extractors run before the flag check
 async fn list_company_mappings(
     State(state): State<InvoiceIssuerMappingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -218,6 +223,7 @@ async fn list_company_mappings(
     Ok(Json(ListCompanyMappingsResponse { mappings }))
 }
 
+// SPEC-13.1080: flag, then body validation, then provider
 async fn upsert_company_mapping(
     State(state): State<InvoiceIssuerMappingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -252,6 +258,7 @@ async fn list_product_mappings(
     Ok(Json(ListProductMappingsResponse { mappings }))
 }
 
+// SPEC-13.1080
 async fn upsert_product_mapping(
     State(state): State<InvoiceIssuerMappingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -286,6 +293,7 @@ async fn list_vendor_mappings(
     Ok(Json(ListVendorMappingsResponse { mappings }))
 }
 
+// SPEC-13.1080
 async fn upsert_vendor_mapping(
     State(state): State<InvoiceIssuerMappingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -323,6 +331,7 @@ async fn list_expense_account_mappings(
     Ok(Json(ListExpenseAccountMappingsResponse { mappings }))
 }
 
+// SPEC-13.1080
 async fn upsert_expense_account_mapping(
     State(state): State<InvoiceIssuerMappingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -357,6 +366,7 @@ async fn list_user_mappings(
     Ok(Json(ListUserMappingsResponse { mappings }))
 }
 
+// SPEC-13.1080
 async fn upsert_user_mapping(
     State(state): State<InvoiceIssuerMappingRouterState>,
     RequireBilling { user, .. }: RequireBilling,

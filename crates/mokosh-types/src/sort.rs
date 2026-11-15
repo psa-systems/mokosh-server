@@ -24,6 +24,7 @@
 // SPEC-4.51: the shared allow-list `order_by`/`order_by_mapped` enforce per endpoint.
 
 /// `GET /api/v1/auth/users`.
+// SPEC-4.1039: the sortable fields are fixed per list endpoint in this module.
 pub const USERS: &[&str] = &[
     "email",
     "first_name",

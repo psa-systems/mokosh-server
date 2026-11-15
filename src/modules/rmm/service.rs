@@ -14,6 +14,7 @@ use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
+// SPEC-15.1546: outbound guard on the test probe
 /// Parse and screen a stored `api_url` before the reachability probe connects
 /// to it (PMS-809). The error string is what the endpoint reports back, so a
 /// refused target reads as unreachable-with-a-reason rather than a bare false.
@@ -92,6 +93,7 @@ impl RmmService {
     }
 
     // PMS-102 connections CRUD ------------------------------------------------
+    // SPEC-15.1538
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_connections(
         &self,
@@ -120,6 +122,7 @@ impl RmmService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-15.1541
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_connection(
         &self,
@@ -184,6 +187,7 @@ impl RmmService {
         })
     }
 
+    // SPEC-15.1543
     /// `GET /api/v1/rmm/connections/{id}`. Returns 404 when the row
     /// does not exist in the caller's tenant.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -206,6 +210,7 @@ impl RmmService {
             .ok_or_else(|| AppError::NotFound("RMM connection".to_string()))
     }
 
+    // SPEC-15.1543, SPEC-15.1544
     /// `PUT /api/v1/rmm/connections/{id}`. Missing fields on the
     /// request leave the existing column value untouched. `api_key`
     /// and `api_secret` are only re-encrypted when explicitly
@@ -257,6 +262,7 @@ impl RmmService {
         self.get_connection(tenant_id, id).await
     }
 
+    // SPEC-15.1543
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_connection(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -273,6 +279,7 @@ impl RmmService {
         Ok(())
     }
 
+    // SPEC-15.1545, SPEC-15.1546, SPEC-15.1547
     /// `POST /api/v1/rmm/connections/:id/test`: probe the RMM endpoint.
     /// v1 just decrypts the credentials and HEADs the api_url to confirm
     /// reachability; per-provider auth check is the next commit.
@@ -334,6 +341,7 @@ impl RmmService {
     }
 
     // PMS-103 device mappings -------------------------------------------------
+    // SPEC-15.1538, SPEC-15.1539
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_device_mappings(
         &self,
@@ -380,6 +388,7 @@ impl RmmService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-15.1548
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_device_mapping(
         &self,
@@ -450,6 +459,7 @@ impl RmmService {
             .ok_or_else(|| AppError::NotFound("RMM device mapping".to_string()))
     }
 
+    // SPEC-15.1549
     /// `PUT /api/v1/rmm/device-mappings/{id}`. Missing fields on the
     /// request leave the existing column value untouched (COALESCE),
     /// matching the connection update semantics. `rmm_connection_id` is
@@ -486,6 +496,7 @@ impl RmmService {
         self.get_device_mapping(tenant_id, id).await
     }
 
+    // SPEC-15.1549
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_device_mapping(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -503,6 +514,7 @@ impl RmmService {
     }
 
     // PMS-104 alert rules + ingestion ----------------------------------------
+    // SPEC-15.1538, SPEC-15.1539
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_alert_rules(
         &self,
@@ -565,6 +577,7 @@ impl RmmService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // SPEC-15.1550
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_alert_rule(
         &self,
@@ -640,6 +653,7 @@ impl RmmService {
             .ok_or_else(|| AppError::NotFound("RMM alert rule".to_string()))
     }
 
+    // SPEC-15.1551
     /// `PUT /api/v1/rmm/alert-rules/{id}`. Missing fields on the request
     /// leave the existing column value untouched (COALESCE), matching the
     /// connection update semantics. `rmm_connection_id` is not editable.
@@ -682,6 +696,7 @@ impl RmmService {
         self.get_alert_rule(tenant_id, id).await
     }
 
+    // SPEC-15.1551
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_alert_rule(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -698,6 +713,7 @@ impl RmmService {
         Ok(())
     }
 
+    // SPEC-15.1554, SPEC-15.1555, SPEC-15.1556, SPEC-15.1558, SPEC-15.1559, SPEC-15.1560, SPEC-15.1561
     /// Ingest an RMM alert. Matches `(rmm_connection_id, alert_type)`
     /// to active rules; for each rule with `auto_create_ticket = true`
     /// AND whose `suppression_rules` does not gate the alert, creates
@@ -863,6 +879,7 @@ impl RmmService {
         .await?)
     }
 
+    // SPEC-15.1552, SPEC-15.1553: secret for signature check, none means 401
     /// PMS-105: verify the HMAC-SHA256 signature on an inbound alert.
     /// Returns the connection's stored secret; the route handler does
     /// the constant-time compare.
@@ -991,6 +1008,7 @@ impl From<AlertRuleRow> for RmmAlertRuleResponse {
     }
 }
 
+// SPEC-15.1557
 /// Severity ladder used by suppression checks. Anything outside the
 /// known set ranks higher than `critical` so unknown severities are
 /// never silently dropped.
@@ -1004,10 +1022,18 @@ fn severity_rank(s: Option<&str>) -> u8 {
     }
 }
 
+// SPEC-15.1557
 /// Returns true if the alert is below the rule's `min_severity` (and
 /// therefore should be dropped before any ticket is created). When the
 /// rule has no `suppression_rules` or no `min_severity` key, returns
 /// false (accept).
+///
+/// PMS-1667: an unknown `min_severity` string (a typo, a rule copied
+/// from another vendor's vocabulary) used to rank as `u8::MAX` through
+/// `severity_rank`, so EVERY known-severity alert compared less than it
+/// and was silently suppressed. A whole tenant could stop getting
+/// tickets because of one typo. Refuse to suppress on an unknown
+/// min_severity and log a WARN so an operator can find the rule.
 fn alert_suppressed(rules: Option<&serde_json::Value>, alert: &IngestAlertRequest) -> bool {
     let Some(rules) = rules else {
         return false;
@@ -1015,7 +1041,26 @@ fn alert_suppressed(rules: Option<&serde_json::Value>, alert: &IngestAlertReques
     let Some(min_sev) = rules.get("min_severity").and_then(|v| v.as_str()) else {
         return false;
     };
+    if !is_known_severity(min_sev) {
+        tracing::warn!(
+            min_severity = %min_sev,
+            "rmm rule's suppression_rules.min_severity is not one of {{low, info, medium, warning, high, critical}}; accepting the alert instead of silently dropping every incoming alert",
+        );
+        return false;
+    }
     severity_rank(alert.severity.as_deref()) < severity_rank(Some(min_sev))
+}
+
+/// The vocabulary `severity_rank` recognises explicitly; used by
+/// `alert_suppressed` so a typo in a rule's `min_severity` does not get
+/// quietly ranked as `u8::MAX` (above everything) and suppress every
+/// alert.
+// SPEC-15.1558
+fn is_known_severity(s: &str) -> bool {
+    matches!(
+        s,
+        "low" | "info" | "medium" | "warning" | "high" | "critical"
+    )
 }
 
 /// Pulls `dedupe_window_minutes` out of the rule's `suppression_rules`
@@ -1029,6 +1074,7 @@ fn dedupe_window_minutes(rules: Option<&serde_json::Value>) -> Option<i32> {
         .filter(|n| *n > 0)
 }
 
+// SPEC-15.1559
 /// Render the (title, description) fields from the rule's
 /// `ticket_template` JSONB. Both fields fall back to the raw alert
 /// when the template is missing or omits a key.
@@ -1081,6 +1127,24 @@ mod tests {
         assert!(!alert_suppressed(None, &alert(Some("low"))));
         let rules = serde_json::json!({});
         assert!(!alert_suppressed(Some(&rules), &alert(Some("low"))));
+    }
+
+    /// PMS-1667: a typoed or alien min_severity used to rank as u8::MAX
+    /// through `severity_rank`, so every known-severity alert was less
+    /// than it and silently suppressed. The fix refuses to suppress when
+    /// min_severity is not in the known vocabulary; a typo stops being a
+    /// silent kill-switch and the operator sees a WARN they can trace.
+    #[test]
+    fn suppression_does_not_drop_everything_on_a_typoed_min_severity() {
+        for bad in ["catastrophic", "Critical", "LOW", "WARN", "", "9999"] {
+            let rules = serde_json::json!({"min_severity": bad});
+            for incoming in ["low", "info", "medium", "warning", "high", "critical"] {
+                assert!(
+                    !alert_suppressed(Some(&rules), &alert(Some(incoming))),
+                    "min_severity={bad:?}, incoming={incoming:?}: unknown rule value must not suppress a known-severity alert"
+                );
+            }
+        }
     }
 
     #[test]

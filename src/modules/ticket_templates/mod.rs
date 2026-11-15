@@ -10,6 +10,7 @@
 //! create path (audit + SLA + `ticket.created` workflow rules) runs
 //! unchanged.
 
+// SPEC-7.1119: a template is only a pre-fill; ticket creation from one is a plain create.
 mod models;
 #[cfg(feature = "server")]
 mod routes;

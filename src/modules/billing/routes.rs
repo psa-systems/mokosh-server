@@ -5,10 +5,6 @@
 //! PayPal webhook attempts and their outcomes) that the admin reaches
 //! through the API; the delivery-log screen is deferred. Every other route
 //! in this file is consumed.
-//!
-//! parity record 2026-10-16: `/invoices/summary` has no SPA caller yet;
-//! MAPPS-983 wires the dashboard "open invoices" widget to it (MAPPS-984
-//! is the server half this adds). Note covers ONLY the summary route.
 
 use std::sync::Arc;
 
@@ -60,10 +56,12 @@ pub struct BillingRouterState {
 
 /// Build the billing router. URLs are absolute (`/invoices`, etc.) so
 /// the call site `merge`s rather than `nest`s.
+// SPEC-13.1, SPEC-13.2
 pub fn billing_routes(service: BillingService, public_api_base: Option<String>) -> Router {
     let state = BillingRouterState {
         service: Arc::new(service),
         public_api_base,
+        // SPEC-13.82
         // MAPPS-677: 20 mints per minute per caller (staff `users.id` or
         // portal `contacts.id`) and 10 per minute per invoice, mirroring
         // the AuthRateLimiter quotas the auth endpoints already use.
@@ -228,6 +226,7 @@ pub fn billing_routes(service: BillingService, public_api_base: Option<String>) 
         .with_state(state)
 }
 
+// SPEC-13.56
 async fn list_payment_terms(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -246,6 +245,7 @@ async fn list_payment_terms(
     )))
 }
 
+// SPEC-13.57
 async fn create_payment_term(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -261,6 +261,7 @@ async fn create_payment_term(
     Ok(Json(t))
 }
 
+// SPEC-13.58
 async fn update_payment_term(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -276,6 +277,7 @@ async fn update_payment_term(
     Ok(Json(t))
 }
 
+// SPEC-13.59
 async fn delete_payment_term(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -286,6 +288,7 @@ async fn delete_payment_term(
     Ok(())
 }
 
+// SPEC-13.51
 async fn list_tax_rates(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -304,6 +307,7 @@ async fn list_tax_rates(
     )))
 }
 
+// SPEC-13.52
 async fn create_tax_rate(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -319,6 +323,7 @@ async fn create_tax_rate(
     Ok(Json(r))
 }
 
+// SPEC-13.53
 async fn update_tax_rate(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -335,6 +340,7 @@ async fn update_tax_rate(
     Ok(Json(r))
 }
 
+// SPEC-13.54
 async fn delete_tax_rate(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -354,6 +360,7 @@ struct LookupQuery {
     name: String,
 }
 
+// SPEC-13.55
 async fn lookup_tax_rate(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -377,6 +384,7 @@ async fn lookup_tax_rate(
 /// closes.
 ///
 /// The tenant is the CALLER's, never a value off the request.
+// SPEC-13.69
 async fn list_gateway_webhook_endpoints(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -400,6 +408,7 @@ async fn list_gateway_webhook_endpoints(
 /// record, and it is the one this application could not say: a refused
 /// delivery left no trace, so an MSP's only recourse was their provider's own
 /// dashboard.
+// SPEC-13.70
 async fn list_gateway_webhook_deliveries(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -425,6 +434,7 @@ async fn list_gateway_webhook_deliveries(
     Ok(Json(deliveries))
 }
 
+// SPEC-13.60
 async fn list_payment_gateways(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -443,6 +453,7 @@ async fn list_payment_gateways(
     )))
 }
 
+// SPEC-13.62, SPEC-13.64
 async fn upsert_payment_gateway(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -465,6 +476,7 @@ async fn upsert_payment_gateway(
 /// exercise them is a customer's payment. A wrong PayPal webhook id in
 /// particular survives the save, the readiness check and the checkout, and
 /// shows up only as a payment that never reaches the invoice.
+// SPEC-13.67
 async fn check_payment_gateway(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -481,6 +493,7 @@ async fn check_payment_gateway(
     Ok(Json(checks))
 }
 
+// SPEC-13.66
 async fn delete_payment_gateway(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -498,6 +511,7 @@ async fn delete_payment_gateway(
     Ok(())
 }
 
+// SPEC-13.88
 async fn list_payments(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -517,6 +531,7 @@ async fn list_payments(
     )))
 }
 
+// SPEC-13.89
 async fn create_payment(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -532,6 +547,7 @@ async fn create_payment(
     Ok(Json(p))
 }
 
+// SPEC-13.92
 async fn delete_payment(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -546,6 +562,7 @@ async fn delete_payment(
     Ok(())
 }
 
+// SPEC-13.96, SPEC-13.98
 async fn update_invoice(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -563,6 +580,7 @@ async fn update_invoice(
 }
 
 /// PMS-1462: see [`BillingService::invoice_delivery_options`].
+// SPEC-13.115
 async fn invoice_delivery_options(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -576,6 +594,7 @@ async fn invoice_delivery_options(
     Ok(Json(options))
 }
 
+// SPEC-13.18
 async fn create_invoice(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -595,6 +614,7 @@ async fn create_invoice(
 /// entries. Lower-risk than overloading `POST /invoices` (whose body is
 /// a fully-specified line set): this is a distinct, additive route with
 /// its own DTO, so existing invoice-create callers are untouched.
+// SPEC-13.27
 async fn create_invoice_from_time_entries(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -610,6 +630,7 @@ async fn create_invoice_from_time_entries(
     Ok(Json(inv))
 }
 
+// SPEC-13.4, SPEC-13.6, SPEC-13.12
 async fn get_invoice(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -644,6 +665,7 @@ async fn get_invoice(
 /// paging the full `/invoices` list to compute a count + total. Returns
 /// `{ count, total }` using the same filter shape and gating as
 /// `list_invoices`.
+// SPEC-13.5, SPEC-13.8, SPEC-13.9
 async fn invoices_summary(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -667,6 +689,7 @@ async fn invoices_summary(
     Ok(Json(summary))
 }
 
+// SPEC-13.5, SPEC-13.7, SPEC-13.8
 async fn list_invoices(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -720,6 +743,7 @@ async fn list_invoices(
 /// 404 when the MSP disables billing is a separate product question - the
 /// contact branch gates on the PMS-1025 `caps::INVOICES_*` capabilities
 /// and is deliberately not decided here.
+// SPEC-13.3
 async fn assert_staff_billing_finance(
     auth: &crate::modules::auth::AuthState,
     settings: &SettingsService,
@@ -740,6 +764,7 @@ async fn assert_staff_billing_finance(
 // PMS-953: credit notes
 // ============================================================================
 
+// SPEC-13.124
 async fn list_credit_notes(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -760,6 +785,7 @@ async fn list_credit_notes(
     )))
 }
 
+// SPEC-13.124
 async fn get_credit_note(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -778,6 +804,7 @@ async fn get_credit_note(
 /// PMS-1036: write an invoice off. Finance only, like every other write to
 /// an issued document. 409 names the status when the invoice is not one that
 /// can be written off; the reason is required.
+// SPEC-13.116
 async fn write_off_invoice(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -798,6 +825,7 @@ async fn write_off_invoice(
 /// other write that decides what a client owes. 409 names the status when the
 /// invoice is past `pending`, because from there the correction is a credit
 /// note; the reason is optional.
+// SPEC-13.117
 async fn void_invoice(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -816,6 +844,7 @@ async fn void_invoice(
 
 /// PMS-1334: replace a sent invoice with a linked draft. Both gates, like every
 /// other handler in this file (PMS-962): the module gate first, then finance.
+// SPEC-13.118
 async fn amend_invoice(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -830,6 +859,7 @@ async fn amend_invoice(
     Ok(Json(amendment))
 }
 
+// SPEC-13.119
 async fn create_credit_note(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -847,6 +877,7 @@ async fn create_credit_note(
 
 /// POST rather than DELETE: the row is not removed and the document still
 /// exists. It stops counting against the invoice, and that is a state change.
+// SPEC-13.123
 async fn void_credit_note(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -870,6 +901,7 @@ async fn void_credit_note(
 /// Not paginated, and deliberately so: a statement that dropped rows past a
 /// page boundary would not reconcile, which is the one thing a statement has to
 /// do. A caller who wants less asks for a shorter period.
+// SPEC-13.126
 async fn get_statement(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -932,6 +964,7 @@ impl TemplatePreview {
 /// that 404s a foreign invoice; staff plane keeps the finance inline check.
 /// After the gate passes the handler renders (or serves the stored bytes) via
 /// the shared PMS-959 issuer path.
+// SPEC-13.4, SPEC-13.6, SPEC-13.135
 async fn get_invoice_pdf(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -972,7 +1005,7 @@ async fn get_invoice_pdf(
     // the provider, which Mokosh cannot authenticate this caller for.
     if let Some(provider) = invoice.external_provider.as_deref() {
         return Err(AppError::Conflict(format!(
-            "This invoice was issued by {provider}, so its document is {provider}'s. Open it              there{}.",
+            "This invoice was issued by {provider}, so its document is {provider}'s. Open it there{}.",
             invoice
                 .external_number
                 .as_deref()
@@ -1035,6 +1068,7 @@ async fn get_invoice_pdf(
 /// keeps the billing/finance inline gate. The 400s from the service
 /// (invoice in a non-payable status, zero balance, no active gateway)
 /// pass through unchanged.
+// SPEC-13.4, SPEC-13.6, SPEC-13.78, SPEC-13.81, SPEC-13.82
 async fn pay_invoice(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -1141,6 +1175,7 @@ fn caller_id_for_rate_limit(caller: &CallerContext) -> Uuid {
 /// Extracted because PMS-1179 made the readiness response carry a list AND a
 /// single legacy label: two places computing the same string is how the button
 /// a customer sees comes to disagree with the button the list describes.
+// SPEC-13.75
 fn payment_button_label(provider: &str, override_label: Option<&str>) -> String {
     override_label
         .map(str::trim)
@@ -1153,6 +1188,7 @@ fn payment_button_label(provider: &str, override_label: Option<&str>) -> String 
         })
 }
 
+// SPEC-13.4, SPEC-13.6, SPEC-13.76
 async fn get_invoice_payment_readiness(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -1237,6 +1273,7 @@ async fn get_invoice_payment_readiness(
 /// Always the stored bytes in practice: a credit note is issued at creation, so
 /// unlike an invoice there is no draft state and no document without one. The
 /// live render covers a credit note created before PMS-959 and nothing else.
+// SPEC-13.125
 async fn get_credit_note_pdf(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -1279,6 +1316,7 @@ async fn get_credit_note_pdf(
 /// left the JSON route beside it ungated, because re-permissioning six existing
 /// endpoints did not belong in a branding change; PMS-962 closed that gap, so
 /// the two answer a given role identically again.
+// SPEC-13.126, SPEC-13.129
 async fn get_statement_pdf(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -1336,6 +1374,7 @@ fn pdf_response(bytes: Vec<u8>, filename: &str) -> Response {
 // PMS-955: product catalog
 // ============================================================================
 
+// SPEC-13.130
 async fn list_products(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -1356,6 +1395,7 @@ async fn list_products(
     )))
 }
 
+// SPEC-13.130
 async fn get_product(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -1367,6 +1407,7 @@ async fn get_product(
     ))
 }
 
+// SPEC-13.130
 async fn create_product(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -1383,6 +1424,7 @@ async fn create_product(
     ))
 }
 
+// SPEC-13.130
 async fn update_product(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -1403,6 +1445,7 @@ async fn update_product(
 /// Deleting is for a product nothing has sold. One that has is refused with a
 /// 409 naming the alternative, because retiring a sold product is
 /// `is_active = false`: the documents that sold it still name it.
+// SPEC-13.131
 async fn delete_product(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -1425,6 +1468,7 @@ async fn delete_product(
 /// foreign invoice is the unknown-id 404 and its payments never
 /// surface. Both arms answer the customer-safe subset: no agent
 /// notes, no gateway ids, no provider payloads.
+// SPEC-13.4, SPEC-13.6, SPEC-13.93
 async fn list_invoice_payments(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,

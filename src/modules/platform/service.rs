@@ -31,6 +31,7 @@ pub const PLATFORM_JWT_TYP: &str = "platform";
 /// Session length for a platform admin. Kept short (2 hours) because
 /// the platform surface is high-privilege; refresh is out of scope for
 /// stage A (operator re-logs in).
+// SPEC-5.315
 const PLATFORM_SESSION_TTL: Duration = Duration::hours(2);
 
 /// Claims for a platform-admin JWT. Distinct struct from
@@ -77,6 +78,7 @@ impl PlatformAdminService {
     /// so an offboarded admin is rejected on their next request rather
     /// than riding out their token's TTL (mirrors the tenant plane's
     /// per-request `ensure_principal_usable` gate).
+    // SPEC-5.317
     pub async fn ensure_admin_active(&self, admin_id: Uuid) -> AppResult<()> {
         let pool = self.db.migrator_pool();
         let admin = PlatformAdminRepo::find_by_id(pool, admin_id)
@@ -89,6 +91,7 @@ impl PlatformAdminService {
         Ok(())
     }
 
+    // SPEC-5.309
     pub async fn authenticate(
         &self,
         email: &str,
@@ -123,6 +126,7 @@ impl PlatformAdminService {
             return Err(AppError::Unauthorized);
         }
 
+        // SPEC-5.310, SPEC-5.311
         // An enrolled admin needs a valid second factor. A missing code, a
         // wrong code and a replayed step all answer the same 401 as a bad
         // password, so the response does not reveal which factor failed. A
@@ -160,6 +164,7 @@ impl PlatformAdminService {
             }
         }
 
+        // SPEC-5.312
         // Best-effort last_login stamp; failure does not block the login.
         if let Err(e) = PlatformAdminRepo::update_last_login(pool, admin.id).await {
             tracing::warn!(admin_id = %admin.id, error = %e, "failed to stamp platform admin last_login");
@@ -190,8 +195,10 @@ impl PlatformAdminService {
         // from the platform password over time; the client's
         // chained login will still succeed for whichever password
         // it holds at the moment of login.
+        // SPEC-5.313, SPEC-5.314
         self.ensure_tenant_admin_row(&admin).await?;
 
+        // SPEC-5.315
         let (access_token, expires_at) = self.mint_token(&admin)?;
         Ok(PlatformLoginResponse {
             access_token,
@@ -206,6 +213,7 @@ impl PlatformAdminService {
     /// Best-effort - a failure is logged and swallowed, never
     /// propagated back to `authenticate` (a hiccup here must not
     /// block a login that has already verified valid credentials).
+    // SPEC-5.313, SPEC-5.314
     async fn ensure_tenant_admin_row(&self, admin: &PlatformAdminRow) -> AppResult<()> {
         let pool = self.db.migrator_pool();
         // Any live users row at this email is enough - do not clobber
@@ -272,6 +280,7 @@ impl PlatformAdminService {
     /// access token cannot enrol an authenticator, finish one it started,
     /// or remove the factor. The two failure arms both answer 401 so a probe
     /// cannot map an id to a wrong password.
+    // SPEC-5.320
     async fn reauthenticate(&self, admin_id: Uuid, password: &str) -> AppResult<PlatformAdminRow> {
         let pool = self.db.migrator_pool();
         let admin = PlatformAdminRepo::find_by_id(pool, admin_id)
@@ -288,6 +297,7 @@ impl PlatformAdminService {
         Ok(admin)
     }
 
+    // SPEC-5.321
     /// Stage a fresh TOTP secret WITHOUT flipping `mfa_enabled`, same
     /// contract the contact plane's `start_mfa_enrollment` has: only
     /// `enable_mfa`, after a live code verifies, turns MFA on, so a mis-set
@@ -323,6 +333,7 @@ impl PlatformAdminService {
         })
     }
 
+    // SPEC-5.322
     /// Finish MFA enrolment. Re-verifies the password, checks one live code
     /// against the staged secret, flips `mfa_enabled`, and mints the
     /// single-use recovery codes, returned once and stored as hashes.
@@ -361,6 +372,7 @@ impl PlatformAdminService {
         Ok(PlatformMfaEnableResponse { recovery_codes })
     }
 
+    // SPEC-5.323
     /// Remove MFA. Needs the current password AND a live code (TOTP or an
     /// unspent recovery code), so a stolen access token cannot quietly
     /// weaken the account. Not enabled is the same 401 as a wrong password,
@@ -408,6 +420,7 @@ impl PlatformAdminService {
         Ok(())
     }
 
+    // SPEC-5.319
     pub async fn change_password(
         &self,
         admin_id: Uuid,
@@ -444,6 +457,7 @@ impl PlatformAdminService {
     }
 
     /// Verify a platform bearer token and return the admin's id + email.
+    // SPEC-5.316
     pub fn decode_token(&self, token: &str) -> AppResult<(Uuid, String)> {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
@@ -462,6 +476,7 @@ impl PlatformAdminService {
         Ok((claims.sub, claims.email))
     }
 
+    // SPEC-5.315
     fn mint_token(
         &self,
         admin: &PlatformAdminRow,
