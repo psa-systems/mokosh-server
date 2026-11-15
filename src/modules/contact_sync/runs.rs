@@ -153,6 +153,16 @@ impl SourceFactory for GoogleSourceFactory {
         // SecretKey address Google's does. The HTTP shape of the provider
         // itself (Graph) is Phase 1's `super::microsoft::MicrosoftContactsProvider`.
         if provider == "microsoft" {
+            // MAPPS-1101 Phase 5: capability-gate check. Refuses when the
+            // tenant has not delegated the Contacts capability on the
+            // integrations row, so a user who connected Microsoft but then
+            // unticked Contacts under Settings > Integrations stops the
+            // sync without losing the credential / folder selection /
+            // review state the connection owns. Google has no symmetric
+            // gate yet (see the method's docstring).
+            self.service
+                .assert_microsoft_contacts_capability_delegated(tenant_id)
+                .await?;
             let token = self
                 .service
                 .microsoft_access_token(tenant_id, connection_id)
