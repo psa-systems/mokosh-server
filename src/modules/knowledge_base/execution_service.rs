@@ -341,8 +341,34 @@ mod rows {
     impl ExecutionRow {
         // SPEC-15.1112
         pub(super) fn into_response(self, steps: Vec<StepRow>) -> KbExecutionResponse {
+            // PMS-1664 finding: a corrupt stored `variable_values` used
+            // to read as an empty map silently, so the step rendering
+            // saw a different variable set than the one that was
+            // actually run. Keep the empty fallback (`into_response` is
+            // infallible), WARN with the execution id + error.
             let variable_values: BTreeMap<String, String> =
-                serde_json::from_value(self.variable_values).unwrap_or_default();
+                match serde_json::from_value(self.variable_values.clone()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            execution_id = %self.id,
+                            error = %e,
+                            "kb_executions.variable_values failed to decode; reading as empty map"
+                        );
+                        BTreeMap::new()
+                    }
+                };
+            let started_by_name = self.started_by_name.unwrap_or_else(|| {
+                // PMS-1664 finding: the "Unknown" default used to swap
+                // in with no trace of the unresolved user id, unlike
+                // sibling KB paths that log it.
+                tracing::warn!(
+                    execution_id = %self.id,
+                    started_by_user_id = %self.started_by_user_id,
+                    "kb_executions.started_by_user_id did not resolve to a user name; rendering 'Unknown'"
+                );
+                "Unknown".to_string()
+            });
             KbExecutionResponse {
                 id: self.id,
                 ticket_id: self.ticket_id,
@@ -352,9 +378,7 @@ mod rows {
                 variable_values,
                 started_at: self.started_at,
                 started_by_user_id: self.started_by_user_id,
-                started_by_name: self
-                    .started_by_name
-                    .unwrap_or_else(|| "Unknown".to_string()),
+                started_by_name,
                 steps: steps.into_iter().map(StepRow::into_response).collect(),
             }
         }
@@ -401,6 +425,16 @@ mod rows {
 
     impl SummaryRow {
         pub(super) fn into_summary(self) -> KbExecutionSummary {
+            let started_by_name = self.started_by_name.unwrap_or_else(|| {
+                // PMS-1664 finding: same "Unknown" default on the
+                // summary path, same WARN with the unresolved user id.
+                tracing::warn!(
+                    execution_id = %self.id,
+                    started_by_user_id = %self.started_by_user_id,
+                    "kb_executions.started_by_user_id did not resolve to a user name on the summary path; rendering 'Unknown'"
+                );
+                "Unknown".to_string()
+            });
             KbExecutionSummary {
                 id: self.id,
                 ticket_id: self.ticket_id,
@@ -409,9 +443,7 @@ mod rows {
                 article_version_id: self.article_version_id,
                 started_at: self.started_at,
                 started_by_user_id: self.started_by_user_id,
-                started_by_name: self
-                    .started_by_name
-                    .unwrap_or_else(|| "Unknown".to_string()),
+                started_by_name,
                 total_steps: self.total_steps,
                 checked_steps: self.checked_steps,
             }

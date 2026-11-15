@@ -68,8 +68,23 @@ impl OrgIdentity {
     /// is exactly where this feature started.
     // SPEC-5.373
     pub fn from_row(name: String, branding: serde_json::Value) -> Self {
+        // PMS-1659 finding: the fallback used to be silent, so a
+        // malformed `branding` on a tenant lost the invoice contact
+        // line with no log. Keep the fallback (the doc above says
+        // the invoice must still go out) but WARN with the raw error
+        // and the tenant name so the drift is findable.
         let branding: mokosh_types::tenants::TenantBranding =
-            serde_json::from_value(branding).unwrap_or_default();
+            match serde_json::from_value(branding.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        tenant_name = %name,
+                        error = %e,
+                        "tenants.branding failed to decode for OrgIdentity; reading as default"
+                    );
+                    Default::default()
+                }
+            };
         Self::from_branding(name, &branding)
     }
 

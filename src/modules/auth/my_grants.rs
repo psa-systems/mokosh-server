@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use super::mokosh_bunyip_grants::{GranteeLeaveOutcome, MokoshBunyipGrantService};
 use crate::modules::auth::middleware::RequireAuth;
-use crate::utils::error::{AppError, AppResult};
+use crate::utils::error::AppResult;
 
 /// Wiring state: only the `PgPool`, because the grants table sits outside
 /// the standard tenant-scoped surface (cross-tenant BY DESIGN, see
@@ -78,7 +78,14 @@ async fn leave_grant(
     // `bunyip_user_id`; any one placement answers for the sub. Read on the
     // migrator pool because `users` is RLS-covered and this handler holds no
     // tenant GUC (the endpoint is identity-plane, not tenant-scoped).
-    let bunyip_user_id: Option<Uuid> = sqlx::query_scalar(
+    // PMS-1658 finding: `users.bunyip_user_id` is nullable, so a
+    // `query_scalar::<Option<Uuid>>` + `fetch_optional` decoded a
+    // NULL column as a decode error (500) rather than reaching the
+    // "no Bunyip id -> 404" branch the doc below describes. Read
+    // the outer optional (row found?) through `Option<Option<Uuid>>`
+    // and flatten: `None` = row missing or column NULL, both of
+    // which collapse to the "no grant to leave" 404 below.
+    let bunyip_user_id: Option<Uuid> = sqlx::query_scalar::<_, Option<Uuid>>(
         // SAFETY (PMS-285): identity-plane read of the caller's own row. No
         // tenant GUC because the endpoint is cross-tenant by design: the
         // caller might be revoking a row on a tenant they are not currently
@@ -87,13 +94,14 @@ async fn leave_grant(
     )
     .bind(user.id)
     .fetch_optional(state.pool.as_ref())
-    .await?;
+    .await?
+    .flatten();
 
     let Some(bunyip_user_id) = bunyip_user_id else {
         // A caller with no `bunyip_user_id` (a pre-Bunyip local user) has no
         // grant to leave. Answer 404 rather than 400 to match the id-based
         // shape below, so a legacy caller and a foreign id are told the
-        // same story.
+        // same story (SPEC-5.226).
         return Ok(StatusCode::NOT_FOUND);
     };
 
@@ -106,8 +114,3 @@ async fn leave_grant(
         GranteeLeaveOutcome::NotFound => Ok(StatusCode::NOT_FOUND),
     }
 }
-
-// Silence unused-import warnings on the smaller feature sets; every symbol
-// is used above under the default features.
-#[allow(dead_code)]
-fn _unused_error(_: AppError) {}

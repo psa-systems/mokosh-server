@@ -859,10 +859,22 @@ impl XeroClient {
             .into_iter()
             .next()
             .ok_or_else(|| AppError::internal("Xero returned no invoice".to_string()))?;
+        // PMS-1660 finding: an absent `InvoiceNumber` used to return
+        // the empty string silently. The local row then stored "" as
+        // its external_number, which reads as "Xero did not assign a
+        // number" versus "we never saw a number". Log the absence so
+        // an operator can tell which.
+        let external_number = dto.invoice_number.unwrap_or_else(|| {
+            tracing::warn!(
+                invoice_id = %dto.invoice_id,
+                "Xero issue_invoice returned no InvoiceNumber; storing empty external_number"
+            );
+            String::new()
+        });
         Ok(ExternalInvoiceRef {
             provider: InvoiceProviderKind::Xero,
             external_invoice_id: dto.invoice_id,
-            external_number: dto.invoice_number.unwrap_or_default(),
+            external_number,
         })
     }
 
@@ -950,10 +962,21 @@ impl XeroClient {
             .into_iter()
             .next()
             .ok_or_else(|| AppError::internal("Xero returned no credit note".to_string()))?;
+        // PMS-1660 finding: same shape as issue_invoice's
+        // external_number log; note the absence so an operator can
+        // tell "Xero did not assign a number" versus "we never saw
+        // a number".
+        let external_number = dto.credit_note_number.unwrap_or_else(|| {
+            tracing::warn!(
+                credit_note_id = %dto.credit_note_id,
+                "Xero issue_credit_note returned no CreditNoteNumber; storing empty external_number"
+            );
+            String::new()
+        });
         Ok(ExternalCreditNoteRef {
             provider: InvoiceProviderKind::Xero,
             external_credit_note_id: dto.credit_note_id,
-            external_number: dto.credit_note_number.unwrap_or_default(),
+            external_number,
         })
     }
 
@@ -1216,7 +1239,15 @@ impl XeroClient {
                 return Err(AppError::Unauthorized);
             }
             if status == reqwest::StatusCode::NOT_FOUND {
-                return Err(AppError::NotFound("Xero invoice".to_string()));
+                // PMS-1660: `call_with_retry` is the shared Xero HTTP
+                // helper used by every resource (invoices, credit notes,
+                // bills, connections, payments, ...), not just invoices.
+                // Naming it "Xero invoice" lied for every non-invoice
+                // caller - a credit-note lookup against an unknown id
+                // surfaced as `NotFound("Xero invoice")`. Say "resource"
+                // instead; the surrounding log context identifies the
+                // Mokosh call path.
+                return Err(AppError::NotFound("Xero resource".to_string()));
             }
             if status == reqwest::StatusCode::CONFLICT {
                 return Err(AppError::Conflict(

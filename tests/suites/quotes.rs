@@ -748,6 +748,164 @@ async fn validation_rejects_malformed_quotes(pool: PgPool) {
     assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
 }
 
+/// PMS-1661 finding 15: `list_quotes` used to interpolate the `q` filter
+/// into an `ILIKE` pattern without escaping `%` / `_` / `\\`, so a search
+/// for `50_%` matched every quote whose title had any character between
+/// `50` and `%` and would have caught wildcard-free titles too.
+///
+/// Seed three titles, one of which contains a literal `_` and `%`; a
+/// `q=50_%` search must match ONLY that title.
+#[mokosh_test]
+async fn list_quotes_q_treats_percent_and_underscore_as_literals(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // The literal title we want to match.
+    let literal = create_quote(
+        &app,
+        &token,
+        serde_json::json!({
+            "company_id": company,
+            "title": "Upgrade 50_% discount",
+            "lines": [line("Work", "1", "100")],
+        }),
+    )
+    .await;
+    // Decoy titles that contained `50` and `%` would have matched the
+    // old unescaped `%50_%%` pattern (the client's `_` is a wildcard,
+    // the `%` is a wildcard, `50` is just `50`).
+    let _ = create_quote(
+        &app,
+        &token,
+        serde_json::json!({
+            "company_id": company,
+            "title": "Upgrade 500 licences",
+            "lines": [line("Work", "1", "100")],
+        }),
+    )
+    .await;
+    let _ = create_quote(
+        &app,
+        &token,
+        serde_json::json!({
+            "company_id": company,
+            "title": "Renewal 50 seats",
+            "lines": [line("Work", "1", "100")],
+        }),
+    )
+    .await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/quotes"))
+        .bearer_auth(&token)
+        .query(&[("q", "50_%")])
+        .send()
+        .await
+        .expect("list quotes");
+    assert_eq!(resp.status(), StatusCode::OK, "list should 200");
+    let body: Value = resp.json().await.expect("list body");
+    let items = body["data"].as_array().expect("data array");
+    let ids: Vec<&str> = items.iter().map(|q| q["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec![literal["id"].as_str().unwrap()],
+        "`50_%` is a literal substring, not a wildcard; it must match only the title that contains it, got {ids:?}",
+    );
+}
+
+/// PMS-1661 finding 1: `update_line` accepted `is_taxable` in its request
+/// body but never wrote it to `quote_lines`, so `PUT /quotes/{id}/lines/{line_id}`
+/// could not change a line's taxability while `add_line` and the bulk
+/// update can. SPEC-13.1375 says the stored value drives tax derivation,
+/// so a line that was taxable at creation stayed taxable forever.
+#[mokosh_test]
+async fn update_line_writes_is_taxable(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Create a quote with one taxable line.
+    let quote = create_quote(
+        &app,
+        &token,
+        serde_json::json!({
+            "company_id": company,
+            "title": "Taxability",
+            "lines": [{
+                "line_type": "service",
+                "description": "Install",
+                "quantity": "1",
+                "unit_price": "100",
+                "is_taxable": true,
+            }],
+        }),
+    )
+    .await;
+    let quote_id = quote["id"].as_str().unwrap().to_string();
+    let line_id = quote["lines"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(quote["lines"][0]["is_taxable"], true);
+
+    // Flip is_taxable off on the existing line.
+    let edited: Value = app
+        .client
+        .put(app.url(&format!("/api/v1/quotes/{quote_id}/lines/{line_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "line_type": "service",
+            "description": "Install",
+            "quantity": "1",
+            "unit_price": "100",
+            "is_taxable": false,
+        }))
+        .send()
+        .await
+        .expect("update line")
+        .json()
+        .await
+        .expect("update line body");
+
+    let line = edited["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["id"] == line_id.as_str())
+        .expect("updated line present");
+    assert_eq!(
+        line["is_taxable"], false,
+        "update_line must write is_taxable, got {line}"
+    );
+
+    // And flipping it back ON through the same path also takes.
+    let re_enabled: Value = app
+        .client
+        .put(app.url(&format!("/api/v1/quotes/{quote_id}/lines/{line_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "line_type": "service",
+            "description": "Install",
+            "quantity": "1",
+            "unit_price": "100",
+            "is_taxable": true,
+        }))
+        .send()
+        .await
+        .expect("re-enable")
+        .json()
+        .await
+        .expect("re-enable body");
+    let line = re_enabled["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["id"] == line_id.as_str())
+        .expect("line still present");
+    assert_eq!(line["is_taxable"], true);
+}
+
 #[mokosh_test]
 async fn approvals_surface_still_works_on_an_api_created_quote(pool: PgPool) {
     // PMS-484 wired `/quotes/{id}/approvals` against the stub table. It
