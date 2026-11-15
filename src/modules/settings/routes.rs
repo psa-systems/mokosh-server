@@ -141,6 +141,17 @@ pub fn settings_routes(
         .with_state(state)
 }
 
+/// PMS-1350: refuse a non-admin caller access to an administrative
+/// category. `Personal` categories pass for every authenticated user.
+fn require_visible(category: &str, u: &crate::modules::auth::CurrentUser) -> AppResult<()> {
+    if setting_visibility(category) == SettingVisibility::Administrative && !u.role.is_admin() {
+        return Err(crate::utils::error::AppError::forbidden(
+            "You do not have permission to do that",
+        ));
+    }
+    Ok(())
+}
+
 /// PMS-638: read the deployment-wide email settings. PMS-1280: the
 /// deployment's operator only ([`DeploymentOperator`]), as are the other five
 /// deployment-wide handlers below; `RequireAdmin` let any organisation's admin
@@ -300,7 +311,7 @@ async fn list_settings(
     pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
-        .list_tenant_settings(u.tenant(), &pagination)
+        .list_tenant_settings(u.tenant(), &pagination, u.role.is_admin())
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -313,10 +324,10 @@ async fn list_settings(
 async fn upsert_setting(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
-    _a: RequireAdmin,
     Json(req): Json<UpsertTenantSettingRequest>,
 ) -> AppResult<Json<TenantSettingResponse>> {
     req.validate()?;
+    require_visible(&req.category, &u)?;
     // PMS-776: the body-carried write of the same rows the per-key route below
     // validates. Without this a branding value reached `tenant_settings`
     // unchecked through the older URL shape.
@@ -391,6 +402,7 @@ async fn get_settings_by_category(
     RequireAuth(u): RequireAuth,
     Path(category): Path<String>,
 ) -> AppResult<Json<Vec<TenantSettingResponse>>> {
+    require_visible(&category, &u)?;
     Ok(Json(
         s.service
             .list_settings_by_category(u.tenant(), &category)
@@ -404,6 +416,7 @@ async fn get_setting(
     RequireAuth(u): RequireAuth,
     Path((category, key)): Path<(String, String)>,
 ) -> AppResult<Json<TenantSettingResponse>> {
+    require_visible(&category, &u)?;
     Ok(Json(
         s.service.get_setting(u.tenant(), &category, &key).await?,
     ))
@@ -413,10 +426,10 @@ async fn get_setting(
 async fn put_setting(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
-    _a: RequireAdmin,
     Path((category, key)): Path<(String, String)>,
     Json(req): Json<PutSettingValueRequest>,
 ) -> AppResult<Json<TenantSettingResponse>> {
+    require_visible(&category, &u)?;
     validate_setting_value(&category, &key, &req.value)?;
     if category == "branding" {
         // PMS-1371: the shape check above never looked at whose id follows an
@@ -441,9 +454,9 @@ async fn put_setting(
 async fn delete_setting_by_key(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
-    _a: RequireAdmin,
     Path((category, key)): Path<(String, String)>,
 ) -> AppResult<()> {
+    require_visible(&category, &u)?;
     s.service
         .delete_setting_by_key(u.tenant(), &category, &key)
         .await
