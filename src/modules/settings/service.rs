@@ -20,31 +20,58 @@ impl SettingsService {
     }
 
     // PMS-115 tenant settings -------------------------------------------------
+    /// PMS-1350: `is_admin` restricts the listing to [`PERSONAL_CATEGORIES`]
+    /// for a non-admin caller, at the SQL layer so `total` stays accurate
+    /// for what the caller can actually see.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     // SPEC-15.2006
     pub async fn list_tenant_settings(
         &self,
         tenant_id: TenantId,
         pagination: &PaginationParams,
+        is_admin: bool,
     ) -> AppResult<(Vec<TenantSettingResponse>, u64)> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let total: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM tenant_settings WHERE tenant_id = $1")
-                .bind(tenant_id)
-                .fetch_one(&mut *tx)
-                .await?;
-
-        let rows = sqlx::query_as::<_, SettingRow>(
-            r#"SELECT id, category, key, value FROM tenant_settings
-               WHERE tenant_id = $1
-               ORDER BY category, key
-               LIMIT $2 OFFSET $3"#,
-        )
-        .bind(tenant_id)
-        .bind(pagination.limit() as i64)
-        .bind(pagination.offset() as i64)
-        .fetch_all(&mut *tx)
-        .await?;
+        let (total, rows) = if is_admin {
+            let total: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM tenant_settings WHERE tenant_id = $1")
+                    .bind(tenant_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let rows = sqlx::query_as::<_, SettingRow>(
+                r#"SELECT id, category, key, value FROM tenant_settings
+                   WHERE tenant_id = $1
+                   ORDER BY category, key
+                   LIMIT $2 OFFSET $3"#,
+            )
+            .bind(tenant_id)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(&mut *tx)
+            .await?;
+            (total, rows)
+        } else {
+            let total: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM tenant_settings WHERE tenant_id = $1 AND category = ANY($2)",
+            )
+            .bind(tenant_id)
+            .bind(PERSONAL_CATEGORIES)
+            .fetch_one(&mut *tx)
+            .await?;
+            let rows = sqlx::query_as::<_, SettingRow>(
+                r#"SELECT id, category, key, value FROM tenant_settings
+                   WHERE tenant_id = $1 AND category = ANY($2)
+                   ORDER BY category, key
+                   LIMIT $3 OFFSET $4"#,
+            )
+            .bind(tenant_id)
+            .bind(PERSONAL_CATEGORIES)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(&mut *tx)
+            .await?;
+            (total, rows)
+        };
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 

@@ -211,17 +211,31 @@ impl TenantLogoStore {
     pub async fn read(&self, tenant_id: Uuid, mime: &str) -> AppResult<Vec<u8>> {
         let mime = check_mime(mime)?;
         let extension = extension_for(mime);
-        if let Ok(bytes) = self
+        // PMS-1659 finding: the old `if let Ok(..)` + `.map_err(|_|
+        // NotFound)` collapsed every error from either shape into 404
+        // "Logo", so a permission or backend fault read as missing.
+        // Match on the error kind: only `NotFound` falls through to
+        // the legacy layout, any other error bubbles verbatim. Pairs
+        // with the LocalProvider::read fix (PR #1323) and the
+        // branding/assets open distinction (PR #1327).
+        match self
             .store
             .read(&ObjectKey::tenant_logo(tenant_id, extension))
             .await
         {
-            return Ok(bytes);
+            Ok(bytes) => return Ok(bytes),
+            Err(AppError::NotFound(_)) => {}
+            Err(e) => return Err(e),
         }
-        self.store
+        match self
+            .store
             .read(&ObjectKey::legacy_tenant_logo(tenant_id, extension))
             .await
-            .map_err(|_| AppError::NotFound("Logo".to_string()))
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(AppError::NotFound(_)) => Err(AppError::NotFound("Logo".to_string())),
+            Err(e) => Err(e),
+        }
     }
 
     /// Delete every stored format for this tenant. Best effort: a logo the

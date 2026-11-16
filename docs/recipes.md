@@ -7,6 +7,7 @@ Every task in this repository runs through [`just`](https://github.com/casey/jus
 just                        # the `default` recipe: list every recipe
 just install-hooks          # install the git pre-commit and pre-push hooks (once per fresh clone) -> run `just pre-commit` and `just pre-push` [from common]
 just pre-commit             # fmt-only check plus check-tree-ownership, runs on every commit [from common]
+just check-tree-ownership    # fail if the working tree contains any path not owned by the host user [from common]
 just pre-push                # check.yml's cargo checks except doc tests (fmt/clippy/compile/unit), no scope guard, in the dev `server` container [from common]
 
 # Dev stack

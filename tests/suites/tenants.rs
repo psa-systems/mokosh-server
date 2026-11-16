@@ -2536,3 +2536,37 @@ async fn companies_carry_a_nullable_portal_slug_column(pool: PgPool) {
         "mokosh-contact-login prompt 002: portal_slug must default to NULL"
     );
 }
+
+/// PMS-1659: suspend_tenant on an id with no row answered 200 and
+/// was indistinguishable from a successful flip; the row count is
+/// now enforced so a missing id surfaces as a NotFound rather than
+/// masking a stale caller or a cross-tenant slip.
+#[mokosh_test]
+async fn suspend_tenant_rejects_an_unknown_id(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let unknown = mokosh_server::modules::auth::TenantId::from_trusted(uuid::Uuid::new_v4());
+    let err = svc
+        .suspend_tenant(unknown)
+        .await
+        .expect_err("an unknown id must fail");
+    assert!(
+        matches!(err, mokosh_server::utils::error::AppError::NotFound(ref what) if what == "Tenant"),
+        "expected NotFound(\"Tenant\"), got {err:?}"
+    );
+}
+
+/// PMS-1659: activate_tenant on an id with no row answered 200;
+/// now returns NotFound so the operator does not flip a phantom row.
+#[mokosh_test]
+async fn activate_tenant_rejects_an_unknown_id(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let unknown = mokosh_server::modules::auth::TenantId::from_trusted(uuid::Uuid::new_v4());
+    let err = svc
+        .activate_tenant(unknown)
+        .await
+        .expect_err("an unknown id must fail");
+    assert!(
+        matches!(err, mokosh_server::utils::error::AppError::NotFound(ref what) if what == "Tenant"),
+        "expected NotFound(\"Tenant\"), got {err:?}"
+    );
+}

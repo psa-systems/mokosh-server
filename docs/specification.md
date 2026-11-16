@@ -2687,7 +2687,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.172**: The grantee role must be `map_grant_role(mokosh_grant_role)` (`admin`, `manager`, `technician`,
   `finance`, `read_only` mapping to ReadOnly); an absent or unknown value must log at info and be refused with 403
   `Access to this organization is not active`; a stored role that differs must be updated best effort (warn on failure)
-  while the request uses the grant role.
+  while the request uses the grant role. (This `read_only` Bunyip grant role is distinct from the first-class
+  `UserRole::ReadOnly` whose write refusal is SPEC-5.423a.)
 - **SPEC-5.173**: A first-sight grantee must be provisioned only with a non-blank verified email; otherwise the request
   must be refused with 403 `Couldn't confirm your identity for this shared account. Contact the account owner or
   support with the time of this attempt so they can check the server log.`, and a provisioning write failure must log a
@@ -3315,6 +3316,10 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.423**: The built-in role "Read-Only" (builtin_key "read_only") must hold exactly tickets:read, invoices:read,
   quotes:read, contracts:read, assets:read, projects:read, kb:read and notifications:read, and BUILTIN_ROLES must list
   the three built-in roles in the order Billing Contact, Support Contact, Read-Only with their builtin_key values.
+- **SPEC-5.423a**: `RequireWriteAccess` and the `require_write_for_mutations` middleware (`src/modules/auth/middleware.rs`)
+  must refuse any request whose caller's `UserRole::can_write()` is false; a handler that mutates state must take
+  `RequireWriteAccess` in place of `RequireAuth`. `ReadOnly` (see SPEC-5.172, SPEC-5.217) is currently the only role this
+  refuses.
 - **SPEC-5.424**: The areas a contact can request access to (ACCESS_AREAS) must be exactly: invoices (already reachable
   when the contact holds invoices:read, granted by Billing Contact), tickets (tickets:read, Support Contact), quotes
   (quotes:read, Billing Contact), contracts (contracts:read, Read-Only), assets (assets:read, Read-Only), projects
