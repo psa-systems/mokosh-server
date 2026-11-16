@@ -377,6 +377,11 @@ impl TicketService {
         // PSA audit: every foreign id from the request body must belong to
         // this tenant before it is linked, so a request cannot point a
         // ticket at another tenant's company/contact/site/etc.
+        //
+        // PMS-1667: priority_id, queue_id and the two kb_article fields were
+        // left out of this list and the FK defeated RLS, so a request could
+        // point a ticket at another tenant's row. A missing request-supplied
+        // id now surfaces as a named 400 instead of a database FK 500.
         self.validate_fks(
             tenant_id,
             &[
@@ -390,6 +395,10 @@ impl TicketService {
                 ("contracts", request.contract_id),
                 ("sla_policies", request.sla_id),
                 ("assets", request.asset_id),
+                ("ticket_priorities", request.priority_id),
+                ("ticket_queues", request.queue_id),
+                ("kb_articles", request.source_kb_article_id),
+                ("kb_articles", request.procedure_kb_article_id),
             ],
         )
         .await?;
@@ -713,9 +722,14 @@ impl TicketService {
         // (Option<Option<Uuid>>); only the inner Some(uuid) needs an FK
         // validation. Some(None) means "clear to NULL", which is always
         // safe; None means "leave unchanged".
+        // PMS-1667: status_id was left out of the validate_fks list, and the
+        // `is_closed` lookup below (and the UPDATE after it) read from
+        // `ticket_statuses` by id alone; a foreign-tenant status id surfaced
+        // as a 404 "Record" from fetch_one rather than a named 400.
         self.validate_fks(
             tenant_id,
             &[
+                ("ticket_statuses", request.status_id),
                 ("ticket_priorities", request.priority_id),
                 ("ticket_types", request.type_id.flatten()),
                 ("ticket_categories", request.category_id.flatten()),
@@ -2881,6 +2895,13 @@ impl TicketService {
 
         // Append a public audit-trail note so the agent side sees the
         // reopen (and any reason) in the same thread the SPA renders.
+        // PMS-1667: `.unwrap_or_else(Uuid::nil)` used to substitute the nil
+        // UUID when the tenant had no admin/manager user to attribute the
+        // note to, so the INSERT below would then raise 23503 on the
+        // created_by_id FK after the status flip had already written into
+        // the same open transaction. Match the sibling portal-note paths
+        // and refuse with the named Configuration error BEFORE writing,
+        // and only when a human is there to see it.
         let fallback_creator: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM users WHERE tenant_id = $1 AND status = 'active' \
              AND role IN ('super_admin', 'admin', 'manager') \
@@ -2889,12 +2910,24 @@ impl TicketService {
         .bind(tenant_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let creator_id = fallback_creator.unwrap_or_else(Uuid::nil);
+        let creator_id = fallback_creator.ok_or(AppError::Configuration(
+            "Cannot reopen ticket: tenant has no admin/manager user to attribute the audit note to"
+                .into(),
+        ))?;
+        // PMS-1667: the appended note always said "reopened by customer"
+        // even when a staff caller drove the reopen (contact_id None). Pick
+        // the actor from whose seat the call came so the thread reads
+        // truthfully for a reader.
+        let actor = if contact_id.is_some() {
+            "customer"
+        } else {
+            "staff"
+        };
         let content = match reason {
             Some(r) if !r.trim().is_empty() => {
-                format!("Ticket reopened by customer. Reason: {}", r.trim())
+                format!("Ticket reopened by {actor}. Reason: {}", r.trim())
             }
-            _ => "Ticket reopened by customer.".to_string(),
+            _ => format!("Ticket reopened by {actor}."),
         };
         sqlx::query(
             "INSERT INTO ticket_notes (id, tenant_id, ticket_id, note_type,

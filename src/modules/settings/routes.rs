@@ -1,4 +1,11 @@
 //! Settings HTTP routes.
+//!
+//! parity record 2026-11-12: `/settings/microsoft-contacts-client` has
+//! no SPA caller yet. The matching Integrations admin page lives at
+//! `/settings/integrations/microsoft-contacts/client` in `mokosh-apps`
+//! and ships as a follow-up (same shape as the Google client page
+//! above). The server route lands here now so the SPA can build against
+//! a stable surface. The note comes off with the first SPA call.
 
 use std::sync::Arc;
 
@@ -32,6 +39,9 @@ pub struct SettingsRouterState {
     // PMS-1444: the live Google client handle, swapped after a write so the
     // setting takes effect without a restart, exactly as `shared_mailer` is.
     pub google_client: Arc<crate::modules::contact_sync::SharedGoogleClient>,
+    // MAPPS-1101: the live Microsoft 365 Entra client handle, same posture
+    // as `google_client`.
+    pub microsoft_client: Arc<crate::modules::contact_sync::microsoft_oauth::SharedMicrosoftClient>,
     // PMS-1444: the providers the Google client is read from and written to.
     pub app_secrets: Arc<crate::app_secrets::AppSecrets>,
 }
@@ -42,6 +52,7 @@ pub fn settings_routes(
     enc_key: [u8; 32],
     shared_mailer: Arc<SharedMailer>,
     google_client: Arc<crate::modules::contact_sync::SharedGoogleClient>,
+    microsoft_client: Arc<crate::modules::contact_sync::microsoft_oauth::SharedMicrosoftClient>,
     app_secrets: Arc<crate::app_secrets::AppSecrets>,
 ) -> Router {
     let state = SettingsRouterState {
@@ -50,6 +61,7 @@ pub fn settings_routes(
         enc_key,
         shared_mailer,
         google_client,
+        microsoft_client,
         app_secrets,
     };
     Router::new()
@@ -102,6 +114,15 @@ pub fn settings_routes(
             "/settings/google-contacts-client",
             get(get_google_client).put(put_google_client),
         )
+        // MAPPS-1101: the host's Microsoft 365 Entra OAuth client. Same
+        // posture as the Google route above - deployment-wide, operator-
+        // only, stored in the declared app-secret provider, hot-swapped on
+        // write - and parallel SPA page lives at
+        // `/settings/integrations/microsoft-contacts/client` (follow-up).
+        .route(
+            "/settings/microsoft-contacts-client",
+            get(get_microsoft_client).put(put_microsoft_client),
+        )
         // PMS-789: the deployment-wide product name. Literal, so it is matched
         // before the generic `/settings/{category}` below - which writes the
         // CALLER's tenant and is therefore not a way to set a system value.
@@ -118,6 +139,17 @@ pub fn settings_routes(
                 .delete(delete_setting_by_key),
         )
         .with_state(state)
+}
+
+/// PMS-1350: refuse a non-admin caller access to an administrative
+/// category. `Personal` categories pass for every authenticated user.
+fn require_visible(category: &str, u: &crate::modules::auth::CurrentUser) -> AppResult<()> {
+    if setting_visibility(category) == SettingVisibility::Administrative && !u.role.is_admin() {
+        return Err(crate::utils::error::AppError::forbidden(
+            "You do not have permission to do that",
+        ));
+    }
+    Ok(())
 }
 
 /// PMS-638: read the deployment-wide email settings. PMS-1280: the
@@ -171,6 +203,37 @@ async fn put_google_client(
         &s.db,
         &s.app_secrets,
         s.google_client.as_ref(),
+        input,
+        &ctx,
+    )
+    .await?;
+    Ok(Json(view))
+}
+
+/// MAPPS-1101: whether this deployment's Microsoft 365 client is set and
+/// where it lives. Never either half of it, same posture as the Google
+/// GET.
+async fn get_microsoft_client(
+    State(s): State<SettingsRouterState>,
+    _operator: DeploymentOperator,
+) -> AppResult<Json<super::microsoft_client::MicrosoftClientView>> {
+    Ok(Json(super::microsoft_client::get_microsoft_client(
+        s.app_secrets.as_ref(),
+    )))
+}
+
+/// MAPPS-1101: set the host's Microsoft Entra client, then swap the one
+/// the process is using so a Connect that happens a second later uses it.
+async fn put_microsoft_client(
+    State(s): State<SettingsRouterState>,
+    _operator: DeploymentOperator,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(input): Json<super::microsoft_client::MicrosoftClientInput>,
+) -> AppResult<Json<super::microsoft_client::MicrosoftClientView>> {
+    let view = super::microsoft_client::put_microsoft_client(
+        &s.db,
+        &s.app_secrets,
+        s.microsoft_client.as_ref(),
         input,
         &ctx,
     )
@@ -248,7 +311,7 @@ async fn list_settings(
     pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
-        .list_tenant_settings(u.tenant(), &pagination)
+        .list_tenant_settings(u.tenant(), &pagination, u.role.is_admin())
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -261,10 +324,10 @@ async fn list_settings(
 async fn upsert_setting(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
-    _a: RequireAdmin,
     Json(req): Json<UpsertTenantSettingRequest>,
 ) -> AppResult<Json<TenantSettingResponse>> {
     req.validate()?;
+    require_visible(&req.category, &u)?;
     // PMS-776: the body-carried write of the same rows the per-key route below
     // validates. Without this a branding value reached `tenant_settings`
     // unchecked through the older URL shape.
@@ -339,6 +402,7 @@ async fn get_settings_by_category(
     RequireAuth(u): RequireAuth,
     Path(category): Path<String>,
 ) -> AppResult<Json<Vec<TenantSettingResponse>>> {
+    require_visible(&category, &u)?;
     Ok(Json(
         s.service
             .list_settings_by_category(u.tenant(), &category)
@@ -352,6 +416,7 @@ async fn get_setting(
     RequireAuth(u): RequireAuth,
     Path((category, key)): Path<(String, String)>,
 ) -> AppResult<Json<TenantSettingResponse>> {
+    require_visible(&category, &u)?;
     Ok(Json(
         s.service.get_setting(u.tenant(), &category, &key).await?,
     ))
@@ -361,10 +426,10 @@ async fn get_setting(
 async fn put_setting(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
-    _a: RequireAdmin,
     Path((category, key)): Path<(String, String)>,
     Json(req): Json<PutSettingValueRequest>,
 ) -> AppResult<Json<TenantSettingResponse>> {
+    require_visible(&category, &u)?;
     validate_setting_value(&category, &key, &req.value)?;
     if category == "branding" {
         // PMS-1371: the shape check above never looked at whose id follows an
@@ -389,9 +454,9 @@ async fn put_setting(
 async fn delete_setting_by_key(
     State(s): State<SettingsRouterState>,
     RequireAuth(u): RequireAuth,
-    _a: RequireAdmin,
     Path((category, key)): Path<(String, String)>,
 ) -> AppResult<()> {
+    require_visible(&category, &u)?;
     s.service
         .delete_setting_by_key(u.tenant(), &category, &key)
         .await

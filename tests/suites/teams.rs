@@ -917,3 +917,45 @@ async fn team_delete_of_team_with_tickets_soft_deletes_not_hard(pool: PgPool) {
         .unwrap();
     assert_eq!(ticket_team, Some(team.id), "ticket still references team");
 }
+
+/// PMS-1659: reactivating an archived team with `is_active: true` and no
+/// `name` on the same PATCH used to skip the uniqueness probe, so a name
+/// clash with an active team surfaced only as the Postgres unique-index
+/// error (a generic 500) instead of the 409 "A team with this name
+/// already exists" that create and rename already produce. Service-level
+/// test calls `update_team` directly so the 409 is pinned at the service
+/// layer, independent of the route's own validation.
+#[mokosh_test]
+async fn reactivating_a_team_whose_name_now_clashes_is_409(pool: PgPool) {
+    let s = svc(pool);
+    let archived = s
+        .create_team(tenant(), &create_req("Golf"), &ctx())
+        .await
+        .expect("create archived team");
+    s.soft_delete_team(tenant(), archived.id, &ctx())
+        .await
+        .expect("archive it");
+    // An active team now takes the same name.
+    let _active = s
+        .create_team(tenant(), &create_req("Golf"), &ctx())
+        .await
+        .expect("active team can take the archived name");
+
+    // Try to reactivate the first one without supplying a new name.
+    let upd = UpdateTeamRequest {
+        name: None,
+        description: None,
+        manager_id: None,
+        color: None,
+        is_active: Some(true),
+    };
+    let err = s
+        .update_team(tenant(), archived.id, &upd, &ctx())
+        .await
+        .expect_err("name collision must refuse");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("A team with this name already exists"),
+        "want the named 409 collision, got: {err:?}"
+    );
+}

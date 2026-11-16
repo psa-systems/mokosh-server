@@ -180,6 +180,7 @@ One line per rule, or per group of rules answering one subject, linking its full
 - `users` mirrors to `identities` one way ([PMS-1120](docs/invariants/identity-auth.md#identity-mirror-pms-1120))
 - A TOTP secret is sealed on both planes ([PMS-1055](docs/invariants/identity-auth.md#totp-secret-pms-1055))
 - A grant invitation mirrors into Bunyip only on accept, and cancel never orphans it ([PMS-1208](docs/invariants/identity-auth.md#grant-invitations-pms-1208))
+- A setting's category, not its route, decides whether every user or only an admin reaches it ([PMS-1350](docs/invariants/identity-auth.md#settings-visibility-pms-1350))
 
 ### Configuration and providers
 

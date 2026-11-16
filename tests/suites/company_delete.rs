@@ -670,3 +670,41 @@ async fn a_raw_company_delete_nulls_the_contact_mirror_instead_of_cascading(pool
         "the contact row survives with a NULL company_id (SET NULL, not CASCADE)"
     );
 }
+
+/// PMS-1663: a `DELETE` against an id that names no row used to answer 200
+/// and write a `delete` audit entry with a null `before` snapshot, so the
+/// stale caller saw a success and the audit stream grew a bogus row. The
+/// service now refuses with 404 and no audit write.
+#[mokosh_test]
+async fn delete_company_with_unknown_id_returns_404_and_writes_no_audit_row(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let ghost = Uuid::new_v4();
+    let audit_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE tenant_id = $1 AND entity_type = 'companies'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit rows before");
+
+    let (status, body) = delete_company_raw(&app, &token, ghost).await;
+    assert_eq!(
+        status, 404,
+        "an unknown id must not look like a successful delete (body: {body})"
+    );
+
+    let audit_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE tenant_id = $1 AND entity_type = 'companies'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit rows after");
+    assert_eq!(
+        audit_before, audit_after,
+        "a refused delete must not write an audit row"
+    );
+}

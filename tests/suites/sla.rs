@@ -653,6 +653,23 @@ async fn reopen_portal_ticket_evaluates_sla(pool: PgPool) {
         .await
         .expect("reopen ticket");
 
+    // PMS-1667: when reopen is driven by a staff caller (contact_id None),
+    // the appended public note must say "staff", not the pre-fix
+    // "Ticket reopened by customer." that was hard-coded for every path.
+    let note_content: String = sqlx::query_scalar(
+        "SELECT content FROM ticket_notes \
+         WHERE ticket_id = $1 AND note_type = 'public' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(ticket_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the reopen path must write a public note");
+    assert_eq!(
+        note_content, "Ticket reopened by staff.",
+        "the staff-driven reopen must not claim the customer did it; got {note_content:?}"
+    );
+
     let (fr_due, res_due): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
         sqlx::query_as("SELECT first_response_due, resolution_due FROM tickets WHERE id = $1")
             .bind(ticket_id)

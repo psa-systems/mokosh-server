@@ -340,6 +340,73 @@ async fn asset_relationships(pool: PgPool) {
     );
 }
 
+/// PMS-1664: the relationship list ran LIMIT/OFFSET without an ORDER BY, so
+/// two consecutive pages against the same `(page, per_page)` could serve
+/// different rows depending on whatever physical order Postgres returned,
+/// and an edge could appear on two pages or none. Pin stability by
+/// requesting one row per page across a small set and asserting the
+/// returned ids partition the full set without overlap or gap.
+#[mokosh_test]
+async fn asset_relationship_list_is_stable_across_pages(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Paging Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let type_id = create_asset_type(&app, &token, "Server").await;
+    let parent = create_asset(&app, &token, "p-host", &type_id, company).await;
+    let mut created_ids: Vec<String> = Vec::new();
+    for i in 0..3 {
+        let child = create_asset(&app, &token, &format!("p-child-{i}"), &type_id, company).await;
+        let resp: serde_json::Value = app
+            .client
+            .post(app.url(&format!("/api/v1/assets/{parent}/relationships")))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "child_asset_id": child,
+                "relationship_type": "hosts",
+            }))
+            .send()
+            .await
+            .expect("create relationship")
+            .json()
+            .await
+            .expect("relationship JSON");
+        created_ids.push(resp["id"].as_str().expect("id").to_string());
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    for page in 1..=3u32 {
+        let resp: serde_json::Value = app
+            .client
+            .get(app.url(&format!(
+                "/api/v1/assets/{parent}/relationships?page={page}&per_page=1"
+            )))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("list relationships")
+            .json()
+            .await
+            .expect("relationships JSON");
+        let data = resp["data"].as_array().expect("data array");
+        assert_eq!(
+            data.len(),
+            1,
+            "page {page} must serve exactly one row with per_page=1 (got {})",
+            data.len()
+        );
+        seen.push(data[0]["id"].as_str().expect("id").to_string());
+    }
+    seen.sort();
+    let mut expected = created_ids.clone();
+    expected.sort();
+    assert_eq!(
+        seen, expected,
+        "the three single-row pages must partition the full set with no duplicates or gaps"
+    );
+}
+
 // AC4 (credentials): encrypted at rest, NEVER leaked in a list, reveal is
 // authz-gated + audited.
 #[mokosh_test]
@@ -1138,5 +1205,136 @@ async fn retiring_lifecycle_stage_flips_status_to_retired_on_put_and_patch(pool:
         after["status"].as_str(),
         Some("active"),
         "PATCH: non-retired lifecycle must leave status untouched (default 'active')"
+    );
+}
+
+/// PMS-1664: `POST /assets/{id}/credentials` with an unknown asset id used to
+/// fall through to a 23503 (500) at INSERT time, or (if the FK happened to
+/// resolve against a foreign-tenant row) silently link the credential to an
+/// asset that the caller cannot see. The service now refuses with 404 after
+/// a tenant-scoped existence check.
+#[mokosh_test]
+async fn create_credential_against_an_unknown_asset_returns_404(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let ghost = Uuid::new_v4();
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/assets/{ghost}/credentials")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "ghost-cred",
+            "credential_type": "domain",
+            "username": "administrator",
+            "password": "x",
+        }))
+        .send()
+        .await
+        .expect("create credential against ghost asset");
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "ghost asset id must not surface as 500; body: {}",
+        resp.text().await.unwrap_or_default()
+    );
+}
+
+/// PMS-1664: same for configuration items.
+#[mokosh_test]
+async fn upsert_configuration_item_against_an_unknown_asset_returns_404(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let ghost = Uuid::new_v4();
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/assets/{ghost}/configuration-items")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "ghost-config",
+            "category": "network",
+            "value": "x",
+        }))
+        .send()
+        .await
+        .expect("create config item against ghost asset");
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "ghost asset id must not surface as 500; body: {}",
+        resp.text().await.unwrap_or_default()
+    );
+}
+
+/// PMS-1664: `POST /assets/{parent}/relationships` used to accept any
+/// `child_asset_id`, including an id naming a foreign-tenant row (silent
+/// cross-tenant link via FK) or a missing one (23503 500); and would
+/// write `relationship_type` free-text, outside the closed set the DTO
+/// doc names; and allowed `parent == child` self-edges. Now all three
+/// refuse with a named 400/404 before the INSERT runs.
+#[mokosh_test]
+async fn create_asset_relationship_rejects_bad_inputs(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Rel Validation Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let type_id = create_asset_type(&app, &token, "Server").await;
+    let parent = create_asset(&app, &token, "parent-host", &type_id, company).await;
+    let child = create_asset(&app, &token, "child-host", &type_id, company).await;
+
+    // 1) Self-edge refused as 400 before any FK/tenant work runs.
+    let r = app
+        .client
+        .post(app.url(&format!("/api/v1/assets/{parent}/relationships")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "child_asset_id": parent,
+            "relationship_type": "hosts",
+        }))
+        .send()
+        .await
+        .expect("self-edge POST");
+    assert_eq!(r.status().as_u16(), 400, "self-edge must refuse as 400");
+
+    // 2) Unknown relationship_type refused as 400.
+    let r = app
+        .client
+        .post(app.url(&format!("/api/v1/assets/{parent}/relationships")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "child_asset_id": child,
+            "relationship_type": "bogus",
+        }))
+        .send()
+        .await
+        .expect("bogus type POST");
+    assert_eq!(
+        r.status().as_u16(),
+        400,
+        "unknown relationship_type must refuse as 400"
+    );
+
+    // 3) Ghost child asset id refuses as 404 (no silent cross-tenant link,
+    //    no 500 from the FK).
+    let ghost = uuid::Uuid::new_v4();
+    let r = app
+        .client
+        .post(app.url(&format!("/api/v1/assets/{parent}/relationships")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "child_asset_id": ghost,
+            "relationship_type": "hosts",
+        }))
+        .send()
+        .await
+        .expect("ghost child POST");
+    assert_eq!(
+        r.status().as_u16(),
+        404,
+        "unknown child asset must refuse as 404"
     );
 }

@@ -363,19 +363,45 @@ impl StatusService {
         let systems = rows
             .into_iter()
             .map(|r| {
-                let outcome: Option<String> = r.try_get("outcome").ok();
+                // PMS-1666 F6: `try_get.ok()` used to turn a column
+                // decode error into "no backup observation", and the
+                // observed_at/payload fall-backs invented an
+                // `Utc::now()` / empty-object for a NULL-column shape
+                // the schema does not allow (every backup observation
+                // row has observed_at set). WARN with the system id
+                // on a decode error; the shape still falls back to
+                // None/Utc::now() for the same reason as before (the
+                // page must still render).
+                let system_id: Uuid = r.get("system_id");
+                let outcome: Option<String> = match r.try_get("outcome") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            system_id = %system_id,
+                            error = %e,
+                            "status.backup_for_company: outcome column failed to decode; reading as no observation"
+                        );
+                        None
+                    }
+                };
                 let latest = outcome.map(|out| CurrentObservation {
                     check_kind: "backup".to_string(),
                     outcome: out,
                     observed_at: r
                         .get::<Option<DateTime<Utc>>, _>("observed_at")
-                        .unwrap_or_else(Utc::now),
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                system_id = %system_id,
+                                "status.backup_for_company: outcome present but observed_at is NULL; using Utc::now() placeholder"
+                            );
+                            Utc::now()
+                        }),
                     payload: r
                         .get::<Option<serde_json::Value>, _>("payload")
                         .unwrap_or_else(|| serde_json::json!({})),
                 });
                 CompanySystemBackup {
-                    monitored_system_id: r.get("system_id"),
+                    monitored_system_id: system_id,
                     system_name: r.get("system_name"),
                     latest,
                 }

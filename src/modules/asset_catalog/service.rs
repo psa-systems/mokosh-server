@@ -42,6 +42,12 @@ impl AssetCatalogService {
             .map(|s| s.to_lowercase());
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows: Vec<AssetModelResponse> = if let Some(needle) = needle {
+            // PMS-1664: escape `%` and `_` in the user-typed needle so a
+            // literal `100%` or `a_b` search does not expand to match any
+            // row. `ESCAPE '\'` is Postgres' default escape character but
+            // naming it explicitly keeps the behaviour on an older server
+            // or a forward-ported SQL flavour.
+            let pattern = format!("%{}%", crate::utils::text::escape_like_wildcards(&needle));
             sqlx::query_as::<_, AssetModelResponse>(
                 "SELECT id, manufacturer, model, asset_type_id, \
                         warranty_months, end_of_life_months, default_department, \
@@ -49,12 +55,12 @@ impl AssetCatalogService {
                         source, uses_count, created_at, updated_at \
                  FROM asset_models \
                  WHERE tenant_id = $1 \
-                   AND lower(manufacturer || ' ' || model) LIKE $2 \
+                   AND lower(manufacturer || ' ' || model) LIKE $2 ESCAPE '\\' \
                  ORDER BY uses_count DESC, lower(manufacturer), lower(model) \
                  LIMIT $3",
             )
             .bind(*tenant_id)
-            .bind(format!("%{needle}%"))
+            .bind(pattern)
             .bind(limit)
             .fetch_all(&mut *tx)
             .await?
