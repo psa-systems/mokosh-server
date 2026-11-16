@@ -590,3 +590,72 @@ async fn replacing_the_lines_keeps_the_product_link(pool: PgPool) {
     );
     assert_eq!(dec(&still["total"]), Decimal::from(40));
 }
+
+/// PMS-1660: the products list wrapped `q` as `%q%` without escaping
+/// `%` or `_`. A user searching for literal `%` in a sale-item name
+/// matched every row instead of their match. After the fix, both the
+/// pattern and the SQL carry `ESCAPE '\'` so a metacharacter in the
+/// needle is matched literally.
+#[mokosh_test]
+async fn list_products_treats_percent_as_literal(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // Three products: one carries `%` in its name, one a `_`, one plain.
+    let _a = a_product(&app, &token, "50%Off", "10.00").await;
+    let _b = a_product(&app, &token, "Vendor_Code", "20.00").await;
+    let _c = a_product(&app, &token, "Regular", "30.00").await;
+
+    // Literal percent search: only the 50%Off row matches.
+    let rows: Value = app
+        .client
+        .get(app.url("/api/v1/products?q=%25"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list products q=%")
+        .json()
+        .await
+        .expect("rows json");
+    let names: Vec<String> = rows["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .filter_map(|r| r["name"].as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        names.contains(&"50%Off".to_string()),
+        "the literal match must come back; got {names:?}"
+    );
+    assert!(
+        !names.contains(&"Regular".to_string()),
+        "Regular must NOT match a literal `%` search (that is the pre-fix bug); got {names:?}"
+    );
+
+    // Underscore: only the Vendor_Code row matches.
+    let rows: Value = app
+        .client
+        .get(app.url("/api/v1/products?q=_"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list products q=_")
+        .json()
+        .await
+        .expect("rows json");
+    let names: Vec<String> = rows["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .filter_map(|r| r["name"].as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        names.contains(&"Vendor_Code".to_string()),
+        "the literal underscore match must come back; got {names:?}"
+    );
+    assert!(
+        !names.contains(&"Regular".to_string()),
+        "Regular must NOT match a literal `_` search; got {names:?}"
+    );
+}

@@ -271,6 +271,16 @@ impl MileageTrackingService {
         } else {
             None
         };
+        // PMS-1662 F11: flipping `is_billable` used to leave the stored
+        // `billing_status` alone, so a mileage entry made non-billable
+        // stayed `ready_to_bill` and would bill anyway. Mirror what
+        // PMS-944 did for time entries: resolve the status from the
+        // post-update billability, keeping `billed` sticky through the
+        // same helper time uses.
+        let billing_status = crate::modules::time_tracking::resolve_billing_status(
+            is_billable,
+            Some(current.billing_status),
+        );
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Write-side tenant validation on update, mirroring create: the UPDATE
@@ -295,6 +305,7 @@ impl MileageTrackingService {
                 rate_per_mile = $11,
                 total_amount  = $12,
                 task_id       = COALESCE($13, task_id),
+                billing_status = $14,
                 updated_at    = NOW()
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -312,6 +323,7 @@ impl MileageTrackingService {
         .bind(rate)
         .bind(total)
         .bind(request.task_id)
+        .bind(billing_status)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -439,6 +451,39 @@ struct MileageEntryRow {
 
 impl From<MileageEntryRow> for MileageEntryResponse {
     fn from(r: MileageEntryRow) -> Self {
+        // PMS-1662 F5: same "unparseable enum maps to default silently"
+        // shape as time entries. Keep the default fallback, WARN with
+        // the entry id + stored value so a drift is findable.
+        let billing_status = r
+            .billing_status
+            .as_deref()
+            .and_then(|s| {
+                let parsed = BillingStatus::from_str(s);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        entry_id = %r.id,
+                        stored = %s,
+                        "mileage_entries.billing_status is not one of the known values; reading as default"
+                    );
+                }
+                parsed
+            })
+            .unwrap_or_default();
+        let approval_status = r
+            .approval_status
+            .as_deref()
+            .and_then(|s| {
+                let parsed = ApprovalStatus::from_str(s);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        entry_id = %r.id,
+                        stored = %s,
+                        "mileage_entries.approval_status is not one of the known values; reading as default"
+                    );
+                }
+                parsed
+            })
+            .unwrap_or_default();
         Self {
             id: r.id,
             user_id: r.user_id,
@@ -453,18 +498,10 @@ impl From<MileageEntryRow> for MileageEntryResponse {
             contract_id: r.contract_id,
             notes: r.notes,
             is_billable: r.is_billable.unwrap_or(true),
-            billing_status: r
-                .billing_status
-                .as_deref()
-                .and_then(BillingStatus::from_str)
-                .unwrap_or_default(),
+            billing_status,
             rate_per_mile: r.rate_per_mile,
             total_amount: r.total_amount,
-            approval_status: r
-                .approval_status
-                .as_deref()
-                .and_then(ApprovalStatus::from_str)
-                .unwrap_or_default(),
+            approval_status,
             created_at: r.created_at,
             updated_at: r.updated_at,
             ticket_number: r.ticket_number,

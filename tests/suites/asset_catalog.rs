@@ -816,3 +816,86 @@ async fn seed_migration_populates_default_tenant_catalog(pool: PgPool) {
         "expected the seed migration to insert at least 30 rows, got {count}"
     );
 }
+
+/// PMS-1664: the typeahead wrapped the user-typed `q` as `%{q}%` without
+/// escaping `%` or `_`, so a user searching for a literal `%` or `_`
+/// matched every row (or every single-char row) instead of just their
+/// own. After the fix the service escapes both and `ESCAPE '\'` on the
+/// LIKE keeps Postgres from treating the meta characters as wildcards.
+#[mokosh_test]
+async fn model_typeahead_treats_percent_and_underscore_as_literal(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let type_id = seed_asset_type(&pool, "Laptop").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+    turn_catalog_on(&app, &token).await;
+
+    // Model whose manufacturer literally carries `%`, another literally
+    // carries `_`, and a third plain-text as the negative control.
+    for (manufacturer, model) in [
+        ("100%Pure", "LitPct"),
+        ("Snake_Case", "LitUnd"),
+        ("PlainCorp", "ControlM"),
+    ] {
+        let r = app
+            .client
+            .post(app.url(MODELS))
+            .bearer_auth(&token)
+            .json(&json!({
+                "manufacturer": manufacturer,
+                "model": model,
+                "asset_type_id": type_id,
+                "warranty_months": 12,
+                "end_of_life_months": 36,
+            }))
+            .send()
+            .await
+            .expect("create model");
+        assert_eq!(
+            r.status(),
+            StatusCode::CREATED,
+            "{manufacturer}/{model}: {}",
+            r.text().await.unwrap_or_default()
+        );
+    }
+
+    // Search for literal `%`. With the pre-fix pattern `%%%` matched all
+    // rows (the inner `%` was a wildcard). After the fix the pattern is
+    // `%\%%` and only `100%Pure` matches.
+    let r = app
+        .client
+        .get(app.url(&format!("{MODELS}?q=%25")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("typeahead q=%");
+    assert_eq!(r.status(), StatusCode::OK);
+    let rows: Vec<Value> = r.json().await.expect("rows");
+    let manufacturers: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r["manufacturer"].as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        manufacturers.contains(&"100%Pure".to_string()),
+        "the literal match must be returned: {manufacturers:?}"
+    );
+    assert!(
+        !manufacturers.contains(&"PlainCorp".to_string()),
+        "PlainCorp must NOT match a literal `%` query (that is the pre-fix bug): {manufacturers:?}"
+    );
+
+    // And a plain-text query still works unchanged.
+    let r = app
+        .client
+        .get(app.url(&format!("{MODELS}?q=Plain")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("typeahead q=Plain");
+    assert_eq!(r.status(), StatusCode::OK);
+    let rows: Vec<Value> = r.json().await.expect("rows");
+    assert!(
+        rows.iter().any(|r| r["manufacturer"] == "PlainCorp"),
+        "plain-text search must still match: {rows:?}"
+    );
+}
