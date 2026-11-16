@@ -1006,3 +1006,178 @@ async fn editing_a_spent_one_time_item_keeps_it_spent(pool: PgPool) {
         "an edit does not un-bill a charge that has already gone out"
     );
 }
+
+/// PMS-1661 F7: on UPDATE, an omitted `billing_rule` used to re-derive
+/// from `item_type` and overwrite the stored explicit rule. A product
+/// that had been set to `every_period` (a monthly licence) would snap
+/// back to `manual` on the next edit that did not restate the field.
+///
+/// Omit the field on a subsequent update and assert the stored rule
+/// stays put.
+#[mokosh_test]
+async fn update_contract_item_preserves_stored_billing_rule_when_omitted(pool: PgPool) {
+    use mokosh_server::modules::audit::AuditCtx;
+    use mokosh_server::modules::contracts::{BillingRule, UpsertContractItemRequest};
+
+    let company = common::seed_company(&pool).await;
+    let contract =
+        seed_block_contract(&pool, company, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).await;
+    let svc = ContractsService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    // A product sold on a contract as a monthly licence - the whole
+    // point of the Create path accepting an explicit rule.
+    let create = UpsertContractItemRequest {
+        name: "Antivirus licence".to_string(),
+        description: None,
+        item_type: "product".to_string(),
+        quantity: Decimal::from(5),
+        unit_price: Decimal::from(10),
+        billing_frequency: "monthly".to_string(),
+        work_type_id: None,
+        included_hours: None,
+        overage_rate: None,
+        rollover_enabled: false,
+        max_rollover_hours: None,
+        sort_order: 0,
+        product_id: None,
+        billing_rule: Some(BillingRule::EveryPeriod),
+    };
+    let created = svc
+        .create_contract_item(tenant, contract, &create, &ctx)
+        .await
+        .expect("create");
+    assert_eq!(created.billing_rule, BillingRule::EveryPeriod);
+
+    // Edit the name. The caller did not restate `billing_rule`, so the
+    // stored `every_period` must survive.
+    let edited = svc
+        .update_contract_item(
+            tenant,
+            created.id,
+            &UpsertContractItemRequest {
+                name: "Antivirus licence (renamed)".to_string(),
+                billing_rule: None,
+                ..create.clone()
+            },
+            &ctx,
+        )
+        .await
+        .expect("update");
+    assert_eq!(edited.name, "Antivirus licence (renamed)");
+    assert_eq!(
+        edited.billing_rule,
+        BillingRule::EveryPeriod,
+        "omitted billing_rule must preserve the stored one, not re-derive from item_type"
+    );
+
+    // And stating it still wins, so the operator can change the rule
+    // when they actually intend to.
+    let changed = svc
+        .update_contract_item(
+            tenant,
+            created.id,
+            &UpsertContractItemRequest {
+                billing_rule: Some(BillingRule::Manual),
+                ..create
+            },
+            &ctx,
+        )
+        .await
+        .expect("change rule");
+    assert_eq!(changed.billing_rule, BillingRule::Manual);
+}
+
+/// PMS-1661 F14: `CreateContractRequest` runs a cross-field
+/// `end_date >= start_date` check, but `UpdateContractRequest` carries
+/// no `start_date`, so `PUT /contracts/{id}` could set `end_date`
+/// before the stored `start_date` and the inverted range persisted.
+#[mokosh_test]
+async fn update_contract_rejects_end_date_before_stored_start_date(pool: PgPool) {
+    use mokosh_server::modules::audit::AuditCtx;
+    use mokosh_server::modules::contracts::{CreateContractRequest, UpdateContractRequest};
+
+    let company = common::seed_company(&pool).await;
+    let svc = ContractsService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    let created = svc
+        .create_contract(
+            tenant,
+            &CreateContractRequest {
+                contract_number: None,
+                name: "Dated".to_string(),
+                company_id: company,
+                contract_type: "managed_services".to_string(),
+                status: "active".to_string(),
+                start_date: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+                end_date: Some(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
+                auto_renew: false,
+                billing_cycle: "monthly".to_string(),
+                billing_amount: None,
+                sla_id: None,
+                signed_date: None,
+                signed_by_contact_id: None,
+                notes: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect("create contract");
+
+    let err = svc
+        .update_contract(
+            tenant,
+            created.id,
+            &UpdateContractRequest {
+                contract_number: None,
+                name: None,
+                status: None,
+                end_date: Some(NaiveDate::from_ymd_opt(2026, 5, 1).unwrap()),
+                auto_renew: None,
+                billing_cycle: None,
+                billing_amount: None,
+                sla_id: None,
+                signed_date: None,
+                signed_by_contact_id: None,
+                notes: None,
+            },
+            &ctx,
+        )
+        .await;
+    assert!(
+        matches!(
+            err,
+            Err(mokosh_server::utils::error::AppError::BadRequest(_))
+        ),
+        "an end_date before the stored start_date must 400, got {err:?}"
+    );
+
+    let edited = svc
+        .update_contract(
+            tenant,
+            created.id,
+            &UpdateContractRequest {
+                contract_number: None,
+                name: None,
+                status: None,
+                end_date: Some(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()),
+                auto_renew: None,
+                billing_cycle: None,
+                billing_amount: None,
+                sla_id: None,
+                signed_date: None,
+                signed_by_contact_id: None,
+                notes: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect("sane end_date must still take");
+    assert_eq!(
+        edited.end_date,
+        Some(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap())
+    );
+}

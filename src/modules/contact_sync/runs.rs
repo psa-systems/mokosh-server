@@ -153,6 +153,16 @@ impl SourceFactory for GoogleSourceFactory {
         // SecretKey address Google's does. The HTTP shape of the provider
         // itself (Graph) is Phase 1's `super::microsoft::MicrosoftContactsProvider`.
         if provider == "microsoft" {
+            // MAPPS-1101 Phase 5: capability-gate check. Refuses when the
+            // tenant has not delegated the Contacts capability on the
+            // integrations row, so a user who connected Microsoft but then
+            // unticked Contacts under Settings > Integrations stops the
+            // sync without losing the credential / folder selection /
+            // review state the connection owns. Google has no symmetric
+            // gate yet (see the method's docstring).
+            self.service
+                .assert_microsoft_contacts_capability_delegated(tenant_id)
+                .await?;
             let token = self
                 .service
                 .microsoft_access_token(tenant_id, connection_id)
@@ -673,7 +683,21 @@ impl ContactSyncRunner {
         .await;
         let (recipient_id, first_name) = match recipient {
             Ok(Some((id, first, _))) => (Some(id), first),
-            Ok(None) => (None, String::new()),
+            Ok(None) => {
+                // PMS-1663 finding: Ok(None) means the query ran fine
+                // but the tenant has no active admin and no active
+                // connected-by user. The notification still goes out
+                // (to the tenant inbox), but the operator's log had
+                // no trace that nobody was found. WARN with the tenant
+                // id so a tenant with zero admins is findable.
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    provider = %streak.provider,
+                    account_email = %streak.account_email,
+                    "contact sync: no active admin or connected-by user to route the failure notification to; dispatching with no recipient"
+                );
+                (None, String::new())
+            }
             Err(e) => {
                 tracing::warn!(
                     "contact sync: could not find who to tell about a failing connection: {e}"

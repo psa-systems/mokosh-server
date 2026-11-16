@@ -528,7 +528,7 @@ impl SavedReportsService {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        self.schedule_get(tenant_id, id).await
+        self.schedule_get(tenant_id, user_id, id).await
     }
 
     // SPEC-15.1626
@@ -551,20 +551,28 @@ impl SavedReportsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// PMS-1665: owner-only. `schedule_update` and `schedule_delete` already
+    /// filter by `user_id`, but GET-by-id used to return any schedule in the
+    /// tenant, so another viewer who could see the parent report could read
+    /// a private schedule's recipient address, cron, last_error and
+    /// is_active. A schedule that does not belong to the caller now 404s
+    /// the same way update/delete do.
     // SPEC-15.1627
     pub async fn schedule_get(
         &self,
         tenant_id: Uuid,
+        user_id: Uuid,
         id: Uuid,
     ) -> AppResult<ScheduledReportResponse> {
         let sql = format!(
             "SELECT {SCHEDULE_SELECT} FROM scheduled_reports \
-             WHERE tenant_id = $1 AND id = $2",
+             WHERE tenant_id = $1 AND id = $2 AND user_id = $3",
         );
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, ScheduleRow>(&sql)
             .bind(tenant_id)
             .bind(id)
+            .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound("Scheduled report".into()))?;
@@ -613,7 +621,7 @@ impl SavedReportsService {
         if rows == 0 {
             return Err(AppError::NotFound("Scheduled report".into()));
         }
-        self.schedule_get(tenant_id, id).await
+        self.schedule_get(tenant_id, user_id, id).await
     }
 
     // SPEC-15.1628

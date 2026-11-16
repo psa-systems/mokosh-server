@@ -532,10 +532,20 @@ mod server_impl {
         if is_json {
             return response;
         }
-        // Non-JSON 4xx: an extractor rejection (or similar) leaked through.
-        // Replace it with the canonical envelope, discarding the raw body.
         // SPEC-2.86
-        (status, Json(envelope_for_rejection(status))).into_response()
+        // Non-JSON 4xx: an extractor rejection (or similar) leaked
+        // through. Replace it with the canonical envelope but preserve
+        // extractor-set headers (WWW-Authenticate on 401, Allow on 405,
+        // Retry-After on 429); drop Content-Type / Content-Length since
+        // the body is being replaced.
+        let (mut parts, _body) = response.into_parts();
+        parts.headers.remove(axum::http::header::CONTENT_TYPE);
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        let mut rebuilt = (status, Json(envelope_for_rejection(status))).into_response();
+        for (name, value) in parts.headers.iter() {
+            rebuilt.headers_mut().insert(name.clone(), value.clone());
+        }
+        rebuilt
     }
 
     // SPEC-4.57: RowNotFound -> NotFound; 23505 -> Conflict; else Database, logged at error.
