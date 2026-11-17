@@ -378,10 +378,16 @@ impl ReportsService {
         let (invoiced, paid, outstanding) =
             totals.unwrap_or((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
 
-        // PMS-1418: the report's own scope, echoed back so the PDF can state
-        // which client it covers rather than staying silent. `None` when
-        // `company_id` names no row in this tenant, the same as when none was
-        // given: either way the totals above cover every client.
+        // PMS-1418: the report's own scope, echoed back so the PDF can
+        // state which client it covers rather than staying silent.
+        //
+        // PMS-1665 F: the old comment claimed `None` was returned both
+        // for "no company_id given" and for "unknown company_id, so the
+        // totals cover every client". That is no longer true; the
+        // `exists` check at line 354 rejects an unknown id with 404
+        // before this point is reached. Reaching here with `Some(c)`
+        // therefore guarantees the company row exists, so the match
+        // below's `None` arm is strictly the "no company_id given" case.
         let company_name: Option<String> = match company_id {
             Some(c) => {
                 sqlx::query_scalar(r#"SELECT name FROM companies WHERE tenant_id = $1 AND id = $2"#)
