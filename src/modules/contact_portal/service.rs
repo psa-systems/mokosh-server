@@ -3036,6 +3036,22 @@ impl ContactAuthService {
         contact_id: Uuid,
         request: &super::models::ContactSelfUpdateRequest,
     ) -> AppResult<ContactMe> {
+        // PMS-1663 finding: `timezone` used to be written straight through
+        // without any validation, and the contact's "today" derivation
+        // (SPEC-14.27, PMS-1027) reads this column. A free-text value
+        // (e.g. "US/Eastern" misspelled) therefore silently broke every
+        // day-bucketed display for the contact. Validate it as an IANA
+        // zone name using `chrono_tz::Tz::from_str`, matching how the
+        // staff plane validates its own tz (SPEC-7.1035 / PMS-1667).
+        if let Some(tz) = request.timezone.as_deref() {
+            use std::str::FromStr;
+            if chrono_tz::Tz::from_str(tz).is_err() {
+                return Err(AppError::validation_field(
+                    "timezone",
+                    "must be an IANA zone name (for example 'America/Los_Angeles')",
+                ));
+            }
+        }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // PMS-1214: a customer correcting their own name on a synced contact
         // is an edit in Mokosh like any other, and locks the same way.
