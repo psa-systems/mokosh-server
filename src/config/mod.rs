@@ -800,7 +800,18 @@ pub fn refresh() -> Arc<Generation> {
 // rejected outcome leaves the live generation and its counter untouched.
 // SPEC-6.10
 pub fn try_refresh(request: RefreshRequest) -> RefreshOutcome {
-    let previous = current();
+    // PMS-1655 F10: build-then-swap was racey: two concurrent refreshes
+    // could both read `previous` under a read lock, both compute
+    // `previous.number() + 1`, and both install the SAME generation
+    // number (the loser stomped the winner's installed candidate with
+    // its own build from a now-stale previous). Take the write lock up
+    // front so `previous.number() + 1` and the swap are one atomic
+    // step, and the loser of two concurrent calls builds its candidate
+    // from the winner's installed `previous`.
+    let mut slot = cell()
+        .write()
+        .expect("the configuration generation lock is never held across a panic");
+    let previous = slot.clone();
 
     // Rule 1: refuse bootstrap-tier keys before any I/O.
     let bootstrap_refused: Vec<&'static ConfigKey> = request
@@ -849,12 +860,9 @@ pub fn try_refresh(request: RefreshRequest) -> RefreshOutcome {
         };
     }
 
-    // Rule 4: atomic swap under the write lock.
+    // Rule 4: swap under the write lock we already hold.
     let installed = Arc::new(candidate);
     let actor = request.actor;
-    let mut slot = cell()
-        .write()
-        .expect("the configuration generation lock is never held across a panic");
     *slot = installed.clone();
     RefreshOutcome::Applied {
         generation: installed,
