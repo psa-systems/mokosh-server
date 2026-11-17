@@ -615,6 +615,21 @@ fn parse_stripe_setup_session(
     if brand.is_empty() || last4.is_empty() || exp_month == 0 || exp_year == 0 {
         return Ok(PaymentEvent::Ignored { kind });
     }
+    // PMS-1660: `as u8` / `as u16` truncate silently. Stripe hands back
+    // exp_month in 1..=12 and exp_year as a four-digit year, so an
+    // out-of-range value means we misread the shape (expanded vs id)
+    // or Stripe changed the schema. Refuse the event (Ignored, with a
+    // warn) rather than storing a truncated expiry that encrypts to a
+    // card the processor will not match.
+    if !(1..=12).contains(&exp_month) || !(1900..=9999).contains(&exp_year) {
+        tracing::warn!(
+            exp_month,
+            exp_year,
+            provider_pm_id,
+            "stripe payment-method card exp_month/exp_year out of plausible range; ignoring event"
+        );
+        return Ok(PaymentEvent::Ignored { kind });
+    }
     Ok(PaymentEvent::PaymentMethodAttached {
         provider_pm_id,
         provider_customer_id,
