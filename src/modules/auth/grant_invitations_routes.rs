@@ -360,7 +360,9 @@ async fn create_invitation(
     if !GRANT_ROLES.contains(&role_trimmed) {
         return Err(AppError::validation_field(
             "role",
-            format!("must be one of {GRANT_ROLES:?}; got {role_trimmed:?}"),
+            format!(
+                "must be one of 'admin', 'manager', 'technician', 'finance', 'read_only'; got '{role_trimmed}'"
+            ),
         ));
     }
     // PMS-1208 SaaS-mode gate: in the bunyip-federated deployment

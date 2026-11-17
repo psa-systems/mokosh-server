@@ -36,6 +36,13 @@ pub struct EntryPoint {
 // SPEC-2.223
 pub const ENTRY_POINTS: &[EntryPoint] = &[
     EntryPoint {
+        path: "src/main.rs",
+        reason: "the server entrypoint reads `RUST_LOG` directly (PMS-1655 F4) to initialise \
+                 the tracing subscriber BEFORE the configuration provider is wired, since the \
+                 subscriber must exist for the provider's own warn / error lines to emit. \
+                 `RUST_LOG` is a tracing build-time filter rather than a configuration key.",
+    },
+    EntryPoint {
         path: "src/bin/mokosh-bootstrap.rs",
         reason: "host-side one-shot CLI; it runs before, and outside, the server process that \
                  would resolve configuration, and reads .env.infisical directly",
