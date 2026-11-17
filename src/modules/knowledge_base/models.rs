@@ -16,6 +16,30 @@ pub struct KbCategoryResponse {
     pub sort_order: i32,
 }
 
+/// PMS-1664: KB `visibility` is the closed set `public` | `internal` |
+/// `client_specific` (SPEC-15.1116). The field was a free string, so
+/// an unknown value was persisted and read back; reject it at the API
+/// boundary.
+fn validate_kb_visibility(v: &str) -> Result<(), validator::ValidationError> {
+    const ALLOWED: &[&str] = &["public", "internal", "client_specific"];
+    if ALLOWED.contains(&v) {
+        Ok(())
+    } else {
+        Err(validator::ValidationError::new("kb_visibility"))
+    }
+}
+
+/// PMS-1664: KB article `status` is the closed set `draft` |
+/// `published` | `archived` (SPEC-15.1126).
+fn validate_kb_article_status(v: &str) -> Result<(), validator::ValidationError> {
+    const ALLOWED: &[&str] = &["draft", "published", "archived"];
+    if ALLOWED.contains(&v) {
+        Ok(())
+    } else {
+        Err(validator::ValidationError::new("kb_article_status"))
+    }
+}
+
 // SPEC-15.1116
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertKbCategoryRequest {
@@ -27,6 +51,7 @@ pub struct UpsertKbCategoryRequest {
     pub slug: String,
     /// "public" | "internal" | "client_specific"
     #[serde(default = "default_internal")]
+    #[validate(custom(function = "validate_kb_visibility"))]
     pub visibility: String,
     #[serde(default)]
     pub sort_order: i32,
@@ -182,8 +207,10 @@ pub struct CreateKbArticleRequest {
     pub summary: Option<String>,
     pub category_id: Option<Uuid>,
     #[serde(default = "default_internal")]
+    #[validate(custom(function = "validate_kb_visibility"))]
     pub visibility: String,
     #[serde(default = "default_draft")]
+    #[validate(custom(function = "validate_kb_article_status"))]
     pub status: String,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -220,7 +247,9 @@ pub struct UpdateKbArticleRequest {
     pub content: Option<String>,
     pub summary: Option<String>,
     pub category_id: Option<Uuid>,
+    #[validate(custom(function = "validate_kb_visibility"))]
     pub visibility: Option<String>,
+    #[validate(custom(function = "validate_kb_article_status"))]
     pub status: Option<String>,
     pub tags: Option<Vec<String>>,
     /// Companies a `client_specific` article is scoped to (PMS-341). When

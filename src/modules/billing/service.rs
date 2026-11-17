@@ -9445,6 +9445,18 @@ struct StatementWriteOffRow {
 // SPEC-13.140
 impl From<StatementWriteOffRow> for StatementWriteOffLine {
     fn from(r: StatementWriteOffRow) -> Self {
+        // `write_off_invoice` always writes both columns, so NULL here
+        // means a corrupt row. Log at warn with the invoice id so the
+        // 0 / "" fallback is at least traceable.
+        if r.write_off_amount.is_none() || r.write_off_reason.is_none() {
+            tracing::warn!(
+                invoice_id = %r.id,
+                invoice_number = %r.invoice_number,
+                has_amount = r.write_off_amount.is_some(),
+                has_reason = r.write_off_reason.is_some(),
+                "statement write-off row has NULL amount or reason; write_off_invoice always sets both"
+            );
+        }
         Self {
             invoice_id: r.id,
             invoice_number: r.invoice_number,

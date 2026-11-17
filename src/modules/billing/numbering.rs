@@ -86,7 +86,16 @@ impl NumberScheme {
     pub fn from_setting(value: Option<&str>) -> Self {
         match value {
             Some("company_prefix") => Self::CompanyPrefix,
-            _ => Self::TenantSequence,
+            None | Some("tenant_sequence") => Self::TenantSequence,
+            Some(other) => {
+                // An MSP whose chosen scheme never applies has no breadcrumb
+                // without this line; `resolve_template` logs a sibling warn.
+                tracing::warn!(
+                    stored = %other,
+                    "invoice numbering scheme setting is not a known value; reading as tenant_sequence"
+                );
+                Self::TenantSequence
+            }
         }
     }
 }
