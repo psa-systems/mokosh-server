@@ -464,17 +464,34 @@ fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
             // each with its own id. Recording all of them with ON CONFLICT DO
             // NOTHING on the refund id makes redelivery + incremental refunds
             // both idempotent: only refunds not yet seen actually insert.
+            //
+            // PMS-1660 finding: entries missing a string `id` or integer
+            // `amount` were silently dropped by filter_map, so a partially
+            // malformed refund list recorded fewer refunds than the charge
+            // actually carries with no breadcrumb. Warn naming the event +
+            // the offending entry so an operator can tie the shortfall
+            // back to the upstream shape.
             let refunds: Vec<RefundLine> = object["refunds"]["data"]
                 .as_array()
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|r| {
-                            let id = r["id"].as_str()?.to_string();
-                            let amount = from_minor_units(r["amount"].as_i64()?);
-                            Some(RefundLine {
-                                provider_reference: id,
-                                amount,
-                            })
+                            let id = r["id"].as_str().map(str::to_string);
+                            let amount_minor = r["amount"].as_i64();
+                            match (id, amount_minor) {
+                                (Some(id), Some(minor)) if !id.is_empty() => Some(RefundLine {
+                                    provider_reference: id,
+                                    amount: from_minor_units(minor),
+                                }),
+                                _ => {
+                                    tracing::warn!(
+                                        payment_intent = %provider_reference,
+                                        entry = %r,
+                                        "stripe charge.refunded refund entry missing id or amount; dropping"
+                                    );
+                                    None
+                                }
+                            }
                         })
                         .collect()
                 })
