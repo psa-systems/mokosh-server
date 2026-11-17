@@ -1954,11 +1954,12 @@ where
         .ok_or_else(|| AppError::NotFound("Ticket".to_string()))
 }
 
-/// Assert a project belongs to the tenant. `NotFound` cross-tenant.
-///
-/// PMS-1662: paired with `assert_task_in_tenant`. Both FKs on
-/// `time_entries` are plain `REFERENCES`, so without these a cross-
-/// tenant project_id / task_id in the request body would be written.
+/// PMS-1662: `time_entries.project_id` and `.task_id` are plain `UUID`
+/// columns with NO foreign-key constraint (migration 006), so they are
+/// soft pointers: an id that resolves to nothing is accepted, matching
+/// the historical behaviour the integration tests rely on, but an id
+/// that resolves on `projects` / `tasks` in a different tenant 404s
+/// to close the cross-tenant leak PMS-1662 names.
 async fn assert_project_in_tenant<'e, E>(
     exec: E,
     tenant_id: TenantId,
@@ -1967,31 +1968,30 @@ async fn assert_project_in_tenant<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let found: Option<i32> =
-        sqlx::query_scalar("SELECT 1 FROM projects WHERE tenant_id = $1 AND id = $2")
-            .bind(tenant_id)
-            .bind(project_id)
-            .fetch_optional(exec)
-            .await?;
-    found
-        .map(|_| ())
-        .ok_or_else(|| AppError::NotFound("Project".to_string()))
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT tenant_id FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(exec)
+        .await?;
+    match owner {
+        None => Ok(()),
+        Some(owner_tenant) if owner_tenant == *tenant_id => Ok(()),
+        Some(_) => Err(AppError::NotFound("Project".to_string())),
+    }
 }
 
-/// Assert a task belongs to the tenant. `NotFound` cross-tenant.
 async fn assert_task_in_tenant<'e, E>(exec: E, tenant_id: TenantId, task_id: Uuid) -> AppResult<()>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let found: Option<i32> =
-        sqlx::query_scalar("SELECT 1 FROM tasks WHERE tenant_id = $1 AND id = $2")
-            .bind(tenant_id)
-            .bind(task_id)
-            .fetch_optional(exec)
-            .await?;
-    found
-        .map(|_| ())
-        .ok_or_else(|| AppError::NotFound("Task".to_string()))
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT tenant_id FROM tasks WHERE id = $1")
+        .bind(task_id)
+        .fetch_optional(exec)
+        .await?;
+    match owner {
+        None => Ok(()),
+        Some(owner_tenant) if owner_tenant == *tenant_id => Ok(()),
+        Some(_) => Err(AppError::NotFound("Task".to_string())),
+    }
 }
 
 /// Assert a company belongs to the tenant. `NotFound` cross-tenant.
