@@ -118,10 +118,32 @@ pub fn decimal_string_to_minor(raw: &str) -> i64 {
         None => (1i64, trimmed),
     };
     let (whole, frac) = digits.split_once('.').unwrap_or((digits, ""));
-    let whole: i64 = whole.parse().unwrap_or(0);
+    // PMS-1660 finding: an unparsable whole part or fractional digit
+    // used to become 0 silently, so a malformed provider amount was
+    // recorded as a legitimate zero-value settlement. Keep the 0
+    // fallback (the signature cannot propagate; a webhook that
+    // returned 500 here would just redeliver and hit the same amount
+    // again) but WARN with the offending value so the webhook delivery
+    // log has a breadcrumb to grep.
+    let whole: i64 = whole.parse().unwrap_or_else(|_| {
+        tracing::warn!(
+            raw = raw,
+            whole_part = whole,
+            "decimal_string_to_minor: whole part did not parse; reading as 0"
+        );
+        0
+    });
     let mut cents = 0i64;
     for (i, c) in frac.chars().take(2).enumerate() {
-        let d = c.to_digit(10).unwrap_or(0) as i64;
+        let d = c.to_digit(10).map(|d| d as i64).unwrap_or_else(|| {
+            tracing::warn!(
+                raw = raw,
+                frac_char = ?c,
+                position = i,
+                "decimal_string_to_minor: fractional digit is not 0-9; reading as 0"
+            );
+            0
+        });
         cents += if i == 0 { d * 10 } else { d };
     }
     sign * (whole.saturating_mul(100).saturating_add(cents))
