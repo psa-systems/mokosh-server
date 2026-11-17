@@ -144,6 +144,19 @@ impl ContractsService {
         // Mutation + audit row in one transaction. CREATE: old = None,
         // after captured by the new contract id. PMS-117.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1661 F13: company_id, sla_id and signed_by_contact_id are
+        // plain `REFERENCES` on `contracts` (migration 009), so without
+        // these checks a cross-tenant id in the request body would be
+        // written. RLS hides the row on read-back, but the link is a
+        // leak either way. Mirror the quotes module's
+        // `assert_company_in_tenant` pattern and 404 before the INSERT.
+        assert_contract_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
+        if let Some(sla_id) = request.sla_id {
+            assert_contract_sla_in_tenant(&mut tx, tenant_id, sla_id).await?;
+        }
+        if let Some(signed_by_contact_id) = request.signed_by_contact_id {
+            assert_contract_contact_in_tenant(&mut tx, tenant_id, signed_by_contact_id).await?;
+        }
         sqlx::query(
             r#"INSERT INTO contracts (
                 id, tenant_id, contract_number, name, company_id, contract_type, status,
@@ -251,6 +264,17 @@ impl ContractsService {
                     ));
                 }
             }
+        }
+
+        // PMS-1661 F13: see create_contract. These FKs are plain
+        // REFERENCES, so verify any new link is in-tenant before the
+        // UPDATE. Only check fields the request actually sets so a
+        // partial PUT does not re-check existing stored links.
+        if let Some(sla_id) = request.sla_id {
+            assert_contract_sla_in_tenant(&mut tx, tenant_id, sla_id).await?;
+        }
+        if let Some(signed_by_contact_id) = request.signed_by_contact_id {
+            assert_contract_contact_in_tenant(&mut tx, tenant_id, signed_by_contact_id).await?;
         }
 
         let n = sqlx::query(
@@ -2003,4 +2027,59 @@ struct DueContractRow {
     auto_renew: Option<bool>,
     renewal_terms: Option<serde_json::Value>,
     before_snapshot: Option<serde_json::Value>,
+}
+
+/// PMS-1661 F13: assert the `company_id` the request body names is a
+/// row in the caller's tenant before linking it on an INSERT/UPDATE.
+/// `contracts.company_id` is a plain `REFERENCES`, so a cross-tenant
+/// id would otherwise persist until a read-back blurred by RLS.
+async fn assert_contract_company_in_tenant(
+    tx: &mut crate::db::TenantTransaction<'_>,
+    tenant_id: TenantId,
+    company_id: Uuid,
+) -> AppResult<()> {
+    let found: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM companies WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(company_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    found
+        .map(|_| ())
+        .ok_or_else(|| AppError::NotFound("Company".to_string()))
+}
+
+/// Same rule as [`assert_contract_company_in_tenant`], for `sla_id`.
+async fn assert_contract_sla_in_tenant(
+    tx: &mut crate::db::TenantTransaction<'_>,
+    tenant_id: TenantId,
+    sla_id: Uuid,
+) -> AppResult<()> {
+    let found: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM sla_policies WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(sla_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    found
+        .map(|_| ())
+        .ok_or_else(|| AppError::NotFound("SLA policy".to_string()))
+}
+
+/// Same rule as [`assert_contract_company_in_tenant`], for
+/// `signed_by_contact_id`.
+async fn assert_contract_contact_in_tenant(
+    tx: &mut crate::db::TenantTransaction<'_>,
+    tenant_id: TenantId,
+    contact_id: Uuid,
+) -> AppResult<()> {
+    let found: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM contacts WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(contact_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    found
+        .map(|_| ())
+        .ok_or_else(|| AppError::NotFound("Contact".to_string()))
 }
