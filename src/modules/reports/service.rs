@@ -10,6 +10,21 @@ use crate::db::Database;
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
 
+/// PMS-1665 F: reports that take an optional `from` / `to` window
+/// used to accept an inverted range (`from > to`) and return an empty
+/// payload silently; the caller then thought their filter had applied
+/// and that the window genuinely had no activity. Refuse at the entry
+/// with 422 naming both bounds.
+fn reject_inverted_range(from: NaiveDate, to: NaiveDate) -> AppResult<()> {
+    if from > to {
+        return Err(AppError::validation_field(
+            "to",
+            format!("must be on or after from (from={from}, to={to})"),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ReportsService {
     db: Database,
@@ -162,6 +177,12 @@ impl ReportsService {
             from.unwrap_or_else(|| today - chrono::Duration::days(30)),
             to.unwrap_or(today),
         );
+        // PMS-1665 F: an inverted range used to be accepted and the
+        // BETWEEN clauses below returned an empty report silently. A
+        // caller typing from=2026-10-01, to=2026-09-01 learned the
+        // mistake only by reading an empty response. Refuse with 422
+        // at the entry.
+        reject_inverted_range(from, to)?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let opened: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT ts.name, COUNT(*)::bigint
@@ -249,6 +270,8 @@ impl ReportsService {
             from.unwrap_or_else(|| today - chrono::Duration::days(30)),
             to.unwrap_or(today),
         );
+        // PMS-1665 F: same inverted-range guard as `tickets` above.
+        reject_inverted_range(from, to)?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Joined to `users` for the same reason as the ticket assignee query
         // above: the PDF export names the user rather than printing their id
@@ -818,6 +841,9 @@ impl ReportsService {
             from.unwrap_or_else(|| month_start(today)),
             to.unwrap_or(today),
         );
+        // PMS-1665 F: inverted-range guard, matching `tickets` and
+        // `time` above.
+        reject_inverted_range(from, to)?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, RequestTypeDurationRow>(
