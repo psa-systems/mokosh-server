@@ -401,6 +401,17 @@ impl TimeTrackingService {
         if let Some(ticket_id) = request.ticket_id {
             assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
         }
+        // PMS-1662: the project / task FKs are plain REFERENCES (no
+        // composite with tenant_id), so without this check a request
+        // body could attach an entry to another tenant's project or
+        // task. Mirror the ticket / company / work-type pattern above
+        // so cross-tenant ids 404 rather than being written.
+        if let Some(project_id) = request.project_id {
+            assert_project_in_tenant(&mut *tx, tenant_id, project_id).await?;
+        }
+        if let Some(task_id) = request.task_id {
+            assert_task_in_tenant(&mut *tx, tenant_id, task_id).await?;
+        }
         // PMS-942: whose time this is, settled before anything is priced. It
         // decides whether the entry can be billed at all, so resolving it after
         // `resolve_billing` would mean pricing employee time and then throwing
@@ -614,6 +625,13 @@ impl TimeTrackingService {
         // (PMS-315 review hardening; same fix applied to mileage_entries).
         if let Some(ticket_id) = request.ticket_id {
             assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
+        }
+        // PMS-1662: the same hole as create for project_id / task_id.
+        if let Some(project_id) = request.project_id {
+            assert_project_in_tenant(&mut *tx, tenant_id, project_id).await?;
+        }
+        if let Some(task_id) = request.task_id {
+            assert_task_in_tenant(&mut *tx, tenant_id, task_id).await?;
         }
         // The UPDATE binds ticket_id / project_id straight from the request, so
         // re-derive work_category from those same post-update values (PMS-394).
@@ -1471,6 +1489,11 @@ impl TimeTrackingService {
         if let Some(work_type_id) = request.work_type_id {
             fetch_work_type_defaults(&mut *tx, tenant_id, work_type_id).await?;
         }
+        // PMS-1662: see create_time_entry; project / task FKs are plain
+        // REFERENCES on active_timers.
+        if let Some(project_id) = request.project_id {
+            assert_project_in_tenant(&mut *tx, tenant_id, project_id).await?;
+        }
 
         let id = Uuid::new_v4();
         let started_at: chrono::DateTime<Utc> = match sqlx::query_scalar(
@@ -1929,6 +1952,46 @@ where
         .fetch_optional(exec)
         .await?
         .ok_or_else(|| AppError::NotFound("Ticket".to_string()))
+}
+
+/// Assert a project belongs to the tenant. `NotFound` cross-tenant.
+///
+/// PMS-1662: paired with `assert_task_in_tenant`. Both FKs on
+/// `time_entries` are plain `REFERENCES`, so without these a cross-
+/// tenant project_id / task_id in the request body would be written.
+async fn assert_project_in_tenant<'e, E>(
+    exec: E,
+    tenant_id: TenantId,
+    project_id: Uuid,
+) -> AppResult<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let found: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM projects WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(project_id)
+            .fetch_optional(exec)
+            .await?;
+    found
+        .map(|_| ())
+        .ok_or_else(|| AppError::NotFound("Project".to_string()))
+}
+
+/// Assert a task belongs to the tenant. `NotFound` cross-tenant.
+async fn assert_task_in_tenant<'e, E>(exec: E, tenant_id: TenantId, task_id: Uuid) -> AppResult<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let found: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM tasks WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(task_id)
+            .fetch_optional(exec)
+            .await?;
+    found
+        .map(|_| ())
+        .ok_or_else(|| AppError::NotFound("Task".to_string()))
 }
 
 /// Assert a company belongs to the tenant. `NotFound` cross-tenant.
