@@ -1171,51 +1171,52 @@ impl ContractsService {
 
         // 2. find or create the balance row for this period.
         // SPEC-13.1337
-        let existing = sqlx::query_as::<_, BalanceMutRow>(
-            r#"SELECT id, hours_used, hours_remaining
-               FROM contract_hour_balances
-               WHERE tenant_id = $1 AND contract_id = $2 AND contract_item_id = $3
-                 AND period_start = $4 AND period_end = $5
-               FOR UPDATE"#,
+        //
+        // PMS-1660 F11: the old pattern `SELECT FOR UPDATE`, then
+        // INSERT when the row did not exist, was racey: two concurrent
+        // first draws in a fresh period both missed the SELECT and the
+        // second INSERT hit `uq_contract_hour_balances_period`
+        // (migration 025) with a bare database error (500) instead of
+        // the serialised wait the SELECT FOR UPDATE was meant to give.
+        // Upsert-first instead: a conflicting concurrent INSERT returns
+        // zero rows and the follow-up SELECT FOR UPDATE then waits on
+        // the winner's lock just like a row that was already there.
+        let id = Uuid::new_v4();
+        let inserted: Option<BalanceMutRow> = sqlx::query_as(
+            r#"INSERT INTO contract_hour_balances
+               (id, tenant_id, contract_id, contract_item_id, period_start, period_end,
+                hours_included, hours_used, hours_remaining, rollover_hours)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,0,$7,0)
+               ON CONFLICT ON CONSTRAINT uq_contract_hour_balances_period DO NOTHING
+               RETURNING id, hours_used, hours_remaining"#,
         )
+        .bind(id)
         .bind(tenant_id)
         .bind(contract_id)
         .bind(item.id)
         .bind(period_start)
         .bind(period_end)
+        .bind(included)
         .fetch_optional(&mut *tx)
         .await?;
 
-        let balance = match existing {
-            Some(b) => b,
-            None => {
-                // SPEC-13.1335
-                // Seed a fresh period. `hours_included` is the item's
-                // included hours (rollover from a closed prior period is
-                // applied separately by roll_to_next_period, which seeds
-                // the row up-front; if no such row exists we start clean).
-                let id = Uuid::new_v4();
-                sqlx::query(
-                    r#"INSERT INTO contract_hour_balances
-                       (id, tenant_id, contract_id, contract_item_id, period_start, period_end,
-                        hours_included, hours_used, hours_remaining, rollover_hours)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,0,$7,0)"#,
-                )
-                .bind(id)
-                .bind(tenant_id)
-                .bind(contract_id)
-                .bind(item.id)
-                .bind(period_start)
-                .bind(period_end)
-                .bind(included)
-                .execute(&mut *tx)
-                .await?;
-                BalanceMutRow {
-                    id,
-                    hours_used: Some(Decimal::ZERO),
-                    hours_remaining: included,
-                }
-            }
+        let balance = if let Some(b) = inserted {
+            b
+        } else {
+            sqlx::query_as::<_, BalanceMutRow>(
+                r#"SELECT id, hours_used, hours_remaining
+                   FROM contract_hour_balances
+                   WHERE tenant_id = $1 AND contract_id = $2 AND contract_item_id = $3
+                     AND period_start = $4 AND period_end = $5
+                   FOR UPDATE"#,
+            )
+            .bind(tenant_id)
+            .bind(contract_id)
+            .bind(item.id)
+            .bind(period_start)
+            .bind(period_end)
+            .fetch_one(&mut *tx)
+            .await?
         };
 
         // 3. split request into applied (against remaining) + overage.
