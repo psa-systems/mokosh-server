@@ -1670,7 +1670,11 @@ impl TimeTrackingService {
         // the time.
         let worked_minutes = raw;
         let billable_minutes = if kind.billable {
-            Some(derive_billable_minutes(worked_minutes, true, rounding_rule.as_ref()))
+            Some(derive_billable_minutes(
+                worked_minutes,
+                true,
+                rounding_rule.as_ref(),
+            ))
         } else {
             None
         };

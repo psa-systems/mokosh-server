@@ -919,9 +919,8 @@ async fn start_add_payment_method(
     // browsing context on completion. The provider's contract is HTTP
     // in both directions, so a non-http(s) scheme is always a defect.
     let check_http_scheme = |raw: &str, field: &str| -> AppResult<()> {
-        let parsed = url::Url::parse(raw).map_err(|_| {
-            AppError::BadRequest(format!("{field} must be a valid URL."))
-        })?;
+        let parsed = url::Url::parse(raw)
+            .map_err(|_| AppError::BadRequest(format!("{field} must be a valid URL.")))?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(AppError::BadRequest(format!(
                 "{field} must use the http or https scheme."

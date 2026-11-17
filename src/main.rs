@@ -704,8 +704,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cause in a thread-panic payload. Propagate the error so a bad
     // secret / unparseable PORT / unreadable MOKOSH_MAX_TENANTS lands
     // on stderr in the same shape as the neighbouring checks.
-    let config = AppConfig::from_env()
-        .map_err(|e| format!("Failed to load configuration: {e}"))?;
+    let config = AppConfig::from_env().map_err(|e| format!("Failed to load configuration: {e}"))?;
 
     // PMS-1160: refuse to start when an essential deployment-shape variable
     // is unset outside dev/test. Two incidents in 48 hours came from this
@@ -947,10 +946,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse is set-but-invalid, as is an OIDC_ISSUER paired with no
     // OIDC_AUDIENCE. Only "both unset" is a legitimate disable.
     let bunyip_verifier = {
-        let issuer = config::get(&config::registry::OIDC_ISSUER)
-            .filter(|s| !s.trim().is_empty());
-        let audience = config::get(&config::registry::OIDC_AUDIENCE)
-            .filter(|s| !s.trim().is_empty());
+        let issuer = config::get(&config::registry::OIDC_ISSUER).filter(|s| !s.trim().is_empty());
+        let audience =
+            config::get(&config::registry::OIDC_AUDIENCE).filter(|s| !s.trim().is_empty());
         match (issuer.is_some(), audience.is_some()) {
             (false, false) => {
                 tracing::info!("Bunyip RS verifier disabled (OIDC_ISSUER / OIDC_AUDIENCE unset)");
@@ -959,7 +957,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (true, false) | (false, true) => {
                 return Err(format!(
                     "OIDC_ISSUER and OIDC_AUDIENCE must be set together; only {} is set",
-                    if issuer.is_some() { "OIDC_ISSUER" } else { "OIDC_AUDIENCE" }
+                    if issuer.is_some() {
+                        "OIDC_ISSUER"
+                    } else {
+                        "OIDC_AUDIENCE"
+                    }
                 )
                 .into());
             }
@@ -969,7 +971,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tracing::info!(issuer = %cfg.issuer, audience = %cfg.audience, "Bunyip RS verifier mounted");
                         Some(mokosh_server::modules::auth::oidc_rs::Verifier::new(cfg))
                     }
-                    Err(reason) => return Err(format!("Bunyip RS verifier config invalid: {reason}").into()),
+                    Err(reason) => {
+                        return Err(format!("Bunyip RS verifier config invalid: {reason}").into())
+                    }
                 }
             }
         }

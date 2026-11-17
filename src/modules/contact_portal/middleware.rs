@@ -99,10 +99,7 @@ pub async fn portal_contact_middleware(
                             .await
                         {
                             Err(e) => {
-                                if matches!(
-                                    e,
-                                    AppError::Unauthorized | AppError::NotFound(_)
-                                ) {
+                                if matches!(e, AppError::Unauthorized | AppError::NotFound(_)) {
                                     tracing::info!(
                                         tenant_id = %claims.tid,
                                         contact_id = %claims.sub,
