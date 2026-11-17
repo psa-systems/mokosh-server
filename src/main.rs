@@ -1449,7 +1449,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SPEC-1.12 SPEC-2.56
     // SPEC-6.47
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
+    let addr_str = format!("{}:{}", config.host, config.port);
+    let addr: SocketAddr = addr_str.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "could not parse listen address from HOST={:?} and PORT={:?} (combined: {:?}): {e}",
+            config.host,
+            config.port,
+            addr_str,
+        )
+    })?;
     // SPEC-1.9
     let listener = TcpListener::bind(addr).await?;
     // SPEC-2.56
