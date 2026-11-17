@@ -5523,11 +5523,20 @@ impl BillingService {
         requested_contract: Option<Uuid>,
     ) -> AppResult<CompanyMove> {
         let to_name = Self::assert_company_in_tenant(&mut *tx, tenant_id, to).await?;
-        // The company it is on now: present by construction, so a missing row
-        // is a deleted company rather than a bad request.
-        let from_name = Self::assert_company_in_tenant(&mut *tx, tenant_id, from)
-            .await
-            .unwrap_or_else(|_| "its current company".to_string());
+        // The company it is on now: present by construction, so a
+        // missing row is a deleted company rather than a bad request.
+        //
+        // PMS-1660 finding: the previous `unwrap_or_else(|_| "its
+        // current company")` swallowed every error, including database
+        // faults, as if the row were just absent. Only map NotFound to
+        // the placeholder; propagate any other error (connection drop,
+        // permission failure, etc.) so a server fault does not render
+        // as a benign refusal.
+        let from_name = match Self::assert_company_in_tenant(&mut *tx, tenant_id, from).await {
+            Ok(name) => name,
+            Err(AppError::NotFound(_)) => "its current company".to_string(),
+            Err(e) => return Err(e),
+        };
 
         #[derive(sqlx::FromRow)]
         struct Holds {
