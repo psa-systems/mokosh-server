@@ -209,9 +209,16 @@ impl PaypalProvider {
                 AppError::external_service("paypal", "token response missing access_token")
             })?
             .to_string();
-        // PayPal documents `expires_in`; if it is ever absent, assume a conservative
-        // 55 minutes (tokens last about 9 hours) so the token is still cached.
-        let expires_in = body["expires_in"].as_u64().unwrap_or(55 * 60);
+        // Absent `expires_in` silently doubled auth QPS: cache entry expired
+        // at `Instant::now()`, next call paid for a fresh round-trip. WARN so
+        // the drift from PayPal's documented shape is traceable; 0 fallback
+        // keeps the token usable without caching it.
+        let expires_in = body["expires_in"].as_u64().unwrap_or_else(|| {
+            tracing::warn!(
+                "paypal token response missing or non-u64 expires_in; caching with ttl=0s"
+            );
+            0
+        });
         let mut cached = self.token.write().await;
         *cached = Some(AccessToken {
             value: value.clone(),
