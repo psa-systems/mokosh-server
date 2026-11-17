@@ -119,6 +119,46 @@ fn default_monthly() -> String {
     "monthly".into()
 }
 
+/// PMS-1661 F8: the contract_items CHECK accepts five item_type values
+/// (migration 009); reject anything outside the set at the API boundary
+/// so a mistake surfaces as 422 with the allowed set, not a 500 from
+/// the database.
+fn validate_contract_item_type(v: &str) -> Result<(), validator::ValidationError> {
+    const ALLOWED: &[&str] = &[
+        "recurring_service",
+        "block_hours",
+        "retainer",
+        "product",
+        "one_time",
+    ];
+    if ALLOWED.contains(&v) {
+        Ok(())
+    } else {
+        Err(validator::ValidationError::new("contract_item_type"))
+    }
+}
+
+/// PMS-1661 F8: contract_items `billing_frequency` is the recurring
+/// generator's period set (see src/modules/billing/recurring.rs).
+fn validate_billing_frequency(v: &str) -> Result<(), validator::ValidationError> {
+    const ALLOWED: &[&str] = &["monthly", "quarterly", "semi_annual", "annual", "weekly"];
+    if ALLOWED.contains(&v) {
+        Ok(())
+    } else {
+        Err(validator::ValidationError::new("billing_frequency"))
+    }
+}
+
+/// PMS-1661 F8: a non-negative Decimal, for `quantity` and
+/// `unit_price` on a contract item.
+fn validate_non_negative_decimal(v: &Decimal) -> Result<(), validator::ValidationError> {
+    if v.is_sign_negative() {
+        Err(validator::ValidationError::new("non_negative_decimal"))
+    } else {
+        Ok(())
+    }
+}
+
 // SPEC-13.1308
 /// Cross-field check: a contract may not end before it starts (PMS-306). An
 /// inverted range (`end_date < start_date`) was previously accepted and
@@ -199,10 +239,19 @@ pub struct UpsertContractItemRequest {
     #[validate(length(min = 1, max = 255))]
     pub name: String,
     pub description: Option<String>,
+    /// PMS-1661 F8: reject at 422 before the DB CHECK fires. The
+    /// CHECK is in migration 009 (item_type IN 'recurring_service',
+    /// 'block_hours', 'retainer', 'product', 'one_time').
+    #[validate(custom(function = "validate_contract_item_type"))]
     pub item_type: String,
+    #[validate(custom(function = "validate_non_negative_decimal"))]
     pub quantity: Decimal,
+    #[validate(custom(function = "validate_non_negative_decimal"))]
     pub unit_price: Decimal,
+    /// PMS-1661 F8: reject at 422 before the DB CHECK fires. Accepted
+    /// values mirror the recurring generator's period set.
     #[serde(default = "default_monthly")]
+    #[validate(custom(function = "validate_billing_frequency"))]
     pub billing_frequency: String,
     pub work_type_id: Option<Uuid>,
     pub included_hours: Option<Decimal>,
