@@ -305,6 +305,26 @@ impl KbService {
         request: &UpsertKbCategoryRequest,
     ) -> AppResult<KbCategoryResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1664 finding: create rejects a duplicate slug with a
+        // named 409, but update used to let the DB unique index
+        // decide and the caller saw a generic 500. Probe here with
+        // the same shape, excluding the row being updated so a PUT
+        // that keeps its own slug still passes.
+        let clash: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kb_categories \
+             WHERE tenant_id = $1 AND slug = $2 AND id <> $3)",
+        )
+        .bind(tenant_id)
+        .bind(&request.slug)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if clash {
+            return Err(AppError::Conflict(format!(
+                "KbCategory slug '{}' already exists",
+                request.slug
+            )));
+        }
         let n = sqlx::query(
             r#"UPDATE kb_categories SET
                   name = $3, description = $4, parent_id = $5, slug = $6,
@@ -782,6 +802,27 @@ impl KbService {
             }
         };
         let before = Self::article_snapshot(&mut tx, tenant_id, id).await?;
+        // PMS-1664 finding: create rejects a duplicate slug with a
+        // named 409 (line 600 above); update deferred to the DB
+        // unique index and surfaced 500. Probe when the caller is
+        // actually changing the slug (request.slug = Some), excluding
+        // this row so an unchanged PUT still passes.
+        if let Some(new_slug) = request.slug.as_deref() {
+            let clash: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM kb_articles \
+                 WHERE tenant_id = $1 AND slug = $2 AND id <> $3)",
+            )
+            .bind(tenant_id)
+            .bind(new_slug)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if clash {
+                return Err(AppError::Conflict(format!(
+                    "KbArticle slug '{new_slug}' already exists",
+                )));
+            }
+        }
         let n = sqlx::query(
             r#"UPDATE kb_articles SET
                 title = COALESCE($3, title),
