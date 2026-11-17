@@ -1331,7 +1331,20 @@ impl ContractsService {
         .await?;
         // A balance the contract took with it is not an error: the entry has
         // nothing to give back to, which is the right answer.
+        //
+        // PMS-1661 F9: that answer used to leave no trace, so a stale
+        // `balance_id` (a bug upstream, or a period that was purged while
+        // a time entry still referenced it) silently lost the give-back
+        // and the hours stayed `used` on the row that WAS there. Keep
+        // the Ok return, but log at warn with the balance id and the
+        // amount so the drift is findable.
         let Some(row) = row else {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                balance_id = %balance_id,
+                applied = %applied,
+                "release_hours_in_tx: contract_hour_balances row is gone; cannot credit back"
+            );
             return Ok(());
         };
         // Never credit back more than was taken, whatever the caller says.
