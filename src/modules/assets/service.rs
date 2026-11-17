@@ -2661,14 +2661,11 @@ impl SearchWhereBuilder {
     }
 
     fn push_clause(&mut self, prefix: &str) {
+        // PMS-1664 F16: the previous `if let Some(last) = ...` +
+        // `let _ = last;` carried no logic - the comment itself
+        // notes "Simpler: just push a new clause string". Drop the
+        // dead branch.
         let idx = self.binds.len() + 1;
-        if let Some(last) = self.clauses.last_mut() {
-            // The prefix already carries the field + operator (e.g.
-            // "a.status = "), so we append its $N anchor to the previous
-            // clause only when the caller is extending a composite.
-            // Simpler: just push a new clause string with the slot.
-            let _ = last;
-        }
         self.clauses.push(format!("{prefix}${idx}"));
     }
 
