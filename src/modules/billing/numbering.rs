@@ -152,18 +152,33 @@ pub async fn ensure_company_prefix(
         .await;
         match updated {
             Ok(result) if result.rows_affected() == 1 => return Ok(candidate),
-            // Nobody updated: another writer assigned one first. Read theirs.
+            // Nobody updated: another writer assigned one first, OR
+            // the company was deleted between the initial read at
+            // the top of the function and this write. Read back.
             Ok(_) => {
-                let theirs: Option<String> = sqlx::query_scalar(
+                // PMS-1660 finding: the previous branch read
+                // `invoice_prefix` alone and treated a NULL (row gone)
+                // the same as "winner has not written yet", so a
+                // concurrently-deleted company silently fell through
+                // to the attempts loop and the final error misdescribed
+                // the cause as "after several attempts" instead of
+                // 404. Read the whole row shape (Option<Option<...>>):
+                // outer None = company deleted, inner None = prefix
+                // still unset (winner has not committed yet), Some(p)
+                // = winner's prefix.
+                let theirs: Option<Option<String>> = sqlx::query_scalar(
                     "SELECT invoice_prefix FROM companies WHERE id = $1 AND tenant_id = $2",
                 )
                 .bind(company_id)
                 .bind(tenant_id)
                 .fetch_optional(&mut *tx)
-                .await?
-                .flatten();
-                if let Some(prefix) = theirs {
-                    return Ok(prefix);
+                .await?;
+                match theirs {
+                    None => return Err(AppError::NotFound("Company".to_string())),
+                    Some(Some(prefix)) => return Ok(prefix),
+                    Some(None) => {
+                        // Winner has not committed yet; retry.
+                    }
                 }
             }
             // A unique violation is another company holding this draw.
