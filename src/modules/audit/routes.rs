@@ -104,14 +104,17 @@ async fn export_audit_log_csv(
 ) -> AppResult<axum::response::Response> {
     filter.validate()?;
     // SPEC-5.518: intended 50,000-row ceiling.
-    let pagination = PaginationParams {
-        page: 1,
-        per_page: 50_000,
-        sort: None,
-        sort_dir: "desc".to_string(),
-    };
+    //
+    // PMS-1659 F1: the former `PaginationParams { per_page: 50_000 }`
+    // hit `PaginationParams::limit()`'s MAX_PER_PAGE=100 clamp, so the
+    // export silently returned at most 100 rows. Use the service's
+    // dedicated export path, which bypasses the page clamp but still
+    // caps at the documented 50,000-row defensive ceiling.
     let scope = Some(u.tenant());
-    let (items, _total) = s.service.list(scope, &filter, &pagination).await?;
+    let (items, _total) = s
+        .service
+        .list_for_export(scope, &filter, AuditService::CSV_EXPORT_MAX)
+        .await?;
 
     let mut buf = String::new();
     // Header row. Matches the column order an operator typically wants
