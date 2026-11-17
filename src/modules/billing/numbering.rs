@@ -152,7 +152,10 @@ pub async fn ensure_company_prefix(
         .await;
         match updated {
             Ok(result) if result.rows_affected() == 1 => return Ok(candidate),
-            // Nobody updated: another writer assigned one first. Read theirs.
+            // Nobody updated: another writer assigned one first, or the row
+            // was deleted since the opening read. Outer None = deleted row,
+            // so a concurrent delete surfaces as 404 instead of falling
+            // through to the attempts-exhaustion error.
             Ok(_) => {
                 let theirs: Option<Option<String>> = sqlx::query_scalar(
                     "SELECT invoice_prefix FROM companies WHERE id = $1 AND tenant_id = $2",
@@ -162,15 +165,11 @@ pub async fn ensure_company_prefix(
                 .fetch_optional(&mut *tx)
                 .await?;
                 match theirs {
+                    None => return Err(AppError::NotFound("Company".to_string())),
                     Some(Some(prefix)) => return Ok(prefix),
-                    // The row is gone, so no draw can ever land: say so rather
-                    // than ending in the "several attempts" error below.
-                    None => {
-                        return Err(AppError::internal(format!(
-                            "company {company_id} no longer exists, so no invoice prefix can be assigned"
-                        )));
+                    Some(None) => {
+                        // Winner has not committed yet; retry.
                     }
-                    Some(None) => {}
                 }
             }
             // A unique violation is another company holding this draw.
