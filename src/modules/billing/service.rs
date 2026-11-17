@@ -5594,11 +5594,12 @@ impl BillingService {
         requested_contract: Option<Uuid>,
     ) -> AppResult<CompanyMove> {
         let to_name = Self::assert_company_in_tenant(&mut *tx, tenant_id, to).await?;
-        // The company it is on now: present by construction, so a missing row
-        // is a deleted company rather than a bad request.
+        // Present by construction: only NotFound maps to the placeholder, so a
+        // connection drop or permission failure is not reported as a benign
+        // "company unknown".
         let from_name = match Self::assert_company_in_tenant(&mut *tx, tenant_id, from).await {
             Ok(name) => name,
-            Err(AppError::Validation { .. }) => "its current company".to_string(),
+            Err(AppError::NotFound(_)) => "its current company".to_string(),
             Err(e) => return Err(e),
         };
 
