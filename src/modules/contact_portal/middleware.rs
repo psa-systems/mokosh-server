@@ -86,21 +86,41 @@ pub async fn portal_contact_middleware(
                         // 15-minute TTL expired. PMS-1259: asked of the
                         // rotation family, so an ordinary refresh does not
                         // count as a revocation.
-                        if state
+                        // PMS-1659 F2: distinguish a DB fault from a
+                        // revocation. The old `.is_err()` folded every
+                        // outcome into the same info "session family is
+                        // revoked" log, so an outage read as a routine
+                        // rejection. Log the fault at warn; still deny
+                        // the request so a failed read never admits a
+                        // caller it should have rejected.
+                        match state
                             .service
                             .ensure_session_active(claims.tid, claims.sid)
                             .await
-                            .is_err()
                         {
-                            tracing::info!(
-                                tenant_id = %claims.tid,
-                                contact_id = %claims.sub,
-                                sid = %claims.sid,
-                                "contact request rejected: session family is revoked",
-                            );
-                            ContactAuthState::default()
-                        } else {
-                            ContactAuthState::authenticated(ContactSession {
+                            Err(e) => {
+                                if matches!(
+                                    e,
+                                    AppError::Unauthorized | AppError::NotFound(_)
+                                ) {
+                                    tracing::info!(
+                                        tenant_id = %claims.tid,
+                                        contact_id = %claims.sub,
+                                        sid = %claims.sid,
+                                        "contact request rejected: session family is revoked",
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        tenant_id = %claims.tid,
+                                        contact_id = %claims.sub,
+                                        sid = %claims.sid,
+                                        error = ?e,
+                                        "contact request rejected: ensure_session_active failed",
+                                    );
+                                }
+                                ContactAuthState::default()
+                            }
+                            Ok(()) => ContactAuthState::authenticated(ContactSession {
                                 id: claims.sub,
                                 tenant_id: claims.tid,
                                 company_id: claims.cid,
@@ -108,7 +128,7 @@ pub async fn portal_contact_middleware(
                                 sid: claims.sid,
                                 role_cache: Default::default(),
                                 timezone_cache: Default::default(),
-                            })
+                            }),
                         }
                     }
                     Ok(false) => {
