@@ -16,7 +16,7 @@ use crate::modules::assets::AssetsService;
 use crate::modules::auth::TenantId;
 use crate::modules::knowledge_base::models::{KbArticleFilter, KbArticleResponse};
 use crate::modules::knowledge_base::KbService;
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
 // SPEC-15.1149
@@ -64,6 +64,28 @@ impl DocumentationService {
         tenant_id: TenantId,
         company_id: Uuid,
     ) -> AppResult<CompanyDocumentation> {
+        // PMS-1664 finding: mod.rs claimed "a request for a company
+        // that belongs to another tenant answers 404 via the shared
+        // company-scoping queries each child service enforces", but
+        // `list_assets` + `list_credentials_for_company` +
+        // `list_articles` each just filter by `(tenant_id, company_id)`
+        // and return empty lists for a company the caller's tenant
+        // does not own. That is a 200 with three empty lists, not the
+        // 404 the mod doc promises. Assert the company belongs to the
+        // caller's tenant here so the aggregate honours its own
+        // contract.
+        let mut probe_tx = self.assets.db().begin_with_tenant(tenant_id).await?;
+        let company_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM companies WHERE tenant_id = $1 AND id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *probe_tx)
+        .await?;
+        probe_tx.commit().await?;
+        if !company_exists {
+            return Err(AppError::NotFound("Company".to_string()));
+        }
         let page = PaginationParams {
             page: 1,
             per_page: PER_LIST_LIMIT,
