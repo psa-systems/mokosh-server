@@ -6,8 +6,9 @@
 //! with a fixed column + filter whitelist; the data shape on the
 //! `saved_reports` row is opaque-on-write so the SPA can iterate
 //! without a server redeploy, and validation happens here at execute
-//! time. Anything the compiler does not recognise surfaces as 422
-//! naming the offender.
+//! time. Anything the compiler does not recognise surfaces as 400
+//! BadRequest naming the offender (PMS-1665: earlier text said 422,
+//! but every compiler error is `AppError::BadRequest`).
 //!
 //! Why a hand-rolled compiler instead of the existing list endpoint:
 //! the list endpoint shape is fixed (it returns `TicketResponse` rows

@@ -137,11 +137,12 @@ impl RmmService {
         };
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
+        let created_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
             r#"INSERT INTO rmm_connections
                (id, tenant_id, name, provider, api_url, api_key_encrypted,
                 api_secret_encrypted, is_active, sync_interval_minutes)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               RETURNING created_at"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -152,7 +153,7 @@ impl RmmService {
         .bind(&secret_enc)
         .bind(request.is_active)
         .bind(request.sync_interval_minutes)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM rmm_connections t WHERE tenant_id = $1 AND id = $2",
@@ -173,6 +174,11 @@ impl RmmService {
         )
         .await?;
         tx.commit().await?;
+        // PMS-1665: the response `created_at` used to be
+        // `chrono::Utc::now()` from the handler, which drifted from the
+        // stored row value (DEFAULT NOW()) by whatever the INSERT took.
+        // Return it from the RETURNING above so the response matches
+        // what a subsequent GET will show.
         Ok(RmmConnectionResponse {
             id,
             name: request.name.clone(),
@@ -183,7 +189,7 @@ impl RmmService {
             last_sync_at: None,
             sync_status: "never".into(),
             last_error: None,
-            created_at: chrono::Utc::now(),
+            created_at,
         })
     }
 
