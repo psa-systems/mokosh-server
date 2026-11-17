@@ -362,7 +362,16 @@ impl ContactSyncService {
     ) -> Self {
         Self {
             db,
-            http: reqwest::Client::new(),
+            // PMS-1656 F3: SPEC-11.4 bounds every outbound client; a
+            // bare `Client::new()` here let a stalled Google / Microsoft
+            // / iCloud call hang the surrounding sync run indefinitely.
+            // 30s matches the general-purpose bound used by every other
+            // outbound client in the tree (RMM, bunyip_directory,
+            // tickets::automation).
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build reqwest client"),
             secrets,
             public_api_base,
             spa_base_url,

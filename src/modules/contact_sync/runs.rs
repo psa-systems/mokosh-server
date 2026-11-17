@@ -114,7 +114,13 @@ impl GoogleSourceFactory {
     pub fn new(service: Arc<ContactSyncService>) -> Self {
         Self {
             service,
-            http: reqwest::Client::new(),
+            // PMS-1656 F3: SPEC-11.4. Bound the factory's own client so
+            // a stalled Google People API call cannot hold a sync-run
+            // worker open. Matches the 30s used by the sibling clients.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build reqwest client"),
         }
     }
 }
