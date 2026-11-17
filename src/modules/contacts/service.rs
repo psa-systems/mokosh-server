@@ -3789,15 +3789,31 @@ impl ContactService {
     /// Update an industry's name / active flag. 404 if not in this tenant; a
     /// duplicate name returns 409.
     // SPEC-15.89: 404 unknown; duplicate is 409
+    //
+    // PMS-1663: create writes an audit row with the created name + is_active.
+    // Previously update left no trail, so an "industry renamed from X to Y"
+    // or "industry marked inactive" change was invisible on the audit log.
+    // Snapshot the before- and after- rows under the same tx as the write,
+    // matching the create shape.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_company_industry(
         &self,
         tenant_id: TenantId,
         id: Uuid,
         request: &UpsertCompanyIndustryRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<CompanyIndustryResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<CompanyIndustryRow> = sqlx::query_as(
+        let before: Option<CompanyIndustryRow> = sqlx::query_as(
+            "SELECT id, name, is_active FROM company_industries \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let before = before.ok_or_else(|| AppError::NotFound("Company industry".to_string()))?;
+        let row: CompanyIndustryRow = sqlx::query_as(
             "UPDATE company_industries SET name = $3, is_active = $4, updated_at = NOW() \
              WHERE tenant_id = $1 AND id = $2 RETURNING id, name, is_active",
         )
@@ -3805,26 +3821,68 @@ impl ContactService {
         .bind(id)
         .bind(request.name.trim())
         .bind(request.is_active)
-        .fetch_optional(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-        let row = row.ok_or_else(|| AppError::NotFound("Company industry".to_string()))?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "company_industries",
+            Some(id),
+            Some(serde_json::json!({
+                "name": before.name,
+                "is_active": before.is_active,
+            })),
+            Some(serde_json::json!({ "name": row.name, "is_active": row.is_active })),
+        )
+        .await?;
         tx.commit().await?;
         Ok(row.into())
     }
 
     /// Delete an industry. 404 if not in this tenant.
     // SPEC-15.90: 404 unknown
+    //
+    // PMS-1663: same shape as update; snapshot the before-row for the
+    // audit log before the DELETE so an "industry deleted" change
+    // is traceable.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_company_industry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+    pub async fn delete_company_industry(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let res = sqlx::query("DELETE FROM company_industries WHERE tenant_id = $1 AND id = $2")
+        let before: Option<CompanyIndustryRow> = sqlx::query_as(
+            "SELECT id, name, is_active FROM company_industries \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let before = before.ok_or_else(|| AppError::NotFound("Company industry".to_string()))?;
+        sqlx::query("DELETE FROM company_industries WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        if res.rows_affected() == 0 {
-            return Err(AppError::NotFound("Company industry".to_string()));
-        }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "company_industries",
+            Some(id),
+            Some(serde_json::json!({
+                "name": before.name,
+                "is_active": before.is_active,
+            })),
+            None,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }

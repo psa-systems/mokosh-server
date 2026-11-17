@@ -611,13 +611,14 @@ async fn update_company_industry(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
     _admin: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(request): Json<UpsertCompanyIndustryRequest>,
 ) -> AppResult<Json<CompanyIndustryResponse>> {
     request.validate()?;
     let row = state
         .contact_service
-        .update_company_industry(user.tenant(), id, &request)
+        .update_company_industry(user.tenant(), id, &request, &ctx)
         .await?;
     Ok(Json(row))
 }
@@ -627,11 +628,12 @@ async fn delete_company_industry(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
     _admin: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
     state
         .contact_service
-        .delete_company_industry(user.tenant(), id)
+        .delete_company_industry(user.tenant(), id, &ctx)
         .await
 }
 
