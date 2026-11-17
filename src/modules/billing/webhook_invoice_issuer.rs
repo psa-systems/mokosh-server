@@ -381,17 +381,34 @@ pub async fn invoice_issuer_webhook_handler(
     // 401 with nothing written. There is no tenant to write a row against
     // yet, which is the shape of this route (MAPPS-1141): the signature is
     // checked first and the delivery says afterwards whose it is.
+    // PMS-1660 F8: all three 401 branches used to answer with no log,
+    // so a misconfigured subscription (wrong key) or a forged signature
+    // was invisible to the operator. Log at warn naming which branch
+    // hit before 401ing. No secret values in the log: the signature
+    // is skipped, only its presence is recorded.
     let Some(key) = state
         .dispatcher
         .webhook_key(provider)
         .filter(|k| !k.trim().is_empty())
     else {
+        tracing::warn!(
+            provider = provider.as_str(),
+            "invoice-issuer webhook: no signing key configured for this provider; 401"
+        );
         return Err(AppError::Unauthorized);
     };
     let Some(signature) = signature_header(provider, &headers) else {
+        tracing::warn!(
+            provider = provider.as_str(),
+            "invoice-issuer webhook: signature header missing; 401"
+        );
         return Err(AppError::Unauthorized);
     };
     if !verify(provider, &body, signature, key) {
+        tracing::warn!(
+            provider = provider.as_str(),
+            "invoice-issuer webhook: signature did not verify against the stored key; 401"
+        );
         return Err(AppError::Unauthorized);
     }
 
