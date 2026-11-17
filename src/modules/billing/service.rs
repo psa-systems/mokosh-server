@@ -8073,9 +8073,27 @@ impl BillingService {
         let total_paid: Decimal = payments.iter().map(|p| p.amount).sum();
         let total_refunded: Decimal = refunds.iter().map(|r| r.amount).sum();
         let total_credited: Decimal = credit_notes.iter().map(|c| c.total).sum();
+        // PMS-1660 finding: `write_off_invoice` always writes both
+        // `write_off_amount` and `write_off_reason`, so a NULL on
+        // either is a corrupt row (manual UPDATE or a partial-rollback
+        // artefact) rather than a legitimate shape. The old
+        // `.unwrap_or(Decimal::ZERO)` summed the row as 0 and the
+        // reason rendered as "" with no trace. Log at warn with the
+        // invoice id so a drift between the status column and the
+        // bucket columns is findable; keep the 0 fallback so the
+        // statement itself still renders (SPEC-13.140).
         let total_written_off: Decimal = write_offs
             .iter()
-            .map(|w| w.write_off_amount.unwrap_or(Decimal::ZERO))
+            .map(|w| match w.write_off_amount {
+                Some(v) => v,
+                None => {
+                    tracing::warn!(
+                        invoice_id = %w.id,
+                        "build_statement: write_off row has NULL write_off_amount; counting as 0"
+                    );
+                    Decimal::ZERO
+                }
+            })
             .sum();
 
         Ok(StatementResponse {

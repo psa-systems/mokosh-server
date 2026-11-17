@@ -1512,10 +1512,26 @@ pub struct CreateInvoiceRequestShape<'a> {
 /// causing the dispatched provider total to diverge from the issued
 /// invoice. Use `MidpointAwayFromZero` explicitly.
 fn decimal_to_minor(d: Decimal) -> i64 {
-    (d * Decimal::from(100))
-        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
-        .to_i64()
-        .unwrap_or_default()
+    let scaled = (d * Decimal::from(100))
+        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+    match scaled.to_i64() {
+        Some(v) => v,
+        None => {
+            // PMS-1660 finding: out-of-range values used to become 0
+            // via `.unwrap_or_default()`, sending a zero-value line
+            // to the provider with no trace. A `Decimal` whose minor
+            // units overflow i64 is a bookkeeping mistake upstream
+            // (invoice total > i64 cents, roughly $92 quadrillion);
+            // keep the 0 fallback so the dispatch does not panic
+            // mid-send, but log the offending value at error so an
+            // operator can find the row and refuse the dispatch.
+            tracing::error!(
+                decimal = %d,
+                "decimal_to_minor: value does not fit in i64 minor units; using 0 as placeholder"
+            );
+            0
+        }
+    }
 }
 
 /// Convert a `Decimal` quantity to hundredths (matches
