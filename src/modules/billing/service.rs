@@ -5811,6 +5811,18 @@ impl BillingService {
         .fetch_optional(&mut **tx)
         .await?;
         let Some(company) = company else {
+            // PMS-1660: rendering an issued document against a missing
+            // company used to swap in the name "Customer" with no
+            // breadcrumb, so an issued invoice that showed the generic
+            // placeholder had no trace back to the company row that
+            // vanished. WARN with tenant + company id; the placeholder
+            // stays so the render still ships (SPEC-13.134 keeps the
+            // document issuable).
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                company_id = %company_id,
+                "bill_to_in_tx: companies row not found in tenant; rendering with placeholder name"
+            );
             return Ok(BillTo {
                 name: "Customer".to_string(),
                 ..Default::default()
