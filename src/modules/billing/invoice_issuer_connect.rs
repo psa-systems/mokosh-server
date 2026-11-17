@@ -503,15 +503,25 @@ impl InvoiceIssuerConnectService {
                 last_error: None,
             });
         };
+        // SPEC-13.1038
+        // A status the enum does not know means the CHECK constraint and
+        // the enum have drifted, which is a deployment running a schema
+        // this build does not understand. Reading it as `error` is the
+        // honest answer, the same call `integrations::compose` makes.
+        // Log a warn so an operator can find the drifted value.
+        let status = IntegrationStatus::from_str(&row.status).unwrap_or_else(|| {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                provider = provider.as_str(),
+                stored = %row.status,
+                "integrations.status is not one of the known values; reading as 'error'"
+            );
+            IntegrationStatus::Error
+        });
         Ok(InvoiceIssuerOverview {
             provider: provider.as_str().to_string(),
             configured,
-            // SPEC-13.1038
-            // A status the enum does not know means the CHECK constraint and
-            // the enum have drifted, which is a deployment running a schema
-            // this build does not understand. Reading it as `error` is the
-            // honest answer, the same call `integrations::compose` makes.
-            status: IntegrationStatus::from_str(&row.status).unwrap_or(IntegrationStatus::Error),
+            status,
             organisation_id: row.external_organisation_id,
             delegated: row
                 .enabled_capabilities

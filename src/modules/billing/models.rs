@@ -292,7 +292,10 @@ pub struct CreateInvoiceRequest {
     pub currency: Option<String>,
     pub notes: Option<String>,
     pub po_number: Option<String>,
-    #[validate(length(min = 1, message = "At least one line item is required"))]
+    #[validate(
+        length(min = 1, message = "At least one line item is required"),
+        nested
+    )]
     pub lines: Vec<CreateInvoiceLineRequest>,
 }
 
@@ -375,7 +378,10 @@ pub struct UpdateInvoiceRequest {
     /// can carry `status`, so it could be sent in that state. Omitting the key
     /// is how a caller leaves the existing lines alone; there is no edit that
     /// means "this invoice bills for nothing".
-    #[validate(length(min = 1, message = "At least one line item is required"))]
+    #[validate(
+        length(min = 1, message = "At least one line item is required"),
+        nested
+    )]
     pub lines: Option<Vec<CreateInvoiceLineRequest>>,
     /// Transition status. Deserializes the same set as the schema CHECK
     /// constraint, but the service rejects `void` and `written_off` here
