@@ -18,11 +18,9 @@
 //! when it is present or falling back to the token's stored
 //! invitee id.
 //!
-//! PMS-840 parity record 2026-10-16: none of the seven routes in this
-//! file has a real SPA caller yet. MAPPS-1084 (in progress) is the
-//! accept/decline UI that will call the by-token surface; the owner and
-//! grantee list/revoke surfaces have no tracked SPA work yet either. The
-//! note comes off once a real caller lands.
+//! The by-token get/accept/decline routes have a SPA caller
+//! (MAPPS-1084 accept-grant page). The owner outbox, grantee inbox,
+//! and id-scoped cancel/accept/decline routes do not yet.
 
 use crate::utils::json::Json;
 use axum::{
