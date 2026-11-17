@@ -125,8 +125,24 @@ struct ConnectionRow {
 
 impl From<ConnectionRow> for ConnectionStatus {
     fn from(row: ConnectionRow) -> Self {
+        // PMS-1663 F: a corrupt stored selection used to render as an
+        // empty list with no trace, which looks like "nothing selected"
+        // and sends plan() down the "no groups" path. A From impl
+        // cannot propagate; WARN with the connection id so the drift
+        // is findable.
+        let selected_groups = match serde_json::from_value(row.selected_groups.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    connection_id = %row.id,
+                    error = %e,
+                    "contact_sync_connections.selected_groups failed to decode; reading as empty"
+                );
+                Vec::new()
+            }
+        };
         Self {
-            selected_groups: serde_json::from_value(row.selected_groups).unwrap_or_default(),
+            selected_groups,
             sync_interval_minutes: row.sync_interval_minutes,
             consecutive_failures: row.consecutive_failures,
             open_reviews: row.open_reviews,
@@ -2417,18 +2433,39 @@ impl ContactSyncService {
 
     /// Best effort: a failure to record the state must not mask the token
     /// failure the caller is already handling.
+    ///
+    /// PMS-1663 F: the hard-coded "Google has revoked this connection"
+    /// message was written for every provider, including the Microsoft
+    /// refresh path. Derive the message from the connection's stored
+    /// `provider` so a reconnect prompt is correctly attributed in the
+    /// UI.
     // SPEC-15.559
     async fn mark_reconnect_required(&self, tenant_id: TenantId, connection_id: Uuid) {
         let written = async {
             let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-            sqlx::query(
-                "UPDATE contact_sync_connections \
-                 SET sync_status = 'reconnect_required', \
-                     last_error = 'Google has revoked this connection.', updated_at = NOW() \
+            let provider: Option<String> = sqlx::query_scalar(
+                "SELECT provider FROM contact_sync_connections \
                  WHERE tenant_id = $1 AND id = $2",
             )
             .bind(tenant_id)
             .bind(connection_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let human = match provider.as_deref() {
+                Some("google") => "Google has revoked this connection.",
+                Some("microsoft") => "Microsoft has revoked this connection.",
+                Some("icloud") => "iCloud rejected the app password for this connection.",
+                _ => "The source has revoked this connection.",
+            };
+            sqlx::query(
+                "UPDATE contact_sync_connections \
+                 SET sync_status = 'reconnect_required', \
+                     last_error = $3, updated_at = NOW() \
+                 WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(connection_id)
+            .bind(human)
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
