@@ -352,6 +352,19 @@ async fn create_invitation(
             ));
         }
     }
+    // PMS-1658: reject an unknown grant role at create time with a
+    // precise 422, rather than storing it and failing opaquely later
+    // when `map_grant_role` returns None at accept / consume. The
+    // vocabulary mirrors BUNYIP-674's PMS-1162 set + `read_only` from
+    // migration 297.
+    const GRANT_ROLES: &[&str] = &["admin", "manager", "technician", "finance", "read_only"];
+    let role_trimmed = body.role.trim();
+    if !GRANT_ROLES.contains(&role_trimmed) {
+        return Err(AppError::validation_field(
+            "role",
+            format!("must be one of {GRANT_ROLES:?}; got {role_trimmed:?}"),
+        ));
+    }
     // PMS-1208 SaaS-mode gate: in the bunyip-federated deployment
     // (`bunyip_directory` is `Some`) the grantee eventually signs in
     // through Bunyip and the accept flow binds their Bunyip sub, so
