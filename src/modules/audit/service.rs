@@ -28,7 +28,38 @@ impl AuditService {
     ) -> AppResult<(Vec<AuditLogEntryResponse>, u64)> {
         let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i64;
+        self.list_with_limit(tenant_id, filter, limit, offset).await
+    }
 
+    /// PMS-1659 F1: bounded ceiling for the CSV export, so the SPEC-5.518
+    /// 50,000-row cap is honoured end-to-end. A defensive ceiling;
+    /// CSV_EXPORT_MAX is the ONE value both the handler builds its cap
+    /// around AND the service enforces downstream.
+    pub const CSV_EXPORT_MAX: u32 = 50_000;
+
+    /// PMS-1659 F1: bypass `PaginationParams::limit()`'s 100-row clamp
+    /// for the CSV export. The clamp is right for the SPA (SPEC-4.49),
+    /// wrong for an operator download whose documented cap is 50k.
+    /// Keeping the SQL path identical to [`Self::list`] by sharing its
+    /// implementation means the filter semantics and the resolved
+    /// labels agree between page and export.
+    pub async fn list_for_export(
+        &self,
+        tenant_id: Option<TenantId>,
+        filter: &AuditLogFilter,
+        max_rows: u32,
+    ) -> AppResult<(Vec<AuditLogEntryResponse>, u64)> {
+        let capped = max_rows.min(Self::CSV_EXPORT_MAX) as i64;
+        self.list_with_limit(tenant_id, filter, capped, 0).await
+    }
+
+    async fn list_with_limit(
+        &self,
+        tenant_id: Option<TenantId>,
+        filter: &AuditLogFilter,
+        limit: i64,
+        offset: i64,
+    ) -> AppResult<(Vec<AuditLogEntryResponse>, u64)> {
         // Build the WHERE clause with sequential positional placeholders.
         // The same `where_clause` string is reused by the data and count
         // queries, so the tenant + filter placeholders MUST be numbered

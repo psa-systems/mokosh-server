@@ -84,15 +84,26 @@ pub struct CreateTeamRequest {
 
 /// Request body for `PUT /api/v1/teams/{id}`. Every field optional; omitted
 /// fields are left unchanged. `null` on nullable fields clears the column.
+///
+/// PMS-1659 F5: `description` and `color` carry `Option<Option<String>>`
+/// (with `double_option`) for the same reason `manager_id` does. A plain
+/// `Option<String>` cannot tell apart an absent key from `null`, so the
+/// doc comment's "null clears the column" rule only worked on
+/// `manager_id`. Now a request body of `{"description": null}` clears the
+/// stored description and an omitted key leaves it alone.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateTeamRequest {
     #[validate(length(min = 1, max = 255))]
     pub name: Option<String>,
-    pub description: Option<String>,
+    /// Absent leaves the description alone; an explicit `null` clears it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub description: Option<Option<String>>,
     /// Absent leaves the lead alone; an explicit `null` clears it.
     #[serde(default, deserialize_with = "double_option")]
     pub manager_id: Option<Option<Uuid>>,
-    pub color: Option<String>,
+    /// Absent leaves the color alone; an explicit `null` clears it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub color: Option<Option<String>>,
     pub is_active: Option<bool>,
 }
 

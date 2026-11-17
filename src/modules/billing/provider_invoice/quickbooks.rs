@@ -914,7 +914,21 @@ impl QuickBooksClient {
         // The same classifier the status read uses, so a void decision and
         // a status read can never disagree about the same invoice.
         let status = classify_status(&dto);
-        Ok(Some((status, dto.sync_token.clone().unwrap_or_default())))
+        // PMS-1660 finding: an absent `SyncToken` used to collapse to
+        // an empty string here, which the subsequent void request would
+        // then send and QBO would reject as a stale-object conflict. A
+        // missing token is a shape problem (QBO always writes one), not
+        // a stale-token problem, so fail the read naming the invoice
+        // id so an operator sees the real cause.
+        let Some(sync_token) = dto.sync_token.clone() else {
+            return Err(AppError::external_service(
+                "quickbooks",
+                format!(
+                    "QuickBooks invoice {external_invoice_id} returned no SyncToken; cannot void"
+                ),
+            ));
+        };
+        Ok(Some((status, sync_token)))
     }
 
     // SPEC-13.795
@@ -1106,7 +1120,19 @@ impl QuickBooksClient {
             .private_note
             .as_deref()
             .is_some_and(|note| note.to_ascii_lowercase().contains("voided"));
-        Ok(Some((voided, dto.sync_token.clone().unwrap_or_default())))
+        // PMS-1660 finding: same as the invoice twin - a missing
+        // `SyncToken` would otherwise be silently sent as "" and the
+        // void would fail as a stale-token conflict the operator could
+        // not distinguish from an actual stale write.
+        let Some(sync_token) = dto.sync_token.clone() else {
+            return Err(AppError::external_service(
+                "quickbooks",
+                format!(
+                    "QuickBooks credit memo {external_credit_memo_id} returned no SyncToken; cannot void"
+                ),
+            ));
+        };
+        Ok(Some((voided, sync_token)))
     }
 
     /// Void a credit memo in QuickBooks (PMS-1546).
