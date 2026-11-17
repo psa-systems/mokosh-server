@@ -7,14 +7,15 @@
 //! - `GET /status/*` is internal-user-authenticated: a company's own
 //!   staff looking at their own systems.
 //!
-//! parity record 2026-09-25: `/status/companies/{company_id}/backup`,
-//! `/reports/status/backup-success-rate` and `/reports/status/uptime`
-//! have no SPA caller today. PMS-795 and PMS-797 ship the server plane
-//! first (schema, service, routes, retention worker, integration tests)
-//! so the SPA "Client status" and reports screens can build against a
-//! stable surface; the mokosh-apps screens are filed under the same
-//! tickets and land after this merges. The route shapes are already the
-//! ones the spec commits to.
+//! parity record 2026-11-17: `/reports/status/backup-success-rate`
+//! and `/reports/status/uptime` have no SPA caller today. PMS-797
+//! ships the server plane first (schema, service, routes, retention
+//! worker, integration tests) so the SPA reports screens can build
+//! against a stable surface; those screens are filed under the same
+//! ticket and land separately. Remove a route from this list when it
+//! ships a SPA caller. The `/status/companies/{company_id}/backup`
+//! route (previously listed) has shipped a SPA caller in the contacts
+//! page.
 
 use crate::utils::json::Json;
 use axum::{
