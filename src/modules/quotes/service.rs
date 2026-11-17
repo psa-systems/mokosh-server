@@ -271,7 +271,7 @@ impl QuotesService {
                 "quotes.status is not one of the known values; refusing the operation"
             );
             AppError::Internal(format!(
-                "quote {quote_id} has an unknown stored status {raw:?}"
+                "quote {quote_id} has an unknown stored status {raw}"
             ))
         })
     }
@@ -1440,7 +1440,7 @@ impl QuotesService {
                 "quotes.status is not one of the known values on decide_quote"
             );
             AppError::Internal(format!(
-                "quote {quote_id} has an unknown stored status {raw_status:?}"
+                "quote {quote_id} has an unknown stored status {raw_status}"
             ))
         })?;
         if row_company != decision.company_id || !stored.is_client_visible() {
@@ -1614,7 +1614,7 @@ impl QuotesService {
                 "quotes.status is not one of the known values on convert"
             );
             AppError::Internal(format!(
-                "quote {quote_id} has an unknown stored status {:?}",
+                "quote {quote_id} has an unknown stored status {}",
                 row.status
             ))
         })?;
