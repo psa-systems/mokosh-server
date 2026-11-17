@@ -577,6 +577,26 @@ impl AppConfig {
     }
 }
 
+/// Build the tracing `EnvFilter` from `RUST_LOG`, falling back to `info`
+/// only when `RUST_LOG` is unset. A set-but-unparseable value writes a
+/// message to stderr (the subscriber is not initialised yet, so there
+/// is nowhere else to go) and falls back to `info`; previously an
+/// invalid filter silently became `info` with no trace.
+fn resolve_env_filter() -> tracing_subscriber::EnvFilter {
+    match std::env::var("RUST_LOG") {
+        Ok(value) => match value.parse::<tracing_subscriber::EnvFilter>() {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "RUST_LOG={value:?} is not a valid tracing filter ({e}); falling back to 'info'"
+                );
+                tracing_subscriber::EnvFilter::new("info")
+            }
+        },
+        Err(_) => tracing_subscriber::EnvFilter::new("info"),
+    }
+}
+
 // SPEC-2.58
 // SPEC-1.9
 #[tokio::main]
@@ -604,10 +624,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SPEC-2.16
     // SPEC-11.1 SPEC-6.64
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(resolve_env_filter())
         .init();
 
     // SPEC-2.17
@@ -1476,21 +1493,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // PMS-1577: same rule as the server's own startup load above: a missing
     // file is the documented default, a malformed one is not.
+    //
+    // PMS-1656 finding 5: eprintln + process::exit matches the standalone
+    // `mokosh-bootstrap` binary's shape (one unquoted message on stderr,
+    // exit 1), so both binaries report a malformed env file identically.
+    // Returning the message as `Err` from main would make Rust print it
+    // Debug-quoted ("env file could not be loaded: \\\"...\\\"").
     for result in [dotenvy::from_filename(".env.infisical"), dotenvy::dotenv()] {
         if let Err(e) = result {
             if !matches!(e, dotenvy::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
             {
-                return Err(format!("env file could not be loaded: {e}").into());
+                eprintln!("env file could not be loaded: {e}");
+                std::process::exit(1);
             }
         }
     }
 
     // SPEC-2.59
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(resolve_env_filter())
         .init();
 
     // SPEC-2.60
