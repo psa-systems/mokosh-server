@@ -59,6 +59,26 @@ impl RmmSyncWorker {
     /// of connections processed.
     #[tracing::instrument(skip_all)]
     pub async fn run_tick(&self) -> AppResult<u64> {
+        // PMS-1665 finding: `in_progress` used to be the terminal
+        // condition for a process crash mid-sync. Once a connection's
+        // status was `in_progress`, the `WHERE sync_status <>
+        // 'in_progress'` predicate here excluded it from every later
+        // tick forever. Expire a stale claim whose `updated_at` is
+        // older than a generous window (one hour; the longest realistic
+        // sync is minutes), so a crash recovers on the next tick
+        // instead of needing an operator to clear the row.
+        let _ = sqlx::query(
+            r#"UPDATE rmm_connections
+               SET sync_status = 'failed',
+                   last_error = 'rmm sync did not finish in the expected window; the worker treated the stale in_progress claim as a crash and will retry on the next tick',
+                   updated_at = NOW()
+               WHERE sync_status = 'in_progress'
+                 AND updated_at <= NOW() - INTERVAL '1 hour'"#,
+        )
+        .execute(self.db.migrator_pool())
+        .await
+        .map_err(|e| AppError::Database(format!("rmm worker expire stale in_progress: {e}")))?;
+
         let due: Vec<DueConnection> = sqlx::query_as(
             r#"
             SELECT id, tenant_id, provider, api_url, api_key_encrypted, api_secret_encrypted
