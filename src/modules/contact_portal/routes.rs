@@ -50,18 +50,34 @@ pub struct ContactRouterState {
     pub set_password_limiter: Arc<crate::modules::auth::rate_limit::AuthRateLimiter>,
 }
 
-/// Build the `/api/v1/contact/*` sub-router. Layered with
-/// `portal_contact_middleware` so every request through this tree
-/// decodes the Bearer / cookie into a `ContactAuthState` extension
-/// (default when absent); downstream extractors then 401 as needed.
+/// Layer the `portal_contact_middleware` on a composed `/api/v1/contact/*`
+/// router. Every request through this tree decodes the Bearer / cookie
+/// into a `ContactAuthState` extension (default when absent); downstream
+/// extractors then 401 as needed.
+///
+/// PMS-1656 finding 1: `.layer(...)` only covers routes present on the
+/// router at the time of the call, so a caller that merges more
+/// contact routes AFTER `contact_routes` applied the layer leaves the
+/// newly-merged routes without the extension (every signed-in call then
+/// 401s). The layer is applied here so the caller can merge first and
+/// layer last.
+pub fn apply_contact_auth_layer(router: Router, service: Arc<ContactAuthService>) -> Router {
+    let mw = ContactAuthMiddleware { service };
+    router.layer(middleware::from_fn_with_state(
+        mw,
+        portal_contact_middleware,
+    ))
+}
+
+/// Build the `/api/v1/contact/*` sub-router. The returned router does
+/// NOT carry `portal_contact_middleware`; apply it with
+/// `apply_contact_auth_layer` AFTER merging every other contact-plane
+/// router (branding, ...) so the layer covers them too.
 pub fn contact_routes(
     service: ContactAuthService,
     payment_methods: Arc<super::payment_methods::PaymentMethodsService>,
 ) -> Router {
     let service_arc = Arc::new(service);
-    let mw = ContactAuthMiddleware {
-        service: service_arc.clone(),
-    };
     // SPEC-5.457, SPEC-5.476
     let state = ContactRouterState {
         service: service_arc,
@@ -160,10 +176,6 @@ pub fn contact_routes(
             put(set_default_payment_method),
         )
         .with_state(state)
-        .layer(middleware::from_fn_with_state(
-            mw,
-            portal_contact_middleware,
-        ))
 }
 
 // ============================================================================
