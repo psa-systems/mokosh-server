@@ -165,7 +165,39 @@ impl MicrosoftContactsProvider {
     // SPEC-15.644 to 15.646
     async fn get<T: DeserializeOwned>(&self, url_or_path: &str) -> SourceResult<Option<T>> {
         let url = if url_or_path.starts_with("http://") || url_or_path.starts_with("https://") {
-            url_or_path.to_string()
+            // PMS-1663: an absolute `@odata.nextLink` / `@odata.deltaLink`
+            // (and the stored sync token, which replays a deltaLink) was
+            // being requested verbatim with the Bearer token. A hostile
+            // or corrupt link would then send our access token to any
+            // http(s) host. Refuse an absolute URL whose host is not the
+            // Graph origin before any request goes out.
+            match reqwest::Url::parse(url_or_path) {
+                Ok(parsed) => {
+                    let allowed_host = reqwest::Url::parse(&self.base_url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(str::to_string));
+                    let link_host = parsed.host_str().map(str::to_string);
+                    if allowed_host != link_host {
+                        tracing::warn!(
+                            url = url_or_path,
+                            expected_host = ?allowed_host,
+                            actual_host = ?link_host,
+                            "Microsoft Graph nextLink / deltaLink points at a host that is not Graph; refusing to send the Bearer token"
+                        );
+                        return Err(SourceError::Failed(
+                            "Microsoft Graph pagination link points at an unexpected host; refusing to follow."
+                                .to_string(),
+                        ));
+                    }
+                    url_or_path.to_string()
+                }
+                Err(e) => {
+                    tracing::warn!(url = url_or_path, error = %e, "Microsoft Graph pagination link did not parse as a URL");
+                    return Err(SourceError::Failed(
+                        "Microsoft Graph pagination link did not parse.".to_string(),
+                    ));
+                }
+            }
         } else {
             format!("{}{url_or_path}", self.base_url)
         };
