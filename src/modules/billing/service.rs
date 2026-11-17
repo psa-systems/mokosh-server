@@ -96,6 +96,19 @@ struct AmendedOriginalRow {
     external_invoice_id: Option<String>,
 }
 
+/// PMS-1656 F3: bound `BillingService`'s shared `reqwest` client, which
+/// the Stripe and PayPal `PaymentProvider` instances borrow via
+/// `provider::build`. Without this, a stalled gateway held the request
+/// open indefinitely (SPEC-11.4). 30s matches the general-purpose bound
+/// used by bunyip_directory, RMM and tickets::automation; the delegated
+/// invoice-issuer clients in `provider_invoice` pin their own 45s.
+fn default_billing_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("build reqwest client")
+}
+
 impl BillingService {
     /// Zero-key constructor for callers that never touch secret material (the
     /// QA seeder). Its secret provider is the database one under the same zero
@@ -109,7 +122,7 @@ impl BillingService {
         Self {
             db,
             encryption_key: [0u8; 32],
-            http: reqwest::Client::new(),
+            http: default_billing_http_client(),
             mailer: None,
             portal_origin: None,
             secrets,
@@ -838,7 +851,7 @@ impl BillingService {
         Self {
             db,
             encryption_key,
-            http: reqwest::Client::new(),
+            http: default_billing_http_client(),
             mailer: None,
             portal_origin: None,
             secrets,
@@ -861,7 +874,7 @@ impl BillingService {
         Self {
             db,
             encryption_key,
-            http: reqwest::Client::new(),
+            http: default_billing_http_client(),
             mailer: Some(mailer),
             portal_origin: Some(portal_origin),
             secrets,
