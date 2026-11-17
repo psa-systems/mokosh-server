@@ -22,7 +22,7 @@ use uuid::Uuid;
 use super::sync::fields;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 
 /// The lockable fields of one contact at one moment, as comparable strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,19 +89,29 @@ impl EditSnapshot {
         .bind(contact_id)
         .fetch_optional(&mut *conn)
         .await?;
+        // PMS-1663 finding: the previous shape silently built an
+        // empty capture when the contact row was gone (a vanishingly
+        // rare race between capture and the surrounding UPDATE, but
+        // still possible). An empty capture then compared field-by-
+        // field against the post-UPDATE row as 'every field was
+        // cleared', which `lock_edited_fields` would persist as locks.
+        // Fail loud: an edit against a contact that is not there is a
+        // 404 from the caller's own UPDATE, and this helper now matches
+        // that shape rather than inventing an all-zero before-image.
+        let Some((scalars, tags, phones)) = row else {
+            return Err(AppError::NotFound("Contact".to_string()));
+        };
         let mut values = BTreeMap::new();
-        if let Some((scalars, tags, phones)) = row {
-            for column in SCALAR_COLUMNS {
-                let value = scalars
-                    .get(*column)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                values.insert(*column, value);
-            }
-            values.insert(fields::TAGS, tags);
-            values.insert(fields::PHONES, phones);
+        for column in SCALAR_COLUMNS {
+            let value = scalars
+                .get(*column)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            values.insert(*column, value);
         }
+        values.insert(fields::TAGS, tags);
+        values.insert(fields::PHONES, phones);
         Ok(Self { values })
     }
 
