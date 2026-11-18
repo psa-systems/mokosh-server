@@ -147,13 +147,14 @@ async fn update_work_type(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     _admin: RequireAdmin,
     Path(id): Path<Uuid>,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertWorkTypeRequest>,
 ) -> AppResult<Json<WorkTypeResponse>> {
     request.validate()?;
     Ok(Json(
         state
             .service
-            .update_work_type(user.tenant(), id, &request)
+            .update_work_type(user.tenant(), id, &request, &ctx)
             .await?,
     ))
 }
@@ -164,8 +165,12 @@ async fn delete_work_type(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     _admin: RequireAdmin,
     Path(id): Path<Uuid>,
+    ctx: crate::modules::audit::AuditCtx,
 ) -> AppResult<()> {
-    state.service.delete_work_type(user.tenant(), id).await
+    state
+        .service
+        .delete_work_type(user.tenant(), id, &ctx)
+        .await
 }
 
 // ============================================================================
@@ -215,12 +220,13 @@ async fn create_time_entry(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     ctx: crate::modules::audit::AuditCtx,
-    Json(mut request): Json<CreateTimeEntryRequest>,
+    Json(request): Json<CreateTimeEntryRequest>,
 ) -> AppResult<Json<TimeEntryResponse>> {
-    // SPEC-14.6, SPEC-14.7: owner rewrite for non-admins, then range validation.
-    // Non-admins can only log time for themselves.
-    if !user.role.is_admin() && request.user_id != user.id {
-        request.user_id = user.id;
+    // SPEC-14.6, SPEC-14.7: only a manager or above may attribute time to another user; anyone else is refused.
+    if !user.role.can_manage_users() && request.user_id != user.id {
+        return Err(crate::utils::error::AppError::Forbidden(
+            "Only a manager or above can log time for another user".to_string(),
+        ));
     }
     request.validate()?;
     Ok(Json(
@@ -244,6 +250,7 @@ async fn update_time_entry(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpdateTimeEntryRequest>,
 ) -> AppResult<Json<TimeEntryResponse>> {
     // SPEC-14.7, SPEC-14.22: range validation, then 404 before the owner check.
@@ -258,7 +265,7 @@ async fn update_time_entry(
     Ok(Json(
         state
             .service
-            .update_time_entry(user.tenant(), id, &request)
+            .update_time_entry(user.tenant(), id, &request, &ctx)
             .await?,
     ))
 }
@@ -267,6 +274,7 @@ async fn delete_time_entry(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     Path(id): Path<Uuid>,
+    ctx: crate::modules::audit::AuditCtx,
 ) -> AppResult<()> {
     // SPEC-14.22: 404 before the owner check.
     // A non-admin can only delete their own entry; an unknown id 404s first.
@@ -276,7 +284,10 @@ async fn delete_time_entry(
             "Cannot delete another user's time entry".to_string(),
         ));
     }
-    state.service.delete_time_entry(user.tenant(), id).await
+    state
+        .service
+        .delete_time_entry(user.tenant(), id, &ctx)
+        .await
 }
 
 // ============================================================================
@@ -622,13 +633,14 @@ async fn update_rounding_rule(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     _admin: RequireAdmin,
     Path(id): Path<Uuid>,
+    ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<UpsertTimeRoundingRuleRequest>,
 ) -> AppResult<Json<TimeRoundingRuleResponse>> {
     request.validate()?;
     Ok(Json(
         state
             .service
-            .update_rounding_rule(user.tenant(), id, &request)
+            .update_rounding_rule(user.tenant(), id, &request, &ctx)
             .await?,
     ))
 }
@@ -639,6 +651,10 @@ async fn delete_rounding_rule(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     _admin: RequireAdmin,
     Path(id): Path<Uuid>,
+    ctx: crate::modules::audit::AuditCtx,
 ) -> AppResult<()> {
-    state.service.delete_rounding_rule(user.tenant(), id).await
+    state
+        .service
+        .delete_rounding_rule(user.tenant(), id, &ctx)
+        .await
 }
