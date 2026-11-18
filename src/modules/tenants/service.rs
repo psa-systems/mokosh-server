@@ -396,12 +396,9 @@ impl TenantService {
         .await?;
         tx.commit().await?;
 
-        // Copy default configuration from default tenant
-        self.copy_default_config(tenant_id).await?;
-
-        // PMS-413: every tenant gets an internal "own company" so general /
-        // overhead time entries have a stable company_id. Idempotent.
-        self.ensure_own_company(tenant_id).await?;
+        // Default config copy and own-company seeding (PMS-413: general /
+        // overhead time entries need a stable company_id) run after the commit.
+        self.seed_after_create(tenant_id).await?;
 
         // mokosh-contact-login prompt 002: seed the three built-in
         // portal roles (Billing Contact / Support Contact / Read-
@@ -409,11 +406,42 @@ impl TenantService {
         // Contact edit page from day one. Mirrors migration 142's
         // shape for existing tenants; ON CONFLICT keeps this idempotent
         // against a re-run.
-        self.seed_builtin_portal_roles(tenant_id).await?;
+        self.seed_builtin_portal_roles(tenant_id).await.map_err(|e| {
+            tracing::error!(
+                tenant_id = %tenant_id,
+                error = %e,
+                "tenant created but portal role seeding failed; the tenant exists without built-in portal roles"
+            );
+            e
+        })?;
 
         // SAFETY (PMS-261): re-reading the tenant just minted above; `tenant_id`
         // is the same minted id, bridged via `from_trusted`.
         self.get_tenant(TenantId::from_trusted(tenant_id)).await
+    }
+
+    /// Post-commit seeding shared by the two create paths. The tenant row is
+    /// already committed, so a failure here cannot be rolled back; both steps
+    /// are idempotent (`ensure_default_config` and the placement path re-run
+    /// them), so the partial state is logged with the tenant id and the step
+    /// rather than left silent.
+    async fn seed_after_create(&self, tenant_id: Uuid) -> AppResult<()> {
+        self.copy_default_config(tenant_id).await.map_err(|e| {
+            tracing::error!(
+                tenant_id = %tenant_id,
+                error = %e,
+                "tenant created but default config copy failed; the tenant exists unseeded and a retry of create will 409"
+            );
+            e
+        })?;
+        self.ensure_own_company(tenant_id).await.map_err(|e| {
+            tracing::error!(
+                tenant_id = %tenant_id,
+                error = %e,
+                "tenant created but own-company provisioning failed; the tenant exists without one and a retry of create will 409"
+            );
+            e
+        })
     }
 
     // SPEC-5.331, SPEC-5.332, SPEC-5.336
@@ -560,8 +588,7 @@ impl TenantService {
 
         tx.commit().await?;
 
-        self.copy_default_config(tenant_id).await?;
-        self.ensure_own_company(tenant_id).await?;
+        self.seed_after_create(tenant_id).await?;
 
         let tenant = self.get_tenant(TenantId::from_trusted(tenant_id)).await?;
         Ok((tenant, admin_id))
