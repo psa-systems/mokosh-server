@@ -1,11 +1,13 @@
 //! Notifications HTTP routes.
 //!
-//! SPEC-7.630: documents that every route in this file is admin-surface API with no SPA caller as of the 2026-09-22 parity record, and lists the exempted paths below.
-//! parity record 2026-09-22: every route in this file is admin-surface API
-//! for notification channels, templates, rules and the per-user preferences
-//! page. None has a SPA caller today; the Settings > Notifications screens
-//! that would wire them are deferred, not dead. Remove a route from this
-//! note when it ships a SPA caller.
+//! SPEC-7.630: parity record 2026-11-17: the channels, templates,
+//! rules, dispatch and per-user preferences routes below are admin-
+//! surface API with no SPA caller yet; the Settings > Notifications
+//! screens that would wire them are deferred, not dead. Remove a route
+//! from this list when it ships a SPA caller. `/notifications`,
+//! `/notifications/{id}/read` and `/notifications/preview` have
+//! shipped SPA callers (layout bell and email-preview) and are no
+//! longer listed.
 //!
 //! Exempted paths (named per MAPPS-1083):
 //!   - `/notification-channels`
@@ -14,10 +16,7 @@
 //!   - `/notification-templates/{id}`
 //!   - `/notification-rules`
 //!   - `/notification-rules/{id}`
-//!   - `/notifications`
-//!   - `/notifications/{id}/read`
 //!   - `/notifications/dispatch`
-//!   - `/notifications/preview`
 //!   - `/me/notification-preferences`
 
 use std::sync::Arc;

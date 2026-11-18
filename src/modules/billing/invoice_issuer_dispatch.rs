@@ -1061,6 +1061,19 @@ impl IssuerDispatcher {
             IntegrationCredentialBlob::Xero(x) => {
                 let creds = xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, x);
                 let contact_id = self.xero_contact_for(tenant_id, shape.company_id).await?;
+                // PMS-1660 finding: Xero identifies an invoice by UUID,
+                // and this id came from Xero itself when the invoice was
+                // issued, so a value that will not parse is a local
+                // corruption rather than a caller's mistake. Parse it
+                // BEFORE the create, because the previous order (parse
+                // after `issue_credit_note`) left an unreferenced credit
+                // note at Xero whenever the parse failed.
+                let invoice_id = Uuid::parse_str(shape.external_invoice_id).map_err(|_| {
+                    AppError::internal(format!(
+                        "invoice is recorded as Xero {} but Xero expects a UUID InvoiceID",
+                        shape.external_invoice_id
+                    ))
+                })?;
                 let request = XeroIssueCreditNoteRequest {
                     contact_id,
                     issue_date: shape.issue_date,
@@ -1076,16 +1089,6 @@ impl IssuerDispatcher {
                         .collect(),
                 };
                 let reference = self.xero.issue_credit_note(&creds, &request).await?;
-                // Xero identifies an invoice by UUID, and this id came
-                // from Xero itself when the invoice was issued, so a
-                // value that will not parse is a local corruption rather
-                // than a caller's mistake.
-                let invoice_id = Uuid::parse_str(shape.external_invoice_id).map_err(|_| {
-                    AppError::internal(format!(
-                        "invoice is recorded as Xero {} but Xero expects a UUID InvoiceID",
-                        shape.external_invoice_id
-                    ))
-                })?;
                 let allocation = match self
                     .xero
                     .allocate_credit_note(

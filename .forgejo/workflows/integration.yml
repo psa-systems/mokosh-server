@@ -25,6 +25,17 @@
 # is pool-heavy. Workflow touch alone re-triggers the matrix (Forgejo
 # 16.0.3 has no rerun API).
 #
+# Integration-branch gotcha (2026-11-17): on a pull_request event the
+# classifier runs against HEAD^1..HEAD. For an integration branch
+# built from a stack of `git merge --no-ff` commits, HEAD^1 is the
+# previous merge commit and the diff between the two is just the
+# LAST merged branch's content. When the last merged branch happened
+# to be docs-only (SPEC markdown, a plan file, ...) the whole
+# integration PR classified as `non-code` and the fmt + clippy +
+# tests + machete and integration shards skipped. Force a code-class
+# touch on the branch (workflow / action files count as code
+# outright) so every job runs against the aggregate tree.
+#
 # PMS-1252: `cache-warm.yml` archives the same `cargo nextest archive` on push
 # to main so the shared build cache is populated for a later pull-request run
 # to restore. The warm job archives and discards; it does not run tests, so

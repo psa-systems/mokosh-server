@@ -1267,13 +1267,28 @@ impl ContactAuthService {
                     "recipient_email": email,
                     "magic_link_url": magic_link_url,
                 });
-                let _ = notify
+                // PMS-1659 F: a failed dispatch used to be swallowed with
+                // `let _ = ...`, so a magic-link mail that could not be
+                // sent left the caller with a 204 and no trace. The intent
+                // is persisted whatever happens (the SPA shape stays the
+                // same so a login does not leak existence); WARN with the
+                // intent + tenant so the dispatch failure is findable.
+                // No credential in the log: only the intent id.
+                if let Err(e) = notify
                     .dispatch(
                         TenantId::from_trusted(tenant_id),
                         "auth.login_link",
                         &context,
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        intent_id = %intent_id,
+                        tenant_id = %tenant_id,
+                        error = %e,
+                        "auth.login_link dispatch failed; intent persisted"
+                    );
+                }
             } else {
                 // PMS-1663: the magic-link URL carries the live single-use
                 // secret; CLAUDE.md invariant "a log line must not carry a

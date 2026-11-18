@@ -366,7 +366,7 @@ impl InvitationsService {
         // delete).
         // SPEC-5.550: enrol as member only into an active team of the invite's tenant.
         if let Some(team_id) = invite.team_id {
-            sqlx::query(
+            let result = sqlx::query(
                 r#"INSERT INTO team_members (tenant_id, team_id, user_id, role)
                    SELECT $1, $2, $3, 'member'
                    FROM teams
@@ -378,6 +378,23 @@ impl InvitationsService {
             .bind(accepted_by)
             .execute(&mut *tx)
             .await?;
+            // PMS-1659 F3: the INSERT guarded on `is_active = TRUE` quietly
+            // matches zero rows when the team has been archived or deleted
+            // between create and accept, and the invite still accepts
+            // cleanly (SPEC-5.550). That is intentional, but an operator
+            // trying to find out why a new user's team enrolment never
+            // happened had no breadcrumb. One log line names the invite's
+            // team and user.
+            if result.rows_affected() == 0 {
+                tracing::warn!(
+                    invite_id = %invite.id,
+                    tenant_id = %invite.tenant_id,
+                    team_id = %team_id,
+                    user_id = %accepted_by,
+                    "invitation named a team that is archived, deleted or absent; \
+                     accepting the invite without team enrolment"
+                );
+            }
         }
 
         tx.commit().await?;

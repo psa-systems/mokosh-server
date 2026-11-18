@@ -178,7 +178,7 @@ impl TeamsService {
         request: &UpdateTeamRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Team> {
-        if let Some(color) = request.color.as_deref() {
+        if let Some(Some(color)) = request.color.as_ref() {
             validate_hex_color(color)?;
         }
         if let Some(Some(mgr_id)) = request.manager_id {
@@ -255,13 +255,16 @@ impl TeamsService {
             q = q.bind(n);
         }
         if let Some(ref d) = request.description {
-            q = q.bind(d);
+            // PMS-1659 F5: `Some(None)` binds NULL (clear); `Some(Some(s))`
+            // binds the value; absent is skipped entirely by the
+            // is_some() check that builds the column list above.
+            q = q.bind(d.as_ref());
         }
         if let Some(m) = request.manager_id {
             q = q.bind(m);
         }
         if let Some(ref c) = request.color {
-            q = q.bind(c);
+            q = q.bind(c.as_ref());
         }
         if let Some(a) = request.is_active {
             q = q.bind(a);

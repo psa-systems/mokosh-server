@@ -216,14 +216,36 @@ async fn parse(bytes: Vec<u8>) -> AppResult<VcardFile> {
 /// The stored upload, read and parsed. What the runner imports from.
 // SPEC-15.610
 pub async fn load_source(tenant_id: TenantId, file_id: Uuid) -> AppResult<VcardFileSource> {
-    let bytes = crate::storage::shared()
+    // PMS-1663 finding: `.map_err(|_|...)` used to map every storage
+    // error (I/O fault, permission denied, backend outage) to the
+    // same 'no longer held' conflict with no log of the real cause.
+    // Distinguish NotFound (the one case the message actually names)
+    // from any other error: log the latter at warn with the file id
+    // and still return the same user-facing conflict, matching the
+    // error-visibility rule's "a lookup that found nothing is not a
+    // failed attempt" distinction (PMS-1477).
+    let bytes = match crate::storage::shared()
         .read(&ObjectKey::contact_import(tenant_id.get(), file_id))
         .await
-        .map_err(|_| {
-            AppError::Conflict(
+    {
+        Ok(b) => b,
+        Err(AppError::NotFound(_)) => {
+            return Err(AppError::Conflict(
                 "The uploaded file is no longer held. Upload it again to import it.".to_string(),
-            )
-        })?;
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                file_id = %file_id,
+                error = %e,
+                "contact-import load_source: storage read failed with a non-NotFound error"
+            );
+            return Err(AppError::Conflict(
+                "The uploaded file is no longer held. Upload it again to import it.".to_string(),
+            ));
+        }
+    };
     Ok(VcardFileSource::new(parse(bytes).await?))
 }
 

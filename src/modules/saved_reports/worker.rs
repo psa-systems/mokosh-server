@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sqlx::Row;
+use sqlx::{Acquire, Row};
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -90,15 +90,37 @@ impl ScheduledReportsWorker {
             let cron_expr: String = row.try_get("cron_expr")?;
             let recipient_email: Option<String> = row.try_get("recipient_email")?;
 
-            let outcome = self
-                .materialise_and_enqueue(
-                    &mut tx,
-                    tenant_id,
-                    saved_report_id,
-                    user_id,
-                    recipient_email.as_deref(),
-                )
-                .await;
+            // PMS-1665 F: run the delivery under a nested
+            // transaction (savepoint) so a failed notifications INSERT
+            // does NOT poison the outer tick's tx. Previously an SQL
+            // error from the notifications INSERT aborted the outer tx
+            // and the subsequent schedule UPDATE failed with `?`,
+            // rolling back every schedule in the tick and repeating
+            // them on the next tick in a loop. The savepoint pattern
+            // isolates each schedule's delivery and keeps the
+            // last_error semantics the module comment promises.
+            let outcome = {
+                let mut inner = tx.begin().await?;
+                let result = self
+                    .materialise_and_enqueue(
+                        &mut inner,
+                        tenant_id,
+                        saved_report_id,
+                        user_id,
+                        recipient_email.as_deref(),
+                    )
+                    .await;
+                match result {
+                    Ok(()) => {
+                        inner.commit().await?;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        drop(inner);
+                        Err(e)
+                    }
+                }
+            };
 
             // Advance the schedule regardless of outcome. A failing
             // report should not stall its next cadence; the
