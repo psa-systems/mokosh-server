@@ -309,6 +309,7 @@ pub fn classify(
         // A reached URL always carries a host (it was built from a guarded one),
         // so the empty fallback is unreachable and would only report "no change".
         Some((final_url, _)) => {
+            debug_assert!(final_url.host_str().is_some(), "reached URL has no host");
             www_change(requested_host, final_url.host_str().unwrap_or_default())
         }
         None => WwwChange::None,

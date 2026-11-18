@@ -9302,7 +9302,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   ID and app-specific password. ...", a throttle must fail 409 "Apple is asking us to wait before checking this account
   again. ...", and any other source failure must fail 400 with the failure message.
 - **SPEC-15.531**: The failure redirect for a failed callback must be `{SPA
-  base}/settings/integrations/google-contacts?contact_sync=failed`, with no provider text in it.
+  base}/settings/integrations/<provider>-contacts?contact_sync=failed`, where `<provider>` is `microsoft` for a Microsoft
+  callback and `google` otherwise, with no provider text in it.
 - **SPEC-15.532**: The overview must read each provider's enabled switch from the tenant's settings, report `configured`
   as whether the host holds a Google client and `microsoft_configured` as whether it holds a Microsoft client, and read
   each live connection scoped to the tenant.
@@ -9361,7 +9362,7 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   by `connection_id`. When the record waits in more than one source and none is named it must fail with a validation
   error on `connection_id` ("this record is waiting in more than one source; name the one you are answering"). It must
   fail 409 when the source's switch is off (the file-upload source is exempt), and when no source is found it must first
-  fail 409 if the Google switch is off, else 404 "Review item".
+  fail 409 if the Google, iCloud or Microsoft switch is off, else 404 "Review item".
 - **SPEC-15.549**: A resolve whose link or create hits a conflict because a sync linked the record meanwhile must fail
   409 "This record was linked by a sync while it was waiting for review. Reload the queue.".
 - **SPEC-15.550**: Reading a contact's provenance must fail 404 "Contact" for a contact outside the tenant, and

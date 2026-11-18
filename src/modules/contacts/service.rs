@@ -721,7 +721,7 @@ impl ContactService {
         let mut count_builder = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
 
         if let Some(ref q) = filter.q {
-            let search = format!("%{}%", q);
+            let search = format!("%{}%", crate::utils::text::escape_like_wildcards(q));
             query_builder = query_builder.bind(search.clone());
             count_builder = count_builder.bind(search);
         }
@@ -781,6 +781,8 @@ impl ContactService {
         )
         .await?;
         self.assert_contact_of_company(tenant_id, company_id, request.default_billing_contact_id)
+            .await?;
+        self.assert_no_parent_cycle(tenant_id, company_id, request.parent_company_id)
             .await?;
 
         // Build the dynamic UPDATE the same way update_site does. The
@@ -1123,6 +1125,18 @@ impl ContactService {
         contact_id: Uuid,
     ) -> AppResult<Vec<PortalAccessRequestRow>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // An unknown or foreign-tenant contact is a 404, like the other
+        // contact-scoped calls, not an empty list.
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM contacts WHERE tenant_id = $1 AND id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            return Err(AppError::NotFound("Contact".to_string()));
+        }
         let rows = sqlx::query_as::<_, PortalAccessRequestRow>(
             "SELECT id, contact_id, company_id, area, note, status, requested_at, \
                     resolved_by_id, resolved_at \
@@ -3640,7 +3654,7 @@ impl ContactService {
         let mut count_builder = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
 
         if let Some(ref q) = filter.q {
-            let search = format!("%{}%", q);
+            let search = format!("%{}%", crate::utils::text::escape_like_wildcards(q));
             query_builder = query_builder.bind(search.clone());
             count_builder = count_builder.bind(search);
         }
@@ -3708,7 +3722,7 @@ impl ContactService {
         let pattern = q
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| format!("%{s}%"));
+            .map(|s| format!("%{}%", crate::utils::text::escape_like_wildcards(s)));
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let values: Vec<String> = sqlx::query_scalar(&sql)
@@ -3800,8 +3814,18 @@ impl ContactService {
         tenant_id: TenantId,
         id: Uuid,
         request: &UpsertCompanyIndustryRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<CompanyIndustryResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<CompanyIndustryRow> = sqlx::query_as(
+            "SELECT id, name, is_active FROM company_industries \
+             WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let before = before.ok_or_else(|| AppError::NotFound("Company industry".to_string()))?;
         let row: Option<CompanyIndustryRow> = sqlx::query_as(
             "UPDATE company_industries SET name = $3, is_active = $4, updated_at = NOW() \
              WHERE tenant_id = $1 AND id = $2 RETURNING id, name, is_active",
@@ -3813,6 +3837,17 @@ impl ContactService {
         .fetch_optional(&mut *tx)
         .await?;
         let row = row.ok_or_else(|| AppError::NotFound("Company industry".to_string()))?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "company_industries",
+            Some(id),
+            Some(serde_json::json!({ "name": before.name, "is_active": before.is_active })),
+            Some(serde_json::json!({ "name": row.name, "is_active": row.is_active })),
+        )
+        .await?;
         tx.commit().await?;
         Ok(row.into())
     }
@@ -3820,17 +3855,84 @@ impl ContactService {
     /// Delete an industry. 404 if not in this tenant.
     // SPEC-15.90: 404 unknown
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_company_industry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+    pub async fn delete_company_industry(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let res = sqlx::query("DELETE FROM company_industries WHERE tenant_id = $1 AND id = $2")
+        let before: Option<CompanyIndustryRow> = sqlx::query_as(
+            "SELECT id, name, is_active FROM company_industries \
+             WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let before = before.ok_or_else(|| AppError::NotFound("Company industry".to_string()))?;
+        sqlx::query("DELETE FROM company_industries WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        if res.rows_affected() == 0 {
-            return Err(AppError::NotFound("Company industry".to_string()));
-        }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "company_industries",
+            Some(id),
+            Some(serde_json::json!({ "name": before.name, "is_active": before.is_active })),
+            None,
+        )
+        .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Refuse a parent that is the company itself or one of its descendants,
+    /// either of which would close a loop in the parent chain.
+    // SPEC-15.25: parent must not be self or a descendant
+    async fn assert_no_parent_cycle(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        parent_company_id: Option<Uuid>,
+    ) -> AppResult<()> {
+        let Some(parent_id) = parent_company_id else {
+            return Ok(());
+        };
+        let cycle_error = || {
+            AppError::validation_field(
+                "parent_company_id",
+                "A company cannot be its own parent or sit under one of its sub-companies",
+            )
+        };
+        if parent_id == company_id {
+            return Err(cycle_error());
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Walk up from the proposed parent; reaching this company means the
+        // proposed parent is one of its descendants. UNION (not UNION ALL)
+        // stops the walk on any pre-existing loop.
+        let is_descendant: bool = sqlx::query_scalar(
+            "WITH RECURSIVE ancestors(id) AS ( \
+                 SELECT id FROM companies WHERE tenant_id = $1 AND id = $2 \
+                 UNION \
+                 SELECT c.parent_company_id FROM companies c \
+                 JOIN ancestors a ON c.id = a.id \
+                 WHERE c.tenant_id = $1 AND c.parent_company_id IS NOT NULL \
+             ) SELECT EXISTS (SELECT 1 FROM ancestors WHERE id = $3)",
+        )
+        .bind(tenant_id)
+        .bind(parent_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if is_descendant {
+            return Err(cycle_error());
+        }
         Ok(())
     }
 
@@ -4222,6 +4324,36 @@ impl ContactService {
         } else {
             None
         };
+
+        // Clearing the flag must end portal access the way `revoke_portal_access`
+        // does, or the contact keeps roles, a live session and an unredeemed
+        // setup link.
+        // SPEC-15.75: a true-to-false flip revokes roles, tokens and sessions
+        if request.is_portal_user == Some(false) {
+            sqlx::query(
+                "DELETE FROM contact_role_assignments WHERE tenant_id = $1 AND contact_id = $2",
+            )
+            .bind(tenant_id)
+            .bind(contact_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM portal_setup_tokens \
+                 WHERE tenant_id = $1 AND contact_id = $2 AND used_at IS NULL",
+            )
+            .bind(tenant_id)
+            .bind(contact_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE contact_sessions SET revoked_at = NOW() \
+                 WHERE tenant_id = $1 AND contact_id = $2 AND revoked_at IS NULL",
+            )
+            .bind(tenant_id)
+            .bind(contact_id)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         // SPEC-15.76: edited fields stop following the sync source
         if let Some(sync_before) = sync_before {
