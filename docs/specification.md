@@ -3393,9 +3393,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   portal_locked_until, stamp portal_last_login_at (a failure of that write must be logged at warn with contact_id and
   must not fail the login), insert a contact_sessions row whose family_id equals its own id, and return access_token,
   refresh_token, expires_at and the contact object with mfa_required false.
-- **SPEC-5.449**: Login, refresh and a magic-link redeem that mints a session must set the cookie
-  mokosh:contact_token=<refresh token> with HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth; Max-Age=2592000,
-  adding Domain=<value> only when configuration PORTAL_COOKIE_DOMAIN is non-blank after trimming.
+- **SPEC-5.449**: Login, refresh and a magic-link redeem that mints a session must not set any cookie; the refresh
+  token travels only in the response body.
 - **SPEC-5.450**: POST /api/v1/contact/auth/refresh must answer 401 when the token does not parse as
   {session-uuid}.{secret}, names no contact_sessions row, or carries a secret that does not verify against the stored
   hash, and a secret that did not verify must revoke nothing.
@@ -3410,10 +3409,10 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   portal.refresh_replay_detected and answer 401.
 - **SPEC-5.454**: A successful refresh must insert a new session row with a new id in the presented row's family, mint
   an access token whose caps claim is loaded fresh and whose email is the contact's current lower-cased email, and
-  return it with a new refresh token, the contact object, mfa_required false and the cookie.
-- **SPEC-5.455**: POST /api/v1/contact/auth/logout must answer 204 and clear the mokosh:contact_token cookie (same
-  attributes and Domain as when set, Max-Age=0) for a malformed, unknown or wrong-secret token without revoking
-  anything, and for a token whose secret verifies must revoke the whole rotation family and write audit portal.logout.
+  return it with a new refresh token, the contact object, mfa_required false.
+- **SPEC-5.455**: POST /api/v1/contact/auth/logout must answer 204 and clear the legacy mokosh:contact_token cookie
+  (HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth; Max-Age=0, with the PORTAL_COOKIE_DOMAIN Domain when
+  configured) for a malformed, unknown or wrong-secret token without revoking anything, and for a token whose secret verifies must revoke the whole rotation family and write audit portal.logout.
 - **SPEC-5.456**: Revoking a rotation family must set revoked_at on every unrevoked contact_sessions row sharing the
   family_id, and this must be the single mechanism used by logout, replay detection, a portal-access-revoked refresh and
   the revoke-session route.
@@ -4078,8 +4077,8 @@ the value as given.
   an unset or blank value must mean none: the tenant logo is then omitted from client-facing email (SPEC-15.519).
 - **SPEC-6.60**: `ABUSE_CONTACT_EMAIL` (application, since `v0.12.0`) must be trimmed, and an unset or blank value must
   mean none: the abuse-report line is then omitted from request-form email, and no other address is substituted.
-- **SPEC-6.61**: `PORTAL_COOKIE_DOMAIN` (application, since `v0.19.0`) must add a `Domain` attribute to the portal
-  refresh cookie only when it is non-blank after trimming (SPEC-5.449).
+- **SPEC-6.61**: `PORTAL_COOKIE_DOMAIN` (application, since `v0.19.0`) must add a `Domain` attribute to the legacy portal
+  cookie cleared at logout only when it is non-blank after trimming (SPEC-5.449).
 - **SPEC-6.62**: `MOKOSH_MAX_TENANTS` (application, since `v0.14.0`) must be read once at boot as a positive integer; an
   unset or blank value must leave tenant creation uncapped (SPEC-5.332), and a malformed or non-positive value must end
   boot (SPEC-6.46). A change takes effect on the next restart.
