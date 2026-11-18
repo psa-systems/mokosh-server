@@ -406,6 +406,8 @@ impl AppConfig {
             resolve_secret(&keys::ENCRYPTION_KEY, &environment, DEV_ENCRYPTION_KEY)?;
         // SPEC-2.233
         let client_origin = config::get(&keys::CLIENT_ORIGIN)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "http://localhost:4301".to_string());
         // MAPPS-425: falls back to `client_origin` so a single-origin dev
         // stack is unaffected. Deployed environments MUST set it, because
@@ -505,11 +507,16 @@ impl AppConfig {
             app_database_url,
             jwt_secret,
             // SPEC-2.230
-            host: config::get(&keys::HOST).unwrap_or_else(|| "0.0.0.0".to_string()),
+            host: config::get(&keys::HOST)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "0.0.0.0".to_string()),
             port,
             environment,
             // SPEC-2.233
             base_url: config::get(&keys::BASE_URL)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "http://localhost:8080".to_string()),
             run_migrations,
             encryption_key,
@@ -616,6 +623,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_cli(&args).await;
     }
 
+    // The env file has to land before ANYTHING reads a variable: the hosting
+    // profile below chooses the configuration provider, and that provider then
+    // resolves every declared key out of this process's environment.
+    // PMS-1577: a missing `.env` is the documented default (nothing to load);
+    // a malformed one silently discarded every variable it defined, with
+    // nothing logged, so only the not-found case is ignored here.
+    // SPEC-2.18
+    // SPEC-6.36
+    if let Err(e) = dotenvy::dotenv() {
+        if !matches!(e, dotenvy::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(format!(".env could not be loaded: {e}").into());
+        }
+    }
+
     // PMS-504 (M14): do not hardcode debug logging in every environment.
     // Honor RUST_LOG (the dev stack sets `info,mokosh_server=debug`) and fall
     // back to `info` when it is unset so production runs at info, not debug.
@@ -632,21 +654,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SPEC-1.1
     tracing::info!("Running in multi-tenant mode");
-
-    // The env file has to land before ANYTHING reads a variable: the hosting
-    // profile below chooses the configuration provider, and that provider then
-    // resolves every declared key out of this process's environment.
-    // PMS-1577: a missing `.env` is the documented default (nothing to load);
-    // a malformed one silently discarded every variable it defined, with
-    // nothing logged, so only the not-found case is ignored here.
-    // SPEC-2.18
-    // SPEC-6.36
-    if let Err(e) = dotenvy::dotenv() {
-        if !matches!(e, dotenvy::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
-        {
-            return Err(format!(".env could not be loaded: {e}").into());
-        }
-    }
 
     // PMS-1011: the same variable, read strictly, because this answer chooses
     // providers rather than gating mail. Read here so an unrecognised mode
@@ -1427,8 +1434,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _scheduler_handles = scheduler.start();
 
     // PMS-657: build the IP -> country resolver for login-location alerts.
-    // Optional: an unset path or a failed .BIN load leaves it None and the
-    // alerts stay disabled (login is never affected).
+    // Optional: an unset path leaves it None and the alerts stay disabled. A
+    // configured but unloadable path ends boot rather than disabling silently.
     // SPEC-2.53
     let geoip = match config.ip2location_db_path.as_deref() {
         Some(path) => match mokosh_server::utils::geoip::GeoIpService::new(path) {
@@ -1437,8 +1444,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(std::sync::Arc::new(svc))
             }
             Err(e) => {
-                tracing::warn!(path = %path, error = %e, "Failed to load IP2Location DB; login-location alerts disabled");
-                None
+                return Err(format!(
+                    "IP2LOCATION_DB_PATH={path:?} could not be loaded: {e}; unset it to disable login-location alerts"
+                )
+                .into());
             }
         },
         None => {

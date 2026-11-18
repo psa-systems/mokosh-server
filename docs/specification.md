@@ -1503,7 +1503,8 @@ and are not reused.
   hop's URL (the website probe and the automation webhook sender do).
 - **SPEC-4.11**: `PrivateTargetAllowlist::parse` must treat an entry that parses as an IP address or CIDR as a network
   exemption and any other non-blank entry as an exact (case-insensitive) hostname exemption; an empty or all-blank
-  input must produce an allowlist that exempts nothing (fail closed). A host named by `allows_host` must be exempted
+  input must produce an allowlist that exempts nothing (fail closed). An entry containing `/` that does not parse as a
+  CIDR must still be stored as a hostname and must log at warn naming the entry and the parse error. A host named by `allows_host` must be exempted
   from resolution and screening entirely.
 - **SPEC-4.12**: `utils::net::loggable_url_authority` must reduce a URL-shaped string to its authority (`host[:port]`),
   stripping any scheme, userinfo, path, query and fragment, even when the input does not parse as a URL at all, so the
@@ -3910,7 +3911,7 @@ the value as given.
 - **SPEC-6.20**: The file configuration provider must hold a key's value as the file's contents with exactly one
   trailing newline (`\r\n` or `\n`) removed and every other character preserved. A file that exists but cannot be read
   must be logged at error, naming the path and the key, and the key must be treated as not held. A file whose name is
-  not a declared key must be ignored.
+  not a declared key must be ignored and logged at warn, once per file.
 - **SPEC-6.21**: The file configuration provider's `set` and `delete` must refuse a bootstrap-tier key with a
   configuration error "{KEY} is a bootstrap-tier key and cannot be written to the file configuration provider" (or
   "deleted from"), before touching the filesystem. `set` on a provider with no directory must fail with "file
@@ -3940,8 +3941,9 @@ the value as given.
   external-service error that names `BUNYIP_CONFIG_CLIENT_ID` and `bunyip-api machine-client rotate`. A 403 must fail
   the build with an error that names the key and `bunyip-api machine-client register --name mokosh-host-config
   --config-key {remote key}`. Any other non-2xx status must fail the build with "bunyip answered {status} for {key}:
-  {body}". A transport failure must fail the build with "could not reach bunyip at {url}: {cause}. Check
-  BUNYIP_CONFIG_URL and that bunyip is reachable from this host.". The value is `data.value` of the response envelope,
+  {body}". A transport failure on one key must log at error "could not reach bunyip at {url}: {cause}. Check
+  BUNYIP_CONFIG_URL and that bunyip is reachable from this host." and leave that key unheld, and the remaining keys
+  must still be read. The value is `data.value` of the response envelope,
   trimmed, and a blank or absent value leaves the key unheld.
 - **SPEC-6.26**: The Bunyip configuration provider's `set` and `delete` must always fail with a configuration error
   ("bunyip provider write is not implemented" for `set`, "bunyip provider does not support deletes" for `delete`), so
@@ -4029,10 +4031,11 @@ the value as given.
 - **SPEC-6.46**: A set-but-unparseable `PORT` (a `u16`), `RUN_MIGRATIONS` (a boolean) or `MOKOSH_MAX_TENANTS` (a
   positive `usize`) must end boot with the `parse_optional` or `parse_positive` message of SPEC-6.27 or SPEC-6.28, and a
   set-but-unparseable `OIDC_DEFAULT_TENANT_ID` (a UUID) or feature flag must end boot with the message of SPEC-6.29 or
-  SPEC-6.32. A failure inside `AppConfig::from_env` must stop the process with a panic whose message begins "Failed to
-  load configuration".
+  SPEC-6.32. A failure inside `AppConfig::from_env` must end boot with a non-zero exit and an error whose message begins
+  "Failed to load configuration"; it must not panic.
 - **SPEC-6.47**: Boot must fail when the listen address "{HOST}:{PORT}" does not parse as a socket address, and when the
-  address cannot be bound, with a non-zero exit and the underlying cause.
+  address cannot be bound, with a non-zero exit and the underlying cause. The parse error must name `HOST`, `PORT` and
+  the combined value.
 - **SPEC-6.48**: When `RUN_MIGRATIONS` is true, boot must run the embedded migrations before serving, and a failed
   migration must log at error "Failed to run database migrations: {cause}" and end boot with a non-zero exit.
   `RUN_MIGRATIONS=false` must skip the step.
@@ -4055,8 +4058,8 @@ the value as given.
   check must be the exact string `production`, and the demo-seed gate must compare `production` case-insensitively
   (SPEC-15.2053).
 - **SPEC-6.53**: `HOST` (application, since `v0.1.0`) must default to `0.0.0.0` and `PORT` (application, since `v0.1.0`)
-  must default to `8080` only when the variable is unset or `PORT` is blank; a blank `HOST` must be used as given and
-  fail the socket address parse of SPEC-6.47.
+  must default to `8080` only when the variable is unset or blank, so a blank `HOST` must read as unset like every other optional variable.
+  A blank `CLIENT_ORIGIN` or `BASE_URL` must likewise read as unset and take its default.
 - **SPEC-6.54**: `RUN_MIGRATIONS` (application, since `v0.1.0`) must default to true when unset or blank and must accept
   only the literals `true` and `false`, so `1`, `yes` and `TRUE` must end boot with "RUN_MIGRATIONS is set to \"{raw}\",
   which is not a valid value: provided string was not `true` or `false`".
@@ -4147,10 +4150,11 @@ the value as given.
 - **SPEC-6.78**: `OIDC_ISSUER` and `OIDC_AUDIENCE` (application, since `v0.3.0`) must mount the identity-provider token
   verifier only when both are present. An absent one must fail the verifier configuration with "OIDC_ISSUER must be set
   (e.g. {url})" or "OIDC_AUDIENCE must be set (e.g. {url})", the issuer's trailing `/` must be removed (SPEC-5.113,
-  SPEC-5.114), and boot must log at info "Bunyip RS verifier disabled" with the reason and continue.
+  SPEC-5.114). Both unset or blank must log at info "Bunyip RS verifier disabled" and boot must continue; exactly one
+  set must end boot with an error naming the missing variable, and a blank value must read as unset.
 - **SPEC-6.79**: `OIDC_JWKS_CACHE_TTL_SECS` (since `v0.3.0`) must default to 600 and `OIDC_LEEWAY_SECONDS` (since
   `v0.3.0`) to 30, both parsed as `u64` seconds; a set value that does not parse must be an error naming the key and the
-  raw value (SPEC-5.115) and the verifier must then be disabled.
+  raw value (SPEC-5.115) and boot must end with "Bunyip RS verifier config invalid: {reason}".
 - **SPEC-6.80**: `OIDC_DEFAULT_TENANT_ID` (application, since `v0.3.0`) must be a UUID, checked at boot by SPEC-6.29.
   The tenant a first-seen identity-provider user lands in must be this UUID, else the UUID
   `00000000-0000-0000-0000-000000000001`, and an unparseable value seen after boot must log at warn and use that
@@ -4220,8 +4224,7 @@ the value as given.
   with a configuration error and must not end boot.
 - **SPEC-6.99**: `IP2LOCATION_DB_PATH` (application, since `v0.7.0`) must be trimmed and a blank or unset value must
   disable login-location alerts, logging at info "IP2LOCATION_DB_PATH unset; login-location alerts disabled". A path
-  whose database cannot be loaded must log at warn "Failed to load IP2Location DB; login-location alerts disabled" with
-  the path and cause, and boot must continue (SPEC-4.5).
+  whose database cannot be loaded must end boot with an error naming the path and the cause (SPEC-4.5).
 - **SPEC-6.100**: `IP2PROXY_DB_PATH` (application, since `v0.11.0`) must be trimmed and a blank or unset value must
   disable IP enrichment, logging at info "IP2PROXY_DB_PATH unset; IP enrichment disabled". A path whose database cannot
   be loaded must log at warn "Failed to load IP2Proxy DB; IP enrichment disabled" with the path and cause, and boot must

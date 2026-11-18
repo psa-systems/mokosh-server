@@ -151,7 +151,17 @@ impl PrivateTargetAllowlist {
             }
             match entry.parse::<IpNetwork>() {
                 Ok(net) => networks.push(net),
-                Err(_) => hosts.push(entry.to_ascii_lowercase()),
+                Err(e) => {
+                    // A CIDR-shaped entry that fails to parse exempts nothing; say so.
+                    if entry.contains('/') {
+                        tracing::warn!(
+                            entry = %entry,
+                            error = %e,
+                            "OUTBOUND_PRIVATE_ALLOWLIST entry is not a valid address or CIDR; treated as a hostname and exempts no network"
+                        );
+                    }
+                    hosts.push(entry.to_ascii_lowercase());
+                }
             }
         }
         Self { hosts, networks }

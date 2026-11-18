@@ -800,8 +800,6 @@ pub fn refresh() -> Arc<Generation> {
 // rejected outcome leaves the live generation and its counter untouched.
 // SPEC-6.10
 pub fn try_refresh(request: RefreshRequest) -> RefreshOutcome {
-    let previous = current();
-
     // Rule 1: refuse bootstrap-tier keys before any I/O.
     let bootstrap_refused: Vec<&'static ConfigKey> = request
         .required_keys
@@ -817,12 +815,20 @@ pub fn try_refresh(request: RefreshRequest) -> RefreshOutcome {
                 bootstrap_keys_refused: bootstrap_refused,
                 providers_consulted: Vec::new(),
             },
-            previous,
+            previous: current(),
         };
     }
 
-    // Rule 2: build a candidate. The number is committed only on Applied.
+    // Rules 2 to 4 run under one write lock so two concurrent refreshes cannot
+    // both build from the same previous generation and install the same number
+    // or a stale candidate over a newer one.
     let provider = provider();
+    let mut slot = cell()
+        .write()
+        .expect("the configuration generation lock is never held across a panic");
+    let previous = slot.clone();
+
+    // Rule 2: build a candidate. The number is committed only on Applied.
     let candidate = Generation::resolve(
         provider.as_ref(),
         Some(&previous),
@@ -852,9 +858,6 @@ pub fn try_refresh(request: RefreshRequest) -> RefreshOutcome {
     // Rule 4: atomic swap under the write lock.
     let installed = Arc::new(candidate);
     let actor = request.actor;
-    let mut slot = cell()
-        .write()
-        .expect("the configuration generation lock is never held across a panic");
     *slot = installed.clone();
     RefreshOutcome::Applied {
         generation: installed,
@@ -2136,6 +2139,29 @@ mod tests {
                 panic!("expected Applied with no required keys, got Rejected: {reason:?}")
             }
         }
+    }
+
+    /// Concurrent refreshes must each install a distinct, increasing number.
+    #[test]
+    fn concurrent_try_refresh_never_installs_a_duplicate_generation() {
+        let _guard = refresh_test_lock();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| match try_refresh(RefreshRequest::system()) {
+                    RefreshOutcome::Applied { generation, .. } => generation.number(),
+                    RefreshOutcome::Rejected { .. } => panic!("refresh with no required keys"),
+                })
+            })
+            .collect();
+        let mut numbers: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        numbers.sort_unstable();
+        let before = numbers.len();
+        numbers.dedup();
+        assert_eq!(
+            numbers.len(),
+            before,
+            "duplicate generation numbers installed"
+        );
     }
 
     /// A required key that no provider holds rejects the refresh, names the
