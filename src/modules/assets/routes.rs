@@ -172,12 +172,15 @@ async fn update_asset_type(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<UpsertAssetTypeRequest>,
 ) -> AppResult<Json<AssetTypeResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.update_asset_type(u.tenant(), id, &req).await?,
+        s.service
+            .update_asset_type(u.tenant(), id, &req, &ctx)
+            .await?,
     ))
 }
 
@@ -186,9 +189,10 @@ async fn delete_asset_type(
     State(s): State<AssetsRouterState>,
     RequireAssets { user: u, .. }: RequireAssets,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_asset_type(u.tenant(), id).await
+    s.service.delete_asset_type(u.tenant(), id, &ctx).await
 }
 
 // SPEC-15.1026: dual-plane read, contact scoped to own company
@@ -656,19 +660,14 @@ async fn report_asset_issue(
     if use_portal_path {
         // Route through the shared portal-ticket path so the ticket
         // lands with `source = portal`, the tenant's default status /
-        // priority / queue, and the `contact_id` stamped. The path
-        // does NOT yet support arbitrary extra fields (it wraps
-        // `create_ticket` with a fixed subset), so the `asset_id`
-        // linkage is applied as a follow-up UPDATE below; the whole
-        // report-issue flow tolerates the extra round-trip.
+        // priority / queue, and the `contact_id` stamped. `asset_id` goes
+        // in on the same INSERT so the ticket and its asset link are one
+        // atomic write: a failure cannot leave an unlinked ticket behind.
         //
-        // PMS-1664 F9: the old `unwrap_or_else(Uuid::nil)` substituted
-        // a nil contact id for a report that reached here without one,
-        // so a ticket could land attributed to no one; fail fast
-        // instead. `use_portal_path` is only set in the Contact arm
-        // above where `contact_id` is `Some(session.id)`, so hitting
-        // the `None` branch is an invariant break that the operator
-        // must see.
+        // `use_portal_path` is only set in the Contact arm above where
+        // `contact_id` is `Some(session.id)`, so the `None` branch is an
+        // invariant break that the operator must see rather than a nil
+        // contact id silently attributing the ticket to no one.
         let Some(contact) = contact_id else {
             return Err(AppError::Internal(
                 "report-issue portal path reached without a contact id".to_string(),
@@ -683,33 +682,10 @@ async fn report_asset_issue(
                 description,
                 None,
                 None,
+                Some(asset_id),
             )
             .await?;
-        // Stamp the asset link now; the row is already
-        // Company-scoped so this UPDATE cannot leak across tenants.
-        // Hold the tx in a local so the explicit commit lands (a
-        // dropped tx auto-rolls back and the update would silently
-        // disappear).
-        let mut tx = s.service.db().begin_with_tenant(tenant).await?;
-        sqlx::query(
-            "UPDATE tickets SET asset_id = $1, updated_at = NOW() \
-             WHERE tenant_id = $2 AND id = $3",
-        )
-        .bind(asset_id)
-        .bind(tenant.get())
-        .bind(ticket.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Internal(format!("stamp asset_id on report-issue ticket: {e}")))?;
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Internal(format!("commit asset_id stamp: {e}")))?;
-        // Re-fetch so the response reflects the freshly-stamped
-        // `asset_id`.
-        let refreshed = ticket_service
-            .get_ticket_response(tenant, ticket.id)
-            .await?;
-        Ok(Json(refreshed))
+        Ok(Json(ticket))
     } else {
         // Staff branch: go through the standard `create_ticket` path
         // so the fully-populated request (with `asset_id` inline) lets
