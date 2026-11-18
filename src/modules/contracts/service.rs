@@ -129,7 +129,11 @@ impl ContractsService {
             .bind(pagination.limit() as i64)
             .bind(pagination.offset() as i64);
         let rows = q.fetch_all(&mut *tx).await?;
-        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+        let rows = rows
+            .into_iter()
+            .map(ContractResponse::try_from)
+            .collect::<AppResult<Vec<_>>>()?;
+        Ok((rows, total as u64))
     }
 
     // SPEC-13.1309
@@ -220,7 +224,7 @@ impl ContractsService {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Contract".to_string()))?;
-        Ok(row.into())
+        ContractResponse::try_from(row)
     }
 
     // SPEC-13.1310
@@ -387,6 +391,7 @@ impl ContractsService {
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ContractItemResponse>, u64)> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        assert_contract_in_tenant(&mut tx, tenant_id, contract_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM contract_items WHERE tenant_id = $1 AND contract_id = $2",
         )
@@ -410,7 +415,11 @@ impl ContractsService {
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
         .await?;
-        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+        let rows = rows
+            .into_iter()
+            .map(ContractItemResponse::try_from)
+            .collect::<AppResult<Vec<_>>>()?;
+        Ok((rows, total as u64))
     }
 
     // SPEC-13.1313, SPEC-13.1314, SPEC-13.1316
@@ -654,6 +663,7 @@ impl ContractsService {
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<ContractHourBalanceResponse>, u64)> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        assert_contract_in_tenant(&mut tx, tenant_id, contract_id).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM contract_hour_balances WHERE tenant_id = $1 AND contract_id = $2",
         )
@@ -1623,9 +1633,11 @@ impl ContractsService {
     /// Transition `active` contracts whose `end_date` has passed as of
     /// `now`:
     ///   * `auto_renew = true` with a non-empty `renewal_terms` (or a
-    ///     derivable term) -> status stays `active` conceptually but is
-    ///     stamped `renewed` for the closing term, and `start_date` /
-    ///     `end_date` are advanced by the renewal length. The renewal
+    ///     derivable term) -> status stays `active` and `start_date` /
+    ///     `end_date` are advanced by the renewal length, so the next
+    ///     sweep sees the new term. Legacy rows already stamped `renewed`
+    ///     (a deprecated status this sweep no longer writes) are picked up
+    ///     here too and move back to `active` or `expired`. The renewal
     ///     length is taken from `renewal_terms->>'term_months'` when
     ///     present, else the span of the current term (end - start).
     ///   * otherwise -> status set to `expired`.
@@ -1662,7 +1674,7 @@ impl ContractsService {
         let tenants: Vec<Uuid> = sqlx::query_scalar(
             r#"SELECT DISTINCT tenant_id
                FROM contracts
-               WHERE status = 'active' AND end_date IS NOT NULL AND end_date < $1"#,
+               WHERE status IN ('active', 'renewed') AND end_date IS NOT NULL AND end_date < $1"#,
         )
         .bind(latest_anywhere)
         .fetch_all(self.db.migrator_pool())
@@ -1694,7 +1706,7 @@ impl ContractsService {
                     r#"SELECT id, start_date, end_date, auto_renew, renewal_terms,
                               to_jsonb(contracts) AS before_snapshot
                        FROM contracts
-                       WHERE tenant_id = $1 AND status = 'active'
+                       WHERE tenant_id = $1 AND status IN ('active', 'renewed')
                          AND end_date IS NOT NULL AND end_date < $2
                        ORDER BY id
                        LIMIT $3
@@ -1742,7 +1754,7 @@ impl ContractsService {
 
                         let after = sqlx::query_scalar(
                             r#"UPDATE contracts
-                               SET status = 'renewed',
+                               SET status = 'active',
                                    start_date = $2,
                                    end_date = $3,
                                    updated_at = NOW()
@@ -1818,7 +1830,9 @@ impl ContractsService {
         .bind(contract_id)
         .fetch_all(&mut *tx)
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        rows.into_iter()
+            .map(ContractItemResponse::try_from)
+            .collect()
     }
 }
 
@@ -1851,19 +1865,37 @@ struct ContractRow {
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-impl From<ContractRow> for ContractResponse {
-    fn from(r: ContractRow) -> Self {
-        Self {
+/// A NULL in a column the schema always defaults is corruption: fail naming
+/// the row instead of inventing a value.
+fn required_column(
+    value: Option<String>,
+    table: &str,
+    id: Uuid,
+    column: &str,
+) -> AppResult<String> {
+    value.ok_or_else(|| {
+        tracing::warn!(%id, table, column, "column is NULL but is documented as always set");
+        AppError::Internal(format!("{table} row {id} has a NULL {column}"))
+    })
+}
+
+impl TryFrom<ContractRow> for ContractResponse {
+    type Error = AppError;
+
+    fn try_from(r: ContractRow) -> AppResult<Self> {
+        let status = required_column(r.status, "contracts", r.id, "status")?;
+        let billing_cycle = required_column(r.billing_cycle, "contracts", r.id, "billing_cycle")?;
+        Ok(Self {
             id: r.id,
             contract_number: r.contract_number,
             name: r.name,
             company_id: r.company_id,
             contract_type: r.contract_type,
-            status: r.status.unwrap_or_else(|| "draft".into()),
+            status,
             start_date: r.start_date,
             end_date: r.end_date,
             auto_renew: r.auto_renew.unwrap_or(false),
-            billing_cycle: r.billing_cycle.unwrap_or_else(|| "monthly".into()),
+            billing_cycle,
             billing_amount: r.billing_amount,
             sla_id: r.sla_id,
             signed_date: r.signed_date,
@@ -1871,7 +1903,7 @@ impl From<ContractRow> for ContractResponse {
             notes: r.notes,
             created_at: r.created_at,
             updated_at: r.updated_at,
-        }
+        })
     }
 }
 
@@ -1897,9 +1929,17 @@ struct ContractItemRow {
     billed_at: Option<chrono::DateTime<Utc>>,
 }
 
-impl From<ContractItemRow> for ContractItemResponse {
-    fn from(r: ContractItemRow) -> Self {
-        Self {
+impl TryFrom<ContractItemRow> for ContractItemResponse {
+    type Error = AppError;
+
+    fn try_from(r: ContractItemRow) -> AppResult<Self> {
+        let billing_frequency = required_column(
+            r.billing_frequency,
+            "contract_items",
+            r.id,
+            "billing_frequency",
+        )?;
+        Ok(Self {
             id: r.id,
             contract_id: r.contract_id,
             name: r.name,
@@ -1908,7 +1948,7 @@ impl From<ContractItemRow> for ContractItemResponse {
             quantity: r.quantity,
             unit_price: r.unit_price,
             total_price: r.total_price,
-            billing_frequency: r.billing_frequency.unwrap_or_else(|| "monthly".into()),
+            billing_frequency,
             work_type_id: r.work_type_id,
             included_hours: r.included_hours,
             overage_rate: r.overage_rate,
@@ -1921,7 +1961,7 @@ impl From<ContractItemRow> for ContractItemResponse {
             // SPEC-13.1315
             billing_rule: BillingRule::from_str(&r.billing_rule).unwrap_or(BillingRule::Manual),
             billed_at: r.billed_at,
-        }
+        })
     }
 }
 
@@ -2043,6 +2083,24 @@ struct DueContractRow {
     before_snapshot: Option<serde_json::Value>,
 }
 
+/// 404 for a contract id that is unknown or belongs to another tenant, so a
+/// list read does not answer 200 with an empty page.
+async fn assert_contract_in_tenant(
+    tx: &mut crate::db::TenantTransaction<'_>,
+    tenant_id: TenantId,
+    contract_id: Uuid,
+) -> AppResult<()> {
+    let found: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM contracts WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(contract_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    found
+        .map(|_| ())
+        .ok_or_else(|| AppError::NotFound("Contract".to_string()))
+}
+
 /// PMS-1661 F13: assert the `company_id` the request body names is a
 /// row in the caller's tenant before linking it on an INSERT/UPDATE.
 /// `contracts.company_id` is a plain `REFERENCES`, so a cross-tenant
@@ -2096,4 +2154,39 @@ async fn assert_contract_contact_in_tenant(
     found
         .map(|_| ())
         .ok_or_else(|| AppError::NotFound("Contact".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contract_row(status: Option<&str>, cycle: Option<&str>) -> ContractRow {
+        let now = chrono::Utc::now();
+        ContractRow {
+            id: Uuid::nil(),
+            contract_number: None,
+            name: "c".into(),
+            company_id: Uuid::nil(),
+            contract_type: "managed".into(),
+            status: status.map(str::to_string),
+            start_date: now.date_naive(),
+            end_date: None,
+            auto_renew: Some(false),
+            billing_cycle: cycle.map(str::to_string),
+            billing_amount: None,
+            sla_id: None,
+            signed_date: None,
+            signed_by_contact_id: None,
+            notes: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn null_status_or_billing_cycle_fails_the_read() {
+        assert!(ContractResponse::try_from(contract_row(Some("active"), Some("monthly"))).is_ok());
+        assert!(ContractResponse::try_from(contract_row(None, Some("monthly"))).is_err());
+        assert!(ContractResponse::try_from(contract_row(Some("active"), None)).is_err());
+    }
 }
