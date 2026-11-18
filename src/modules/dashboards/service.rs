@@ -291,10 +291,8 @@ impl DashboardsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// PMS-1665: owner-only. Same shape as the saved_reports fix: update
-    /// and delete already filter by `user_id` but GET-by-id used to leak
-    /// another user's schedule (recipient, cron, last_error, is_active)
-    /// to any viewer of the parent dashboard.
+    /// Owner-only, like update and delete: another viewer of the parent
+    /// dashboard gets 404, not the schedule's recipient, cron and last_error.
     // SPEC-15.1645
     pub async fn schedule_get(
         &self,
