@@ -8,15 +8,15 @@
 //!
 //! # What this module holds
 //!
-//! - [`models`]: the Rust types that mirror the schema and the endpoint
+//! - The [`models`] module holds the Rust types that mirror the schema and the endpoint
 //!   shapes.
-//! - [`service::ExpensesService`]: the one writer. Vendors and expense
+//! - [`service::ExpensesService`] is the one writer. Vendors and expense
 //!   categories CRUD, bills (`draft -> approved -> paid`, `void`) and
 //!   expenses (`draft -> submitted -> approved -> reimbursed`,
 //!   `rejected`), each header atomic with its lines in one transaction,
 //!   tenant-isolated through `begin_with_tenant`, every mutation writing
 //!   an `audit_log` row in the same transaction as the change.
-//! - [`routes::expenses_routes`]: `/api/v1/vendors`,
+//! - The router [`routes::expenses_routes`] mounts `/api/v1/vendors`,
 //!   `/api/v1/expense-categories`, `/api/v1/bills` and `/api/v1/expenses`
 //!   with their transition sub-routes, merged into the staff plane.
 //!

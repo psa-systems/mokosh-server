@@ -511,7 +511,7 @@ async fn nothing_is_sent_before_the_claim_is_paid_back(pool: PgPool) {
     svc.submit_expense(tenant(), rejected, &ctx())
         .await
         .expect("submit");
-    svc.reject_expense(tenant(), rejected, &ctx())
+    svc.reject_expense(tenant(), rejected, admin, &ctx())
         .await
         .expect("reject");
 
