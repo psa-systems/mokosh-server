@@ -34,6 +34,7 @@ pub struct CreateRmmConnectionRequest {
     #[serde(default)]
     pub is_active: bool,
     #[serde(default = "default_60")]
+    #[validate(range(min = 1))]
     pub sync_interval_minutes: i32,
 }
 
@@ -55,6 +56,7 @@ pub struct UpdateRmmConnectionRequest {
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
     pub is_active: Option<bool>,
+    #[validate(range(min = 1))]
     pub sync_interval_minutes: Option<i32>,
 }
 
