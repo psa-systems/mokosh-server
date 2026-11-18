@@ -8699,7 +8699,8 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
   for this transition."
 - **SPEC-14.68**: `GET /bills` must list the tenant's bills ordered by issue date then creation time descending,
   paginated (a `sort` parameter gives 422). The optional `status` (up to 20 characters, blank ignored) must filter by
-  exact status, an unknown value returning an empty page, and `q` (up to 200 characters, blank ignored) must match the
+  exact status, an unknown value answering 200 with an empty page (deliberate: a status filter is a lookup, not a
+  closed vocabulary the caller must already know, matching `GET /invoices`), and `q` (up to 200 characters, blank ignored) must match the
   bill number or the vendor name case-insensitively as a substring; the total must count the filtered set.
 - **SPEC-14.69**: `GET /bills/{id}` must return the bill with its lines ordered by position then creation time, failing
   with 404 "Bill" when absent.
@@ -8731,7 +8732,7 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
 - **SPEC-14.76**: `GET /expenses` must list only the caller's own claims unless the caller is `super_admin`, `admin` or
   `finance`, who see every claim; the scope must not be settable by a query parameter and the total must count the same
   scope. Results must be ordered by `incurred_on` then creation time descending, paginated (a `sort` parameter gives
-  422), filtered by exact `status` (unknown value giving an empty page) and by `q` matching claim notes or line
+  422), filtered by exact `status` (an unknown value answers 200 with an empty page, deliberately, as for `GET /bills`) and by `q` matching claim notes or line
   descriptions case-insensitively.
 - **SPEC-14.77**: `GET /expenses/{id}` must return the claim with its lines ordered by position, failing with 404
   "Expense" for an unknown id before any ownership check and with 403 "That expense claim belongs to somebody else" when
