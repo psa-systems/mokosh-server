@@ -149,12 +149,19 @@ impl InvitationResponse {
     /// tenants). A missing row (deleted/soft-deleted tenant) leaves the slug
     /// `None`; the caller falls back to its own lookup.
     pub async fn with_tenant_slug(mut self, db: &Database) -> Self {
-        let slug: Option<String> = sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
-            .bind(self.tenant_id)
-            .fetch_optional(db.migrator_pool())
-            .await
-            .ok()
-            .flatten();
+        let slug: Option<String> = match sqlx::query_scalar(
+            "SELECT slug FROM tenants WHERE id = $1",
+        )
+        .bind(self.tenant_id)
+        .fetch_optional(db.migrator_pool())
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, tenant_id = %self.tenant_id, "grant invitation tenant slug lookup failed");
+                None
+            }
+        };
         self.tenant_slug = slug;
         self
     }
@@ -174,12 +181,19 @@ async fn fill_tenant_slugs(
         return rows;
     }
     let ids: Vec<Uuid> = rows.iter().map(|r| r.tenant_id).collect();
-    let slug_rows: Vec<(Uuid, String)> =
-        sqlx::query_as("SELECT id, slug FROM tenants WHERE id = ANY($1)")
-            .bind(&ids)
-            .fetch_all(db.migrator_pool())
-            .await
-            .unwrap_or_default();
+    let slug_rows: Vec<(Uuid, String)> = match sqlx::query_as(
+        "SELECT id, slug FROM tenants WHERE id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(db.migrator_pool())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, tenant_ids = ?ids, "grant invitation batch tenant slug lookup failed");
+            Vec::new()
+        }
+    };
     let by_id: std::collections::HashMap<Uuid, String> = slug_rows.into_iter().collect();
     for r in rows.iter_mut() {
         if let Some(slug) = by_id.get(&r.tenant_id) {
@@ -414,9 +428,8 @@ async fn create_invitation(
         _ => None,
     };
 
-    // The service's create returns Conflict on the partial-UNIQUE
-    // trip; the "already an active grant" pre-check runs here so
-    // the two 409s are named separately.
+    // The service's create returns Conflict on the partial-UNIQUE trip;
+    // there is no separate already-active-grant pre-check.
     let addr = invitee_email.unwrap();
     let resolved_invitee_id = body.invitee_bunyip_user_id.or(invitee_id_from_directory);
     let CreatedInvitation {
@@ -586,13 +599,17 @@ fn humanize_expiry(expires_at: chrono::DateTime<chrono::Utc>) -> String {
 /// still fires with the substitution blank rather than blocking on
 /// a name lookup.
 async fn lookup_tenant_name(state: &GrantInvitationsState, tenant_id: Uuid) -> Option<String> {
-    sqlx::query_as::<_, (String,)>("SELECT name FROM tenants WHERE id = $1")
+    match sqlx::query_as::<_, (String,)>("SELECT name FROM tenants WHERE id = $1")
         .bind(tenant_id)
         .fetch_optional(state.db.migrator_pool())
         .await
-        .ok()
-        .flatten()
-        .map(|(name,)| name)
+    {
+        Ok(row) => row.map(|(name,)| name),
+        Err(e) => {
+            tracing::warn!(error = %e, tenant_id = %tenant_id, "grant invitation tenant name lookup failed");
+            None
+        }
+    }
 }
 
 // SPEC-5.254
@@ -678,16 +695,20 @@ async fn get_invitation_by_token(
     // bunyip_user_id the invitation row carries. An unresolved lookup
     // leaves the SPA's existing "unresolved person" helper to render a
     // placeholder; the page does not refuse to load.
-    let inviter_name: Option<String> = sqlx::query_scalar(
+    let inviter_name: Option<String> = match sqlx::query_scalar::<_, Option<String>>(
         "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
              FROM users WHERE bunyip_user_id = $1",
     )
     .bind(invitation.inviter_bunyip_user_id)
     .fetch_optional(state.db.migrator_pool())
     .await
-    .ok()
-    .flatten()
-    .flatten();
+    {
+        Ok(name) => name.flatten(),
+        Err(e) => {
+            tracing::warn!(error = %e, invitation_id = %invitation.id, "inviter name lookup failed");
+            None
+        }
+    };
 
     Ok(Json(InvitationMetadata {
         mokosh_account_name: name,
