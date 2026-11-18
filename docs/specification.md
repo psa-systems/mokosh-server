@@ -3650,7 +3650,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   `audit_log` rows whose entity type and entity id equal the request, plus a `total` computed with the same predicate as
   the page.
 - **SPEC-5.521**: For `entity_type` `tickets`, the history must also include `ticket_notes` rows whose action is not
-  `create` and whose `new_values.ticket_id` equals the ticket id as text. `ticket_notes` rows with action `create` must
+  `create` and whose `new_values.ticket_id` or `old_values.ticket_id` equals the ticket id as text (so a deleted note, whose
+  `new_values` is NULL, still appears). `ticket_notes` rows with action `create` must
   not be included, and each entry must report its own `entity_type` and `entity_id`.
 - **SPEC-5.522**: A history entry's `user_name` must be the actor's trimmed full name from a user of the same tenant,
   falling back to the user's email when both names are blank, and `null` only when `user_id` is NULL or the user row is
@@ -3686,8 +3687,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.531**: `kind=user` must return only native users without a grant, `kind=guest` must return users with a grant
   plus unplaced guests, and `kind` absent or `everyone` must return both.
 - **SPEC-5.532**: `q` (ignored when empty) must keep only user rows whose email, first name or last name contains it
-  case-insensitively; the characters `%` and `_` in `q` must be treated as wildcards. `q` must not filter unplaced
-  guests.
+  case-insensitively, and the characters `%` and `_` in `q` must match literally. `q` must also keep only unplaced
+  guests whose `grantee_email` contains it.
 - **SPEC-5.533**: `role` must keep user rows whose own `users.role` equals it and unplaced guests whose grant `role`
   equals it.
 - **SPEC-5.534**: `team_id` must keep only users who are members of that team in the tenant and must exclude all
