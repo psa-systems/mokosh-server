@@ -96,7 +96,8 @@ migrations/             SQLx migrations, embedded at compile time via sqlx::migr
 oci-build/Dockerfile    Production multi-stage Alpine + musl
 Dockerfile              Dev image (debug build, source-mounted)
 compose.dev.yml         Traefik-routed dev stack (per-developer *.a8n.run)
-.forgejo/workflows/     CI (Forgejo)
+.forgejo/workflows/     CI (Forgejo); `publish-docs.yml` pushes to docs.a8n.systems on main
+sarracenia.toml         Storefront docs-site push config (README + workspace module docs)
 docs/                   Contributor/user docs; dev-docs/ = internal notes
 ```
 
