@@ -1132,16 +1132,11 @@ pub fn create_api_router(
         pool: db.migrator_pool().clone(),
         webhook_secret: bunyip_webhook_secret,
     });
-    // PMS-998: the OIDC back-channel logout receiver, in the same nest and
-    // outside the auth chain for the same reason the webhooks are: the caller
-    // is the OP and carries no session. What authenticates it is the logout
-    // token's own signature over bunyip's key, verified through the same JWKS
-    // the bearer path uses, so it needs no shared secret. Mounted whether or
-    // not the verifier exists; with no verifier there is nothing to verify
-    // against, and the route answering 404 in that deployment would be
-    // indistinguishable from a typo in bunyip's registered URI.
-    // DEFECT: the comment above claims the receiver is "Mounted whether or not the verifier exists", but `logout_verifier.map(...)` below only builds `Some(router)` when `bunyip_verifier` was `Some`; the `match`
-    // further down (around line 1127) merges it into `bunyip_nest` only in that case, so with no verifier the route is NOT mounted and a request to it 404s exactly as the comment says it would not. Not fixed here; see Defects found.
+    // The OIDC back-channel logout receiver, in the same nest and outside the auth chain for the same reason the
+    // webhooks are: the caller is the OP and carries no session. What authenticates it is the logout token's own
+    // signature over bunyip's key, verified through the same JWKS the bearer path uses, so it needs no shared secret.
+    // Mounted only when the verifier exists: with no verifier there is nothing to verify against, so the route is
+    // absent and answers 404 (SPEC-12.40, SPEC-8.4).
     let backchannel_logout = logout_verifier.map(|verifier| {
         let state = Arc::new(
             crate::modules::auth::backchannel_logout::BackchannelLogoutState {
@@ -1192,8 +1187,6 @@ pub fn create_api_router(
     // the OP's own status codes rather than this API's error envelope: a 400
     // it wraps would still be a delivery failure to bunyip, but the body
     // would claim to be a Mokosh error for a caller that is not a client.
-    // DEFECT: this `match` is the actual mount decision for the back-channel logout route; it merges `logout` only when `backchannel_logout` is `Some`,
-    // contradicting the "mounted whether or not the verifier exists" comment above `logout_verifier.map(...)` (around line 1072). Not fixed here; see Defects found.
     // SPEC-12.40: the logout route is merged after the normaliser layer, and only when a verifier exists.
     let bunyip_nest = match backchannel_logout {
         Some(logout) => bunyip_nest.merge(logout),
