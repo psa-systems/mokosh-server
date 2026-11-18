@@ -191,7 +191,7 @@ impl ScheduledReportsWorker {
         // cannot render must fail the delivery visibly, not be sent as CSV.
         if format != "csv" {
             return Err(crate::utils::error::AppError::BadRequest(format!(
-                "scheduled report format '{format}' is not supported; only csv is delivered"
+                "The scheduled report format '{format}' is not supported; only csv is delivered."
             )));
         }
         // execute() runs against the service's own pool, not the

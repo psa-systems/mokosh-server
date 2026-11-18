@@ -1568,9 +1568,11 @@ pub struct CreateInvoiceRequestShape<'a> {
 /// causing the dispatched provider total to diverge from the issued
 /// invoice. Use `MidpointAwayFromZero` explicitly.
 fn decimal_to_minor(d: Decimal) -> AppResult<i64> {
-    (d * Decimal::from(100))
-        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
-        .to_i64()
+    d.checked_mul(Decimal::from(100))
+        .map(|minor| {
+            minor.round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+        })
+        .and_then(|minor| minor.to_i64())
         .ok_or_else(|| {
             // Roughly 92 quadrillion in major units: a bookkeeping mistake
             // upstream. Refuse the dispatch rather than send a zero-value line.

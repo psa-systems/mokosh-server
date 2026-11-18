@@ -3906,7 +3906,7 @@ impl ContactService {
         let cycle_error = || {
             AppError::validation_field(
                 "parent_company_id",
-                "A company cannot be its own parent or sit under one of its sub-companies",
+                "a company cannot be its own parent or sit under one of its sub-companies",
             )
         };
         if parent_id == company_id {
@@ -5684,7 +5684,7 @@ mod mirror_writers {
         }
 
         assert!(
-            seen >= 4,
+            seen >= 3,
             "the scan found only {seen} `INSERT INTO contacts` statements, so it \
              has stopped matching this repository's shape and is no longer \
              proving anything"

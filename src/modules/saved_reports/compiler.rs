@@ -709,6 +709,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A compiler rejection is a 422 whose detail sits in the field errors,
+    /// which `Display` omits, so flatten both for substring assertions.
+    fn rendered(err: &AppError) -> String {
+        match err {
+            AppError::Validation { message, errors } => {
+                let fields: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+                format!("{message} {}", fields.join(" "))
+            }
+            other => other.to_string(),
+        }
+    }
+
     fn tenant() -> Uuid {
         Uuid::from_u128(0xfeed)
     }
@@ -725,7 +737,7 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("Phase 2 only supports 'tickets'"));
+        assert!(rendered(&err).contains("Phase 2 only supports 'tickets'"));
     }
 
     #[test]
@@ -740,7 +752,7 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("totally_made_up"));
+        assert!(rendered(&err).contains("totally_made_up"));
     }
 
     #[test]
@@ -829,7 +841,7 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("garbage"));
+        assert!(rendered(&err).contains("garbage"));
     }
 
     #[test]
@@ -844,7 +856,7 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("empty array"));
+        assert!(rendered(&err).contains("empty array"));
     }
 
     #[test]
@@ -859,7 +871,7 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("not-a-uuid"));
+        assert!(rendered(&err).contains("not-a-uuid"));
     }
 
     #[test]
@@ -890,7 +902,11 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("double quote"), "got {err}");
+        assert!(
+            rendered(&err).contains("double quote"),
+            "got {}",
+            rendered(&err)
+        );
     }
 
     #[test]
@@ -905,7 +921,7 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("at most"), "got {err}");
+        assert!(rendered(&err).contains("at most"), "got {}", rendered(&err));
     }
 
     #[test]

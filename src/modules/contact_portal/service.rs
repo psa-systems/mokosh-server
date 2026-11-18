@@ -3059,7 +3059,7 @@ impl ContactAuthService {
         if let Some(tz) = request.timezone.as_deref() {
             if tz.parse::<chrono_tz::Tz>().is_err() {
                 return Err(AppError::BadRequest(format!(
-                    "timezone must be an IANA zone name (e.g. America/New_York), got {tz:?}"
+                    "The timezone must be an IANA zone name (e.g. America/New_York), got {tz}"
                 )));
             }
         }
