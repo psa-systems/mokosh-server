@@ -406,6 +406,8 @@ impl AppConfig {
             resolve_secret(&keys::ENCRYPTION_KEY, &environment, DEV_ENCRYPTION_KEY)?;
         // SPEC-2.233
         let client_origin = config::get(&keys::CLIENT_ORIGIN)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "http://localhost:4301".to_string());
         // MAPPS-425: falls back to `client_origin` so a single-origin dev
         // stack is unaffected. Deployed environments MUST set it, because
@@ -505,11 +507,16 @@ impl AppConfig {
             app_database_url,
             jwt_secret,
             // SPEC-2.230
-            host: config::get(&keys::HOST).unwrap_or_else(|| "0.0.0.0".to_string()),
+            host: config::get(&keys::HOST)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "0.0.0.0".to_string()),
             port,
             environment,
             // SPEC-2.233
             base_url: config::get(&keys::BASE_URL)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "http://localhost:8080".to_string()),
             run_migrations,
             encryption_key,
@@ -1427,8 +1434,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _scheduler_handles = scheduler.start();
 
     // PMS-657: build the IP -> country resolver for login-location alerts.
-    // Optional: an unset path or a failed .BIN load leaves it None and the
-    // alerts stay disabled (login is never affected).
+    // Optional: an unset path leaves it None and the alerts stay disabled. A
+    // configured but unloadable path ends boot rather than disabling silently.
     // SPEC-2.53
     let geoip = match config.ip2location_db_path.as_deref() {
         Some(path) => match mokosh_server::utils::geoip::GeoIpService::new(path) {
@@ -1437,8 +1444,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(std::sync::Arc::new(svc))
             }
             Err(e) => {
-                tracing::warn!(path = %path, error = %e, "Failed to load IP2Location DB; login-location alerts disabled");
-                None
+                return Err(format!(
+                    "IP2LOCATION_DB_PATH={path:?} could not be loaded: {e}; unset it to disable login-location alerts"
+                )
+                .into());
             }
         },
         None => {
