@@ -585,11 +585,27 @@ impl ContactSyncEngine {
                 "This contact sync connection is not active.".to_string(),
             ));
         }
-        let selected: BTreeSet<String> =
-            serde_json::from_value::<Vec<String>>(connection.selected_groups.clone())
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
+        // PMS-1663 F: a corrupt stored `selected_groups` used to decode
+        // to an empty set and the next condition fired "Choose at least
+        // one group" - a misleading 409 that pointed the admin at the
+        // settings page while the real problem was the stored value.
+        // Fail the run naming the connection so the admin sees the real
+        // cause instead.
+        let selected: BTreeSet<String> = match serde_json::from_value::<Vec<String>>(
+            connection.selected_groups.clone(),
+        ) {
+            Ok(v) => v.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(
+                    connection_id = %connection_id,
+                    error = %e,
+                    "contact_sync run: selected_groups failed to decode; refusing the run"
+                );
+                return Err(AppError::Conflict(
+                    "This connection's selected groups are stored in a shape this server cannot read; reconnect the source to fix it.".to_string(),
+                ));
+            }
+        };
         // An empty selection is "not chosen yet", never "everything" (PSA-70 E).
         if selected.is_empty() {
             // PMS-1409: the provider's own word for a group. An address book is
@@ -1007,11 +1023,42 @@ impl ContactSyncEngine {
         .bind(report.skipped() as i32)
         .bind(report.deleted_in_source as i32)
         .bind(report.failed as i32)
-        .bind(serde_json::to_value(&report.failures).unwrap_or_default())
+        .bind(match serde_json::to_value(&report.failures) {
+            Ok(v) => v,
+            Err(e) => {
+                // PMS-1663 F: a serialize failure here used to default
+                // to `Value::Null` with no trace, dropping every
+                // failure record from the run. Log at warn with the
+                // run id so the drift is findable; write `[]` so the
+                // run page still renders a valid array.
+                tracing::warn!(
+                    run_id = %run_id,
+                    error = %e,
+                    "contact_sync checkpoint: failures failed to serialize; writing []"
+                );
+                serde_json::json!([])
+            }
+        })
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(cancel.unwrap_or(false))
+        match cancel {
+            Some(v) => Ok(v),
+            None => {
+                // PMS-1663 F: the RETURNING with fetch_optional yields
+                // None when the run row vanished (operator cleared it
+                // mid-sync). The old `.unwrap_or(false)` read that as
+                // "not cancelled" and the sync pressed on against a
+                // ghost run id. Fail with a specific error so the
+                // next tick sees a real signal, not a silent fall-
+                // through.
+                tracing::warn!(
+                    run_id = %run_id,
+                    "contact_sync checkpoint: run row has vanished mid-sync"
+                );
+                Err(AppError::NotFound("Contact sync run".to_string()))
+            }
+        }
     }
 
     async fn load_connection(

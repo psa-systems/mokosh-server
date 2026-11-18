@@ -1817,12 +1817,21 @@ impl ContactAuthService {
     /// checks stay login-only: they establish a NEW session and have
     /// no per-request analogue to re-check against one already minted.
     ///
-    /// Fails closed: any error (row gone, tenant gone) reads as `false`
-    /// rather than propagating, so a caller only needs one bool check.
+    /// Fails closed on a MISSING or SUSPENDED tenant: `Ok(false)` so the
+    /// caller only needs one bool check. A database fault, by contrast,
+    /// propagates so the middleware's warn path fires (SPEC-5.431) and
+    /// an outage does not read as "tenant inactive".
     // SPEC-5.430, SPEC-5.436
+    //
+    // PMS-1659 F1: the previous `.is_err()` collapsed every error
+    // (including DB faults) into `Ok(false)`, which the middleware
+    // then logged as an ordinary access-check rejection rather than
+    // a fault. Distinguish the two.
     pub async fn contact_access_ok(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<bool> {
-        if self.ensure_tenant_active(tenant_id).await.is_err() {
-            return Ok(false);
+        match self.ensure_tenant_active(tenant_id).await {
+            Ok(()) => {}
+            Err(AppError::Forbidden(_)) | Err(AppError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
         }
         let row: Option<(bool, Option<DateTime<Utc>>)> = sqlx::query_as(
             "SELECT is_portal_user, portal_locked_until FROM contacts \

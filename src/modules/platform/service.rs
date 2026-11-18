@@ -81,9 +81,16 @@ impl PlatformAdminService {
     // SPEC-5.317
     pub async fn ensure_admin_active(&self, admin_id: Uuid) -> AppResult<()> {
         let pool = self.db.migrator_pool();
+        // PMS-1659: a DB fault during the find used to collapse to
+        // AppError::Unauthorized with no trace, so an outage looked
+        // like a bad credential. Log the cause before the 401 so an
+        // operator can tell a database fault from a real rejection.
         let admin = PlatformAdminRepo::find_by_id(pool, admin_id)
             .await
-            .map_err(|_| AppError::Unauthorized)?
+            .map_err(|e| {
+                tracing::warn!(error = %e, admin_id = %admin_id, "platform.ensure_admin_active: find_by_id failed");
+                AppError::Unauthorized
+            })?
             .ok_or(AppError::Unauthorized)?;
         if admin.status != "active" {
             return Err(AppError::Unauthorized);
@@ -100,9 +107,14 @@ impl PlatformAdminService {
         recovery_code: Option<&str>,
     ) -> AppResult<PlatformLoginResponse> {
         let pool = self.db.migrator_pool();
+        // PMS-1659: log DB faults before the 401 so a fault is
+        // distinguishable from a bad credential in the logs.
         let admin = PlatformAdminRepo::find_by_email(pool, email)
             .await
-            .map_err(|_| AppError::Unauthorized)?
+            .map_err(|e| {
+                tracing::warn!(error = %e, email = email, "platform.authenticate: find_by_email failed");
+                AppError::Unauthorized
+            })?
             .ok_or(AppError::Unauthorized)?;
         if admin.status != "active" {
             return Err(AppError::Unauthorized);
@@ -147,7 +159,11 @@ impl PlatformAdminService {
                     match crate::utils::totp::verify(&secret, code, Utc::now(), 1) {
                         Some(step) => PlatformAdminRepo::advance_totp_step(pool, admin.id, step)
                             .await
-                            .map_err(|_| AppError::Unauthorized)?,
+                            .map_err(|e| {
+                                // PMS-1659: log DB fault before 401 so an outage is findable.
+                                tracing::warn!(error = %e, admin_id = %admin.id, "platform.authenticate: advance_totp_step failed");
+                                AppError::Unauthorized
+                            })?,
                         None => false,
                     }
                 }
@@ -155,7 +171,11 @@ impl PlatformAdminService {
                     let hash = crate::utils::recovery::hash_code_hex(code);
                     PlatformAdminRepo::spend_recovery_code(pool, admin.id, &hash)
                         .await
-                        .map_err(|_| AppError::Unauthorized)?
+                        .map_err(|e| {
+                            // PMS-1659: log DB fault before 401 so an outage is findable.
+                            tracing::warn!(error = %e, admin_id = %admin.id, "platform.authenticate: spend_recovery_code failed");
+                            AppError::Unauthorized
+                        })?
                 }
                 (None, None) => return Err(AppError::Unauthorized),
             };
@@ -218,7 +238,15 @@ impl PlatformAdminService {
         let pool = self.db.migrator_pool();
         // Any live users row at this email is enough - do not clobber
         // a real tenant admin at the same email.
-        let existing: Option<Uuid> = sqlx::query_scalar(
+        // PMS-1659: the doc comment says a lookup failure is "logged and
+        // swallowed" so a verified-credentials login still succeeds. The
+        // previous code logged then returned `AppError::Internal` which
+        // `authenticate` propagates with `?`, so the login 500d instead
+        // of proceeding. Fall back to "no match found" on a DB error
+        // after the warn, so the heal attempts to INSERT (the INSERT
+        // itself propagates any DB failure, so a genuine outage still
+        // surfaces, just not as a 500 on the lookup half).
+        let existing: Option<Uuid> = match sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM users \
              WHERE lower(email) = lower($1) AND deleted_at IS NULL \
              LIMIT 1",
@@ -226,10 +254,13 @@ impl PlatformAdminService {
         .bind(&admin.email)
         .fetch_optional(pool)
         .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, admin_id = %admin.id, "MAPPS-520 ensure_tenant_admin_row: users lookup failed; skipping heal");
-            AppError::Internal("users lookup failed".to_string())
-        })?;
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, admin_id = %admin.id, "MAPPS-520 ensure_tenant_admin_row: users lookup failed; falling through to insert");
+                None
+            }
+        };
 
         if existing.is_some() {
             return Ok(());
@@ -285,7 +316,11 @@ impl PlatformAdminService {
         let pool = self.db.migrator_pool();
         let admin = PlatformAdminRepo::find_by_id(pool, admin_id)
             .await
-            .map_err(|_| AppError::Unauthorized)?
+            .map_err(|e| {
+                // PMS-1659: log DB fault before 401.
+                tracing::warn!(error = %e, admin_id = %admin_id, "platform.reauthenticate: find_by_id failed");
+                AppError::Unauthorized
+            })?
             .ok_or(AppError::Unauthorized)?;
         let hash = admin
             .password_hash
@@ -402,14 +437,22 @@ impl PlatformAdminService {
             match crate::utils::totp::verify(&secret, code, Utc::now(), 1) {
                 Some(step) => PlatformAdminRepo::advance_totp_step(pool, admin.id, step)
                     .await
-                    .map_err(|_| AppError::Unauthorized)?,
+                    .map_err(|e| {
+                        // PMS-1659: log DB fault before 401.
+                        tracing::warn!(error = %e, admin_id = %admin.id, "platform.disable_mfa: advance_totp_step failed");
+                        AppError::Unauthorized
+                    })?,
                 None => false,
             }
         } else {
             let hash = crate::utils::recovery::hash_code_hex(code);
             PlatformAdminRepo::spend_recovery_code(pool, admin.id, &hash)
                 .await
-                .map_err(|_| AppError::Unauthorized)?
+                .map_err(|e| {
+                    // PMS-1659: log DB fault before 401.
+                    tracing::warn!(error = %e, admin_id = %admin.id, "platform.disable_mfa: spend_recovery_code failed");
+                    AppError::Unauthorized
+                })?
         };
         if !accepted {
             return Err(AppError::Unauthorized);
@@ -435,9 +478,13 @@ impl PlatformAdminService {
             ));
         }
         let pool = self.db.migrator_pool();
+        // PMS-1659: log DB fault before 401 so a fault is tellable.
         let admin = PlatformAdminRepo::find_by_id(pool, admin_id)
             .await
-            .map_err(|_| AppError::Unauthorized)?
+            .map_err(|e| {
+                tracing::warn!(error = %e, admin_id = %admin_id, "platform.change_password: find_by_id failed");
+                AppError::Unauthorized
+            })?
             .ok_or(AppError::Unauthorized)?;
         let hash = admin
             .password_hash

@@ -912,16 +912,24 @@ async fn start_add_payment_method(
     // Minimal validation: a non-URL success/cancel would be refused by the
     // provider anyway, but we refuse here so the SPA sees the 400 without
     // an extra round trip.
-    if url::Url::parse(&body.success_url).is_err() {
-        return Err(AppError::BadRequest(
-            "success_url must be a valid URL.".to_string(),
-        ));
-    }
-    if url::Url::parse(&body.cancel_url).is_err() {
-        return Err(AppError::BadRequest(
-            "cancel_url must be a valid URL.".to_string(),
-        ));
-    }
+    //
+    // PMS-1659 F10: also pin the scheme to http/https. A
+    // `javascript:` / `data:` / `vbscript:` URL parses cleanly and
+    // would otherwise be forwarded to Stripe + echoed into the SPA's
+    // browsing context on completion. The provider's contract is HTTP
+    // in both directions, so a non-http(s) scheme is always a defect.
+    let check_http_scheme = |raw: &str, field: &str| -> AppResult<()> {
+        let parsed = url::Url::parse(raw)
+            .map_err(|_| AppError::BadRequest(format!("{field} must be a valid URL.")))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(AppError::BadRequest(format!(
+                "{field} must use the http or https scheme."
+            )));
+        }
+        Ok(())
+    };
+    check_http_scheme(&body.success_url, "success_url")?;
+    check_http_scheme(&body.cancel_url, "cancel_url")?;
     let tenant = crate::modules::auth::TenantId::from_trusted(session.tenant_id);
     let session_out = state
         .payment_methods

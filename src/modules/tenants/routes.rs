@@ -309,9 +309,13 @@ async fn self_serve_tenant(
     //    keep the new users row in sync with what the identity plane
     //    already believes.
     let pool = state.auth_service.db().migrator_pool();
+    // PMS-1659: log DB faults before 401 so a fault is tellable.
     let identity = crate::db::identity::IdentityRepo::find_by_id(pool, identity_id)
         .await
-        .map_err(|_| AppError::Unauthorized)?
+        .map_err(|e| {
+            tracing::warn!(error = %e, identity_id = %identity_id, "tenants.setup_tenant: find_by_id failed");
+            AppError::Unauthorized
+        })?
         .ok_or(AppError::Unauthorized)?;
     if identity.status != "active" {
         return Err(AppError::Unauthorized);
@@ -323,7 +327,10 @@ async fn self_serve_tenant(
     //    for authenticated identities that goes through a different route.
     let existing = crate::db::identity::MembershipRepo::list_active_for_identity(pool, identity_id)
         .await
-        .map_err(|_| AppError::Unauthorized)?;
+        .map_err(|e| {
+            tracing::warn!(error = %e, identity_id = %identity_id, "tenants.setup_tenant: list_active_for_identity failed");
+            AppError::Unauthorized
+        })?;
     if !existing.is_empty() {
         return Err(AppError::conflict(
             "You already belong to an organization. Sign in and use the in-app Create button instead.",
@@ -393,9 +400,13 @@ async fn create_additional_tenant(
     // shape as `self_serve_tenant`: users row in the new tenant must
     // mirror the identity plane so login stays coherent.
     let pool = state.auth_service.db().migrator_pool();
+    // PMS-1659: log DB faults before 401.
     let identity = crate::db::identity::IdentityRepo::find_by_id(pool, identity_id)
         .await
-        .map_err(|_| AppError::Unauthorized)?
+        .map_err(|e| {
+            tracing::warn!(error = %e, identity_id = %identity_id, "tenants.create_additional: find_by_id failed");
+            AppError::Unauthorized
+        })?
         .ok_or(AppError::Unauthorized)?;
     if identity.status != "active" {
         return Err(AppError::Unauthorized);

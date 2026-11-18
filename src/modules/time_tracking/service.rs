@@ -1655,9 +1655,28 @@ impl TimeTrackingService {
             contract_id: None,
             is_billable: defaults.default_billable,
         })?;
-        let duration = match default_rounding_rule(&mut *tx, tenant_id).await? {
-            Some(rule) => apply_rounding(raw, &rule),
+        let rounding_rule = default_rounding_rule(&mut *tx, tenant_id).await?;
+        let duration = match rounding_rule.as_ref() {
+            Some(rule) => apply_rounding(raw, rule),
             None => raw,
+        };
+        // PMS-1662 F: a stopped timer is time that was worked, so it
+        // follows the same shape as `create_time_entry`:
+        //   - worked_minutes = the unrounded elapsed figure (PMS-395)
+        //   - billable_minutes = derived from worked when billable;
+        //     None when not (PMS-944)
+        // The INSERT below used to leave both NULL, so a stopped timer
+        // reported no worked total and the day cap (PMS-396) never saw
+        // the time.
+        let worked_minutes = raw;
+        let billable_minutes = if kind.billable {
+            Some(derive_billable_minutes(
+                worked_minutes,
+                true,
+                rounding_rule.as_ref(),
+            ))
+        } else {
+            None
         };
         let (hourly_rate, total) = resolve_billing(None, kind.billable, &defaults, duration);
         // PMS-951: a stopped timer draws on the same terms as time typed in.
@@ -1671,16 +1690,30 @@ impl TimeTrackingService {
         )
         .await?;
 
+        // PMS-1662 F: start/end used to be the UTC clock times while
+        // `date` was the owner's local day, so a timer run across
+        // midnight in the owner's zone had its segment split land on
+        // the "wrong" side. Convert to the owner's zone so the time
+        // triple agrees.
+        let (start_time_local, end_time_local) = match owner_tz.parse::<chrono_tz::Tz>() {
+            Ok(tz) => (
+                timer.started_at.with_timezone(&tz).naive_local().time(),
+                now.with_timezone(&tz).naive_local().time(),
+            ),
+            Err(_) => (timer.started_at.time(), now.time()),
+        };
+
         let entry_id = Uuid::new_v4();
         sqlx::query(
             r#"
             INSERT INTO time_entries (
                 id, tenant_id, user_id, date, start_time, end_time,
-                duration_minutes, work_type_id, ticket_id, project_id,
+                duration_minutes, worked_minutes, billable_minutes,
+                work_type_id, ticket_id, project_id,
                 company_id, notes, is_billable, hourly_rate, total_amount,
                 entry_kind, billing_status, contract_id
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
             )
             "#,
         )
@@ -1688,9 +1721,11 @@ impl TimeTrackingService {
         .bind(tenant_id)
         .bind(timer.user_id)
         .bind(today)
-        .bind(timer.started_at.time())
-        .bind(now.time())
+        .bind(start_time_local)
+        .bind(end_time_local)
         .bind(duration)
+        .bind(worked_minutes)
+        .bind(billable_minutes)
         .bind(work_type_id)
         .bind(timer.ticket_id)
         .bind(timer.project_id)

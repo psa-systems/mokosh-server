@@ -1,11 +1,13 @@
 //! PMS-1211 (PSA-70): one-way contact import from an external directory.
 //!
-//! Google Contacts is the only provider this epic implements. Mokosh never
-//! writes back: the scope requested is `contacts.readonly` (PMS-1212), so
-//! one-way is a permission rather than a promise this code keeps.
+//! Mokosh never writes back: the scope requested is `contacts.readonly`
+//! (PMS-1212), so one-way is a permission rather than a promise this code
+//! keeps. Supported providers are listed in [`provider::SUPPORTED`]: Google
+//! Contacts (People API), Microsoft 365 (Graph), iCloud (CardDAV) and
+//! locally-uploaded vCard files.
 //!
-//! * `provider`: the read-only seam, `google` its one implementation
-//!   (PMS-1211, PMS-1213).
+//! * `provider`: the read-only seam, with `google`, `microsoft`, `icloud`
+//!   and `vcard` implementations (PMS-1211, PMS-1213, PMS-1289, PMS-1290).
 //! * `oauth`, `service`, `routes`: connecting and keeping a usable token
 //!   (PMS-1212).
 //! * `normalize`, `matching`, `mapping`: what a source record means to the

@@ -127,6 +127,14 @@ async fn ingest_status(
         return Err(AppError::Unauthorized);
     }
 
+    // PMS-1666 F8: `IngestStatusRequest.system_name` carries
+    // `#[validate(length(min = 1, max = 255))]` but no code path
+    // called `.validate()`, so an empty or oversized name was stored.
+    // Validate AFTER the HMAC check, so a validation 422 is never an
+    // oracle for authenticated vs unauthenticated callers (an
+    // unauthenticated POST still only gets 401).
+    validator::Validate::validate(&request)?;
+
     match state
         .service
         .ingest(tenant_id, EXTERNAL_SOURCE_TACTICAL_RMM, &request)

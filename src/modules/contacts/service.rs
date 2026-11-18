@@ -1963,6 +1963,13 @@ impl ContactService {
             None => {
                 let mut candidate = crate::utils::crypto::generate_portal_slug();
                 for _ in 0..3 {
+                    // PMS-1663 F: `.ok().flatten()` used to discard a DB
+                    // error here, so a real fault looked like "somebody
+                    // else set the slug" and the loop fell to the
+                    // re-read. The tx is already poisoned on a DB error
+                    // (sqlx aborts the whole thing), so propagate the
+                    // error directly - the caller's tenant-scoped tx
+                    // will unwind.
                     let updated: Option<String> = sqlx::query_scalar(
                         "UPDATE companies SET portal_slug = $1, updated_at = NOW() \
                          WHERE id = $2 AND tenant_id = $3 AND portal_slug IS NULL \
@@ -1972,9 +1979,7 @@ impl ContactService {
                     .bind(company_id)
                     .bind(*tenant_id)
                     .fetch_optional(&mut *tx)
-                    .await
-                    .ok()
-                    .flatten();
+                    .await?;
                     if let Some(_s) = updated {
                         break;
                     }

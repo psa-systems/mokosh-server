@@ -1234,6 +1234,12 @@ impl TenantService {
             .fetch_one(self.db.migrator_pool())
             .await?;
 
+        // PMS-1659: list_tenants used to count every non-deleted users
+        // row, which includes the hidden `system+<tenant_id>@mokosh.local`
+        // attribution row every tenant carries (see `create_tenant`).
+        // `get_tenant_usage` excludes it (line 1731). Match that
+        // definition here so the two surfaces agree on "a tenant's user
+        // count".
         let sql = format!(
             r#"
             SELECT id, name, slug, status, settings, branding, billing_email,
@@ -1241,7 +1247,8 @@ impl TenantService {
                    trial_ends_at, created_at, updated_at,
                    (SELECT COUNT(*)::bigint FROM users u
                     WHERE u.tenant_id = tenants.id
-                      AND u.deleted_at IS NULL) AS user_count
+                      AND u.deleted_at IS NULL
+                      AND u.email NOT LIKE 'system+%@mokosh.local') AS user_count
             FROM tenants
             ORDER BY {order_by}, id ASC
             LIMIT $1 OFFSET $2
@@ -1727,9 +1734,16 @@ impl TenantService {
         // MAPPS-562: exclude the hidden system attribution users row
         // from the operator-facing user count so a fresh tenant with no
         // human users still reports zero, not one.
+        //
+        // PMS-1659: also filter `deleted_at IS NULL` so a tombstoned
+        // user does not inflate the count (list_tenants already
+        // filtered deleted_at; this query did not, so the two surfaces
+        // disagreed for a tenant with any soft-deleted users).
         let user_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM users \
-             WHERE tenant_id = $1 AND email NOT LIKE 'system+%@mokosh.local'",
+             WHERE tenant_id = $1 \
+               AND email NOT LIKE 'system+%@mokosh.local' \
+               AND deleted_at IS NULL",
         )
         .bind(tenant_id)
         .fetch_one(&mut *tx)

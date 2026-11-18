@@ -34,7 +34,7 @@
 //! appeared nowhere, six structs held a `LocalProvider` by name and four free
 //! functions constructed one inline, so "selected by configuration" had nowhere
 //! to plug in. Every caller now holds an `Arc<dyn ObjectProvider>` from
-//! [`shared`], which is built once per process from `STORAGE_BACKEND` and
+//! [`shared`], which is built once per process from `STORAGE_PROVIDER` and
 //! touched first by `main` so a misconfigured provider ends startup rather than
 //! the first upload. A process-wide handle rather than a constructor argument,
 //! because the provider is constructed at thirteen sites across the router, the
@@ -44,9 +44,9 @@
 //!
 //! PMS-1010 settled the word: a selectable implementation of a capability is a
 //! PROVIDER, here as in [`crate::secrets`] and as
-//! [`crate::modules::billing::provider::PaymentProvider`] already was. The
-//! operator-facing variable is still `STORAGE_BACKEND` and deliberately so:
-//! renaming it breaks every existing deployment for a vocabulary change.
+//! [`crate::modules::billing::provider::PaymentProvider`] already was. PMS-1317
+//! renamed the operator-facing variable to `STORAGE_PROVIDER`; the retired
+//! `STORAGE_BACKEND` alias refuses boot (PMS-1443), naming the replacement.
 
 // PMS-1317: the `STORAGE_`-prefixed variables an operator sets. PMS-1443
 // retired the older alias names; a non-blank value on one now fails boot
