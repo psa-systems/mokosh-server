@@ -45,7 +45,8 @@ use super::data::{demo_companies, demo_contacts, demo_projects, demo_sla, demo_t
 /// Whether the automatic first-visit demo seed runs in this deployment (PMS-710).
 ///
 /// Production seeds every new account so a fresh signup has example PSA data to
-/// explore. Every other environment (staging, dev, test) seeds NOTHING by
+/// explore; demo seeding is on by default there and an operator who does not
+/// want it must run a non-production `ENVIRONMENT`. Every other environment (staging, dev, test) seeds NOTHING by
 /// default: staging is the shared demo environment where people log in to see
 /// the real, current app, so it is kept clean; a developer can still opt in
 /// locally with `MOKOSH_DEMO_SEED=true`. Read once from `ENVIRONMENT` (the same

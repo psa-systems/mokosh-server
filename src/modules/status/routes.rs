@@ -85,7 +85,8 @@ const EXTERNAL_SOURCE_TACTICAL_RMM: &str = "tactical_rmm";
 /// `POST /api/v1/rmm/status`. Machine-authenticated by HMAC over the raw
 /// body: a byte rewritten by any middle layer turns the signature into
 /// a 401, which is why the path is in the sanitizer's `RAW_BODY_PATHS`
-/// list.
+/// list. An unparsable body also answers 401, not 400, so the endpoint does
+/// not tell an unauthenticated caller whether a payload was well-formed.
 // SPEC-15.2109, SPEC-15.2113
 async fn ingest_status(
     State(state): State<StatusRouterState>,
