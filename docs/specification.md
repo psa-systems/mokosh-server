@@ -3377,7 +3377,9 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   to the seconds remaining, never less than 1, and must do so before the password is checked.
 - **SPEC-5.444**: A wrong password must answer 401 Unauthorized, write audit portal.login_failed, and increment
   portal_failed_login_count, which on reaching 5 or more must set portal_locked_until to 5 minutes ahead; a failure to
-  write the counter must be logged at error with tenant_id, contact_id and the error and must not change the 401.
+  write the counter must be logged at error with tenant_id, contact_id and the error and must not change the 401. The
+  lockout is per contact only: there is no per-IP throttle on POST /auth/login or on the magic-link redeem route, and a
+  login for an unknown email is never counted.
 - **SPEC-5.445**: When portal_mfa_enabled is true and neither mfa_code nor recovery_code is non-blank after trimming,
   login with a correct password must answer 200 with mfa_required true, empty access_token and refresh_token, contact
   null, and must create no session.
