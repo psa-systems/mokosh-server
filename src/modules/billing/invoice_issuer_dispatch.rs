@@ -877,9 +877,10 @@ impl IssuerDispatcher {
     /// provider showing it owing, and the accountant reconciled against a
     /// balance wrong by the amount paid.
     ///
-    /// `None` when there is nothing to tell: no dispatcher, the switch
-    /// off, or a bill no provider holds. Each missing mapping is a
-    /// `Conflict` naming the route that sets it, as every other push
+    /// Returns the provider's id for the payment it recorded. The caller
+    /// decides whether there is anything to tell (a dispatcher, the switch
+    /// on, a bill a provider holds) before calling. Each missing mapping is
+    /// a `Conflict` naming the route that sets it, as every other push
     /// here is.
     pub async fn pay_bill_in_provider(
         &self,

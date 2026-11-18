@@ -7409,7 +7409,8 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   the row), write the plaintext to the secret provider with put_if_absent at the (tenant, provider) address, then read
   it back and require equality (otherwise a Configuration error and the row left as is), and only then set
   config_encrypted to NULL with an update that matches only while it is not null; when the address was already claimed
-  the column must be cleared without overwriting the store.
+  the column must be cleared without overwriting the store, and the legacy value is not compared with the stored one, so
+  a differing older credential is dropped.
 - **SPEC-13.138**: The gateway credential move must be known to the one-shot runner by the name
   "gateway_credential_move".
 - **SPEC-13.139**: Every product read (list, detail, create and update responses) must carry in_use, true exactly when

@@ -184,7 +184,7 @@ impl InvoiceIssuerMappingService {
     }
 
     // SPEC-13.1075: returns every provider
-    /// Every vendor mapping this tenant holds for one provider, for the
+    /// Every vendor mapping this tenant holds, across every provider, for the
     /// admin surface that lists vendors beside what they are over there.
     pub async fn list_vendor_mappings(&self, tenant_id: TenantId) -> AppResult<Vec<VendorMapping>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
