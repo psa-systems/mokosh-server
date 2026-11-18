@@ -11192,3 +11192,5 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.2130**: POST /data/seed-demo must require an admin and load the demo dataset into the caller's tenant
   through the seed service, answering 200 {seeded: true, message} when loaded and {seeded: false, message} when the
   tenant already has data, and returning the error when seeding fails.
+  A non-`GET` request to a path no tree handles must answer `405` with an `Allow` header, not the `404` page, because
+  the fallback is a `GET`-only handler.
