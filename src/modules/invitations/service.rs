@@ -335,6 +335,12 @@ impl InvitationsService {
         let pool = self.db.migrator_pool();
         let mut tx = pool.begin().await?;
 
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM tenant_invitations t WHERE id = $1")
+                .bind(invite.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
         let updated = sqlx::query(
             "UPDATE tenant_invitations
              SET status = 'accepted', accepted_at = NOW(), accepted_by = $2, updated_at = NOW()
@@ -397,6 +403,27 @@ impl InvitationsService {
             }
         }
 
+        // SPEC-5.549: acceptance runs pre-session, so the audit row carries a
+        // system context (no actor); `accepted_by` is in the new snapshot.
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(t) FROM tenant_invitations t WHERE id = $1")
+                .bind(invite.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        // SAFETY (PMS-261): the tenant is the one named by the invitation row
+        // just claimed, not a caller claim; `from_trusted` bridges it.
+        audit_write(
+            &mut *tx,
+            TenantId::from_trusted(invite.tenant_id),
+            &AuditCtx::system(invite.tenant_id),
+            AuditAction::Update,
+            "tenant_invitations",
+            Some(invite.id),
+            before,
+            after,
+        )
+        .await?;
+
         tx.commit().await?;
         Ok(())
     }
@@ -405,8 +432,15 @@ impl InvitationsService {
     /// no longer pending.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     // SPEC-5.551: 404 unless a pending invitation of this tenant matched.
-    pub async fn revoke(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+    pub async fn revoke(&self, tenant_id: TenantId, id: Uuid, ctx: &AuditCtx) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM tenant_invitations t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let res = sqlx::query(
             "UPDATE tenant_invitations SET status = 'revoked', updated_at = NOW()
              WHERE id = $1 AND tenant_id = $2 AND status = 'pending'",
@@ -418,6 +452,25 @@ impl InvitationsService {
         if res.rows_affected() == 0 {
             return Err(AppError::NotFound("Invitation".to_string()));
         }
+        // SPEC-5.551: audit row shares the revoke transaction.
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM tenant_invitations t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "tenant_invitations",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }

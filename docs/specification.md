@@ -3737,13 +3737,14 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   `team_id`), or `None`. It must be called only from the pre-session login path and never from a route handler.
 - **SPEC-5.549**: Accepting an invitation must set its status to `accepted` with `accepted_at` and `accepted_by` only
   while its status is still `pending`. When no row was updated (already accepted or revoked) it must roll back, return
-  success, and enrol nobody.
+  success, enrol nobody and write no audit row. Otherwise it must write an `update` audit row for `tenant_invitations`
+  with a system context (no actor) in the same transaction.
 - **SPEC-5.550**: Accepting an invitation that names a team must, in the same transaction, add the accepting user to
   that team with role `member`, only when the team is active and belongs to the invitation's tenant. An existing
   membership must be left unchanged. A missing or archived team must not fail the acceptance.
 - **SPEC-5.551**: Revoking must set the status of a `pending` invitation of the caller's tenant to `revoked` and answer
-  200 with an empty body. An unknown id, an id from another tenant, or an invitation that is not pending must answer 404
-  `Invitation not found`.
+  200 with an empty body, writing an `update` audit row for `tenant_invitations` in the same transaction. An unknown id,
+  an id from another tenant, or an invitation that is not pending must answer 404 `Invitation not found`.
 
 #### Teams
 

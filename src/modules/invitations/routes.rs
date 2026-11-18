@@ -67,7 +67,8 @@ async fn revoke_invitation(
     State(s): State<InvitationsRouterState>,
     RequireAuth(u): RequireAuth,
     _a: RequireAdmin,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.revoke(u.tenant(), id).await
+    s.service.revoke(u.tenant(), id, &ctx).await
 }
