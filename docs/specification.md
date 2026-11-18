@@ -8469,11 +8469,12 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
   2 decimals below 100,000,000, or the request must fail with 422. `default_billable` and `is_active` must default to
   true and `sort_order` to 0 when omitted.
 - **SPEC-14.5**: Creating a work type must write an audit row in the same transaction as the insert. Updating or
-  deleting a work type that does not exist in the tenant must fail with 404 "Work type"; update must replace every field
-  of the work type with the request values.
-- **SPEC-14.6**: `POST /time-entries` by a caller who is not `super_admin` or `admin` must record the entry against the
-  caller's own user id, replacing any other `user_id` in the body without raising an error. An admin may name any
-  `user_id`.
+  deleting a work type must also write an audit row in the same transaction (update carrying the row before and after,
+  delete the row before); one that does not exist in the tenant must fail with 404 "Work type"; update must replace
+  every field of the work type with the request values.
+- **SPEC-14.6**: `POST /time-entries` naming a `user_id` other than the caller's must be refused with 403 unless the
+  caller is `super_admin`, `admin` or `manager`, who may attribute time to any user. The body is never silently
+  rewritten.
 - **SPEC-14.7**: A time entry request must be refused with 422 when `duration_minutes` or `worked_minutes` is outside
   1..=1440, when `billable_minutes` is outside 0..=1440, or when `hourly_rate` is negative, has more than 2 decimals or
   is 100,000,000 or more.
@@ -8529,8 +8530,9 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
   check, and must fail with 403 "Cannot edit another user's time entry" or "Cannot delete another user's time entry"
   when the caller is not `super_admin` or `admin` and the entry belongs to another user.
 - **SPEC-14.23**: An update must keep the stored value of `date`, `notes`, `work_type_id` and `task_id` when omitted. It
-  must set `ticket_id` and `project_id` to exactly the request values (an omitted one becomes null) and re-derive
-  `work_category` from them. `entry_kind` and `company_id` must never change. Attaching a ticket to an `employee` entry
+  must also keep the stored `ticket_id` and `project_id` when omitted, and re-derive `work_category` from the resulting
+  values. A supplied `project_id` or `task_id` that belongs to another tenant must fail with 404. An update and a delete
+  must each write an audit row in the same transaction. `entry_kind` and `company_id` must never change. Attaching a ticket to an `employee` entry
   must fail with 400.
 - **SPEC-14.24**: On update the worked minutes must be the request's `worked_minutes`, else `duration_minutes`, else the
   minutes between the resulting start and end times, else the current worked minutes. Billable minutes must be the
@@ -8593,7 +8595,7 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
 - **SPEC-14.41**: A rounding rule's `rounding_method` must be `up`, `down` or `nearest`, else the request must fail with
   400 "rounding_method `<value>` invalid; expected up | down | nearest". Saving a rule with `is_default` true must clear
   `is_default` on every other rule of the tenant in the same transaction, and updating or deleting an unknown rule must
-  fail with 404 "Time rounding rule". Creating a rule must write an audit row.
+  fail with 404 "Time rounding rule". Creating, updating and deleting a rule must each write an audit row in the same transaction.
 - **SPEC-14.42**: `POST /workday/clock-in` must open a `work` segment for the caller on the body's `date` or, when
   absent, on today in the caller's own time zone; a missing body must be treated as an empty one. While the caller has
   any open segment of any date it must fail with 409 whose message names the open segment's date and elapsed time as
@@ -8635,8 +8637,9 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
   any of `user_id`, `ticket_id`, `project_id`, `date_from` and `date_to` (inclusive), ordered by date descending unless
   an allowed `sort` is given, with a total counting only the filtered set; an unknown `sort` field must be refused with
   422. `GET /mileage-entries/{id}` must fail with 404 "Mileage entry" when absent.
-- **SPEC-14.51**: `POST /mileage-entries` by a caller who is not `super_admin` or `admin` must record the entry against
-  the caller's own user id, replacing any other `user_id` without an error. `distance_miles` must be greater than 0,
+- **SPEC-14.51**: `POST /mileage-entries` naming a `user_id` other than the caller's must be refused with 403 unless
+  the caller is `super_admin`, `admin` or `manager`; the body is never silently rewritten. A supplied `project_id`,
+  `task_id` or `contract_id` that belongs to another tenant must fail with 404. `distance_miles` must be greater than 0,
   have at most 2 decimals and be below 1,000,000, and `rate_per_mile` must be non-negative with at most 4 decimals and
   below 10,000, or the request must fail with 422; a service-level distance of 0 or less must fail with 400
   "distance_miles must be greater than 0".
@@ -8651,10 +8654,12 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
   permission check, and 403 "Cannot edit another user's mileage entry" or "Cannot delete another user's mileage entry"
   when the caller is not `super_admin` or `admin` and the entry belongs to another user.
 - **SPEC-14.56**: A mileage update must keep the stored `date`, `start_address`, `end_address`, `notes` and `task_id`
-  when omitted, but set `ticket_id` and `project_id` to exactly the request values (an omitted one becomes null). The
+  `ticket_id`, `project_id` and `task_id` when omitted. The
   resulting distance must be greater than 0 (400 otherwise), a supplied ticket must belong to the tenant (404 "Ticket"),
-  and the total must be recomputed from the resulting rate, distance and billability. The update must not change the
-  billing status.
+  and the total must be recomputed from the resulting rate, distance and billability. A supplied `project_id` or
+  `task_id` that belongs to another tenant must fail with 404. The update must resolve the billing status from the
+  resulting billability as time entries do: non-billable becomes `not_billed`, billable becomes `ready_to_bill`, and a
+  `billed` entry stays `billed`.
 
 ### 14.3 Expenses
 
@@ -8741,7 +8746,7 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
   (403 "That expense claim belongs to somebody else" otherwise, 404 for an unknown id) and move a `draft` claim to
   `submitted`; approve, reject and reimburse must require the `super_admin`, `admin` or `finance` role.
 - **SPEC-14.79**: Approve must move a `submitted` claim to `approved` recording the approver and approval time, reject
-  must move a `submitted` claim to `rejected`, and reimburse must move an `approved` claim to `reimbursed` recording the
+  must move a `submitted` claim to `rejected` recording the rejecting user in `approver_id`, and reimburse must move an `approved` claim to `reimbursed` recording the
   reimbursement time; each must lock the row, and any other source status must fail with 409.
 - **SPEC-14.80**: A refused expense transition must answer 409 with: for `rejected` "This expense was rejected, which is
   terminal. File a new expense instead."; for `reimbursed` "A reimbursed expense is immutable. File a reversing expense
