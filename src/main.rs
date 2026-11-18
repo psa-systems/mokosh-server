@@ -616,6 +616,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_cli(&args).await;
     }
 
+    // The env file has to land before ANYTHING reads a variable: the hosting
+    // profile below chooses the configuration provider, and that provider then
+    // resolves every declared key out of this process's environment.
+    // PMS-1577: a missing `.env` is the documented default (nothing to load);
+    // a malformed one silently discarded every variable it defined, with
+    // nothing logged, so only the not-found case is ignored here.
+    // SPEC-2.18
+    // SPEC-6.36
+    if let Err(e) = dotenvy::dotenv() {
+        if !matches!(e, dotenvy::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(format!(".env could not be loaded: {e}").into());
+        }
+    }
+
     // PMS-504 (M14): do not hardcode debug logging in every environment.
     // Honor RUST_LOG (the dev stack sets `info,mokosh_server=debug`) and fall
     // back to `info` when it is unset so production runs at info, not debug.
@@ -632,21 +647,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SPEC-1.1
     tracing::info!("Running in multi-tenant mode");
-
-    // The env file has to land before ANYTHING reads a variable: the hosting
-    // profile below chooses the configuration provider, and that provider then
-    // resolves every declared key out of this process's environment.
-    // PMS-1577: a missing `.env` is the documented default (nothing to load);
-    // a malformed one silently discarded every variable it defined, with
-    // nothing logged, so only the not-found case is ignored here.
-    // SPEC-2.18
-    // SPEC-6.36
-    if let Err(e) = dotenvy::dotenv() {
-        if !matches!(e, dotenvy::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
-        {
-            return Err(format!(".env could not be loaded: {e}").into());
-        }
-    }
 
     // PMS-1011: the same variable, read strictly, because this answer chooses
     // providers rather than gating mail. Read here so an unrecognised mode
