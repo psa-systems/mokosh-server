@@ -6740,7 +6740,8 @@ each route tree and the layers every request passes through.
 
 - **SPEC-12.11**: The CORS layer must allow the methods `GET`, `POST`, `PUT`, `DELETE`, `PATCH` and `OPTIONS`, the
   request headers `Authorization`, `Content-Type`, `Accept` and `X-Forwarded-Host`, must allow credentials, must cache
-  preflight answers for 600 seconds, and must expose no response headers.
+  preflight answers for 600 seconds, and must expose the response headers `Retry-After`, `WWW-Authenticate` and
+  `Content-Disposition` so a cross-origin browser client can read them.
 - **SPEC-12.12**: A request whose `Origin` matches no `CORS_ORIGIN` entry, or that has none, must receive no
   `Access-Control-Allow-Origin` header and must still be processed by the route; CORS is not an access control on the
   server side.

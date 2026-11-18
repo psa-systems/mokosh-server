@@ -1078,40 +1078,7 @@ pub fn create_api_router(
     // See `CorsOriginMatcher::from_entries` for the parse rules.
     // SPEC-12.11, SPEC-12.12, SPEC-12.13: fixed method/header lists, credentials, 600 s preflight cache.
     // SPEC-12.14: the matcher was parsed once above; no match means no allow-origin header.
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(move |origin, _| {
-            cors_matcher.matches(origin.as_bytes())
-        }))
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::PATCH,
-            Method::OPTIONS,
-        ])
-        .allow_headers([
-            header::AUTHORIZATION,
-            header::CONTENT_TYPE,
-            header::ACCEPT,
-            // PMS-729: the SPA attaches `X-Forwarded-Host` on every
-            // portal-side fetch so the server's host-to-tenant
-            // extractor sees the real `{slug}.client.<apex>` value
-            // even when a dev reverse proxy rewrites Host. Without it
-            // in the CORS preflight allow-list, the browser refuses
-            // the actual credentialed POST (magic-link redeem,
-            // set-password, etc.) with `Request header field
-            // x-forwarded-host is not allowed by
-            // Access-Control-Allow-Headers`, and the SPA reports the
-            // failure as "This link is invalid or has expired" even
-            // though the token never reached the server.
-            axum::http::HeaderName::from_static("x-forwarded-host"),
-        ])
-        .allow_credentials(true)
-        // Cache preflight for 10 minutes per docs/cors.md §5 so browsers do not
-        // re-issue an OPTIONS before every credentialed request (PMS-389).
-        // SPEC-2.64
-        .max_age(std::time::Duration::from_secs(600));
+    let cors = build_cors_layer(cors_matcher);
 
     // PMS-591: Bunyip account-deleted webhook. Nested under `/api/v1/bunyip`
     // OUTSIDE the JWT auth chain: this endpoint authenticates itself via a
@@ -1795,6 +1762,50 @@ async fn version_info() -> Json<VersionInfo> {
     Json(VersionInfo::current())
 }
 
+/// The CORS layer: origin matcher, fixed method and header lists, credentials, exposed response headers.
+fn build_cors_layer(cors_matcher: CorsOriginMatcher) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            cors_matcher.matches(origin.as_bytes())
+        }))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            // PMS-729: the SPA attaches `X-Forwarded-Host` on every
+            // portal-side fetch so the server's host-to-tenant
+            // extractor sees the real `{slug}.client.<apex>` value
+            // even when a dev reverse proxy rewrites Host. Without it
+            // in the CORS preflight allow-list, the browser refuses
+            // the actual credentialed POST (magic-link redeem,
+            // set-password, etc.) with `Request header field
+            // x-forwarded-host is not allowed by
+            // Access-Control-Allow-Headers`, and the SPA reports the
+            // failure as "This link is invalid or has expired" even
+            // though the token never reached the server.
+            axum::http::HeaderName::from_static("x-forwarded-host"),
+        ])
+        // SPEC-12.11: without this a cross-origin browser client cannot read these from a response.
+        .expose_headers([
+            header::RETRY_AFTER,
+            header::WWW_AUTHENTICATE,
+            header::CONTENT_DISPOSITION,
+        ])
+        .allow_credentials(true)
+        // Cache preflight for 10 minutes per docs/cors.md §5 so browsers do not
+        // re-issue an OPTIONS before every credentialed request (PMS-389).
+        // SPEC-2.64
+        .max_age(std::time::Duration::from_secs(600))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2096,5 +2107,38 @@ mod tests {
     #[tokio::test]
     async fn gzip_only_client_still_gets_gzip() {
         assert_eq!(negotiated_encoding("gzip").await, "gzip");
+    }
+
+    /// A cross-origin response exposes the headers the SPA reads, so a
+    /// browser can see `Retry-After`, `WWW-Authenticate` and
+    /// `Content-Disposition`.
+    #[tokio::test]
+    async fn cors_response_exposes_the_documented_headers() {
+        use tower::ServiceExt;
+
+        let matcher = CorsOriginMatcher::from_entries(&["https://app.example.test".to_string()]);
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(build_cors_layer(matcher));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header(header::ORIGIN, "https://app.example.test")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        let exposed = response
+            .headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .expect("expose header present")
+            .to_str()
+            .expect("ascii")
+            .to_ascii_lowercase();
+        for name in ["retry-after", "www-authenticate", "content-disposition"] {
+            assert!(exposed.contains(name), "{name} missing from {exposed}");
+        }
     }
 }
