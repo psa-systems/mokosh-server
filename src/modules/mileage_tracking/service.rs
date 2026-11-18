@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
+use crate::modules::time_tracking::{assert_project_in_tenant, assert_task_in_tenant};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -137,6 +138,15 @@ impl MileageTrackingService {
         if let Some(ticket_id) = request.ticket_id {
             assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
         }
+        if let Some(project_id) = request.project_id {
+            assert_project_in_tenant(&mut *tx, tenant_id, project_id).await?;
+        }
+        if let Some(task_id) = request.task_id {
+            assert_task_in_tenant(&mut *tx, tenant_id, task_id).await?;
+        }
+        if let Some(contract_id) = request.contract_id {
+            assert_contract_in_tenant(&mut *tx, tenant_id, contract_id).await?;
+        }
 
         // Rate precedence: explicit request rate > tenant default rate card's
         // per-mile rate > None. total_amount only for billable entries.
@@ -249,7 +259,7 @@ impl MileageTrackingService {
         Ok(row.into())
     }
 
-    // SPEC-14.56: ticket_id and project_id bind as given (null when omitted); billing status is untouched.
+    // SPEC-14.56: omitted ticket_id, project_id and task_id keep their stored links; is_billable re-resolves billing status.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_mileage_entry(
         &self,
@@ -291,6 +301,12 @@ impl MileageTrackingService {
         if let Some(ticket_id) = request.ticket_id {
             assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
         }
+        if let Some(project_id) = request.project_id {
+            assert_project_in_tenant(&mut *tx, tenant_id, project_id).await?;
+        }
+        if let Some(task_id) = request.task_id {
+            assert_task_in_tenant(&mut *tx, tenant_id, task_id).await?;
+        }
         let affected = sqlx::query(
             r#"
             UPDATE mileage_entries SET
@@ -298,8 +314,8 @@ impl MileageTrackingService {
                 distance_miles = $4,
                 start_address = COALESCE($5, start_address),
                 end_address   = COALESCE($6, end_address),
-                ticket_id     = $7,
-                project_id    = $8,
+                ticket_id     = COALESCE($7, ticket_id),
+                project_id    = COALESCE($8, project_id),
                 notes         = COALESCE($9, notes),
                 is_billable   = $10,
                 rate_per_mile = $11,
@@ -399,6 +415,28 @@ where
     found
         .map(|_| ())
         .ok_or_else(|| AppError::NotFound("Ticket".to_string()))
+}
+
+/// `contract_id` is a soft pointer like project and task: an id that resolves
+/// in another tenant is refused, one that resolves to nothing is accepted.
+async fn assert_contract_in_tenant<'e, E>(
+    exec: E,
+    tenant_id: TenantId,
+    contract_id: Uuid,
+) -> AppResult<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT tenant_id FROM contracts WHERE id = $1")
+        .bind(contract_id)
+        .fetch_optional(exec)
+        .await?;
+    match owner {
+        Some(owner_tenant) if owner_tenant != *tenant_id => {
+            Err(AppError::NotFound("Contract".to_string()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Assert a company belongs to the tenant. `NotFound` cross-tenant.

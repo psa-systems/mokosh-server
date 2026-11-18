@@ -1,13 +1,11 @@
-//! MAPPS-1100 scaffold: Rust types mirroring the `vendors`, `bills`,
-//! `expenses` tables from migration 279.
+//! Rust types mirroring the `vendors`, `expense_categories`, `bills`,
+//! `bill_lines`, `expenses` and `expense_lines` tables, plus the request,
+//! response and filter shapes of the bills and expenses endpoints.
 //!
-//! Pure data types. No service methods, no construction, no behavior.
-//! The next phase of MAPPS-1100 reads sqlx rows into these and writes
-//! them back out; the shapes here are the contract the first endpoint's
-//! request / response types derive from.
+//! The service reads sqlx rows into these and writes them back out.
 //!
 //! Money is minor units (cents) throughout, matching the schema and the
-//! existing `invoices.subtotal_minor` convention (PMS-1028).
+//! `invoices.subtotal_minor` convention.
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};

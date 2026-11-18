@@ -1,76 +1,45 @@
-//! MAPPS-1100 scaffold: the Bills and Expenses subsystem.
+//! The Bills and Expenses subsystem.
 //!
 //! An MSP tracks what IT is billed for (vendor bills) and what its own
 //! people spend (employee expenses), with the same tenant-isolation
-//! posture and audit shape as the rest of the server. The customer-
-//! facing invoicing plane (`billing/`) exists end-to-end today; this
-//! module is the inbound plane the `Capability::BillsAndExpenses`
-//! registry entry promises but could not deliver until MAPPS-1100.
+//! posture and audit shape as the rest of the server. This is the inbound
+//! plane that the `Capability::BillsAndExpenses` registry entry promises;
+//! the customer-facing invoicing plane lives in `billing/`.
 //!
-//! # What ships in Phase 0
+//! # What this module holds
 //!
-//! - Migration 279 creating `vendors`, `expense_categories`, `bills`,
-//!   `bill_lines`, `expenses`, `expense_lines` with tenant isolation and
-//!   `mokosh_app` grants.
-//! - [`models`]: the Rust types that mirror the schema, derivable to and
-//!   from a sqlx row.
+//! - The [`models`] module holds the Rust types that mirror the schema and the endpoint
+//!   shapes.
+//! - [`service::ExpensesService`] is the one writer. Vendors and expense
+//!   categories CRUD, bills (`draft -> approved -> paid`, `void`) and
+//!   expenses (`draft -> submitted -> approved -> reimbursed`,
+//!   `rejected`), each header atomic with its lines in one transaction,
+//!   tenant-isolated through `begin_with_tenant`, every mutation writing
+//!   an `audit_log` row in the same transaction as the change.
+//! - The router [`routes::expenses_routes`] mounts `/api/v1/vendors`,
+//!   `/api/v1/expense-categories`, `/api/v1/bills` and `/api/v1/expenses`
+//!   with their transition sub-routes, merged into the staff plane.
 //!
-//! # What ships in Phase A
+//! # Delegated issuing
 //!
-//! - [`service::ExpensesService`]: the one writer. Vendors and expense
-//!   categories CRUD, admin+finance gated, tenant-isolated through
-//!   `begin_with_tenant`, every mutation writing an `audit_log` row in
-//!   the same transaction as the change.
-//! - [`routes::expenses_routes`]: `/api/v1/vendors` and
-//!   `/api/v1/expense-categories` CRUD, merged into the staff plane.
-//!
-//! Only the leaf lookups land in Phase A because they are prerequisites
-//! for the bill/expense headers themselves. Mounting empty
-//! `/api/v1/bills` and `/api/v1/expenses` endpoints that return
-//! `NotImplemented` is the "advertises what the build cannot deliver"
-//! anti-pattern MAPPS-1098 and MAPPS-1102 enforce against.
-//!
-//! # What ships in Phase B
-//!
-//! - [`service::ExpensesService`] gains the bill and expense headers,
-//!   each atomic with its lines in one transaction: bills
-//!   (`draft -> approved -> paid`, `void`) and expenses
-//!   (`draft -> submitted -> approved -> reimbursed`, `rejected`).
-//! - [`routes::expenses_routes`] mounts `/api/v1/bills`,
-//!   `/api/v1/bills/{id}`, `/api/v1/bills/{id}/approve`,
-//!   `/api/v1/bills/{id}/void`, `/api/v1/expenses`,
-//!   `/api/v1/expenses/{id}`, `/api/v1/expenses/{id}/submit`,
-//!   `/api/v1/expenses/{id}/approve`, `/api/v1/expenses/{id}/reject`,
-//!   and `/api/v1/expenses/{id}/reimburse`.
-//!
-//! # What ships in Phase 2 (MAPPS-1155)
-//!
-//! - Delegated BILLS: [`service::ExpensesService::create_bill`] raises
-//!   the bill in Xero or QuickBooks when the tenant has delegated
-//!   `BillsAndExpenses` and the deployment has `Feature::DelegatedBills`
-//!   on, and records `external_provider` / `external_bill_id` on the
-//!   local row. The push runs before the write transaction, so a
-//!   provider that refuses leaves nothing behind.
-//! - Migrations 285 and 286: the vendor mapping every push needs, and
-//!   the expense-category-to-account mapping QuickBooks requires on
-//!   every bill line.
-//!
-//! # What ships in Phase 3 (PMS-1541)
-//!
-//! - Delegated EXPENSES: [`service::ExpensesService::reimburse_expense`]
-//!   records a reimbursed claim in Xero or QuickBooks when the tenant has
-//!   delegated `BillsAndExpenses`, the same gate as delegated bills. An
-//!   expense is a claim from a person, not an obligation to a vendor, so
-//!   it is a different document in both providers: a Xero `SPEND` bank
+//! - Bills: [`service::ExpensesService::create_bill`] raises the bill in
+//!   Xero or QuickBooks when the tenant has delegated `BillsAndExpenses`
+//!   and the deployment has `Feature::DelegatedBills` on, and records
+//!   `external_provider` / `external_bill_id` on the local row. The push
+//!   runs before the write transaction, so a provider that refuses leaves
+//!   nothing behind.
+//! - Expenses: [`service::ExpensesService::reimburse_expense`] records a
+//!   reimbursed claim in the provider under the same gate. An expense is
+//!   a claim from a person, not an obligation to a vendor, so it is a
+//!   different document in both providers: a Xero `SPEND` bank
 //!   transaction, or a QuickBooks purchase, never a bill.
 //!
 //! # What does NOT ship
 //!
-//! - **worker**: due-date reminders and reimbursement batching are a
-//!   later phase.
-//! - **vendor payments read back**: the MAPPS-1136 receivers report what
-//!   a customer paid; no receiver reads a vendor payment, so a bill paid
-//!   in the provider stays open here until somebody records it.
+//! - **worker**: due-date reminders and reimbursement batching.
+//! - **vendor payments read back**: the receivers report what a customer
+//!   paid; none reads a vendor payment, so a bill paid in the provider
+//!   stays open here until somebody records it.
 //!
 //! # Why six tables and not fewer
 //!

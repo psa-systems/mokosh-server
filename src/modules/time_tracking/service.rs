@@ -117,15 +117,17 @@ impl TimeTrackingService {
         })
     }
 
-    // SPEC-14.5: full replacement; 404 when the id is not in the tenant.
+    // SPEC-14.5: full replacement with an audit row in the same transaction; 404 when the id is not in the tenant.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_work_type(
         &self,
         tenant_id: TenantId,
         id: Uuid,
         request: &UpsertWorkTypeRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<WorkTypeResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before = audit_snapshot(&mut tx, "work_types", tenant_id, id).await?;
         let affected = sqlx::query(
             r#"
             UPDATE work_types SET
@@ -149,6 +151,18 @@ impl TimeTrackingService {
         if affected == 0 {
             return Err(AppError::NotFound("Work type".to_string()));
         }
+        let after = audit_snapshot(&mut tx, "work_types", tenant_id, id).await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "work_types",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
         tx.commit().await?;
         Ok(WorkTypeResponse {
             id,
@@ -161,10 +175,16 @@ impl TimeTrackingService {
         })
     }
 
-    // SPEC-14.5: 404 when the id is not in the tenant.
+    // SPEC-14.5: audit row in the same transaction; 404 when the id is not in the tenant.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_work_type(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+    pub async fn delete_work_type(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before = audit_snapshot(&mut tx, "work_types", tenant_id, id).await?;
         let affected = sqlx::query("DELETE FROM work_types WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -174,6 +194,17 @@ impl TimeTrackingService {
         if affected == 0 {
             return Err(AppError::NotFound("Work type".to_string()));
         }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "work_types",
+            Some(id),
+            before,
+            None,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -591,6 +622,7 @@ impl TimeTrackingService {
         tenant_id: TenantId,
         id: Uuid,
         request: &UpdateTimeEntryRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TimeEntryResponse> {
         let current = self.get_time_entry(tenant_id, id).await?;
         let start = request.start_time.or(current.start_time);
@@ -633,13 +665,12 @@ impl TimeTrackingService {
         if let Some(task_id) = request.task_id {
             assert_task_in_tenant(&mut *tx, tenant_id, task_id).await?;
         }
-        // The UPDATE binds ticket_id / project_id straight from the request, so
-        // re-derive work_category from those same post-update values (PMS-394).
-        let work_category = derive_work_category(
-            request.work_category.as_deref(),
-            request.ticket_id,
-            request.project_id,
-        )?;
+        // The UPDATE keeps the stored ticket_id / project_id when omitted, so
+        // re-derive work_category from the resulting values.
+        let ticket_id = request.ticket_id.or(current.ticket_id);
+        let project_id = request.project_id.or(current.project_id);
+        let work_category =
+            derive_work_category(request.work_category.as_deref(), ticket_id, project_id)?;
         // PMS-942: the kind is set once, at create, and an update cannot change
         // it - there is no `entry_kind` or `company_id` on the update request,
         // so an entry cannot be moved between the MSP's books and a client's by
@@ -650,8 +681,8 @@ impl TimeTrackingService {
             requested: Some(&current.entry_kind),
             company_id: current.company_id,
             own_company_id: None,
-            ticket_id: request.ticket_id,
-            project_id: request.project_id,
+            ticket_id,
+            project_id,
             task_id: request.task_id,
             contract_id: None,
             is_billable,
@@ -706,6 +737,7 @@ impl TimeTrackingService {
             is_billable,
         )
         .await?;
+        let before = audit_snapshot(&mut tx, "time_entries", tenant_id, id).await?;
         let affected = sqlx::query(
             r#"
             UPDATE time_entries SET
@@ -716,8 +748,8 @@ impl TimeTrackingService {
                 worked_minutes    = $16,
                 billable_minutes  = $17,
                 work_type_id      = COALESCE($7, work_type_id),
-                ticket_id         = $8,
-                project_id        = $9,
+                ticket_id         = COALESCE($8, ticket_id),
+                project_id        = COALESCE($9, project_id),
                 notes             = COALESCE($10, notes),
                 is_billable       = $11,
                 hourly_rate       = $12,
@@ -763,6 +795,18 @@ impl TimeTrackingService {
         if affected == 0 {
             return Err(AppError::NotFound("Time entry".to_string()));
         }
+        let after = audit_snapshot(&mut tx, "time_entries", tenant_id, id).await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "time_entries",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
         tx.commit().await?;
         // PMS-951: an edit re-draws from scratch rather than adjusting. Give
         // back exactly what this entry took, from the period it took it from,
@@ -779,12 +823,18 @@ impl TimeTrackingService {
 
     // SPEC-14.26: release the draw before the row goes.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_time_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+    pub async fn delete_time_entry(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
         // PMS-951: before the row goes, because the row is where the record of
         // what it drew lives. Deleting first would leave the contract short by
         // hours nothing can account for any more.
         self.release_for_entry(tenant_id, id).await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before = audit_snapshot(&mut tx, "time_entries", tenant_id, id).await?;
         let affected = sqlx::query("DELETE FROM time_entries WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -794,6 +844,17 @@ impl TimeTrackingService {
         if affected == 0 {
             return Err(AppError::NotFound("Time entry".to_string()));
         }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "time_entries",
+            Some(id),
+            before,
+            None,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1849,16 +1910,18 @@ impl TimeTrackingService {
         })
     }
 
-    // SPEC-14.41: clears other defaults; 404 "Time rounding rule".
+    // SPEC-14.41: clears other defaults, audit row in the same transaction; 404 "Time rounding rule".
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_rounding_rule(
         &self,
         tenant_id: TenantId,
         id: Uuid,
         request: &UpsertTimeRoundingRuleRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<TimeRoundingRuleResponse> {
         Self::validate_rounding_method(&request.rounding_method)?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before = audit_snapshot(&mut tx, "time_rounding_rules", tenant_id, id).await?;
         if request.is_default {
             sqlx::query(
                 "UPDATE time_rounding_rules SET is_default = FALSE WHERE tenant_id = $1 AND id <> $2",
@@ -1889,6 +1952,18 @@ impl TimeTrackingService {
         if affected == 0 {
             return Err(AppError::NotFound("Time rounding rule".to_string()));
         }
+        let after = audit_snapshot(&mut tx, "time_rounding_rules", tenant_id, id).await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "time_rounding_rules",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
         tx.commit().await?;
         Ok(TimeRoundingRuleResponse {
             id,
@@ -1900,10 +1975,16 @@ impl TimeTrackingService {
         })
     }
 
-    // SPEC-14.41: 404 "Time rounding rule".
+    // SPEC-14.41: audit row in the same transaction; 404 "Time rounding rule".
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_rounding_rule(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+    pub async fn delete_rounding_rule(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before = audit_snapshot(&mut tx, "time_rounding_rules", tenant_id, id).await?;
         let affected =
             sqlx::query("DELETE FROM time_rounding_rules WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)
@@ -1914,6 +1995,17 @@ impl TimeTrackingService {
         if affected == 0 {
             return Err(AppError::NotFound("Time rounding rule".to_string()));
         }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "time_rounding_rules",
+            Some(id),
+            before,
+            None,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1932,6 +2024,21 @@ impl TimeTrackingService {
 // ============================================================================
 // Shared resolve helpers (tenant validation + billing derivation + rounding)
 // ============================================================================
+
+/// Row snapshot for an audit row; `table` is always a literal at the call site.
+async fn audit_snapshot(
+    conn: &mut sqlx::PgConnection,
+    table: &'static str,
+    tenant_id: TenantId,
+    id: Uuid,
+) -> AppResult<Option<serde_json::Value>> {
+    let sql = format!("SELECT to_jsonb(t) FROM {table} t WHERE tenant_id = $1 AND id = $2");
+    Ok(sqlx::query_scalar(&sql)
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(conn)
+        .await?)
+}
 
 struct WorkTypeDefaults {
     default_rate: Option<Decimal>,
@@ -1995,7 +2102,7 @@ where
 /// the historical behaviour the integration tests rely on, but an id
 /// that resolves on `projects` / `tasks` in a different tenant 404s
 /// to close the cross-tenant leak PMS-1662 names.
-async fn assert_project_in_tenant<'e, E>(
+pub(crate) async fn assert_project_in_tenant<'e, E>(
     exec: E,
     tenant_id: TenantId,
     project_id: Uuid,
@@ -2014,7 +2121,11 @@ where
     }
 }
 
-async fn assert_task_in_tenant<'e, E>(exec: E, tenant_id: TenantId, task_id: Uuid) -> AppResult<()>
+pub(crate) async fn assert_task_in_tenant<'e, E>(
+    exec: E,
+    tenant_id: TenantId,
+    task_id: Uuid,
+) -> AppResult<()>
 where
     E: sqlx::PgExecutor<'e>,
 {
