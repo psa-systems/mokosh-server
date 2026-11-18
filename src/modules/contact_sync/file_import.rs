@@ -367,9 +367,14 @@ impl ContactSyncService {
                 "holds no contacts: it has no BEGIN:VCARD. Export the contacts as a vCard (.vcf) file and upload that",
             ));
         }
-        let problems = |list: &[CardProblem]| serde_json::to_value(list).unwrap_or_default();
-        let failures = problems(&parsed.failures);
-        let warnings = problems(&parsed.warnings);
+        // A serialize failure must not store `null` as if there were no problems.
+        let problems = |list: &[CardProblem]| {
+            serde_json::to_value(list).map_err(|e| {
+                AppError::internal(format!("could not record the vCard file's problems: {e}"))
+            })
+        };
+        let failures = problems(&parsed.failures)?;
+        let warnings = problems(&parsed.warnings)?;
         let (cards, contact_count, group_cards) = (
             parsed.cards as i32,
             parsed.contacts.len() as i32,
@@ -383,7 +388,7 @@ impl ContactSyncService {
                 .map(|g| serde_json::json!({ "id": g.id, "name": g.name, "member_count": g.member_count }))
                 .collect::<Vec<_>>(),
         )
-        .unwrap_or_default();
+        .map_err(|e| AppError::internal(format!("could not record the vCard file's groups: {e}")))?;
 
         let connection_id = self.vcard_source_id(tenant_id, ctx.user_id).await?;
         let file_id = Uuid::new_v4();

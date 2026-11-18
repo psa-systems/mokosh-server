@@ -53,6 +53,7 @@ use super::oauth::{Pkce, TokenError};
 const AUTH_ENDPOINT: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize";
 const TOKEN_ENDPOINT: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
 const USERINFO_ENDPOINT: &str = "https://graph.microsoft.com/oidc/userinfo";
+const ME_ENDPOINT: &str = "https://graph.microsoft.com/v1.0/me";
 
 /// Every scope the consent screen asks for.
 ///
@@ -327,7 +328,12 @@ async fn post_token(
         .await
         .map_err(|e| TokenError::Transport(e.to_string()))?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    // An unreadable body hides the error code that decides GrantRevoked, so
+    // say so rather than classify an empty string silently.
+    let body = response.text().await.unwrap_or_else(|e| {
+        tracing::warn!(status = status.as_u16(), error = %e, "Microsoft token endpoint body unreadable");
+        String::new()
+    });
     if !status.is_success() {
         return Err(classify_token_error(status.as_u16(), &body));
     }
@@ -352,6 +358,13 @@ pub async fn account_email(http: &reqwest::Client, access_token: &str) -> AppRes
         #[serde(default)]
         email: Option<String>,
     }
+    #[derive(Deserialize)]
+    struct Profile {
+        #[serde(default)]
+        mail: Option<String>,
+        #[serde(default, rename = "userPrincipalName")]
+        user_principal_name: Option<String>,
+    }
     let response = http
         .get(USERINFO_ENDPOINT)
         .bearer_auth(access_token)
@@ -368,9 +381,32 @@ pub async fn account_email(http: &reqwest::Client, access_token: &str) -> AppRes
         .json()
         .await
         .map_err(|e| AppError::external_service("microsoft", format!("userinfo not JSON: {e}")))?;
-    info.email
-        .filter(|e| !e.trim().is_empty())
-        .ok_or_else(|| AppError::external_service("microsoft", "userinfo carried no email address"))
+    if let Some(email) = info.email.filter(|e| !e.trim().is_empty()) {
+        return Ok(email);
+    }
+    // Userinfo carried no email (a tenant can withhold the claim): fall back
+    // to the profile's mail, then its sign-in name.
+    let response = http
+        .get(ME_ENDPOINT)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| AppError::external_service("microsoft", format!("profile failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(AppError::external_service(
+            "microsoft",
+            format!("profile refused ({})", response.status()),
+        ));
+    }
+    let me: Profile = response
+        .json()
+        .await
+        .map_err(|e| AppError::external_service("microsoft", format!("profile not JSON: {e}")))?;
+    me.mail
+        .into_iter()
+        .chain(me.user_principal_name)
+        .find(|v| !v.trim().is_empty())
+        .ok_or_else(|| AppError::external_service("microsoft", "profile carried no email address"))
 }
 
 #[cfg(test)]

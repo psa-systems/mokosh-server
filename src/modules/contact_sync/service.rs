@@ -877,7 +877,7 @@ impl ContactSyncService {
             &code_verifier,
         )
         .await
-        .map_err(AppError::from)?;
+        .map_err(|e| e.into_app_error(MICROSOFT))?;
         let Some(refresh_token) = tokens.refresh_token.clone() else {
             // Microsoft returns a refresh token when `offline_access` is in
             // the granted scope; the SCOPES constant always includes it, so
@@ -1120,10 +1120,15 @@ impl ContactSyncService {
     /// never the provider's text: this lands in a URL bar and a browser
     /// history.
     // SPEC-15.531
-    pub fn failure_redirect(&self) -> String {
+    pub fn failure_redirect(&self, provider: &str) -> String {
         format!(
-            "{}/settings/integrations/google-contacts?contact_sync=failed",
-            self.spa_base_url.trim_end_matches('/')
+            "{}/settings/integrations/{}-contacts?contact_sync=failed",
+            self.spa_base_url.trim_end_matches('/'),
+            if provider == MICROSOFT {
+                "microsoft"
+            } else {
+                "google"
+            }
         )
     }
 
@@ -1229,9 +1234,9 @@ impl ContactSyncService {
             Ok(tokens) => Ok(tokens.access_token),
             Err(TokenError::GrantRevoked) => {
                 self.mark_reconnect_required(tenant_id, connection_id).await;
-                Err(AppError::from(TokenError::GrantRevoked))
+                Err(TokenError::GrantRevoked.into_app_error(MICROSOFT))
             }
-            Err(other) => Err(AppError::from(other)),
+            Err(other) => Err(other.into_app_error(MICROSOFT)),
         }
     }
 
@@ -1857,11 +1862,12 @@ impl ContactSyncService {
             .await
         {
             Err(AppError::NotFound(what)) => {
-                // PMS-1409: the queue spans every live source, and a reviewer
-                // answering an item does not name a provider, so the switch that
-                // could explain an item having vanished is Google's - the only
-                // one an answer can be refused by here.
-                self.assert_enabled(tenant_id, GOOGLE).await?;
+                // No live source holds the item and the answer does not always
+                // name one, so any provider's switch being off could explain the
+                // item having gone: refuse with 409 for that rather than 404.
+                for provider in [GOOGLE, ICLOUD, MICROSOFT] {
+                    self.assert_enabled(tenant_id, provider).await?;
+                }
                 return Err(AppError::NotFound(what));
             }
             other => other?,

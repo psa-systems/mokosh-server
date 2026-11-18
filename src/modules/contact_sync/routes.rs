@@ -51,6 +51,7 @@ use super::service::{
     ConnectionStatus, ContactProvenance, ContactSyncOverview, ContactSyncService, DataRemoval,
     Resolution, Resolved, ReviewItem,
 };
+use super::service::{GOOGLE, MICROSOFT};
 use super::sync::ImportPreview;
 use crate::modules::audit::AuditCtx;
 use crate::modules::auth::{RequireAdmin, RequireAuth, RequireManager, TenantScoped};
@@ -632,10 +633,15 @@ async fn callback(
         // `access_denied` is the admin pressing Cancel; anything else is
         // Google refusing the request itself. Neither is exceptional.
         tracing::info!(reason, "the Google consent screen returned without a code");
-        return Redirect::to(&state.service.failure_redirect());
+        return Redirect::to(&state.service.failure_redirect(GOOGLE));
     }
     let (Some(code), Some(state_param)) = (query.code.as_deref(), query.state.as_deref()) else {
-        return Redirect::to(&state.service.failure_redirect());
+        tracing::warn!(
+            has_code = query.code.is_some(),
+            has_state = query.state.is_some(),
+            "the Google callback arrived without a code or state"
+        );
+        return Redirect::to(&state.service.failure_redirect(GOOGLE));
     };
     match state.service.complete_connect(state_param, code).await {
         Ok(destination) => Redirect::to(&destination),
@@ -643,7 +649,7 @@ async fn callback(
             // Logged with its shape, on the server, where an operator can see
             // it. The browser is told only that it failed.
             tracing::warn!("Google Contacts connect failed: {e}");
-            Redirect::to(&state.service.failure_redirect())
+            Redirect::to(&state.service.failure_redirect(GOOGLE))
         }
     }
 }
@@ -694,10 +700,15 @@ async fn microsoft_callback(
             reason,
             "the Microsoft consent screen returned without a code"
         );
-        return Redirect::to(&state.service.failure_redirect());
+        return Redirect::to(&state.service.failure_redirect(MICROSOFT));
     }
     let (Some(code), Some(state_param)) = (query.code.as_deref(), query.state.as_deref()) else {
-        return Redirect::to(&state.service.failure_redirect());
+        tracing::warn!(
+            has_code = query.code.is_some(),
+            has_state = query.state.is_some(),
+            "the Microsoft callback arrived without a code or state"
+        );
+        return Redirect::to(&state.service.failure_redirect(MICROSOFT));
     };
     match state
         .service
@@ -707,7 +718,7 @@ async fn microsoft_callback(
         Ok(destination) => Redirect::to(&destination),
         Err(e) => {
             tracing::warn!("Microsoft 365 Contacts connect failed: {e}");
-            Redirect::to(&state.service.failure_redirect())
+            Redirect::to(&state.service.failure_redirect(MICROSOFT))
         }
     }
 }

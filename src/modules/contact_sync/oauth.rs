@@ -324,21 +324,34 @@ pub enum TokenError {
 }
 
 // SPEC-15.655
-impl From<TokenError> for AppError {
-    fn from(value: TokenError) -> Self {
-        match value {
-            TokenError::GrantRevoked => AppError::BadRequest(
-                "Google has revoked this connection. Connect the account again.".to_string(),
-            ),
+impl TokenError {
+    /// The error a caller sees, worded for the provider that produced it:
+    /// Microsoft reuses this type, so the provider name is an argument.
+    pub fn into_app_error(self, provider: &str) -> AppError {
+        let name = if provider == "microsoft" {
+            "Microsoft"
+        } else {
+            "Google"
+        };
+        match self {
+            TokenError::GrantRevoked => AppError::BadRequest(format!(
+                "{name} has revoked this connection. Connect the account again."
+            )),
             // The provider's own words, never the request: the request carried
             // the client secret and the authorization code.
             TokenError::Refused(detail) => {
-                AppError::external_service("google", format!("token request refused: {detail}"))
+                AppError::external_service(provider, format!("token request refused: {detail}"))
             }
             TokenError::Transport(detail) => {
-                AppError::external_service("google", format!("token request failed: {detail}"))
+                AppError::external_service(provider, format!("token request failed: {detail}"))
             }
         }
+    }
+}
+
+impl From<TokenError> for AppError {
+    fn from(value: TokenError) -> Self {
+        value.into_app_error("google")
     }
 }
 
@@ -409,7 +422,12 @@ async fn post_token(
         .await
         .map_err(|e| TokenError::Transport(e.to_string()))?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    // An unreadable body hides the error code that decides GrantRevoked, so
+    // say so rather than classify an empty string silently.
+    let body = response.text().await.unwrap_or_else(|e| {
+        tracing::warn!(status = status.as_u16(), error = %e, "token endpoint body unreadable");
+        String::new()
+    });
     if !status.is_success() {
         return Err(classify_token_error(status.as_u16(), &body));
     }
