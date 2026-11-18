@@ -311,9 +311,9 @@ the error envelope in `src/utils/error.rs`. Authentication extractors and the pe
   `application/json` or `application/<x>+json` (parameters such as charset ignored, case-insensitive), or when the
   header is not visible ASCII, so the extractor rejects it.
 - **SPEC-2.69**: The sanitiser must forward a JSON request unchanged and unbuffered when its Content-Length header is
-  greater than 25 MiB (26,214,400 bytes); the route's own body limit then decides acceptance.
+  greater than 2 MiB (2,097,152 bytes); the route's own body limit then decides acceptance.
 - **SPEC-2.70**: The sanitiser must answer 413 with code `PAYLOAD_TOO_LARGE` and message `The request body could not be
-  read.` when a JSON body with a missing or understated Content-Length cannot be buffered within 25 MiB, and must log a
+  read.` when a JSON body with a missing or understated Content-Length cannot be buffered within 2 MiB, and must log a
   warning naming the path and the cause.
 - **SPEC-2.71**: The sanitiser must forward an empty body, or a body that is not valid JSON, with its original bytes, so
   the `Json` extractor produces the 400.
@@ -1608,7 +1608,7 @@ and are not reused.
   and only if at least one byte changed.
 - **SPEC-4.38**: `utils::text::sanitize_json_body` must forward the request body untouched when the path matches a
   `RAW_BODY_PATHS` prefix, when the `Content-Type` is not JSON, or when a declared `Content-Length` exceeds
-  `MAX_SANITIZED_JSON_BYTES` (25 MB); on a body that parses as JSON it must store the parsed (and possibly
+  `MAX_SANITIZED_JSON_BYTES` (2 MiB); on a body that parses as JSON it must store the parsed (and possibly
   sanitized) tree as a `ParsedJsonBody` request extension, replace the body with an empty one and remove
   `Content-Length`; on an empty or unparseable body it must forward the original bytes untouched.
 
@@ -1966,7 +1966,7 @@ is cited at its code site with a `// SPEC-4.<n>` comment.
   `verify_password` returns `Ok(false)` only for a wrong password and an `Internal` error for an unparseable stored
   hash, and `verify_password_call_count` counts every verification including the dummy one (src/utils/crypto.rs).
 - **SPEC-4.1010**: `sanitize_json_body` sanitizes only `application/json` and `application/*+json` bodies, and
-  answers HTTP 413 `PAYLOAD_TOO_LARGE` when a body without a declared length exceeds the 25 MiB buffer cap
+  answers HTTP 413 `PAYLOAD_TOO_LARGE` when a body without a declared length exceeds the 2 MiB buffer cap
   (src/utils/text.rs).
 - **SPEC-4.1011**: `slugify` keeps Unicode alphanumerics, turns every other character into a separator, and joins the
   non-empty groups with a single `-`, so leading and trailing separators never appear (src/utils/validation.rs).
@@ -6709,6 +6709,8 @@ each route tree and the layers every request passes through.
 - **SPEC-12.2**: A `GET` request that none of the seven trees handles, including `GET /`, must answer `404` with an HTML
   page whose title is `API endpoint`, whose heading is `This is an API endpoint.`, that carries `<meta name="robots"
   content="noindex">`, and that lists no route.
+  A non-`GET` request to a path no tree handles must answer `405` with an `Allow` header, not the `404` page, because
+  the fallback is a `GET`-only handler.
 - **SPEC-12.3**: The fallback page must link to `https://` followed by the remainder of the `Host` header when the
   header begins with `api.msp.`, and otherwise (including when `Host` is absent or not visible ASCII) to the client
   origin passed to `create_api_router`; no domain may be hard-coded.
@@ -6728,9 +6730,9 @@ each route tree and the layers every request passes through.
 - **SPEC-12.8**: JSON body sanitising must run on the full pre-nesting path and must forward the body unchanged for
   paths beginning `/api/v1/bunyip/`, `/api/v1/rmm/alerts`, `/api/v1/rmm/status`, `/api/v1/stripe/`, `/api/v1/paypal/`
   and `/api/v1/webhooks/`, whose signatures cover the raw bytes (SPEC-4.38).
-- **SPEC-12.9**: A JSON request whose declared `Content-Length` is at most 25 MiB must be read in full by the sanitiser
+- **SPEC-12.9**: A JSON request whose declared `Content-Length` is at most 2 MiB must be read in full by the sanitiser
   whatever default body limit the route carries; one declaring more must be forwarded unread to the route's extractor; a
-  body of unknown length that exceeds 25 MiB must be answered `413` with a message containing `The request body could
+  body of unknown length that exceeds 2 MiB must be answered `413` with a message containing `The request body could
   not be read.` and a `warn` log naming the path.
 - **SPEC-12.10**: Each route that accepts a file must carry its own body limit equal to its logical size cap plus 64 KiB
   of multipart framing (SPEC-4.24): ticket attachments and inline images, the tenant logo, KB article images, vCard
@@ -6741,7 +6743,8 @@ each route tree and the layers every request passes through.
 
 - **SPEC-12.11**: The CORS layer must allow the methods `GET`, `POST`, `PUT`, `DELETE`, `PATCH` and `OPTIONS`, the
   request headers `Authorization`, `Content-Type`, `Accept` and `X-Forwarded-Host`, must allow credentials, must cache
-  preflight answers for 600 seconds, and must expose no response headers.
+  preflight answers for 600 seconds, and must expose the response headers `Retry-After`, `WWW-Authenticate` and
+  `Content-Disposition` so a cross-origin browser client can read them.
 - **SPEC-12.12**: A request whose `Origin` matches no `CORS_ORIGIN` entry, or that has none, must receive no
   `Access-Control-Allow-Origin` header and must still be processed by the route; CORS is not an access control on the
   server side.
