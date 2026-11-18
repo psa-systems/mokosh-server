@@ -5562,7 +5562,7 @@ Third-party HTTPS calls use `reqwest` with rustls; the SMTP transport uses the p
 
 ## 9. Data model and migrations
 
-Every migration under `migrations/` is embedded at compile time via `sqlx::migrate!` and runs once, in filename order, against `mokosh_migrator`. Committed migrations are immutable (`common/scripts/check-migration-immutability.nu` fails CI on any modification, rename or deletion), so every `SPEC-9.<n>` requirement sourced from a migration is enforced solely by that migration having already run; none of the 293 migration files below carry an inline `// SPEC-9.<n>` comment, and this section is their only citation. `scripts/test-db-roles.sql` and `scripts/wipe_demo_seed.sql` are the only two files in this section's scope that are not migrations and that do carry inline `// SPEC-9.<n>` comments at their implementing statements.
+Every migration under `migrations/` is embedded at compile time via `sqlx::migrate!` and runs once, in filename order, against `mokosh_migrator`. Committed migrations are immutable (`common/scripts/check-migration-immutability.nu` fails CI on any modification, rename or deletion), so every `SPEC-9.<n>` requirement sourced from a migration is enforced solely by that migration having already run; none of the 298 migration files below carry an inline `// SPEC-9.<n>` comment, and this section is their only citation. `scripts/test-db-roles.sql` and `scripts/wipe_demo_seed.sql` are the only two files in this section's scope that are not migrations and that do carry inline `// SPEC-9.<n>` comments at their implementing statements.
 
 ### Tenancy
 
@@ -5875,6 +5875,13 @@ Every migration under `migrations/` is embedded at compile time via `sqlx::migra
   `checked_by_user_id` constrained by `kb_execution_step_check_pair` to be both set or both NULL). Both tables carry their own
   `tenant_id`, tenant and lookup indexes (plus `kb_article_execution_steps_id_uq`), ENABLE plus FORCE row level security with the fail-closed `tenant_isolation` policy
   (USING and WITH CHECK), and `GRANT SELECT, INSERT, UPDATE, DELETE` to `mokosh_app`.
+- **SPEC-9.1002**: migrations/297_user_role_read_only.sql widens the CHECK on `users.role` and on `tenant_invitations.role` (migration
+  035) to accept `'read_only'`, promoting bunyip's existing `read_only` grant role to a first-class mokosh `UserRole` so `map_grant_role`
+  no longer projects a `read_only` grantee onto `technician`. No data migration is needed: the pre-widened CHECK refused `read_only`, so
+  no existing row can carry it.
+- **SPEC-9.1003**: migrations/298_widen_bill_payment_method_paypal.sql widens the `bill_payments.payment_method` CHECK to include
+  `'paypal'`, closing the gap migration 287 opened by copying the pre-paypal `payments` vocabulary without picking up the `'paypal'` the
+  earlier migration 233 had already added to `payments`. The two tables' method vocabularies are now in step again.
 
 ## 10. Build, CI and deployment
 

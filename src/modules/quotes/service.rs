@@ -247,17 +247,28 @@ impl QuotesService {
 
     /// Load a quote's status, or 404. Used by the mutating paths to
     /// enforce the freeze rules before doing any work.
+    ///
+    /// PMS-1661 F4: `SELECT ... FOR UPDATE` on the quote row, because
+    /// every caller is a mutation path (update_quote, send_quote,
+    /// decide_quote, add_line, update_line, delete_line) and the read
+    /// drives a status-transition check. Without the lock, two
+    /// concurrent send_quote calls could both see `draft` and both
+    /// mail the client, and two concurrent accept/decline calls could
+    /// both pass the single-decision guard. `convert_quote` and
+    /// `apply_decision` already lock the row; this closes the gap for
+    /// the rest.
     async fn status_of(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         quote_id: Uuid,
     ) -> AppResult<QuoteStatus> {
-        let raw: Option<String> =
-            sqlx::query_scalar("SELECT status FROM quotes WHERE tenant_id = $1 AND id = $2")
-                .bind(tenant_id)
-                .bind(quote_id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let raw: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM quotes WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(quote_id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let raw = raw.ok_or_else(|| AppError::NotFound("Quote".to_string()))?;
         // PMS-1661 F2: an unknown stored status used to map to Draft
         // silently, and Draft is editable + settable, so a corrupt
