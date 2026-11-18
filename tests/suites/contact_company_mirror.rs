@@ -158,9 +158,8 @@ async fn an_email_intake_contact_keeps_its_company_when_edited(pool: PgPool) {
 /// The tenant's provisioned portal admin contact survives an edit and still
 /// gets a deliverable portal grant email afterwards.
 ///
-/// Driven through `TenantService::insert_portal_admin_contact`, the writer that
-/// provisioning uses, rather than a fixture copy of its INSERT. Two details of
-/// the shape are worth knowing before reading the steps:
+/// Seeded with the row shape the retired create-time provisioner wrote. Two
+/// details of the shape are worth knowing before reading the steps:
 ///
 /// - that contact is created `is_portal_user = TRUE`, so the grant that mails a
 ///   setup link is the false -> true flip on `PUT /contacts/contacts/{id}`,
@@ -183,18 +182,36 @@ async fn a_provisioned_portal_admin_contact_is_still_mailable_after_an_edit(pool
         .ensure_own_company(common::DEFAULT_TENANT_ID)
         .await
         .expect("tenant own company");
-    let contact_id = tenants
-        .insert_portal_admin_contact(
-            common::DEFAULT_TENANT_ID,
-            "portal.admin@mcl.example",
-            "Portal",
-            "Admin",
-        )
+    let own_company: Uuid = sqlx::query_scalar("SELECT own_company_id FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
         .await
-        .expect("provision portal admin contact");
-    let own_company = company_of(&pool, contact_id)
-        .await
-        .expect("the provisioned contact carries a company_id");
+        .expect("own company id");
+    // The shape the retired create-time provisioner wrote: a portal admin
+    // contact on the own company with its primary `contact_companies` link.
+    let contact_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contacts (id, tenant_id, company_id, first_name, last_name, email, \
+                               is_portal_user, portal_role, contact_type, status) \
+         VALUES ($1, $2, $3, 'Portal', 'Admin', 'portal.admin@mcl.example', TRUE, 'admin', \
+                 'primary', 'active')",
+    )
+    .bind(contact_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(own_company)
+    .execute(&pool)
+    .await
+    .expect("seed portal admin contact");
+    sqlx::query(
+        "INSERT INTO contact_companies (tenant_id, contact_id, company_id, is_primary, sort_order) \
+         VALUES ($1, $2, $3, TRUE, 0)",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contact_id)
+    .bind(own_company)
+    .execute(&pool)
+    .await
+    .expect("seed primary company link");
     assert_eq!(
         primary_link_of(&pool, contact_id).await,
         Some(own_company),
