@@ -274,14 +274,14 @@ No configuration changes.
 | <a id="var-storage-s3-path-style"></a>`STORAGE_S3_PATH_STYLE` | no, default `true` | v0.15.0 | `compose.dev.yml` | Path-style addressing, which every non-AWS store serves; `false` selects virtual-hosted. |
 | <a id="var-storage-s3-access-key-id"></a>`STORAGE_S3_ACCESS_KEY_ID` | no, needed when `STORAGE_PROVIDER=s3` | v0.15.0 | `compose.dev.yml` | Access key id. |
 | <a id="var-storage-s3-secret-access-key"></a>`STORAGE_S3_SECRET_ACCESS_KEY` | no, needed when `STORAGE_PROVIDER=s3` | v0.15.0 | `compose.dev.yml` | Secret access key. |
-| <a id="var-storage-backend"></a>`STORAGE_BACKEND` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_PROVIDER` | `compose.dev.yml` | Deprecated alias, honoured only when the new name is unset; using it logs a line naming the replacement, and `mokosh-server provider-status` reports which name supplied each setting. Removal is PMS-1443. |
-| <a id="var-attachment-dir"></a>`ATTACHMENT_DIR` | no | v0.4.0; deprecated in v0.15.0, use `STORAGE_ROOT` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-endpoint"></a>`S3_ENDPOINT` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ENDPOINT` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-bucket"></a>`S3_BUCKET` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_BUCKET` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-region"></a>`S3_REGION` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_REGION` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-path-style"></a>`S3_PATH_STYLE` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_PATH_STYLE` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-access-key-id"></a>`S3_ACCESS_KEY_ID` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ACCESS_KEY_ID` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-secret-access-key"></a>`S3_SECRET_ACCESS_KEY` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_SECRET_ACCESS_KEY` | `compose.dev.yml` | Deprecated alias, as above. |
+| <a id="var-storage-backend"></a>`STORAGE_BACKEND` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_PROVIDER` | `compose.dev.yml` | Retired by PMS-1443: setting it refuses boot and the error names the replacement. Edit your compose file to use the new name. |
+| <a id="var-attachment-dir"></a>`ATTACHMENT_DIR` | no | v0.4.0; deprecated in v0.15.0, use `STORAGE_ROOT` | `compose.dev.yml` | Retired, as above. |
+| <a id="var-s3-endpoint"></a>`S3_ENDPOINT` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ENDPOINT` | `compose.dev.yml` | Retired, as above. |
+| <a id="var-s3-bucket"></a>`S3_BUCKET` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_BUCKET` | `compose.dev.yml` | Retired, as above. |
+| <a id="var-s3-region"></a>`S3_REGION` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_REGION` | `compose.dev.yml` | Retired, as above. |
+| <a id="var-s3-path-style"></a>`S3_PATH_STYLE` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_PATH_STYLE` | `compose.dev.yml` | Retired, as above. |
+| <a id="var-s3-access-key-id"></a>`S3_ACCESS_KEY_ID` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ACCESS_KEY_ID` | `compose.dev.yml` | Retired, as above. |
+| <a id="var-s3-secret-access-key"></a>`S3_SECRET_ACCESS_KEY` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_SECRET_ACCESS_KEY` | `compose.dev.yml` | Retired, as above. |
 | <a id="var-attachment-max-bytes"></a>`ATTACHMENT_MAX_BYTES` | no, default 25 MiB | v0.4.0 | `.env` | Per-attachment size cap in bytes. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
 | <a id="var-kb-attachment-max-bytes"></a>`KB_ATTACHMENT_MAX_BYTES` | no, default 5 MiB | v0.14.0 | `.env` | Cap on an image embedded in a knowledge base article (PMS-923). Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
 | <a id="var-tenant-logo-max-bytes"></a>`TENANT_LOGO_MAX_BYTES` | no, default 1 MiB | v0.12.0 | `.env` | Cap on an uploaded tenant logo. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |

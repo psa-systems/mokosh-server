@@ -888,7 +888,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // silently degraded to LogMailer.
     //
     // PMS-1013: the email provider selection is named through `MAIL_PROVIDER`
-    // (`log` or `smtp`), matching `SECRET_BACKEND` / `STORAGE_BACKEND` for the
+    // (`log` or `smtp`), matching `SECRET_PROVIDER` / `STORAGE_PROVIDER` for the
     // adjacent seams. The hosting profile supplies the default; an explicit
     // choice overrides. `MAIL_PROVIDER=smtp` with no `SMTP_HOST` refuses to
     // boot (the class of misconfiguration this seam exists to catch), and the
