@@ -2685,9 +2685,10 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   with 403 `Access to this organization is not active` when the slug resolves to no tenant; a slug lookup or grantee
   lookup error on the local-state path must request userinfo instead.
 - **SPEC-5.172**: The grantee role must be `map_grant_role(mokosh_grant_role)` (`admin`, `manager`, `technician`,
-  `finance`, `read_only` mapping to Technician); an absent or unknown value must log at info and be refused with 403
+  `finance`, `read_only` mapping to ReadOnly); an absent or unknown value must log at info and be refused with 403
   `Access to this organization is not active`; a stored role that differs must be updated best effort (warn on failure)
-  while the request uses the grant role.
+  while the request uses the grant role. (This `read_only` Bunyip grant role is distinct from the first-class
+  `UserRole::ReadOnly` whose write refusal is SPEC-5.423a.)
 - **SPEC-5.173**: A first-sight grantee must be provisioned only with a non-blank verified email; otherwise the request
   must be refused with 403 `Couldn't confirm your identity for this shared account. Contact the account owner or
   support with the time of this attempt so they can check the server log.`, and a provisioning write failure must log a
@@ -2785,7 +2786,7 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   warning naming the grantee and account and must not change the 200 answer. A `granted` event, or a revoked event that
   changed no mirror row, must not touch `users`.
 - **SPEC-5.217**: `map_grant_role` must map the Bunyip role names `admin`, `manager`, `technician` and `finance` to the
-  Mokosh roles of the same name, must map `read_only` to the Technician role, and must return `None` for any other
+  Mokosh roles of the same name, must map `read_only` to the ReadOnly role, and must return `None` for any other
   value so the caller refuses placement.
 - **SPEC-5.218**: `MokoshBunyipGrantService::is_grant_active` must return true only when a `mokosh_bunyip_grants` row
   exists for the (grantee, `mokosh_account_id`) pair with `revoked_at` NULL and a non-NULL role; it must return false
@@ -3315,6 +3316,10 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.423**: The built-in role "Read-Only" (builtin_key "read_only") must hold exactly tickets:read, invoices:read,
   quotes:read, contracts:read, assets:read, projects:read, kb:read and notifications:read, and BUILTIN_ROLES must list
   the three built-in roles in the order Billing Contact, Support Contact, Read-Only with their builtin_key values.
+- **SPEC-5.423a**: `RequireWriteAccess` and the `require_write_for_mutations` middleware (`src/modules/auth/middleware.rs`)
+  must refuse any request whose caller's `UserRole::can_write()` is false; a handler that mutates state must take
+  `RequireWriteAccess` in place of `RequireAuth`. `ReadOnly` (see SPEC-5.172, SPEC-5.217) is currently the only role this
+  refuses.
 - **SPEC-5.424**: The areas a contact can request access to (ACCESS_AREAS) must be exactly: invoices (already reachable
   when the contact holds invoices:read, granted by Billing Contact), tickets (tickets:read, Support Contact), quotes
   (quotes:read, Billing Contact), contracts (contracts:read, Read-Only), assets (assets:read, Read-Only), projects
@@ -5557,7 +5562,7 @@ Third-party HTTPS calls use `reqwest` with rustls; the SMTP transport uses the p
 
 ## 9. Data model and migrations
 
-Every migration under `migrations/` is embedded at compile time via `sqlx::migrate!` and runs once, in filename order, against `mokosh_migrator`. Committed migrations are immutable (`common/scripts/check-migration-immutability.nu` fails CI on any modification, rename or deletion), so every `SPEC-9.<n>` requirement sourced from a migration is enforced solely by that migration having already run; none of the 293 migration files below carry an inline `// SPEC-9.<n>` comment, and this section is their only citation. `scripts/test-db-roles.sql` and `scripts/wipe_demo_seed.sql` are the only two files in this section's scope that are not migrations and that do carry inline `// SPEC-9.<n>` comments at their implementing statements.
+Every migration under `migrations/` is embedded at compile time via `sqlx::migrate!` and runs once, in filename order, against `mokosh_migrator`. Committed migrations are immutable (`common/scripts/check-migration-immutability.nu` fails CI on any modification, rename or deletion), so every `SPEC-9.<n>` requirement sourced from a migration is enforced solely by that migration having already run; none of the 298 migration files below carry an inline `// SPEC-9.<n>` comment, and this section is their only citation. `scripts/test-db-roles.sql` and `scripts/wipe_demo_seed.sql` are the only two files in this section's scope that are not migrations and that do carry inline `// SPEC-9.<n>` comments at their implementing statements.
 
 ### Tenancy
 
@@ -5870,6 +5875,13 @@ Every migration under `migrations/` is embedded at compile time via `sqlx::migra
   `checked_by_user_id` constrained by `kb_execution_step_check_pair` to be both set or both NULL). Both tables carry their own
   `tenant_id`, tenant and lookup indexes (plus `kb_article_execution_steps_id_uq`), ENABLE plus FORCE row level security with the fail-closed `tenant_isolation` policy
   (USING and WITH CHECK), and `GRANT SELECT, INSERT, UPDATE, DELETE` to `mokosh_app`.
+- **SPEC-9.1002**: migrations/297_user_role_read_only.sql widens the CHECK on `users.role` and on `tenant_invitations.role` (migration
+  035) to accept `'read_only'`, promoting bunyip's existing `read_only` grant role to a first-class mokosh `UserRole` so `map_grant_role`
+  no longer projects a `read_only` grantee onto `technician`. No data migration is needed: the pre-widened CHECK refused `read_only`, so
+  no existing row can carry it.
+- **SPEC-9.1003**: migrations/298_widen_bill_payment_method_paypal.sql widens the `bill_payments.payment_method` CHECK to include
+  `'paypal'`, closing the gap migration 287 opened by copying the pre-paypal `payments` vocabulary without picking up the `'paypal'` the
+  earlier migration 233 had already added to `payments`. The two tables' method vocabularies are now in step again.
 
 ## 10. Build, CI and deployment
 

@@ -401,6 +401,17 @@ impl TimeTrackingService {
         if let Some(ticket_id) = request.ticket_id {
             assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
         }
+        // PMS-1662: the project / task FKs are plain REFERENCES (no
+        // composite with tenant_id), so without this check a request
+        // body could attach an entry to another tenant's project or
+        // task. Mirror the ticket / company / work-type pattern above
+        // so cross-tenant ids 404 rather than being written.
+        if let Some(project_id) = request.project_id {
+            assert_project_in_tenant(&mut *tx, tenant_id, project_id).await?;
+        }
+        if let Some(task_id) = request.task_id {
+            assert_task_in_tenant(&mut *tx, tenant_id, task_id).await?;
+        }
         // PMS-942: whose time this is, settled before anything is priced. It
         // decides whether the entry can be billed at all, so resolving it after
         // `resolve_billing` would mean pricing employee time and then throwing
@@ -614,6 +625,13 @@ impl TimeTrackingService {
         // (PMS-315 review hardening; same fix applied to mileage_entries).
         if let Some(ticket_id) = request.ticket_id {
             assert_ticket_in_tenant(&mut *tx, tenant_id, ticket_id).await?;
+        }
+        // PMS-1662: the same hole as create for project_id / task_id.
+        if let Some(project_id) = request.project_id {
+            assert_project_in_tenant(&mut *tx, tenant_id, project_id).await?;
+        }
+        if let Some(task_id) = request.task_id {
+            assert_task_in_tenant(&mut *tx, tenant_id, task_id).await?;
         }
         // The UPDATE binds ticket_id / project_id straight from the request, so
         // re-derive work_category from those same post-update values (PMS-394).
@@ -1088,11 +1106,11 @@ impl TimeTrackingService {
         let anchor = monday_anchor(week_start);
         let week_end = anchor + chrono::Duration::days(7);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        // RETURNING the rows that actually transitioned (approval_status was
-        // 'pending') gives us exactly the set to consume hours for, and the
-        // `pending` guard makes re-approval idempotent: a second call returns
-        // no rows, so consume_hours is not double-counted (PMS-405).
-        let approved: Vec<(Uuid,)> = sqlx::query_as(
+        // The `pending` guard makes re-approval idempotent: a second call
+        // affects no rows. The RETURNING/row collection that used to feed
+        // consume_hours is gone (consumption moved to creation per
+        // PMS-944), so the query runs as a plain `execute`.
+        sqlx::query(
             r#"
             UPDATE time_entries
             SET approval_status = 'approved',
@@ -1109,7 +1127,6 @@ impl TimeTrackingService {
               AND date     >= $3
               AND date      < $4
               AND approval_status = 'pending'
-            RETURNING id
             "#,
         )
         .bind(tenant_id)
@@ -1117,11 +1134,10 @@ impl TimeTrackingService {
         .bind(anchor)
         .bind(week_end)
         .bind(approver_id)
-        .fetch_all(&mut *tx)
+        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
 
-        let _ = approved.len();
         // PMS-951: approval is NOT the consumption point any more, and must not
         // draw a second time. PMS-405 put it here because approval was then the
         // moment an entry became real; PMS-944 moved that to creation, and
@@ -1473,6 +1489,11 @@ impl TimeTrackingService {
         if let Some(work_type_id) = request.work_type_id {
             fetch_work_type_defaults(&mut *tx, tenant_id, work_type_id).await?;
         }
+        // PMS-1662: see create_time_entry; project / task FKs are plain
+        // REFERENCES on active_timers.
+        if let Some(project_id) = request.project_id {
+            assert_project_in_tenant(&mut *tx, tenant_id, project_id).await?;
+        }
 
         let id = Uuid::new_v4();
         let started_at: chrono::DateTime<Utc> = match sqlx::query_scalar(
@@ -1552,12 +1573,27 @@ impl TimeTrackingService {
         // hours. The owner's zone rather than the caller's, because the entry
         // is theirs.
         let owner_tz: String =
-            sqlx::query_scalar("SELECT timezone FROM users WHERE id = $1 AND tenant_id = $2")
+            match sqlx::query_scalar("SELECT timezone FROM users WHERE id = $1 AND tenant_id = $2")
                 .bind(timer.user_id)
                 .bind(tenant_id)
                 .fetch_optional(&mut *tx)
                 .await?
-                .unwrap_or_else(|| "UTC".to_string());
+            {
+                Some(tz) => tz,
+                None => {
+                    // PMS-1662 F3: an unreadable or missing zone used to
+                    // silently become UTC and a timer stopped from, say, PST
+                    // at 9pm would record a `date` in tomorrow's PST day.
+                    // Keep the UTC fallback (stopping a timer with no zone
+                    // row is better than refusing) but log the offending
+                    // user so a drift to the wrong day is findable.
+                    tracing::warn!(
+                        user_id = %timer.user_id,
+                        "stop_timer: no timezone row for the timer owner; falling back to UTC"
+                    );
+                    "UTC".to_string()
+                }
+            };
         let today = mokosh_types::datetime::user_today(now, &owner_tz);
 
         // Active timer might not carry work_type_id / company_id; the
@@ -1916,6 +1952,46 @@ where
         .fetch_optional(exec)
         .await?
         .ok_or_else(|| AppError::NotFound("Ticket".to_string()))
+}
+
+/// PMS-1662: `time_entries.project_id` and `.task_id` are plain `UUID`
+/// columns with NO foreign-key constraint (migration 006), so they are
+/// soft pointers: an id that resolves to nothing is accepted, matching
+/// the historical behaviour the integration tests rely on, but an id
+/// that resolves on `projects` / `tasks` in a different tenant 404s
+/// to close the cross-tenant leak PMS-1662 names.
+async fn assert_project_in_tenant<'e, E>(
+    exec: E,
+    tenant_id: TenantId,
+    project_id: Uuid,
+) -> AppResult<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT tenant_id FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(exec)
+        .await?;
+    match owner {
+        None => Ok(()),
+        Some(owner_tenant) if owner_tenant == *tenant_id => Ok(()),
+        Some(_) => Err(AppError::NotFound("Project".to_string())),
+    }
+}
+
+async fn assert_task_in_tenant<'e, E>(exec: E, tenant_id: TenantId, task_id: Uuid) -> AppResult<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT tenant_id FROM tasks WHERE id = $1")
+        .bind(task_id)
+        .fetch_optional(exec)
+        .await?;
+    match owner {
+        None => Ok(()),
+        Some(owner_tenant) if owner_tenant == *tenant_id => Ok(()),
+        Some(_) => Err(AppError::NotFound("Task".to_string())),
+    }
 }
 
 /// Assert a company belongs to the tenant. `NotFound` cross-tenant.
@@ -2413,6 +2489,41 @@ struct TimeEntryRow {
 // SPEC-14.27: worked_minutes falls back to duration_minutes.
 impl From<TimeEntryRow> for TimeEntryResponse {
     fn from(r: TimeEntryRow) -> Self {
+        // PMS-1662 F5: an unparseable `billing_status` or `approval_status`
+        // used to map to the enum default via `unwrap_or_default()` with no
+        // trace, so corrupt data read as a valid pending/ready-to-bill
+        // state. Keep the default fallback (a From impl cannot propagate),
+        // but WARN with the offending value so a drift is findable.
+        let billing_status = r
+            .billing_status
+            .as_deref()
+            .and_then(|s| {
+                let parsed = BillingStatus::from_str(s);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        entry_id = %r.id,
+                        stored = %s,
+                        "time_entries.billing_status is not one of the known values; reading as default"
+                    );
+                }
+                parsed
+            })
+            .unwrap_or_default();
+        let approval_status = r
+            .approval_status
+            .as_deref()
+            .and_then(|s| {
+                let parsed = ApprovalStatus::from_str(s);
+                if parsed.is_none() {
+                    tracing::warn!(
+                        entry_id = %r.id,
+                        stored = %s,
+                        "time_entries.approval_status is not one of the known values; reading as default"
+                    );
+                }
+                parsed
+            })
+            .unwrap_or_default();
         Self {
             id: r.id,
             user_id: r.user_id,
@@ -2440,18 +2551,10 @@ impl From<TimeEntryRow> for TimeEntryResponse {
                 .unwrap_or_else(|| ENTRY_KIND_CLIENT.to_string()),
             notes: r.notes,
             is_billable: r.is_billable.unwrap_or(true),
-            billing_status: r
-                .billing_status
-                .as_deref()
-                .and_then(BillingStatus::from_str)
-                .unwrap_or_default(),
+            billing_status,
             hourly_rate: r.hourly_rate,
             total_amount: r.total_amount,
-            approval_status: r
-                .approval_status
-                .as_deref()
-                .and_then(ApprovalStatus::from_str)
-                .unwrap_or_default(),
+            approval_status,
             work_category: r.work_category,
             created_at: r.created_at,
             updated_at: r.updated_at,

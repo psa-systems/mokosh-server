@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sqlx::Row;
+use sqlx::{Acquire, Row};
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -89,15 +89,31 @@ impl ScheduledDashboardsWorker {
             let cron_expr: String = row.try_get("cron_expr")?;
             let recipient_email: Option<String> = row.try_get("recipient_email")?;
 
-            let outcome = self
-                .materialise_and_enqueue(
-                    &mut tx,
-                    tenant_id,
-                    dashboard_id,
-                    user_id,
-                    recipient_email.as_deref(),
-                )
-                .await;
+            // PMS-1665 F: nested transaction so a failed delivery
+            // does not poison the outer tick's tx (see the matching
+            // comment in saved_reports/worker.rs).
+            let outcome = {
+                let mut inner = tx.begin().await?;
+                let result = self
+                    .materialise_and_enqueue(
+                        &mut inner,
+                        tenant_id,
+                        dashboard_id,
+                        user_id,
+                        recipient_email.as_deref(),
+                    )
+                    .await;
+                match result {
+                    Ok(()) => {
+                        inner.commit().await?;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        drop(inner);
+                        Err(e)
+                    }
+                }
+            };
 
             // Advance the schedule regardless of outcome. A failing
             // render should not stall its next cadence; the

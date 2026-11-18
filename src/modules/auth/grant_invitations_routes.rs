@@ -18,11 +18,9 @@
 //! when it is present or falling back to the token's stored
 //! invitee id.
 //!
-//! PMS-840 parity record 2026-10-16: none of the seven routes in this
-//! file has a real SPA caller yet. MAPPS-1084 (in progress) is the
-//! accept/decline UI that will call the by-token surface; the owner and
-//! grantee list/revoke surfaces have no tracked SPA work yet either. The
-//! note comes off once a real caller lands.
+//! The by-token get/accept/decline routes have a SPA caller
+//! (MAPPS-1084 accept-grant page). The owner outbox, grantee inbox,
+//! and id-scoped cancel/accept/decline routes do not yet.
 
 use crate::utils::json::Json;
 use axum::{
@@ -351,6 +349,21 @@ async fn create_invitation(
                 "You cannot invite yourself.".to_string(),
             ));
         }
+    }
+    // PMS-1658: reject an unknown grant role at create time with a
+    // precise 422, rather than storing it and failing opaquely later
+    // when `map_grant_role` returns None at accept / consume. The
+    // vocabulary mirrors BUNYIP-674's PMS-1162 set + `read_only` from
+    // migration 297.
+    const GRANT_ROLES: &[&str] = &["admin", "manager", "technician", "finance", "read_only"];
+    let role_trimmed = body.role.trim();
+    if !GRANT_ROLES.contains(&role_trimmed) {
+        return Err(AppError::validation_field(
+            "role",
+            format!(
+                "must be one of 'admin', 'manager', 'technician', 'finance', 'read_only'; got '{role_trimmed}'"
+            ),
+        ));
     }
     // PMS-1208 SaaS-mode gate: in the bunyip-federated deployment
     // (`bunyip_directory` is `Some`) the grantee eventually signs in
@@ -798,14 +811,20 @@ async fn decline_invitation(
 /// uses the same shape. Returns `None` for a legacy local user who has no
 /// Bunyip sub yet so the caller falls through to a 404 rather than a 500.
 async fn resolve_caller_bunyip_sub(db: &Database, user_id: Uuid) -> AppResult<Option<Uuid>> {
+    // `users.bunyip_user_id` is nullable: decode as `Option<Option<Uuid>>`
+    // and flatten so a NULL column reaches the "no sub -> None -> 404"
+    // branch instead of becoming a decode error (500). Same shape as
+    // `my_grants::leave_grant`.
     // SAFETY (PMS-285): identity-plane read of the caller's own row; the
     // grantee surface is cross-tenant by design and holds no scoped tenant
-    // GUC. Matches the shape `my_grants::leave_grant` uses.
-    let sub: Option<Uuid> =
-        sqlx::query_scalar("SELECT bunyip_user_id FROM users WHERE id = $1 LIMIT 1")
-            .bind(user_id)
-            .fetch_optional(db.pool())
-            .await?;
+    // GUC.
+    let sub: Option<Uuid> = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT bunyip_user_id FROM users WHERE id = $1 LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(db.pool())
+    .await?
+    .flatten();
     Ok(sub)
 }
 

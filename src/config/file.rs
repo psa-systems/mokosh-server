@@ -152,6 +152,27 @@ impl FileProvider {
             }
         }
 
+        // The loop above only walks REGISTRY, so a file named for something
+        // that is not registered is silently ignored. The doc comment above
+        // promises one warn per such file; emit it here.
+        let registered: std::collections::HashSet<&'static str> =
+            REGISTRY.iter().map(|k| k.name()).collect();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else {
+                    continue;
+                };
+                if !registered.contains(name_str) {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        "the file configuration provider ignored a file whose \
+                         name is not a registered key"
+                    );
+                }
+            }
+        }
+
         Self {
             root: Some(dir),
             values: RwLock::new(values),

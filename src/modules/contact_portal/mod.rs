@@ -20,5 +20,5 @@ pub mod service;
 
 pub use middleware::{ContactAuthMiddleware, ContactAuthState, RequireContactAuth};
 pub use payment_methods::PaymentMethodsService;
-pub use routes::contact_routes;
+pub use routes::{apply_contact_auth_layer, contact_routes};
 pub use service::ContactAuthService;

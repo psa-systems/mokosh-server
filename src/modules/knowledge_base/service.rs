@@ -305,6 +305,26 @@ impl KbService {
         request: &UpsertKbCategoryRequest,
     ) -> AppResult<KbCategoryResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1664 finding: create rejects a duplicate slug with a
+        // named 409, but update used to let the DB unique index
+        // decide and the caller saw a generic 500. Probe here with
+        // the same shape, excluding the row being updated so a PUT
+        // that keeps its own slug still passes.
+        let clash: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kb_categories \
+             WHERE tenant_id = $1 AND slug = $2 AND id <> $3)",
+        )
+        .bind(tenant_id)
+        .bind(&request.slug)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if clash {
+            return Err(AppError::Conflict(format!(
+                "KbCategory slug '{}' already exists",
+                request.slug
+            )));
+        }
         let n = sqlx::query(
             r#"UPDATE kb_categories SET
                   name = $3, description = $4, parent_id = $5, slug = $6,
@@ -547,8 +567,13 @@ impl KbService {
         let template_variables: Vec<KbTemplateVariable> =
             request.template_variables.clone().unwrap_or_default();
         Self::validate_template_variables(&template_variables)?;
-        let template_variables_json =
-            serde_json::to_value(&template_variables).unwrap_or_else(|_| serde_json::json!([]));
+        // PMS-1664 finding: a serialize failure here used to swap in
+        // an empty `[]` silently, dropping the author's declared
+        // variables. `KbTemplateVariable` serializes losslessly, so a
+        // failure is a type-system violation; propagate it as
+        // Internal rather than render a partial article.
+        let template_variables_json = serde_json::to_value(&template_variables)
+            .map_err(|e| AppError::Internal(format!("kb template_variables serialize: {e}")))?;
 
         // Resolve the company scope before any write. A
         // `client_specific` article requires a non-empty, tenant-owned
@@ -722,10 +747,13 @@ impl KbService {
         let (template_vars_touch, template_vars_json) = match &request.template_variables {
             Some(vars) => {
                 Self::validate_template_variables(vars)?;
-                (
-                    true,
-                    serde_json::to_value(vars).unwrap_or_else(|_| serde_json::json!([])),
-                )
+                // PMS-1664 finding: same serialize-failure fallback as
+                // the create path; propagate instead of silently
+                // dropping the caller's set.
+                let json = serde_json::to_value(vars).map_err(|e| {
+                    AppError::Internal(format!("kb template_variables serialize: {e}"))
+                })?;
+                (true, json)
             }
             None => (false, serde_json::json!([])),
         };
@@ -774,6 +802,27 @@ impl KbService {
             }
         };
         let before = Self::article_snapshot(&mut tx, tenant_id, id).await?;
+        // PMS-1664 finding: create rejects a duplicate slug with a
+        // named 409 (line 600 above); update deferred to the DB
+        // unique index and surfaced 500. Probe when the caller is
+        // actually changing the slug (request.slug = Some), excluding
+        // this row so an unchanged PUT still passes.
+        if let Some(new_slug) = request.slug.as_deref() {
+            let clash: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM kb_articles \
+                 WHERE tenant_id = $1 AND slug = $2 AND id <> $3)",
+            )
+            .bind(tenant_id)
+            .bind(new_slug)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if clash {
+                return Err(AppError::Conflict(format!(
+                    "KbArticle slug '{new_slug}' already exists",
+                )));
+            }
+        }
         let n = sqlx::query(
             r#"UPDATE kb_articles SET
                 title = COALESCE($3, title),
@@ -2334,9 +2383,27 @@ impl From<ArticleRow> for KbArticleResponse {
             // A row written before migration 292 reads NULL here; the
             // service always writes a non-null array, so a NULL means
             // "none declared".
+            //
+            // PMS-1664 finding: a non-null-but-corrupt stored value used
+            // to read as the empty vec silently, dropping the author's
+            // declared variables from the response. Keep the fallback
+            // (From impl cannot propagate) and WARN with article id +
+            // decode error.
             template_variables: r
                 .template_variables
-                .map(|v| serde_json::from_value::<Vec<KbTemplateVariable>>(v).unwrap_or_default())
+                .map(
+                    |v| match serde_json::from_value::<Vec<KbTemplateVariable>>(v) {
+                        Ok(vars) => vars,
+                        Err(e) => {
+                            tracing::warn!(
+                                article_id = %r.id,
+                                error = %e,
+                                "kb_articles.template_variables failed to decode; reading as empty"
+                            );
+                            Vec::new()
+                        }
+                    },
+                )
                 .unwrap_or_default(),
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -2588,6 +2655,16 @@ impl KbService {
             from.unwrap_or_else(|| today - chrono::Duration::days(ARTICLE_DURATION_WINDOW_DAYS)),
             to.unwrap_or(today),
         );
+        // PMS-1664 finding: an inverted range used to be accepted and
+        // return null figures silently. A caller typing "2026-10-01"
+        // for `from` and "2026-09-01" for `to` learns the mistake only
+        // by reading an empty response. Refuse with 422 at the entry.
+        if from > to {
+            return Err(AppError::validation_field(
+                "to",
+                "to must be on or after from",
+            ));
+        }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let exists: bool = sqlx::query_scalar(

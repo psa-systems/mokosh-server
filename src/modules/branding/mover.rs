@@ -49,8 +49,17 @@ pub async fn move_all(root: PathBuf, db: Database) -> AppResult<()> {
     let mut skipped = 0usize;
     for (legacy_dir, variant) in plan {
         let dir = root.join(legacy_dir);
-        if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
-            continue;
+        // `.unwrap_or(false)` used to treat a permission or I/O error on
+        // the inspect as "directory does not exist", so a legacy
+        // directory that could not be read was silently skipped and its
+        // files were never moved. Match on the Result instead: a real
+        // "absent" is `Ok(false)`, anything else is surfaced.
+        match tokio::fs::try_exists(&dir).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                return Err(AppError::Internal(format!("try_exists {dir:?}: {e}")));
+            }
         }
         let mut rd = tokio::fs::read_dir(&dir)
             .await
@@ -165,14 +174,26 @@ async fn move_one(
         }
     };
 
-    if tokio::fs::try_exists(&new_path).await.unwrap_or(false) {
-        // The new path already carries a file: a write landed since this
-        // run started, or a previous mover pass moved it. Clear the
-        // legacy source so the next read does not fall back onto it.
-        if let Err(e) = tokio::fs::remove_file(legacy_path).await {
-            tracing::warn!(path = %legacy_path.display(), error = %e, "PMS-1397 mover: legacy delete failed");
+    // `.unwrap_or(false)` used to treat an I/O error on the destination
+    // check as "destination absent" and then overwrite whatever happens
+    // to be there. Match the Result: only `Ok(false)` falls through to
+    // the copy. An error bubbles so an operator can act on the real
+    // cause.
+    match tokio::fs::try_exists(&new_path).await {
+        Ok(true) => {
+            // The new path already carries a file: a write landed since
+            // this run started, or a previous mover pass moved it. Clear
+            // the legacy source so the next read does not fall back onto
+            // it.
+            if let Err(e) = tokio::fs::remove_file(legacy_path).await {
+                tracing::warn!(path = %legacy_path.display(), error = %e, "PMS-1397 mover: legacy delete failed");
+            }
+            return Ok(Some(MoveOutcome::Skipped));
         }
-        return Ok(Some(MoveOutcome::Skipped));
+        Ok(false) => {}
+        Err(e) => {
+            return Err(AppError::Internal(format!("try_exists {new_path:?}: {e}")));
+        }
     }
 
     if let Some(parent) = new_path.parent() {

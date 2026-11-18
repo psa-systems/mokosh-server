@@ -98,8 +98,16 @@ pub struct UpsertBusinessHoursRequest {
     pub name: String,
     // SPEC-7.85: timezone defaults to the literal string "UTC" when
     // omitted.
-    // SPEC-7.1035: timezone is not validated at write time.
+    //
+    // PMS-1667: write-time 422 on an invalid IANA timezone. Before this
+    // check, an unknown timezone passed through to `BusinessSchedule::parse`
+    // which silently fell back to UTC at every read, so an admin could save
+    // "Mars/Olympus_Mons" and the evaluator would quietly compute hours in
+    // UTC without ever telling them. Validate against chrono_tz so the DTO
+    // itself refuses the bad value; SPEC-7.1035 recorded the pre-fix "not
+    // validated at write time" shape.
     #[serde(default = "default_utc")]
+    #[validate(custom(function = validate_iana_timezone))]
     pub timezone: String,
     /// Per-day windows, e.g.
     /// `{"mon": [{"start": "09:00", "end": "17:00"}], ...}`.
@@ -122,6 +130,22 @@ fn json_shape_error(code: &'static str, message: String) -> ValidationError {
     let mut error = ValidationError::new(code);
     error.message = Some(message.into());
     error
+}
+
+/// PMS-1667: reject an unknown IANA timezone string at write time rather
+/// than letting `BusinessSchedule::parse` fall back to UTC silently on
+/// every later read. Uses the same `chrono_tz::Tz::from_str` the clock
+/// reads with, so write-time and read-time cannot drift.
+fn validate_iana_timezone(timezone: &str) -> Result<(), ValidationError> {
+    use std::str::FromStr;
+    if chrono_tz::Tz::from_str(timezone).is_ok() {
+        Ok(())
+    } else {
+        Err(json_shape_error(
+            "invalid_timezone",
+            format!("timezone must be an IANA name (e.g. America/New_York, UTC); got {timezone:?}"),
+        ))
+    }
 }
 
 /// Write-time validation of the `schedule` JSONB payload (PMS-604).
@@ -455,5 +479,35 @@ mod tests {
         };
         let errs = req.validate().unwrap_err();
         assert!(errs.field_errors().contains_key("holidays"));
+    }
+
+    /// PMS-1667: known IANA names (plus the literal "UTC") pass; anything
+    /// else fails at write time rather than falling through to the
+    /// read-time UTC fallback.
+    #[test]
+    fn timezone_validator_accepts_known_iana_zones_and_rejects_the_rest() {
+        assert!(validate_iana_timezone("UTC").is_ok());
+        assert!(validate_iana_timezone("America/New_York").is_ok());
+        assert!(validate_iana_timezone("Europe/London").is_ok());
+        assert!(validate_iana_timezone("Pacific/Auckland").is_ok());
+
+        assert!(validate_iana_timezone("").is_err());
+        assert!(validate_iana_timezone("EST5EDT_but_wrong").is_err());
+        assert!(validate_iana_timezone("Mars/Olympus_Mons").is_err());
+        assert!(validate_iana_timezone("GMT+5").is_err()); // not an IANA name
+    }
+
+    /// PMS-1667: the custom validator must key onto the `timezone` field so
+    /// the SPA can bind the message inline, not onto the whole request.
+    #[test]
+    fn timezone_error_keys_onto_timezone_field() {
+        let req = UpsertBusinessHoursRequest {
+            name: "nope".into(),
+            timezone: "Mars/Olympus_Mons".into(),
+            schedule: serde_json::Value::Null,
+            is_default: false,
+        };
+        let errs = req.validate().expect_err("Mars is not an IANA zone");
+        assert!(errs.field_errors().contains_key("timezone"));
     }
 }

@@ -97,11 +97,22 @@ fn update_check_probe() -> Option<&'static UpdateCheckProbe> {
                 }
                 Err(_) => trimmed.clone(),
             };
-            let client = reqwest::Client::builder()
+            // SPEC-2.264
+            let client = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
-                // SPEC-2.264
                 .build()
-                .ok()?;
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let display_for_log = display.clone();
+                    tracing::warn!(
+                        error = %e,
+                        url = %display_for_log,
+                        "version check probe disabled: reqwest client build failed"
+                    );
+                    return None;
+                }
+            };
             Some(UpdateCheckProbe {
                 url: trimmed,
                 display,

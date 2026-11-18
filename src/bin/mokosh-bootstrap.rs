@@ -50,12 +50,23 @@ async fn main() -> ExitCode {
         }
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // PMS-1656 finding 4: a set-but-unparseable RUST_LOG used to
+    // silently fall back to `info` with no trace. Match on the env
+    // var directly and report a parse failure on stderr (the
+    // subscriber is not initialised yet).
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(value) => match value.parse::<tracing_subscriber::EnvFilter>() {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "RUST_LOG={value:?} is not a valid tracing filter ({e}); falling back to 'info'"
+                );
+                tracing_subscriber::EnvFilter::new("info")
+            }
+        },
+        Err(_) => tracing_subscriber::EnvFilter::new("info"),
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(String::as_str);
@@ -336,10 +347,13 @@ fn parse_tenant_arg(args: &[String]) -> anyhow::Result<uuid::Uuid> {
 }
 
 fn require_env(key: &str) -> anyhow::Result<String> {
-    std::env::var(key).map_err(|_| {
-        anyhow::anyhow!(
+    // PMS-1657: see src/cli/mod.rs's twin. A set-but-empty value is an
+    // operator mistake (unlanded export), not a valid value here.
+    match std::env::var(key) {
+        Ok(v) if !v.is_empty() => Ok(v),
+        _ => Err(anyhow::anyhow!(
             "{} is not set. Put it in .env.infisical or export it before running.",
             key
-        )
-    })
+        )),
+    }
 }

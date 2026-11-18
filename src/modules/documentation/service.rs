@@ -16,17 +16,25 @@ use crate::modules::assets::AssetsService;
 use crate::modules::auth::TenantId;
 use crate::modules::knowledge_base::models::{KbArticleFilter, KbArticleResponse};
 use crate::modules::knowledge_base::KbService;
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
 // SPEC-15.1149
 /// The one aggregate response. Three parallel lists, each already
 /// scoped to the one company at the service level.
+///
+/// PMS-1664 finding: the totals used to be discarded (`_total_assets`,
+/// `_total_articles`), so a company with more than `PER_LIST_LIMIT`
+/// assets or articles was silently truncated. Surface each total
+/// alongside its list so the SPA can show a "showing N of M; see the
+/// full list" affordance.
 #[derive(Debug, Serialize)]
 pub struct CompanyDocumentation {
     pub assets: Vec<AssetResponse>,
+    pub total_assets: u64,
     pub credentials: Vec<CredentialSummary>,
     pub articles: Vec<KbArticleResponse>,
+    pub total_articles: u64,
 }
 
 // SPEC-15.1150, SPEC-15.1152
@@ -56,6 +64,28 @@ impl DocumentationService {
         tenant_id: TenantId,
         company_id: Uuid,
     ) -> AppResult<CompanyDocumentation> {
+        // PMS-1664 finding: mod.rs claimed "a request for a company
+        // that belongs to another tenant answers 404 via the shared
+        // company-scoping queries each child service enforces", but
+        // `list_assets` + `list_credentials_for_company` +
+        // `list_articles` each just filter by `(tenant_id, company_id)`
+        // and return empty lists for a company the caller's tenant
+        // does not own. That is a 200 with three empty lists, not the
+        // 404 the mod doc promises. Assert the company belongs to the
+        // caller's tenant here so the aggregate honours its own
+        // contract.
+        let mut probe_tx = self.assets.db().begin_with_tenant(tenant_id).await?;
+        let company_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM companies WHERE tenant_id = $1 AND id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *probe_tx)
+        .await?;
+        probe_tx.commit().await?;
+        if !company_exists {
+            return Err(AppError::NotFound("Company".to_string()));
+        }
         let page = PaginationParams {
             page: 1,
             per_page: PER_LIST_LIMIT,
@@ -74,7 +104,7 @@ impl DocumentationService {
         // query with no ordering dependency between the three, so they run
         // concurrently.
         #[rustfmt::skip]
-        let ((assets, _total_assets), credentials, (articles, _total_articles)) = tokio::try_join!(
+        let ((assets, total_assets), credentials, (articles, total_articles)) = tokio::try_join!(
             self.assets.list_assets(tenant_id, &asset_filter, &page),
             self.assets.list_credentials_for_company(tenant_id, company_id),
             self.kb.list_articles(tenant_id, &kb_filter, &page)
@@ -82,8 +112,10 @@ impl DocumentationService {
 
         Ok(CompanyDocumentation {
             assets,
+            total_assets,
             credentials,
             articles,
+            total_articles,
         })
     }
 }

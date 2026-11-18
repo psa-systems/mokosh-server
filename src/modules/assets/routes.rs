@@ -661,7 +661,19 @@ async fn report_asset_issue(
         // `create_ticket` with a fixed subset), so the `asset_id`
         // linkage is applied as a follow-up UPDATE below; the whole
         // report-issue flow tolerates the extra round-trip.
-        let contact = contact_id.unwrap_or_else(Uuid::nil);
+        //
+        // PMS-1664 F9: the old `unwrap_or_else(Uuid::nil)` substituted
+        // a nil contact id for a report that reached here without one,
+        // so a ticket could land attributed to no one; fail fast
+        // instead. `use_portal_path` is only set in the Contact arm
+        // above where `contact_id` is `Some(session.id)`, so hitting
+        // the `None` branch is an invariant break that the operator
+        // must see.
+        let Some(contact) = contact_id else {
+            return Err(AppError::Internal(
+                "report-issue portal path reached without a contact id".to_string(),
+            ));
+        };
         let ticket = ticket_service
             .create_portal_ticket(
                 tenant,
@@ -703,9 +715,22 @@ async fn report_asset_issue(
         // so the fully-populated request (with `asset_id` inline) lets
         // us skip the follow-up UPDATE. Attribute the create to the
         // caller's user id.
+        //
+        // PMS-1664 F9: the previous `unwrap_or_default` / `Uuid::nil()`
+        // fallbacks silently attributed the ticket to the nil user
+        // when the Staff auth carried no user or the arm was somehow
+        // reached with a Contact caller. `use_portal_path` is only
+        // false in the Staff arm where `auth.user` is always `Some`,
+        // so both fallbacks were masking invariant breaks.
         let user_id = match &caller {
-            CallerContext::Staff(auth) => auth.user.as_ref().map(|u| u.id).unwrap_or_default(),
-            CallerContext::Contact(_) => Uuid::nil(),
+            CallerContext::Staff(auth) => auth.user.as_ref().map(|u| u.id).ok_or_else(|| {
+                AppError::Internal("staff report-issue path reached without a user".to_string())
+            })?,
+            CallerContext::Contact(_) => {
+                return Err(AppError::Internal(
+                    "staff report-issue path reached with a contact caller".to_string(),
+                ));
+            }
         };
         let req = mokosh_types::tickets::CreateTicketRequest {
             title,

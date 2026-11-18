@@ -580,11 +580,25 @@ impl ObjectProvider for LocalProvider {
     // SPEC-3.44: a missing object returns AppError::NotFound here, while
     // open (below) returns AppError::Internal for the same condition;
     // this asymmetry is deliberate, not a bug to unify.
+    //
+    // PMS-1657: `read` used to map EVERY I/O error (permission denied,
+    // a bad mount, an interrupted read) to AppError::NotFound, so a
+    // caller that then fell back on NotFound (branding/assets, KB
+    // attachments, ...) silently reached for the legacy path on a real
+    // I/O fault - and when both paths failed it reported "Asset not
+    // found" even though the real cause was permission. Distinguish
+    // ErrorKind::NotFound from the rest; the other sites keep their
+    // NotFound fallback shape, but a permission problem now surfaces
+    // as the Internal it actually is.
     async fn read(&self, key: &ObjectKey) -> AppResult<Vec<u8>> {
         let path = self.path_for(key)?;
-        tokio::fs::read(&path)
-            .await
-            .map_err(|e| AppError::NotFound(format!("object ({e})")))
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(AppError::NotFound(format!("object ({e})")))
+            }
+            Err(e) => Err(AppError::Internal(format!("object read failed: {e}"))),
+        }
     }
 
     async fn open(&self, key: &ObjectKey) -> AppResult<ObjectReader> {
@@ -607,9 +621,18 @@ impl ObjectProvider for LocalProvider {
         }
     }
 
+    // PMS-1657: `exists` collapsed every error (permission denied, a
+    // bad mount) into `false`, so an upload that then wrote to the
+    // same path could stomp a file the caller cannot see. Report real
+    // I/O faults as Internal; only ErrorKind::NotFound is a true
+    // "absent".
     async fn exists(&self, key: &ObjectKey) -> AppResult<bool> {
         let path = self.path_for(key)?;
-        Ok(tokio::fs::metadata(&path).await.is_ok())
+        match tokio::fs::metadata(&path).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(AppError::Internal(format!("object stat failed: {e}"))),
+        }
     }
 
     // SPEC-3.45: not best-effort; a missing source is a hard
@@ -1399,6 +1422,70 @@ mod tests {
 
         assert!(!s.exists(&from).await.expect("exists"), "source is gone");
         assert_eq!(s.read(&to).await.expect("read"), b"bytes".to_vec());
+    }
+
+    /// PMS-1657: `read` and `exists` must distinguish ErrorKind::NotFound
+    /// from any other I/O error. A truly-absent object returns the shape
+    /// each method already documents (`NotFound` / `Ok(false)`); an I/O
+    /// fault (permission, bad mount, interrupted read) surfaces as
+    /// `Internal` rather than being swallowed as "absent".
+    #[tokio::test]
+    async fn read_distinguishes_missing_from_other_io_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = LocalProvider::new(StorageConfig {
+            root: dir.path().to_path_buf(),
+        });
+        // Truly missing: NotFound.
+        let err = s
+            .read(&ObjectKey::ticket_attachment(TENANT, OBJECT))
+            .await
+            .expect_err("a missing object must error");
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "missing object must return NotFound, not Internal; got {err:?}"
+        );
+
+        // The stored path exists but points at a DIRECTORY (an I/O fault,
+        // not a missing file). tokio::fs::read returns `IsADirectory` on
+        // Linux, which is NOT ErrorKind::NotFound, so the fix must surface
+        // this as Internal instead of claiming NotFound.
+        let dir_as_object = ObjectKey::ticket_attachment(OTHER, OBJECT);
+        let path = s.path_for(&dir_as_object).expect("path_for");
+        tokio::fs::create_dir_all(&path).await.expect("mkdir");
+        let err = s
+            .read(&dir_as_object)
+            .await
+            .expect_err("reading a directory must error");
+        assert!(
+            matches!(err, AppError::Internal(_)),
+            "an I/O fault must surface as Internal, not NotFound; got {err:?}"
+        );
+    }
+
+    /// PMS-1657: `exists` must not swallow I/O errors into `false`.
+    #[tokio::test]
+    async fn exists_distinguishes_missing_from_other_io_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = LocalProvider::new(StorageConfig {
+            root: dir.path().to_path_buf(),
+        });
+        // Truly missing: Ok(false).
+        assert!(matches!(
+            s.exists(&ObjectKey::ticket_attachment(TENANT, OBJECT))
+                .await,
+            Ok(false)
+        ));
+
+        // A directory where a file was expected still reports Ok(true)
+        // under the current contract (metadata succeeds for directories);
+        // the real I/O-fault case is hard to reproduce portably in a
+        // process-owned tempdir, so this just pins that an existing path
+        // reports true and `missing` reports false - the two halves the
+        // caller cares about.
+        let key = ObjectKey::ticket_attachment(OTHER, OBJECT);
+        let path = s.path_for(&key).expect("path_for");
+        tokio::fs::create_dir_all(&path).await.expect("mkdir");
+        assert!(matches!(s.exists(&key).await, Ok(true)));
     }
 
     /// And a source that is not there is an error, unlike a delete.

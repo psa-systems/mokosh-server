@@ -247,19 +247,44 @@ impl QuotesService {
 
     /// Load a quote's status, or 404. Used by the mutating paths to
     /// enforce the freeze rules before doing any work.
+    ///
+    /// PMS-1661 F4: `SELECT ... FOR UPDATE` on the quote row, because
+    /// every caller is a mutation path (update_quote, send_quote,
+    /// decide_quote, add_line, update_line, delete_line) and the read
+    /// drives a status-transition check. Without the lock, two
+    /// concurrent send_quote calls could both see `draft` and both
+    /// mail the client, and two concurrent accept/decline calls could
+    /// both pass the single-decision guard. `convert_quote` and
+    /// `apply_decision` already lock the row; this closes the gap for
+    /// the rest.
     async fn status_of(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         quote_id: Uuid,
     ) -> AppResult<QuoteStatus> {
-        let raw: Option<String> =
-            sqlx::query_scalar("SELECT status FROM quotes WHERE tenant_id = $1 AND id = $2")
-                .bind(tenant_id)
-                .bind(quote_id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let raw: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM quotes WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(quote_id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let raw = raw.ok_or_else(|| AppError::NotFound("Quote".to_string()))?;
-        Ok(QuoteStatus::from_str(&raw).unwrap_or(QuoteStatus::Draft))
+        // PMS-1661 F2: an unknown stored status used to map to Draft
+        // silently, and Draft is editable + settable, so a corrupt
+        // status read as editable (SPEC-13.17 wants a loud error).
+        // `status_of` is reached before every content check, so a fail
+        // here propagates cleanly up the flow.
+        QuoteStatus::from_str(&raw).ok_or_else(|| {
+            tracing::warn!(
+                quote_id = %quote_id,
+                stored = %raw,
+                "quotes.status is not one of the known values; refusing the operation"
+            );
+            AppError::Internal(format!(
+                "quote {quote_id} has an unknown stored status {raw:?}"
+            ))
+        })
     }
 
     // SPEC-13.1368
@@ -345,7 +370,16 @@ impl QuotesService {
             cq = cq.bind(status);
         }
         if let Some(ref s) = filter.q {
-            let pattern = format!("%{s}%");
+            // Escape SQL-LIKE wildcards so a user typing `%` or `_` matches
+            // the literal character. Postgres ILIKE defaults its escape
+            // character to `\` when `ESCAPE` is omitted, so prefix each
+            // wildcard with a single backslash; the backslash itself is
+            // doubled first so a user-typed `\` does not vanish.
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let pattern = format!("%{escaped}%");
             q = q.bind(pattern.clone());
             cq = cq.bind(pattern);
         }
@@ -1407,8 +1441,19 @@ impl QuotesService {
         .await?;
         let (row_company, raw_status, valid_until) =
             row.ok_or_else(|| AppError::NotFound("Quote".to_string()))?;
-        let stored = QuoteStatus::from_str(&raw_status).unwrap_or(QuoteStatus::Draft);
         // SPEC-13.1385
+        // Fail loud on an unknown stored status; an editable Draft
+        // default silently reached a decision path here.
+        let stored = QuoteStatus::from_str(&raw_status).ok_or_else(|| {
+            tracing::warn!(
+                quote_id = %quote_id,
+                stored = %raw_status,
+                "quotes.status is not one of the known values on decide_quote"
+            );
+            AppError::Internal(format!(
+                "quote {quote_id} has an unknown stored status {raw_status:?}"
+            ))
+        })?;
         if row_company != decision.company_id || !stored.is_client_visible() {
             return Err(AppError::NotFound("Quote".to_string()));
         }
@@ -1572,7 +1617,18 @@ impl QuotesService {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Quote".to_string()))?;
-        let status = QuoteStatus::from_str(&row.status).unwrap_or(QuoteStatus::Draft);
+        // PMS-1661 F2: fail loud on an unknown stored status.
+        let status = QuoteStatus::from_str(&row.status).ok_or_else(|| {
+            tracing::warn!(
+                quote_id = %quote_id,
+                stored = %row.status,
+                "quotes.status is not one of the known values on convert"
+            );
+            AppError::Internal(format!(
+                "quote {quote_id} has an unknown stored status {:?}",
+                row.status
+            ))
+        })?;
 
         // Already converted: return the existing link rather than 409ing.
         // A double-clicked Convert button is not an error, and the caller
@@ -1722,11 +1778,18 @@ impl QuotesService {
         // Scoped by quote_id as well as line id: the parent lookup above
         // is what proves tenancy, so a line from another quote must not be
         // reachable through this path.
+        //
+        // PMS-1661 F1: `is_taxable` from the request used to be ignored
+        // here, so `PUT /quotes/{id}/lines/{line_id}` could not change
+        // taxability even though `add_line` and the bulk update can.
+        // Writing it closes the gap and keeps the three write paths in
+        // step; SPEC-13.1375 says the stored value drives tax derivation.
         let affected = sqlx::query(
             r#"
             UPDATE quote_lines
             SET line_type = $3, description = $4, quantity = $5,
-                unit_price = $6, total = $5 * $6, sort_order = $7
+                unit_price = $6, total = $5 * $6, sort_order = $7,
+                is_taxable = $8
             WHERE id = $1 AND quote_id = $2
             "#,
         )
@@ -1737,6 +1800,7 @@ impl QuotesService {
         .bind(line.quantity)
         .bind(line.unit_price)
         .bind(line.sort_order)
+        .bind(line.is_taxable)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1841,9 +1905,26 @@ struct QuoteLineRow {
 
 impl From<QuoteLineRow> for QuoteLineResponse {
     fn from(r: QuoteLineRow) -> Self {
+        // PMS-1661 F3: an unknown stored line_type used to map to
+        // Service with no trace. The From impl cannot propagate;
+        // keep the Service fallback (the response must still render)
+        // but WARN with the line id + stored value so the drift is
+        // findable, mirroring the enum-decode WARN shape in
+        // PMS-1662/1663/1664.
+        let line_type = {
+            let parsed = QuoteLineType::from_str(&r.line_type);
+            if parsed.is_none() {
+                tracing::warn!(
+                    line_id = %r.id,
+                    stored = %r.line_type,
+                    "quote_lines.line_type is not one of the known values; reading as Service"
+                );
+            }
+            parsed.unwrap_or(QuoteLineType::Service)
+        };
         Self {
             id: r.id,
-            line_type: QuoteLineType::from_str(&r.line_type).unwrap_or(QuoteLineType::Service),
+            line_type,
             description: r.description,
             quantity: r.quantity,
             unit_price: r.unit_price,
@@ -1909,11 +1990,20 @@ impl QuoteRow {
             // `valid_until` reports as `expired` even though the stored
             // column still says `sent`. See `effective_status`.
             // SPEC-13.1357
-            status: effective_status(
-                QuoteStatus::from_str(&r.status).unwrap_or(QuoteStatus::Draft),
-                r.valid_until,
-                today,
-            ),
+            // WARN on unknown stored status rather than silently
+            // reading as Draft; this row-to-response path cannot
+            // propagate the error.
+            status: {
+                let stored = QuoteStatus::from_str(&r.status).unwrap_or_else(|| {
+                    tracing::warn!(
+                        quote_id = %r.id,
+                        stored = %r.status,
+                        "quotes.status is not one of the known values on row-to-response; reading as Draft"
+                    );
+                    QuoteStatus::Draft
+                });
+                effective_status(stored, r.valid_until, today)
+            },
             valid_until: r.valid_until,
             subtotal: r.subtotal,
             tax_amount: r.tax_amount,
