@@ -74,11 +74,14 @@ struct UpdateCheckProbe {
     client: reqwest::Client,
 }
 
-static UPDATE_CHECK_PROBE: std::sync::OnceLock<Option<UpdateCheckProbe>> =
-    std::sync::OnceLock::new();
+/// `None` when unconfigured; `Some(Err(message))` when configured but the HTTP
+/// client could not be built, so the check reports an error instead of `disabled`.
+type ProbeState = Option<Result<UpdateCheckProbe, String>>;
+
+static UPDATE_CHECK_PROBE: std::sync::OnceLock<ProbeState> = std::sync::OnceLock::new();
 
 // SPEC-2.258
-fn update_check_probe() -> Option<&'static UpdateCheckProbe> {
+fn update_check_probe() -> Option<&'static Result<UpdateCheckProbe, String>> {
     UPDATE_CHECK_PROBE
         .get_or_init(|| {
             let configured = crate::config::get(&crate::config::registry::MOKOSH_UPDATE_CHECK_URL)?;
@@ -108,16 +111,16 @@ fn update_check_probe() -> Option<&'static UpdateCheckProbe> {
                     tracing::warn!(
                         error = %e,
                         url = %display_for_log,
-                        "version check probe disabled: reqwest client build failed"
+                        "version check probe failed: reqwest client build failed"
                     );
-                    return None;
+                    return Some(Err(format!("{display_for_log}: HTTP client build failed")));
                 }
             };
-            Some(UpdateCheckProbe {
+            Some(Ok(UpdateCheckProbe {
                 url: trimmed,
                 display,
                 client,
-            })
+            }))
         })
         .as_ref()
 }
@@ -161,6 +164,15 @@ async fn run_update_check() -> UpdateCheck {
         return UpdateCheck::Disabled {
             current_version: PACKAGE_VERSION,
         };
+    };
+    let probe = match probe {
+        Ok(p) => p,
+        Err(message) => {
+            return UpdateCheck::Error {
+                current_version: PACKAGE_VERSION,
+                message: message.clone(),
+            }
+        }
     };
 
     // Serve a fresh cached result without touching the network. The lock is
