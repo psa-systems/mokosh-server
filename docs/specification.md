@@ -2773,18 +2773,20 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   "Unsupported event `<event>`.".
 - **SPEC-5.213**: `mokosh_grant_changed` must treat `state` `granted` as valid only with a `role`, refusing a missing
   role with 400 "A granted event must carry a role."; must treat `state` `revoked` as revoked at the event's `at`; and
-  must refuse any other state with 400 "Unknown grant state `<state>`.".
+  must refuse any other state with 400 "Unknown grant state `<state>`."; a `granted` event whose `role` is not one of
+  the SPEC-5.217 vocabulary must be refused with 400 "Unknown grant role `<role>`." before the mirror is written.
 - **SPEC-5.214**: `mokosh_grant_changed` must refuse an event whose `at` is more than five minutes ahead of the server
   clock with 400 "Event timestamp is too far in the future." and must not write the mirror row in that case.
 - **SPEC-5.215**: A valid `mokosh_grant_changed` event must be upserted into the grant mirror (a revoked event for a
   grant the mirror never saw is inserted directly as revoked) and the endpoint must answer 200 with
   `{"ok": true, "grant_id", "state"}` whether or not the upsert changed a row. A database error from the upsert must
   propagate as an error response, not 200.
-- **SPEC-5.216**: When a `revoked` event changed the mirror row, the receiver must also set `deleted_at` (keeping an
-  existing value) and `updated_at` on the `users` rows whose `bunyip_user_id` is the grantee in the tenant whose slug
-  equals `mokosh_account_id`; an unknown slug must change nothing. A failure of that statement must be logged as a
-  warning naming the grantee and account and must not change the 200 answer. A `granted` event, or a revoked event that
-  changed no mirror row, must not touch `users`.
+- **SPEC-5.216**: On every `revoked` event, whether or not it changed the mirror row, the receiver must also set
+  `deleted_at` and `updated_at` on the not-yet-tombstoned `users` rows (an existing `deleted_at` is kept) whose
+  `bunyip_user_id` is the grantee in the tenant whose slug equals `mokosh_account_id`; an unknown slug must change
+  nothing. Running it on a redelivery is what lets a later delivery heal a failed attempt. A failure of that statement
+  must be logged as a warning naming the grantee and account and must not change the 200 answer. A `granted` event
+  must not touch `users`.
 - **SPEC-5.217**: `map_grant_role` must map the Bunyip role names `admin`, `manager`, `technician` and `finance` to the
   Mokosh roles of the same name, must map `read_only` to the ReadOnly role, and must return `None` for any other
   value so the caller refuses placement.
@@ -2832,7 +2834,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.231**: `find_pending_by_tenant` must return the tenant's rows with status `pending`, newest `invited_at`
   first, and no other tenant's rows.
 - **SPEC-5.232**: `find_pending_for_invitee` must return, across all tenants, rows with `invitee_bunyip_user_id`
-  equal to the given id, status `pending` and `expires_at` in the future, newest `invited_at` first.
+  equal to the given id, or with a NULL `invitee_bunyip_user_id` whose `invitee_email` equals, ignoring case, the
+  email of the `users` row carrying the given id (the SPEC-5.242 rule), status `pending` and `expires_at` in the future, newest `invited_at` first.
 - **SPEC-5.233**: `GrantInvitationsService::cancel` must move a row to `canceled` (setting `canceled_at` and
   `updated_at`) only when it matches the given id and tenant and is `pending`, and return true then. It must return
   false, without distinguishing them, for an unknown id, another tenant's id, and a row that is not pending.
@@ -2907,8 +2910,11 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   endpoint may return the plaintext token.
 - **SPEC-5.254**: `GET /api/v1/grants/invitations` must return the caller's tenant's pending invitations, newest
   first, each with `tenant_slug` filled by one batched tenant lookup, and without any accept token.
-- **SPEC-5.255**: `GET /api/v1/my-grants/invitations` must return the pending, unexpired invitations whose
-  `invitee_bunyip_user_id` equals the authenticated caller's id, across all tenants, newest first, with `tenant_slug`.
+- **SPEC-5.255**: `GET /api/v1/my-grants/invitations` must return the pending, unexpired invitations addressed to the
+  authenticated caller per SPEC-5.232 (by `invitee_bunyip_user_id`, or by email for a NULL one), across all tenants,
+  newest first, with `tenant_slug`. The handler passes `caller.id` as the Bunyip user id; for a Bunyip-issued session
+  `caller.id` is the `sub`, while for a legacy session it can differ from the `users.bunyip_user_id` that the by-id
+  routes (SPEC-5.260) resolve, so the inbox and the by-id routes can disagree for a legacy session.
 - **SPEC-5.256**: `DELETE /api/v1/grants/invitations/{id}` must answer 204 whether or not a row was canceled, so an
   unknown id and another tenant's id are indistinguishable, and must answer an error response when the service fails.
 - **SPEC-5.257**: `GET /api/v1/grants/invitations/by-token/{token}` must answer 404 "invitation" for a malformed,
