@@ -26,6 +26,10 @@ const EXEMPT: &[(&str, &str)] = &[
         "delete_ticket_saved_view",
         "owner-scoped: the service matches on (tenant_id, user_id) so a view id this user does not own answers 404",
     ),
+    (
+        "delete_setting_by_key",
+        "require_visible: admin-gated for an administrative category, open to any authenticated user for a personal category (PMS-1350)",
+    ),
 ];
 
 fn handler_names(src: &str) -> Vec<String> {

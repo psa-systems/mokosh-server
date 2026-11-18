@@ -503,15 +503,25 @@ impl InvoiceIssuerConnectService {
                 last_error: None,
             });
         };
+        // SPEC-13.1038
+        // A status the enum does not know means the CHECK constraint and
+        // the enum have drifted, which is a deployment running a schema
+        // this build does not understand. Reading it as `error` is the
+        // honest answer, the same call `integrations::compose` makes.
+        // Log a warn so an operator can find the drifted value.
+        let status = IntegrationStatus::from_str(&row.status).unwrap_or_else(|| {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                provider = provider.as_str(),
+                stored = %row.status,
+                "integrations.status is not one of the known values; reading as 'error'"
+            );
+            IntegrationStatus::Error
+        });
         Ok(InvoiceIssuerOverview {
             provider: provider.as_str().to_string(),
             configured,
-            // SPEC-13.1038
-            // A status the enum does not know means the CHECK constraint and
-            // the enum have drifted, which is a deployment running a schema
-            // this build does not understand. Reading it as `error` is the
-            // honest answer, the same call `integrations::compose` makes.
-            status: IntegrationStatus::from_str(&row.status).unwrap_or(IntegrationStatus::Error),
+            status,
             organisation_id: row.external_organisation_id,
             delegated: row
                 .enabled_capabilities
@@ -1000,8 +1010,19 @@ async fn callback(
         "{}/settings/integrations?connect=failed",
         state.service.app_base.trim_end_matches('/')
     );
-    let Ok(provider) = parse_provider(&provider) else {
-        return Redirect::to(&failure);
+    // PMS-1660 F7: an unknown provider segment used to redirect to
+    // the failure URL with no log; an operator seeing "connect failed"
+    // in the browser could not find out why. Log the offending
+    // segment at warn before falling through.
+    let provider = match parse_provider(&provider) {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(
+                provider_segment = %provider,
+                "invoice-issuer callback: unknown provider segment; redirecting to failure"
+            );
+            return Redirect::to(&failure);
+        }
     };
     if let Some(reason) = query.error.as_deref() {
         tracing::info!(
@@ -1011,7 +1032,18 @@ async fn callback(
         );
         return Redirect::to(&failure);
     }
+    // PMS-1660 F7: a missing `code` or `state` used to redirect to
+    // failure with no log; the operator sees `connect=failed` and
+    // nothing explains why. Log which parameter was missing (never
+    // log the values themselves: they can be the single-use state
+    // secret) before redirecting.
     let (Some(code), Some(state_param)) = (query.code.as_deref(), query.state.as_deref()) else {
+        tracing::warn!(
+            provider = provider.as_str(),
+            code_present = query.code.is_some(),
+            state_present = query.state.is_some(),
+            "invoice-issuer callback: missing code or state; redirecting to failure"
+        );
         return Redirect::to(&failure);
     };
     match state

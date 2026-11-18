@@ -144,6 +144,19 @@ impl ContractsService {
         // Mutation + audit row in one transaction. CREATE: old = None,
         // after captured by the new contract id. PMS-117.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1661 F13: company_id, sla_id and signed_by_contact_id are
+        // plain `REFERENCES` on `contracts` (migration 009), so without
+        // these checks a cross-tenant id in the request body would be
+        // written. RLS hides the row on read-back, but the link is a
+        // leak either way. Mirror the quotes module's
+        // `assert_company_in_tenant` pattern and 404 before the INSERT.
+        assert_contract_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
+        if let Some(sla_id) = request.sla_id {
+            assert_contract_sla_in_tenant(&mut tx, tenant_id, sla_id).await?;
+        }
+        if let Some(signed_by_contact_id) = request.signed_by_contact_id {
+            assert_contract_contact_in_tenant(&mut tx, tenant_id, signed_by_contact_id).await?;
+        }
         sqlx::query(
             r#"INSERT INTO contracts (
                 id, tenant_id, contract_number, name, company_id, contract_type, status,
@@ -229,6 +242,40 @@ impl ContractsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+
+        // PMS-1661 F14: the create path validates `end_date >= start_date`
+        // via `validate_contract_date_range` on `CreateContractRequest`,
+        // but `UpdateContractRequest` carries no `start_date`, so PUT
+        // could set `end_date` before the stored `start_date`. Reject
+        // that here, matching the create-time cross-field check and the
+        // PMS-306 shape.
+        if let Some(end) = request.end_date {
+            let start: Option<NaiveDate> = sqlx::query_scalar(
+                "SELECT start_date FROM contracts WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(start) = start {
+                if end < start {
+                    return Err(AppError::BadRequest(
+                        "end_date must be on or after start_date".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // PMS-1661 F13: see create_contract. These FKs are plain
+        // REFERENCES, so verify any new link is in-tenant before the
+        // UPDATE. Only check fields the request actually sets so a
+        // partial PUT does not re-check existing stored links.
+        if let Some(sla_id) = request.sla_id {
+            assert_contract_sla_in_tenant(&mut tx, tenant_id, sla_id).await?;
+        }
+        if let Some(signed_by_contact_id) = request.signed_by_contact_id {
+            assert_contract_contact_in_tenant(&mut tx, tenant_id, signed_by_contact_id).await?;
+        }
 
         let n = sqlx::query(
             r#"UPDATE contracts SET
@@ -455,9 +502,14 @@ impl ContractsService {
         ctx: &AuditCtx,
     ) -> AppResult<ContractItemResponse> {
         let total = request.quantity * request.unit_price;
-        let billing_rule = request
-            .billing_rule
-            .unwrap_or_else(|| BillingRule::derive(&request.item_type));
+        // PMS-1661 F7: on UPDATE, an omitted `billing_rule` must preserve
+        // the stored one, not re-derive from `item_type`. The create path
+        // still derives (nothing to preserve). The old code did
+        // `unwrap_or_else(|| BillingRule::derive(...))` here too, which
+        // silently clobbered an explicit rule the caller wasn't restating;
+        // a product set to `every_period` would snap back to `manual` on
+        // any edit that did not re-send the field.
+        let billing_rule = request.billing_rule.map(|r| r.as_str().to_string());
         // Mutation + audit row in one transaction: snapshot before and
         // after, write the audit entry on the same tx. PMS-117.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -471,13 +523,18 @@ impl ContractsService {
         // PMS-956: `billed_at` comes back from the UPDATE rather than being
         // assumed. An edit to a `once` item that has already billed must not
         // report it as unbilled, or the record would say it is still owed.
-        let updated: Option<(Uuid, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
+        //
+        // PMS-1661 F7: `billing_rule` also comes back from the UPDATE so the
+        // response reflects the stored value when COALESCE kept the prior
+        // one.
+        let updated: Option<(Uuid, Option<chrono::DateTime<Utc>>, String)> = sqlx::query_as(
             r#"UPDATE contract_items SET
                 name=$3, description=$4, item_type=$5, quantity=$6, unit_price=$7,
                 total_price=$8, billing_frequency=$9, work_type_id=$10, included_hours=$11,
                 overage_rate=$12, rollover_enabled=$13, max_rollover_hours=$14,
-                sort_order=$15, product_id=$16, billing_rule=$17, updated_at = NOW()
-               WHERE tenant_id = $1 AND id = $2 RETURNING contract_id, billed_at"#,
+                sort_order=$15, product_id=$16,
+                billing_rule=COALESCE($17, billing_rule), updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2 RETURNING contract_id, billed_at, billing_rule"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -495,12 +552,14 @@ impl ContractsService {
         .bind(request.max_rollover_hours)
         .bind(request.sort_order)
         .bind(request.product_id)
-        .bind(billing_rule.as_str())
+        .bind(billing_rule.as_deref())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((cid, billed_at)) = updated else {
+        let Some((cid, billed_at, stored_billing_rule)) = updated else {
             return Err(AppError::NotFound("Contract item".to_string()));
         };
+        let billing_rule = BillingRule::from_str(&stored_billing_rule)
+            .unwrap_or_else(|| BillingRule::derive(&request.item_type));
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM contract_items t WHERE tenant_id = $1 AND id = $2",
@@ -1136,51 +1195,52 @@ impl ContractsService {
 
         // 2. find or create the balance row for this period.
         // SPEC-13.1337
-        let existing = sqlx::query_as::<_, BalanceMutRow>(
-            r#"SELECT id, hours_used, hours_remaining
-               FROM contract_hour_balances
-               WHERE tenant_id = $1 AND contract_id = $2 AND contract_item_id = $3
-                 AND period_start = $4 AND period_end = $5
-               FOR UPDATE"#,
+        //
+        // PMS-1660 F11: the old pattern `SELECT FOR UPDATE`, then
+        // INSERT when the row did not exist, was racey: two concurrent
+        // first draws in a fresh period both missed the SELECT and the
+        // second INSERT hit `uq_contract_hour_balances_period`
+        // (migration 025) with a bare database error (500) instead of
+        // the serialised wait the SELECT FOR UPDATE was meant to give.
+        // Upsert-first instead: a conflicting concurrent INSERT returns
+        // zero rows and the follow-up SELECT FOR UPDATE then waits on
+        // the winner's lock just like a row that was already there.
+        let id = Uuid::new_v4();
+        let inserted: Option<BalanceMutRow> = sqlx::query_as(
+            r#"INSERT INTO contract_hour_balances
+               (id, tenant_id, contract_id, contract_item_id, period_start, period_end,
+                hours_included, hours_used, hours_remaining, rollover_hours)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,0,$7,0)
+               ON CONFLICT ON CONSTRAINT uq_contract_hour_balances_period DO NOTHING
+               RETURNING id, hours_used, hours_remaining"#,
         )
+        .bind(id)
         .bind(tenant_id)
         .bind(contract_id)
         .bind(item.id)
         .bind(period_start)
         .bind(period_end)
+        .bind(included)
         .fetch_optional(&mut *tx)
         .await?;
 
-        let balance = match existing {
-            Some(b) => b,
-            None => {
-                // SPEC-13.1335
-                // Seed a fresh period. `hours_included` is the item's
-                // included hours (rollover from a closed prior period is
-                // applied separately by roll_to_next_period, which seeds
-                // the row up-front; if no such row exists we start clean).
-                let id = Uuid::new_v4();
-                sqlx::query(
-                    r#"INSERT INTO contract_hour_balances
-                       (id, tenant_id, contract_id, contract_item_id, period_start, period_end,
-                        hours_included, hours_used, hours_remaining, rollover_hours)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,0,$7,0)"#,
-                )
-                .bind(id)
-                .bind(tenant_id)
-                .bind(contract_id)
-                .bind(item.id)
-                .bind(period_start)
-                .bind(period_end)
-                .bind(included)
-                .execute(&mut *tx)
-                .await?;
-                BalanceMutRow {
-                    id,
-                    hours_used: Some(Decimal::ZERO),
-                    hours_remaining: included,
-                }
-            }
+        let balance = if let Some(b) = inserted {
+            b
+        } else {
+            sqlx::query_as::<_, BalanceMutRow>(
+                r#"SELECT id, hours_used, hours_remaining
+                   FROM contract_hour_balances
+                   WHERE tenant_id = $1 AND contract_id = $2 AND contract_item_id = $3
+                     AND period_start = $4 AND period_end = $5
+                   FOR UPDATE"#,
+            )
+            .bind(tenant_id)
+            .bind(contract_id)
+            .bind(item.id)
+            .bind(period_start)
+            .bind(period_end)
+            .fetch_one(&mut *tx)
+            .await?
         };
 
         // 3. split request into applied (against remaining) + overage.
@@ -1271,7 +1331,20 @@ impl ContractsService {
         .await?;
         // A balance the contract took with it is not an error: the entry has
         // nothing to give back to, which is the right answer.
+        //
+        // PMS-1661 F9: that answer used to leave no trace, so a stale
+        // `balance_id` (a bug upstream, or a period that was purged while
+        // a time entry still referenced it) silently lost the give-back
+        // and the hours stayed `used` on the row that WAS there. Keep
+        // the Ok return, but log at warn with the balance id and the
+        // amount so the drift is findable.
         let Some(row) = row else {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                balance_id = %balance_id,
+                applied = %applied,
+                "release_hours_in_tx: contract_hour_balances row is gone; cannot credit back"
+            );
             return Ok(());
         };
         // Never credit back more than was taken, whatever the caller says.
@@ -1968,4 +2041,59 @@ struct DueContractRow {
     auto_renew: Option<bool>,
     renewal_terms: Option<serde_json::Value>,
     before_snapshot: Option<serde_json::Value>,
+}
+
+/// PMS-1661 F13: assert the `company_id` the request body names is a
+/// row in the caller's tenant before linking it on an INSERT/UPDATE.
+/// `contracts.company_id` is a plain `REFERENCES`, so a cross-tenant
+/// id would otherwise persist until a read-back blurred by RLS.
+async fn assert_contract_company_in_tenant(
+    tx: &mut crate::db::TenantTransaction<'_>,
+    tenant_id: TenantId,
+    company_id: Uuid,
+) -> AppResult<()> {
+    let found: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM companies WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(company_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    found
+        .map(|_| ())
+        .ok_or_else(|| AppError::NotFound("Company".to_string()))
+}
+
+/// Same rule as [`assert_contract_company_in_tenant`], for `sla_id`.
+async fn assert_contract_sla_in_tenant(
+    tx: &mut crate::db::TenantTransaction<'_>,
+    tenant_id: TenantId,
+    sla_id: Uuid,
+) -> AppResult<()> {
+    let found: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM sla_policies WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(sla_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    found
+        .map(|_| ())
+        .ok_or_else(|| AppError::NotFound("SLA policy".to_string()))
+}
+
+/// Same rule as [`assert_contract_company_in_tenant`], for
+/// `signed_by_contact_id`.
+async fn assert_contract_contact_in_tenant(
+    tx: &mut crate::db::TenantTransaction<'_>,
+    tenant_id: TenantId,
+    contact_id: Uuid,
+) -> AppResult<()> {
+    let found: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM contacts WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(contact_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    found
+        .map(|_| ())
+        .ok_or_else(|| AppError::NotFound("Contact".to_string()))
 }

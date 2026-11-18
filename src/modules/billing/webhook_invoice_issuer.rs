@@ -268,11 +268,18 @@ struct QuickBooksEntity {
 /// document type is settled by asking the provider, in
 /// `external_bill_settlement`.
 fn invoice_events(provider: InvoiceProviderKind, body: &[u8]) -> AppResult<Vec<InvoiceEvent>> {
-    match provider {
+    // PMS-1660 finding: events with an empty id or organisation id used
+    // to be filtered out silently, so a delivery whose entries were all
+    // empty-id noise recorded no delivery row at all and contradicted
+    // the handler's "Every outcome is recorded" comment. Count the
+    // drops here and log at `info` so an operator seeing "no activity"
+    // in the delivery log can tell apart "nothing arrived" from
+    // "arrived, all dropped as shape noise".
+    let events: Vec<InvoiceEvent> = match provider {
         InvoiceProviderKind::Xero => {
             let delivery: XeroDelivery = serde_json::from_slice(body)
                 .map_err(|e| AppError::BadRequest(format!("unreadable Xero delivery: {e}")))?;
-            Ok(delivery
+            delivery
                 .events
                 .into_iter()
                 .filter(|e| e.event_category.eq_ignore_ascii_case("INVOICE"))
@@ -280,14 +287,13 @@ fn invoice_events(provider: InvoiceProviderKind, body: &[u8]) -> AppResult<Vec<I
                     organisation_id: e.tenant_id,
                     external_invoice_id: e.resource_id,
                 })
-                .filter(|e| !e.external_invoice_id.is_empty() && !e.organisation_id.is_empty())
-                .collect())
+                .collect()
         }
         InvoiceProviderKind::Quickbooks => {
             let delivery: QuickBooksDelivery = serde_json::from_slice(body).map_err(|e| {
                 AppError::BadRequest(format!("unreadable QuickBooks delivery: {e}"))
             })?;
-            Ok(delivery
+            delivery
                 .event_notifications
                 .into_iter()
                 .flat_map(|n| {
@@ -311,10 +317,24 @@ fn invoice_events(provider: InvoiceProviderKind, body: &[u8]) -> AppResult<Vec<I
                         })
                         .collect::<Vec<_>>()
                 })
-                .filter(|e| !e.external_invoice_id.is_empty() && !e.organisation_id.is_empty())
-                .collect())
+                .collect()
         }
+    };
+    let total = events.len();
+    let kept: Vec<InvoiceEvent> = events
+        .into_iter()
+        .filter(|e| !e.external_invoice_id.is_empty() && !e.organisation_id.is_empty())
+        .collect();
+    let dropped = total - kept.len();
+    if dropped > 0 {
+        tracing::info!(
+            provider = provider.as_str(),
+            dropped,
+            total,
+            "invoice-issuer webhook: dropped events with empty id or organisation id"
+        );
     }
+    Ok(kept)
 }
 
 /// One invoice event, with the organisation it belongs to.
@@ -381,17 +401,34 @@ pub async fn invoice_issuer_webhook_handler(
     // 401 with nothing written. There is no tenant to write a row against
     // yet, which is the shape of this route (MAPPS-1141): the signature is
     // checked first and the delivery says afterwards whose it is.
+    // PMS-1660 F8: all three 401 branches used to answer with no log,
+    // so a misconfigured subscription (wrong key) or a forged signature
+    // was invisible to the operator. Log at warn naming which branch
+    // hit before 401ing. No secret values in the log: the signature
+    // is skipped, only its presence is recorded.
     let Some(key) = state
         .dispatcher
         .webhook_key(provider)
         .filter(|k| !k.trim().is_empty())
     else {
+        tracing::warn!(
+            provider = provider.as_str(),
+            "invoice-issuer webhook: no signing key configured for this provider; 401"
+        );
         return Err(AppError::Unauthorized);
     };
     let Some(signature) = signature_header(provider, &headers) else {
+        tracing::warn!(
+            provider = provider.as_str(),
+            "invoice-issuer webhook: signature header missing; 401"
+        );
         return Err(AppError::Unauthorized);
     };
     if !verify(provider, &body, signature, key) {
+        tracing::warn!(
+            provider = provider.as_str(),
+            "invoice-issuer webhook: signature did not verify against the stored key; 401"
+        );
         return Err(AppError::Unauthorized);
     }
 

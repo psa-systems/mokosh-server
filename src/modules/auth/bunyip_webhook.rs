@@ -177,14 +177,27 @@ async fn soft_delete(pool: &PgPool, user_id: Uuid) -> AppResult<()> {
     // Tombstone: mark deleted, rewrite email so a future signup can reuse
     // the address without hitting UNIQUE(tenant_id, email).
     let tombstone_email = format!("deleted-{user_id}{TOMBSTONE_EMAIL_DOMAIN}");
-    sqlx::query(
+    let tombstoned = sqlx::query(
         "UPDATE users SET deleted_at = NOW(), email = $2 WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(user_id)
     .bind(&tombstone_email)
     .execute(&mut *tx)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .rows_affected();
+
+    // The pre-tx existence read is advisory: two concurrent deliveries can
+    // both see `deleted_at IS NULL` there, race into `BEGIN`, and one loses
+    // the guarded UPDATE above. The loser must not write a duplicate audit
+    // row or redundantly DELETE artefacts that are already gone, so bail
+    // early when the UPDATE matched nothing.
+    if tombstoned == 0 {
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        return Ok(());
+    }
 
     // Revoke every live artefact that could re-authenticate this user.
     for stmt in [

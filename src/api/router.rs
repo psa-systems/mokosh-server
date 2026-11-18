@@ -931,6 +931,7 @@ pub fn create_api_router(
             encryption_key,
             shared_mailer.clone(),
             google_client.clone(),
+            microsoft_client.clone(),
             app_secrets,
         ))
         // PMS-1414: feature toggles, deployment-wide and operator-gated, in the
@@ -1418,16 +1419,23 @@ pub fn create_api_router(
     // contact_api composes contact_portal::contact_routes with the branding module's contact-scoped routes, sharing one
     // ContactAuthService instance (`contact_service_arc`) between the two merged routers so a single `load_capabilities` implementation backs both.
     // SPEC-12.37, SPEC-12.39
-    // SPEC-12.38 DEFECT: the branding routes merged below sit outside the layer contact_routes applied.
-    let contact_api = crate::modules::contact_portal::contact_routes(
-        contact_service,
-        payment_methods_service.clone(),
-    )
-    // SPEC-2.80
-    .merge(crate::modules::branding::routes::contact_routes(
-        db.clone(),
+    // PMS-1656 finding 1: the contact auth layer is applied AFTER the
+    // merge below, via `apply_contact_auth_layer`, so the branding
+    // contact routes are covered too (previously they slipped through
+    // without a `ContactAuthState` extension and every signed-in call
+    // 401d).
+    let contact_api = crate::modules::contact_portal::apply_contact_auth_layer(
+        crate::modules::contact_portal::contact_routes(
+            contact_service,
+            payment_methods_service.clone(),
+        )
+        // SPEC-2.80
+        .merge(crate::modules::branding::routes::contact_routes(
+            db.clone(),
+            contact_service_arc.clone(),
+        )),
         contact_service_arc,
-    ))
+    )
     // contact_api's own independent normalize_error_envelope
     // instance (one of seven; see the api_v1 one near line 992).
     .layer(middleware::from_fn(

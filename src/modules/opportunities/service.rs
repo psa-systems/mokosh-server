@@ -103,11 +103,22 @@ impl OpportunitiesService {
             .as_deref()
             .unwrap_or("USD")
             .to_ascii_uppercase();
-        if currency.len() != 3 {
+        // PMS-1662 F14: the old `len() != 3` counts bytes, so a 3-byte
+        // multi-byte string ("Ⅲ"-shaped) could pass or a 3-character
+        // non-ASCII string could fail. ISO 4217 codes are three ASCII
+        // letters; check that explicitly.
+        if !is_iso4217_code(&currency) {
             return Err(AppError::validation_field(
                 "currency",
-                "currency must be a 3-letter ISO 4217 code",
+                "currency must be a 3-letter ISO 4217 code (three ASCII letters)",
             ));
+        }
+        // PMS-1662 F14: value_amount is permitted to be absent but,
+        // when present, must be non-negative and fit DECIMAL(15, 2).
+        // The schema keeps a CHECK as the ultimate guard; this gives
+        // a 422 at the API boundary.
+        if let Some(amount) = request.value_amount {
+            validate_value_amount(amount)?;
         }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -188,6 +199,13 @@ impl OpportunitiesService {
             }
         }
         sql.push_str(" ORDER BY updated_at DESC");
+        // PMS-1662 F15 noted this as a dead assignment; it is load-bearing:
+        // the uniform per-filter branches above each bump `idx` after
+        // consuming it, so the final (unread) increment keeps every branch
+        // identical and new filters slot in without re-threading the
+        // numbering. `let _ = idx;` is how Rust silences
+        // `unused_assignments` here; the attribute form does not reach
+        // inside the surrounding block.
         let _ = idx;
 
         let mut q = sqlx::query(&sql).bind(*tenant_id);
@@ -242,6 +260,26 @@ impl OpportunitiesService {
             }
         }
 
+        // PMS-1662 F12: the create path verifies `contact_id` against
+        // the caller's tenant, but the update path used to accept any
+        // id. Mirror the create-time check: a Some(Some(cid)) must
+        // resolve to a tenant-owned contacts row; None means "unset",
+        // Some(None) means "clear", neither of which needs a check.
+        if let Some(Some(cid)) = request.contact_id {
+            let found: Option<Uuid> =
+                sqlx::query_scalar("SELECT id FROM contacts WHERE tenant_id = $1 AND id = $2")
+                    .bind(*tenant_id)
+                    .bind(cid)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if found.is_none() {
+                return Err(AppError::validation_field(
+                    "contact_id",
+                    "contact does not exist in this tenant",
+                ));
+            }
+        }
+
         // Build a dynamic UPDATE from the fields the caller named. The
         // schema-level CHECKs stay the ultimate guard.
         let mut sql = String::from("UPDATE opportunities SET updated_at = NOW()");
@@ -263,6 +301,7 @@ impl OpportunitiesService {
         push!("quote_id", request.quote_id.is_some());
         push!("notes", request.notes.is_some());
         sql.push_str(" WHERE tenant_id = $1 AND id = $2 AND closed_at IS NULL");
+        // See note on the matching `let _ = idx;` in `list` above.
         let _ = idx;
 
         let mut q = sqlx::query(&sql).bind(*tenant_id).bind(id);
@@ -273,14 +312,19 @@ impl OpportunitiesService {
             q = q.bind(v);
         }
         if let Some(v) = request.value_amount {
+            // PMS-1662 F14: validate on update too, matching create.
+            // Some(None) is the "clear it" shape, no bounds to check.
+            if let Some(amount) = v {
+                validate_value_amount(amount)?;
+            }
             q = q.bind(v);
         }
         if let Some(v) = request.currency.as_deref() {
             let upper = v.to_ascii_uppercase();
-            if upper.len() != 3 {
+            if !is_iso4217_code(&upper) {
                 return Err(AppError::validation_field(
                     "currency",
-                    "currency must be a 3-letter ISO 4217 code",
+                    "currency must be a 3-letter ISO 4217 code (three ASCII letters)",
                 ));
             }
             q = q.bind(upper);
@@ -419,6 +463,33 @@ impl OpportunitiesService {
         .ok_or_else(|| AppError::NotFound("Opportunity".to_string()))?;
         Ok(row_to_opportunity(row))
     }
+}
+
+/// ISO 4217 codes are exactly three ASCII letters. The old `len() != 3`
+/// counts bytes, so a multi-byte three-character string could pass or a
+/// three-character non-ASCII string could fail; check explicitly.
+fn is_iso4217_code(s: &str) -> bool {
+    s.len() == 3 && s.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// PMS-1662 F14: value_amount is stored in `DECIMAL(15, 2)`. Reject
+/// negative amounts and anything with more than two fractional digits
+/// at the API boundary (the schema CHECK keeps its job as the ultimate
+/// guard).
+fn validate_value_amount(amount: Decimal) -> AppResult<()> {
+    if amount.is_sign_negative() {
+        return Err(AppError::validation_field(
+            "value_amount",
+            "value_amount must be non-negative",
+        ));
+    }
+    if amount.scale() > 2 {
+        return Err(AppError::validation_field(
+            "value_amount",
+            "value_amount has at most 2 decimal places",
+        ));
+    }
+    Ok(())
 }
 
 fn row_to_opportunity(row: sqlx::postgres::PgRow) -> Opportunity {

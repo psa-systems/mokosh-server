@@ -850,10 +850,21 @@ impl QuickBooksClient {
                     .json(&body)
             })
             .await?;
+        // PMS-1660 finding: same as the Xero twin. An absent DocNumber
+        // from QBO used to be stored as empty silently; log so the
+        // operator can tell apart "QBO did not assign a number" from
+        // "we never saw a number".
+        let external_number = envelope.invoice.doc_number.unwrap_or_else(|| {
+            tracing::warn!(
+                invoice_id = %envelope.invoice.id,
+                "QuickBooks issue_invoice returned no DocNumber; storing empty external_number"
+            );
+            String::new()
+        });
         Ok(ExternalInvoiceRef {
             provider: InvoiceProviderKind::Quickbooks,
             external_invoice_id: envelope.invoice.id,
-            external_number: envelope.invoice.doc_number.unwrap_or_default(),
+            external_number,
         })
     }
 
@@ -903,7 +914,21 @@ impl QuickBooksClient {
         // The same classifier the status read uses, so a void decision and
         // a status read can never disagree about the same invoice.
         let status = classify_status(&dto);
-        Ok(Some((status, dto.sync_token.clone().unwrap_or_default())))
+        // PMS-1660 finding: an absent `SyncToken` used to collapse to
+        // an empty string here, which the subsequent void request would
+        // then send and QBO would reject as a stale-object conflict. A
+        // missing token is a shape problem (QBO always writes one), not
+        // a stale-token problem, so fail the read naming the invoice
+        // id so an operator sees the real cause.
+        let Some(sync_token) = dto.sync_token.clone() else {
+            return Err(AppError::external_service(
+                "quickbooks",
+                format!(
+                    "QuickBooks invoice {external_invoice_id} returned no SyncToken; cannot void"
+                ),
+            ));
+        };
+        Ok(Some((status, sync_token)))
     }
 
     // SPEC-13.795
@@ -983,10 +1008,18 @@ impl QuickBooksClient {
                     .json(&body)
             })
             .await?;
+        // PMS-1660 finding: same log shape as the issue_invoice site.
+        let external_number = envelope.credit_memo.doc_number.unwrap_or_else(|| {
+            tracing::warn!(
+                credit_memo_id = %envelope.credit_memo.id,
+                "QuickBooks issue_credit_memo returned no DocNumber; storing empty external_number"
+            );
+            String::new()
+        });
         Ok(ExternalCreditNoteRef {
             provider: InvoiceProviderKind::Quickbooks,
             external_credit_note_id: envelope.credit_memo.id,
-            external_number: envelope.credit_memo.doc_number.unwrap_or_default(),
+            external_number,
         })
     }
 
@@ -1087,7 +1120,19 @@ impl QuickBooksClient {
             .private_note
             .as_deref()
             .is_some_and(|note| note.to_ascii_lowercase().contains("voided"));
-        Ok(Some((voided, dto.sync_token.clone().unwrap_or_default())))
+        // PMS-1660 finding: same as the invoice twin - a missing
+        // `SyncToken` would otherwise be silently sent as "" and the
+        // void would fail as a stale-token conflict the operator could
+        // not distinguish from an actual stale write.
+        let Some(sync_token) = dto.sync_token.clone() else {
+            return Err(AppError::external_service(
+                "quickbooks",
+                format!(
+                    "QuickBooks credit memo {external_credit_memo_id} returned no SyncToken; cannot void"
+                ),
+            ));
+        };
+        Ok(Some((voided, sync_token)))
     }
 
     /// Void a credit memo in QuickBooks (PMS-1546).
@@ -1231,7 +1276,11 @@ impl QuickBooksClient {
                 return Err(AppError::Unauthorized);
             }
             if status == reqwest::StatusCode::NOT_FOUND {
-                return Err(AppError::NotFound("QuickBooks invoice".to_string()));
+                // PMS-1660: this `call_with_retry` wraps every QBO
+                // resource (invoices, credit memos, bills, connections,
+                // vendor payments, ...), not just invoices. Say
+                // "resource" instead of lying about what was not found.
+                return Err(AppError::NotFound("QuickBooks resource".to_string()));
             }
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
@@ -1265,10 +1314,14 @@ impl QuickBooksClient {
 fn classify_status(invoice: &QuickBooksInvoiceDto) -> QuickBooksInvoiceStatus {
     let total = invoice.total_amt.unwrap_or(0.0);
     let balance = invoice.balance.unwrap_or(total);
+    // PMS-1660 finding: the invoice-void marker was matched case
+    // sensitively (`Voided`) while the credit memo marker below (line
+    // ~1074) is case-insensitive. Normalise to the lowercase match so
+    // a hand-edited private note casing cannot flip the classification.
     let voided_marker = invoice
         .private_note
         .as_deref()
-        .map(|note| note.contains("Voided"))
+        .map(|note| note.to_ascii_lowercase().contains("voided"))
         .unwrap_or(false);
     if voided_marker || (total == 0.0 && invoice.sync_token.is_some() && balance == 0.0) {
         if voided_marker {

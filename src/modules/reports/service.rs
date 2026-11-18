@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::auth::TenantId;
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
 pub struct ReportsService {
@@ -290,6 +290,22 @@ impl ReportsService {
             .map(|(id, _, _)| *id)
             .collect();
         crate::utils::unresolved_person::log_unresolved_person_names("reports.time", &unresolved);
+        // PMS-1665 finding: the user branch above logs unresolved ids,
+        // but the work-type branch rendered "Unknown work type" with
+        // no log. Mirror the shape: collect the ids whose name is
+        // None and WARN once (SPEC-15.1584).
+        let unresolved_work_types: Vec<Uuid> = by_work_type
+            .iter()
+            .filter(|(_, name, _)| name.is_none())
+            .map(|(id, _, _)| *id)
+            .collect();
+        if !unresolved_work_types.is_empty() {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                work_type_ids = ?unresolved_work_types,
+                "reports.time: work_type_ids did not resolve to names; rendering as 'Unknown work type'"
+            );
+        }
         Ok(TimeReportResponse {
             from,
             to,
@@ -321,6 +337,24 @@ impl ReportsService {
         company_id: Option<Uuid>,
     ) -> AppResult<BillingReportResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1665 finding: an unknown company_id used to fall through
+        // to WHERE filters that yielded zero totals + empty aging, and
+        // the doc comment below claimed the response "covers every
+        // client". A caller hitting a stale company id (deleted, wrong
+        // tenant) learned the mistake only by reading an empty report.
+        // 404 up front so the operator can tell the two apart.
+        if let Some(c) = company_id {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM companies WHERE tenant_id = $1 AND id = $2)",
+            )
+            .bind(tenant_id)
+            .bind(c)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !exists {
+                return Err(AppError::NotFound("Company".to_string()));
+            }
+        }
         let totals: Option<(Decimal, Decimal, Decimal)> = if let Some(c) = company_id {
             sqlx::query_as(
                 r#"SELECT COALESCE(SUM(total), 0), COALESCE(SUM(amount_paid), 0),
@@ -344,10 +378,16 @@ impl ReportsService {
         let (invoiced, paid, outstanding) =
             totals.unwrap_or((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
 
-        // PMS-1418: the report's own scope, echoed back so the PDF can state
-        // which client it covers rather than staying silent. `None` when
-        // `company_id` names no row in this tenant, the same as when none was
-        // given: either way the totals above cover every client.
+        // PMS-1418: the report's own scope, echoed back so the PDF can
+        // state which client it covers rather than staying silent.
+        //
+        // PMS-1665 F: the old comment claimed `None` was returned both
+        // for "no company_id given" and for "unknown company_id, so the
+        // totals cover every client". That is no longer true; the
+        // `exists` check at line 354 rejects an unknown id with 404
+        // before this point is reached. Reaching here with `Some(c)`
+        // therefore guarantees the company row exists, so the match
+        // below's `None` arm is strictly the "no company_id given" case.
         let company_name: Option<String> = match company_id {
             Some(c) => {
                 sqlx::query_scalar(r#"SELECT name FROM companies WHERE tenant_id = $1 AND id = $2"#)

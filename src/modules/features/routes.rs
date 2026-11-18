@@ -1,14 +1,12 @@
 //! The feature-toggle surfaces (PMS-1414): the operator's list and flip, and the
 //! public probe every client reads.
 //!
-//! parity record 2026-10-02: no route in this file has an SPA caller yet. The
-//! admin page is MAPPS-955 and the client half of the public probe is the same
-//! issue; this module is what they read. The note comes off with the first
-//! route the client calls, the way PMS-1310's did when MAPPS-971 shipped.
+//! The admin collection `/settings/feature-toggles` has a SPA caller
+//! (admin features page). The per-key flip and the public probe do
+//! not yet.
 //!
 //! Exempted paths (named per MAPPS-1083, so the guard scopes this record to
 //! only the routes the comment lists):
-//!   - `/settings/feature-toggles`
 //!   - `/settings/feature-toggles/{key}`
 //!   - `/config`
 //!

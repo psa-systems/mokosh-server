@@ -172,9 +172,17 @@ pub struct CreateAssetTemplateRequest {
 }
 
 /// `PUT /api/v1/asset-templates/{id}` body. Every field Option; absent
-/// fields leave the column untouched. (`company_id` and friends are
-/// Option<Option<T>> so the SPA can clear them explicitly; the service
-/// treats a bare `None` as "do not touch".)
+/// fields leave the column untouched via `COALESCE($N, col)`. The
+/// column stays non-null for `name` and `asset_model_id`; everything
+/// else is nullable in `asset_templates` (migration 271), so a value
+/// sets the column and an omitted key leaves it alone.
+///
+/// PMS-1664 F1: the previous comment claimed `company_id` and friends
+/// were `Option<Option<T>>` so the SPA could clear them; the fields
+/// are plain `Option<T>` and the UPDATE uses `COALESCE`, so clearing
+/// an already-set column back to null is not supported through this
+/// endpoint. Comment now matches the behavior; the restoration path
+/// for clearing lands when the SPA needs it.
 // SPEC-15.1016: update-template bounds
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateAssetTemplateRequest {

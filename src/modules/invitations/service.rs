@@ -203,33 +203,48 @@ impl InvitationsService {
         // surface, which was already the shape of the old `INSERT INTO
         // notifications` after the row landed).
         // SPEC-5.546: dispatch failure is a WARN, not a request failure.
-        if let (Some(app_url), Some(notifications), Some(tenant_name)) = (
-            self.app_url.as_deref(),
-            self.notifications.as_ref(),
-            tenant_name,
-        ) {
-            let app = crate::utils::app_name::app_name();
-            let context = serde_json::json!({
-                "recipient_email": email,
-                "salutation": crate::utils::email::salutation(""),
-                "tenant_name": tenant_name,
-                "role": request.role,
-                "ttl_days": INVITE_TTL_DAYS,
-                "app_name": app,
-                "app_url": app_url,
-            });
-            if let Err(e) = notifications
-                .dispatch(tenant_id, "invitations.created", &context)
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    invite_id = %invite.id,
-                    recipient = %email,
-                    "invitation mail dispatch failed; the invite row is committed",
-                );
-            }
-        }
+        //
+        // PMS-1659: track whether the dispatch succeeded so the create
+        // response can tell the admin, instead of the WARN log being the
+        // only trace. `None` when there is no dispatcher configured at all
+        // (standalone mode without a mailer); `Some(false)` when dispatch
+        // was attempted and failed; `Some(true)` on a clean send.
+        let mail_sent: Option<bool> =
+            if let (Some(app_url), Some(notifications), Some(tenant_name)) = (
+                self.app_url.as_deref(),
+                self.notifications.as_ref(),
+                tenant_name,
+            ) {
+                let app = crate::utils::app_name::app_name();
+                let context = serde_json::json!({
+                    "recipient_email": email,
+                    "salutation": crate::utils::email::salutation(""),
+                    "tenant_name": tenant_name,
+                    "role": request.role,
+                    "ttl_days": INVITE_TTL_DAYS,
+                    "app_name": app,
+                    "app_url": app_url,
+                });
+                match notifications
+                    .dispatch(tenant_id, "invitations.created", &context)
+                    .await
+                {
+                    Ok(_) => Some(true),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            invite_id = %invite.id,
+                            recipient = %email,
+                            "invitation mail dispatch failed; the invite row is committed",
+                        );
+                        Some(false)
+                    }
+                }
+            } else {
+                None
+            };
+        let mut invite = invite;
+        invite.mail_sent = mail_sent;
         Ok(invite)
     }
 
@@ -351,7 +366,7 @@ impl InvitationsService {
         // delete).
         // SPEC-5.550: enrol as member only into an active team of the invite's tenant.
         if let Some(team_id) = invite.team_id {
-            sqlx::query(
+            let result = sqlx::query(
                 r#"INSERT INTO team_members (tenant_id, team_id, user_id, role)
                    SELECT $1, $2, $3, 'member'
                    FROM teams
@@ -363,6 +378,23 @@ impl InvitationsService {
             .bind(accepted_by)
             .execute(&mut *tx)
             .await?;
+            // PMS-1659 F3: the INSERT guarded on `is_active = TRUE` quietly
+            // matches zero rows when the team has been archived or deleted
+            // between create and accept, and the invite still accepts
+            // cleanly (SPEC-5.550). That is intentional, but an operator
+            // trying to find out why a new user's team enrolment never
+            // happened had no breadcrumb. One log line names the invite's
+            // team and user.
+            if result.rows_affected() == 0 {
+                tracing::warn!(
+                    invite_id = %invite.id,
+                    tenant_id = %invite.tenant_id,
+                    team_id = %team_id,
+                    user_id = %accepted_by,
+                    "invitation named a team that is archived, deleted or absent; \
+                     accepting the invite without team enrolment"
+                );
+            }
         }
 
         tx.commit().await?;

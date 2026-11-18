@@ -443,25 +443,55 @@ fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
                 Some(pi) if !pi.is_empty() => pi.to_string(),
                 _ => return Ok(PaymentEvent::Ignored { kind }),
             };
-            let currency = object["currency"]
-                .as_str()
-                .unwrap_or("usd")
-                .to_ascii_uppercase();
+            // PMS-1660 finding: a `charge.refunded` without a currency
+            // used to be recorded as USD silently. The field is
+            // required by the Stripe contract, so an absent value is
+            // an upstream shape problem the operator should see, not
+            // a fact we invent. Treat as Ignored + WARN so the event
+            // delivery log records "refused" and the operator can grep
+            // for it.
+            let currency = match object["currency"].as_str() {
+                Some(c) if !c.is_empty() => c.to_ascii_uppercase(),
+                _ => {
+                    tracing::warn!(
+                        payment_intent = %provider_reference,
+                        "stripe charge.refunded missing currency; ignoring event"
+                    );
+                    return Ok(PaymentEvent::Ignored { kind });
+                }
+            };
             // A charge carries the cumulative list of every refund against it,
             // each with its own id. Recording all of them with ON CONFLICT DO
             // NOTHING on the refund id makes redelivery + incremental refunds
             // both idempotent: only refunds not yet seen actually insert.
+            //
+            // PMS-1660 finding: entries missing a string `id` or integer
+            // `amount` were silently dropped by filter_map, so a partially
+            // malformed refund list recorded fewer refunds than the charge
+            // actually carries with no breadcrumb. Warn naming the event +
+            // the offending entry so an operator can tie the shortfall
+            // back to the upstream shape.
             let refunds: Vec<RefundLine> = object["refunds"]["data"]
                 .as_array()
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|r| {
-                            let id = r["id"].as_str()?.to_string();
-                            let amount = from_minor_units(r["amount"].as_i64()?);
-                            Some(RefundLine {
-                                provider_reference: id,
-                                amount,
-                            })
+                            let id = r["id"].as_str().map(str::to_string);
+                            let amount_minor = r["amount"].as_i64();
+                            match (id, amount_minor) {
+                                (Some(id), Some(minor)) if !id.is_empty() => Some(RefundLine {
+                                    provider_reference: id,
+                                    amount: from_minor_units(minor),
+                                }),
+                                _ => {
+                                    tracing::warn!(
+                                        payment_intent = %provider_reference,
+                                        entry = %r,
+                                        "stripe charge.refunded refund entry missing id or amount; dropping"
+                                    );
+                                    None
+                                }
+                            }
                         })
                         .collect()
                 })
@@ -507,15 +537,29 @@ fn parse_stripe_payment_session(
     else {
         return Ok(PaymentEvent::Ignored { kind });
     };
+    // PMS-1660 finding: an absent `currency` used to be defaulted to
+    // USD silently. Stripe's contract requires currency on a succeeded
+    // payment, so an absent value is an upstream shape problem the
+    // operator should see; Ignore + WARN so the delivery log records
+    // "refused" and the operator can grep for it.
+    let Some(currency) = object["currency"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_uppercase())
+    else {
+        tracing::warn!(
+            tenant_id = %tenant_id,
+            invoice_id = %invoice_id,
+            "stripe payment session missing currency; ignoring event"
+        );
+        return Ok(PaymentEvent::Ignored { kind });
+    };
     Ok(PaymentEvent::PaymentSucceeded {
         provider_reference,
         tenant_id,
         invoice_id,
         amount: from_minor_units(amount_total),
-        currency: object["currency"]
-            .as_str()
-            .unwrap_or("usd")
-            .to_ascii_uppercase(),
+        currency,
         raw: raw.clone(),
     })
 }
@@ -586,6 +630,21 @@ fn parse_stripe_setup_session(
     let exp_month = card["exp_month"].as_i64().unwrap_or(0);
     let exp_year = card["exp_year"].as_i64().unwrap_or(0);
     if brand.is_empty() || last4.is_empty() || exp_month == 0 || exp_year == 0 {
+        return Ok(PaymentEvent::Ignored { kind });
+    }
+    // PMS-1660: `as u8` / `as u16` truncate silently. Stripe hands back
+    // exp_month in 1..=12 and exp_year as a four-digit year, so an
+    // out-of-range value means we misread the shape (expanded vs id)
+    // or Stripe changed the schema. Refuse the event (Ignored, with a
+    // warn) rather than storing a truncated expiry that encrypts to a
+    // card the processor will not match.
+    if !(1..=12).contains(&exp_month) || !(1900..=9999).contains(&exp_year) {
+        tracing::warn!(
+            exp_month,
+            exp_year,
+            provider_pm_id,
+            "stripe payment-method card exp_month/exp_year out of plausible range; ignoring event"
+        );
         return Ok(PaymentEvent::Ignored { kind });
     }
     Ok(PaymentEvent::PaymentMethodAttached {
