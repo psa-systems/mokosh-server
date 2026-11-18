@@ -4233,7 +4233,8 @@ the value as given.
   with a configuration error and must not end boot.
 - **SPEC-6.99**: `IP2LOCATION_DB_PATH` (application, since `v0.7.0`) must be trimmed and a blank or unset value must
   disable login-location alerts, logging at info "IP2LOCATION_DB_PATH unset; login-location alerts disabled". A path
-  whose database cannot be loaded must end boot with an error naming the path and the cause (SPEC-4.5).
+  whose database cannot be loaded must log at warn "Failed to load IP2Location DB; login-location alerts disabled"
+  with the path and cause, and boot must continue; login must be unaffected.
 - **SPEC-6.100**: `IP2PROXY_DB_PATH` (application, since `v0.11.0`) must be trimmed and a blank or unset value must
   disable IP enrichment, logging at info "IP2PROXY_DB_PATH unset; IP enrichment disabled". A path whose database cannot
   be loaded must log at warn "Failed to load IP2Proxy DB; IP enrichment disabled" with the path and cause, and boot must

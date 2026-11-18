@@ -1434,8 +1434,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _scheduler_handles = scheduler.start();
 
     // PMS-657: build the IP -> country resolver for login-location alerts.
-    // Optional: an unset path leaves it None and the alerts stay disabled. A
-    // configured but unloadable path ends boot rather than disabling silently.
+    // Optional: an unset path or a failed .BIN load leaves it None and the
+    // alerts stay disabled (login is never affected).
     // SPEC-2.53
     let geoip = match config.ip2location_db_path.as_deref() {
         Some(path) => match mokosh_server::utils::geoip::GeoIpService::new(path) {
@@ -1444,10 +1444,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(std::sync::Arc::new(svc))
             }
             Err(e) => {
-                return Err(format!(
-                    "IP2LOCATION_DB_PATH={path:?} could not be loaded: {e}; unset it to disable login-location alerts"
-                )
-                .into());
+                tracing::warn!(path = %path, error = %e, "Failed to load IP2Location DB; login-location alerts disabled");
+                None
             }
         },
         None => {
