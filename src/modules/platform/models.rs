@@ -53,7 +53,7 @@ pub struct PlatformChangePasswordRequest {
     pub current_password: String,
     #[validate(length(min = 12, message = "New password must be at least 12 characters"))]
     pub new_password: String,
-    #[validate(length(min = 12, message = "Confirmation must match"))]
+    #[validate(length(min = 12, message = "Confirmation must be at least 12 characters"))]
     pub confirm_password: String,
 }
 

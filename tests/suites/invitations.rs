@@ -65,7 +65,16 @@ async fn create_list_revoke_roundtrip(pool: PgPool) {
     assert_eq!(total, 1);
     assert_eq!(items.len(), 1);
 
-    s.revoke(tenant, inv.id).await.expect("revoke");
+    s.revoke(tenant, inv.id, &actx()).await.expect("revoke");
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE entity_type = 'tenant_invitations' \
+         AND entity_id = $1 AND action = 'update'",
+    )
+    .bind(inv.id)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit rows");
+    assert_eq!(audited, 1, "revoke writes an audit row");
     let (_items, total) = s
         .list_pending(tenant, &page())
         .await
@@ -73,7 +82,7 @@ async fn create_list_revoke_roundtrip(pool: PgPool) {
     assert_eq!(total, 0, "revoked invite no longer pending");
 
     // Revoking again 404s (no live invite).
-    assert!(s.revoke(tenant, inv.id).await.is_err());
+    assert!(s.revoke(tenant, inv.id, &actx()).await.is_err());
 }
 
 #[mokosh_test]

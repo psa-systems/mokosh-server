@@ -183,13 +183,10 @@ async fn get_team(
 /// `UserRole::Manager` whose row's `manager_id` is set to somebody else, is
 /// refused with 403.
 ///
-/// PMS-1659 F7: the old wording claimed "a non-owner cannot distinguish
-/// a real team from a wrong role", which is not what the code does: a
-/// missing team propagates `get_team`'s 404 and an existing team with
-/// the wrong role returns 403, so a non-owner CAN tell the two apart.
+/// A missing team propagates `get_team`'s 404 and an existing team with
+/// the wrong role returns 403, so a non-owner can tell the two apart.
 /// The split matches the rest of the module (unknown id -> 404 same as
-/// any other read), and the leaked signal is that a team exists, not
-/// its contents.
+/// any other read); what leaks is that a team exists, not its contents.
 ///
 /// Called INLINE from each write handler that needs it, not as an extractor,
 /// because the check needs the team row's `manager_id`, and reading the row

@@ -110,15 +110,9 @@ async fn fresh_link_redeems_and_enables_login(pool: PgPool) {
         StatusCode::OK,
         "prompt 009: freshly redeemed credentials must log in",
     );
-    let cookie_header = resp
-        .headers()
-        .get("set-cookie")
-        .expect("Set-Cookie header")
-        .to_str()
-        .expect("cookie text");
     assert!(
-        cookie_header.contains("mokosh:contact_token="),
-        "prompt 009: login must Set-Cookie for the contact-plane refresh, got {cookie_header}",
+        resp.headers().get("set-cookie").is_none(),
+        "login must not Set-Cookie (SPEC-5.449)",
     );
 }
 

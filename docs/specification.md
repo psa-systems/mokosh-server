@@ -3339,8 +3339,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.427**: portal_login_link must drop a next value that does not start with a single "/", starts with "//", or
   contains any of ? # & space or backslash, returning the bare login link without failing.
 - **SPEC-5.428**: The contact-plane middleware must read the access token from an Authorization header of the form
-  "Bearer <token>" and, only when that yields nothing, from the first non-empty mokosh:contact_token cookie in the
-  Cookie header; with neither present it must attach an unauthenticated state and still run the handler.
+  "Bearer <token>" only; it must not read any cookie. With no Bearer token it must attach an unauthenticated state and
+  still run the handler.
 - **SPEC-5.429**: A token must be accepted only when it is an HS256 JWT signed with the server secret, unexpired, and
   carrying typ "contact"; a token with a bad signature, an expired token, or a token of another typ (such as a staff
   token) must yield an unauthenticated state, so protected routes answer 401.
@@ -3384,7 +3384,9 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   to the seconds remaining, never less than 1, and must do so before the password is checked.
 - **SPEC-5.444**: A wrong password must answer 401 Unauthorized, write audit portal.login_failed, and increment
   portal_failed_login_count, which on reaching 5 or more must set portal_locked_until to 5 minutes ahead; a failure to
-  write the counter must be logged at error with tenant_id, contact_id and the error and must not change the 401.
+  write the counter must be logged at error with tenant_id, contact_id and the error and must not change the 401. The
+  lockout is per contact only: there is no per-IP throttle on POST /auth/login or on the magic-link redeem route, and a
+  login for an unknown email is never counted.
 - **SPEC-5.445**: When portal_mfa_enabled is true and neither mfa_code nor recovery_code is non-blank after trimming,
   login with a correct password must answer 200 with mfa_required true, empty access_token and refresh_token, contact
   null, and must create no session.
@@ -3400,9 +3402,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   portal_locked_until, stamp portal_last_login_at (a failure of that write must be logged at warn with contact_id and
   must not fail the login), insert a contact_sessions row whose family_id equals its own id, and return access_token,
   refresh_token, expires_at and the contact object with mfa_required false.
-- **SPEC-5.449**: Login, refresh and a magic-link redeem that mints a session must set the cookie
-  mokosh:contact_token=<refresh token> with HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth; Max-Age=2592000,
-  adding Domain=<value> only when configuration PORTAL_COOKIE_DOMAIN is non-blank after trimming.
+- **SPEC-5.449**: Login, refresh and a magic-link redeem that mints a session must not set any cookie; the refresh
+  token travels only in the response body.
 - **SPEC-5.450**: POST /api/v1/contact/auth/refresh must answer 401 when the token does not parse as
   {session-uuid}.{secret}, names no contact_sessions row, or carries a secret that does not verify against the stored
   hash, and a secret that did not verify must revoke nothing.
@@ -3417,10 +3418,10 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   portal.refresh_replay_detected and answer 401.
 - **SPEC-5.454**: A successful refresh must insert a new session row with a new id in the presented row's family, mint
   an access token whose caps claim is loaded fresh and whose email is the contact's current lower-cased email, and
-  return it with a new refresh token, the contact object, mfa_required false and the cookie.
-- **SPEC-5.455**: POST /api/v1/contact/auth/logout must answer 204 and clear the mokosh:contact_token cookie (same
-  attributes and Domain as when set, Max-Age=0) for a malformed, unknown or wrong-secret token without revoking
-  anything, and for a token whose secret verifies must revoke the whole rotation family and write audit portal.logout.
+  return it with a new refresh token, the contact object, mfa_required false.
+- **SPEC-5.455**: POST /api/v1/contact/auth/logout must answer 204 and clear the legacy mokosh:contact_token cookie
+  (HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth; Max-Age=0, with the PORTAL_COOKIE_DOMAIN Domain when
+  configured) for a malformed, unknown or wrong-secret token without revoking anything, and for a token whose secret verifies must revoke the whole rotation family and write audit portal.logout.
 - **SPEC-5.456**: Revoking a rotation family must set revoked_at on every unrevoked contact_sessions row sharing the
   family_id, and this must be the single mechanism used by logout, replay detection, a portal-access-revoked refresh and
   the revoke-session route.
@@ -3657,7 +3658,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   `audit_log` rows whose entity type and entity id equal the request, plus a `total` computed with the same predicate as
   the page.
 - **SPEC-5.521**: For `entity_type` `tickets`, the history must also include `ticket_notes` rows whose action is not
-  `create` and whose `new_values.ticket_id` equals the ticket id as text. `ticket_notes` rows with action `create` must
+  `create` and whose `new_values.ticket_id` or `old_values.ticket_id` equals the ticket id as text (so a deleted note, whose
+  `new_values` is NULL, still appears). `ticket_notes` rows with action `create` must
   not be included, and each entry must report its own `entity_type` and `entity_id`.
 - **SPEC-5.522**: A history entry's `user_name` must be the actor's trimmed full name from a user of the same tenant,
   falling back to the user's email when both names are blank, and `null` only when `user_id` is NULL or the user row is
@@ -3693,8 +3695,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.531**: `kind=user` must return only native users without a grant, `kind=guest` must return users with a grant
   plus unplaced guests, and `kind` absent or `everyone` must return both.
 - **SPEC-5.532**: `q` (ignored when empty) must keep only user rows whose email, first name or last name contains it
-  case-insensitively; the characters `%` and `_` in `q` must be treated as wildcards. `q` must not filter unplaced
-  guests.
+  case-insensitively, and the characters `%` and `_` in `q` must match literally. `q` must also keep only unplaced
+  guests whose `grantee_email` contains it.
 - **SPEC-5.533**: `role` must keep user rows whose own `users.role` equals it and unplaced guests whose grant `role`
   equals it.
 - **SPEC-5.534**: `team_id` must keep only users who are members of that team in the tenant and must exclude all
@@ -3744,13 +3746,14 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   `team_id`), or `None`. It must be called only from the pre-session login path and never from a route handler.
 - **SPEC-5.549**: Accepting an invitation must set its status to `accepted` with `accepted_at` and `accepted_by` only
   while its status is still `pending`. When no row was updated (already accepted or revoked) it must roll back, return
-  success, and enrol nobody.
+  success, enrol nobody and write no audit row. Otherwise it must write an `update` audit row for `tenant_invitations`
+  with a system context (no actor) in the same transaction.
 - **SPEC-5.550**: Accepting an invitation that names a team must, in the same transaction, add the accepting user to
   that team with role `member`, only when the team is active and belongs to the invitation's tenant. An existing
   membership must be left unchanged. A missing or archived team must not fail the acceptance.
 - **SPEC-5.551**: Revoking must set the status of a `pending` invitation of the caller's tenant to `revoked` and answer
-  200 with an empty body. An unknown id, an id from another tenant, or an invitation that is not pending must answer 404
-  `Invitation not found`.
+  200 with an empty body, writing an `update` audit row for `tenant_invitations` in the same transaction. An unknown id,
+  an id from another tenant, or an invitation that is not pending must answer 404 `Invitation not found`.
 
 #### Teams
 
@@ -4086,8 +4089,8 @@ the value as given.
   an unset or blank value must mean none: the tenant logo is then omitted from client-facing email (SPEC-15.519).
 - **SPEC-6.60**: `ABUSE_CONTACT_EMAIL` (application, since `v0.12.0`) must be trimmed, and an unset or blank value must
   mean none: the abuse-report line is then omitted from request-form email, and no other address is substituted.
-- **SPEC-6.61**: `PORTAL_COOKIE_DOMAIN` (application, since `v0.19.0`) must add a `Domain` attribute to the portal
-  refresh cookie only when it is non-blank after trimming (SPEC-5.449).
+- **SPEC-6.61**: `PORTAL_COOKIE_DOMAIN` (application, since `v0.19.0`) must add a `Domain` attribute to the legacy portal
+  cookie cleared at logout only when it is non-blank after trimming (SPEC-5.449).
 - **SPEC-6.62**: `MOKOSH_MAX_TENANTS` (application, since `v0.14.0`) must be read once at boot as a positive integer; an
   unset or blank value must leave tenant creation uncapped (SPEC-5.332), and a malformed or non-positive value must end
   boot (SPEC-6.46). A change takes effect on the next restart.

@@ -42,8 +42,9 @@ pub enum MemberRow {
         team_memberships: Vec<TeamChip>,
         /// `Some(grant_id)` when this users row was placed by a grant
         /// (BUNYIP-674 option B). The row is a native user AND has a
-        /// grant; the SPA renders "Guest" beside the name and reads
-        /// role from the grant, not the user.
+        /// grant; the SPA renders "Guest" beside the name. `role` is
+        /// still the user's own `users.role` (what `?role=` filters on); only
+        /// an `UnplacedGuest` takes its role from the grant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placed_by_grant_id: Option<String>,
     },
