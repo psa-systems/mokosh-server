@@ -177,7 +177,7 @@ use uuid::Uuid;
 use crate::modules::auth::TenantId;
 use crate::modules::billing::invoice_issuer::InvoiceProviderKind;
 use crate::modules::billing::invoice_issuer_dispatch::{ExternalInvoiceState, IssuerDispatcher};
-use crate::modules::billing::service::BillingService;
+use crate::modules::billing::service::{BillingService, GatewayPaymentOutcome};
 use crate::utils::error::{AppError, AppResult};
 
 /// State for one invoice-issuer webhook mount.
@@ -633,16 +633,17 @@ async fn apply_one(
                         }),
                     )
                     .await?;
-                outcome = if recorded {
-                    Outcome::Accepted
-                } else if matches!(outcome, Outcome::Ignored) {
-                    // Already recorded by a prior delivery, or refused by a
-                    // guard. The first is the common case and is not a
-                    // problem; both are states a human can read off the
-                    // delivery row rather than states to retry.
-                    Outcome::Unreconciled
-                } else {
-                    outcome
+                outcome = match recorded {
+                    GatewayPaymentOutcome::Recorded => Outcome::Accepted,
+                    // A prior delivery already recorded it: benign, nothing
+                    // for a human to do. Keeps whatever the batch already has.
+                    GatewayPaymentOutcome::AlreadyRecorded => outcome,
+                    // Refused by a guard: a state a human can read off the
+                    // delivery row rather than one to retry.
+                    GatewayPaymentOutcome::Refused if matches!(outcome, Outcome::Ignored) => {
+                        Outcome::Unreconciled
+                    }
+                    GatewayPaymentOutcome::Refused => outcome,
                 };
             }
             ExternalInvoiceState::Voided => {
