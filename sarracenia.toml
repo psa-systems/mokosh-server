@@ -1,0 +1,14 @@
+# Publishes mokosh-server's own docs to the Storefront docs site under /docs/mokosh-server.
+source = "mokosh-server"
+base_path = "/docs/mokosh-server"
+# Workspace-aware: `**/src/**/*.rs` picks up every member under `crates/*/src/`,
+# which sarracenia's default `src/**/*.rs` would miss.
+include = ["README.md", "**/src/**/*.rs"]
+exclude = ["CLAUDE.md", "docs/**", "common/**", "tests/**", "**/tests/**", "target/**", "node_modules/**"]
+
+[storefront]
+url = "https://docs.a8n.systems"
+site = "docs"
+
+[titles]
+"src" = "Module reference"

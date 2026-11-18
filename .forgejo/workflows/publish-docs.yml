@@ -1,0 +1,101 @@
+---
+
+# Publish this repo's own documentation to docs.a8n.systems/docs/mokosh-server on
+# every push to main. The target is pinned by sarracenia.toml; the API token is
+# the psa-systems org secret DOCS_A8N_SYSTEMS_SARRACENIA, scoped by Storefront
+# to the `docs` site with the `content` scope.
+#
+# The pushing binary is the `latest` artifact from Forgejo Generic Packages
+# (published by sarracenia's own build-binary-linux.yml on its main pushes),
+# not a build from HEAD. A change that touches the push code path reaches
+# docs.a8n.systems one sarracenia-release cycle after it merges there. HEAD
+# is unreleased code.
+
+name: Publish docs
+
+on:
+  push:
+    branches:
+      - main
+  # workflow_dispatch is for manual retries after an intermittent failure.
+  # Running it from a feature branch is a mistake and is rejected by the
+  # first step, so a dispatch never publishes an unmerged branch's docs.
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Publish mokosh-server docs to docs.a8n.systems
+    # Base-medium: this job is one HTTP download plus one `sarracenia push`,
+    # no compile, so the HEAVY dev image would waste a large slot.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    permissions:
+      contents: read
+    env:
+      PACKAGE_OWNER: ${{ github.repository_owner }}
+      PACKAGE_NAME: sarracenia
+      BINARY_FILE: sarracenia-linux-x86_64
+
+    steps:
+      - name: Guard - main branch only
+        # workflow_dispatch resolves github.ref to the dispatched branch. A
+        # dispatch on a feature branch would try to publish that branch's
+        # sarracenia.toml and README; fail loudly instead.
+        shell: nu {0}
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if $env.REF != "refs/heads/main" {
+            print --stderr $"publish-docs is restricted to main; ref was ($env.REF)"
+            exit 1
+          }
+
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          # sarracenia's provenance.rs reads git log for the push provenance
+          # object; a shallow clone makes it fall back to a sparse record.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Start job metrics sampler
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-start@main
+
+      - name: Download sarracenia binary from Generic Packages (latest)
+        shell: nu {0}
+        env:
+          # Step-scoped: a job-scoped secret resolves to the empty string
+          # inside a nu step on this runner, same as build-binary-linux.yml's
+          # FORGEJO_TOKEN at line 150-153.
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_PAT }}
+        run: |
+          let auth = [Authorization $"token ($env.FORGEJO_TOKEN)"]
+          let url = (
+            $env.GITHUB_SERVER_URL
+            | url parse
+            | update path ([
+                "api" "packages" $env.PACKAGE_OWNER
+                "generic" $env.PACKAGE_NAME
+                "latest" $env.BINARY_FILE
+              ] | str join "/")
+            | url join
+          )
+          print $"Downloading ($url)"
+          let dest = $"./($env.BINARY_FILE)"
+          http get --headers $auth $url | save $dest
+          chmod +x $dest
+          ^$dest --version
+
+      - name: Publish docs
+        shell: nu {0}
+        env:
+          # Step-scoped for the same reason FORGEJO_TOKEN is above. Also keeps
+          # the token's env lifetime to this one step rather than every step
+          # after it.
+          SARRACENIA_TOKEN: ${{ secrets.DOCS_A8N_SYSTEMS_SARRACENIA }}
+        run: |
+          let bin = $"./($env.BINARY_FILE)"
+          ^$bin push
+
+      - name: Report job metrics
+        if: always()
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main
