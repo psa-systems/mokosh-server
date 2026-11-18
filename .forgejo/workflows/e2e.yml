@@ -71,7 +71,7 @@ jobs:
     # the Playwright browser binaries plus their system libraries. Nothing here
     # compiles, but base carries none of that toolchain.
     # SPEC-10.30: heavy label, 20 minute bound, e2e working directory
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_HEAVY }}
 
     # Backstop, not a target (PMS-829): 42 green runs over the same window took
     # 1.2-4.2 minutes, median 2.0. The bound is generous against that because
@@ -162,7 +162,7 @@ jobs:
       - name: Report the runner's shared memory and fonts
         # PMS-1408: the two runner facts the chromium quarantine turned on, in
         # the log, because neither is knowable from any repository. The image and
-        # the container options come from `vars.RUNS_ON_OPENSUSE_BASE_HEAVY` and
+        # the container options come from `vars.RUNS_ON_OPENSUSE_HEAVY` and
         # the forgejo-runner config on the host, so a job log is the only place
         # that records what a given run actually got.
         #

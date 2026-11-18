@@ -96,7 +96,7 @@ concurrency:
 jobs:
   classify:
     name: classify diff
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     outputs:
       result: ${{ steps.classify.outputs.result }}
     steps:

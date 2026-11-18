@@ -56,5 +56,5 @@ jobs:
     # releases API. It compiles nothing, so the dev image's C toolchain is not
     # needed. Medium is the size common's own stub specifies for it.
     # SPEC-10.46
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     secrets: inherit
