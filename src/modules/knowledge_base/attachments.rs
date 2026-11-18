@@ -354,8 +354,15 @@ impl KbAttachmentService {
         // which does distinguish: a true absence is NotFound, an I/O
         // fault bubbles verbatim so an operator sees it.
         let primary = ObjectKey::kb_attachment(row.tenant_id, row.id);
-        if let Ok(reader) = self.store.open(&primary).await {
-            return Ok(reader);
+        match self.store.open(&primary).await {
+            Ok(reader) => return Ok(reader),
+            // Logged so a storage fault on the tenant-scoped key is not lost
+            // when the legacy open below succeeds or reports its own error.
+            Err(e) => tracing::warn!(
+                attachment_id = %row.id,
+                error = %e,
+                "kb attachment: primary open failed, trying legacy layout"
+            ),
         }
         let legacy = ObjectKey::legacy_kb_attachment(row.tenant_id, row.id);
         match self.store.open(&legacy).await {

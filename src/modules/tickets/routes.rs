@@ -232,6 +232,7 @@ async fn create_ticket(
                     request.description.clone(),
                     request.priority_id,
                     request.type_id,
+                    None,
                 )
                 .await?
         }

@@ -9863,9 +9863,11 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1003**: `GET /asset-models/signature-detector` must be served by the signature handler and never parsed as
   an `{id}` of `/asset-models/{id}`.
 - **SPEC-15.1004**: `GET /asset-models` must reject a `q` longer than 200 characters with a validation error. A
-  non-empty `q`, trimmed and lowercased, must match case-insensitively as a substring of `manufacturer + " " + model`.
+  non-empty `q`, trimmed and lowercased, must match case-insensitively as a literal substring of `manufacturer + " " +
+  model`: a typed `%` or `_` must match itself and not act as a wildcard.
 - **SPEC-15.1005**: `GET /asset-models` must apply `limit` default 10 when omitted and clamp any supplied value to the
-  range 1..=50.
+  range 1..=50. A value outside that range must be clamped silently, never rejected with a validation error; this is
+  the intended contract, not an oversight.
 - **SPEC-15.1006**: `GET /asset-models` with a missing, empty or whitespace-only `q` must return the caller tenant's
   models without filtering. Results must be ordered by `uses_count` descending, then lowercased manufacturer, then
   lowercased model.
@@ -9879,8 +9881,10 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1009**: `POST /asset-models` must store `specs` as the empty JSON object `{}` when the field is omitted.
 - **SPEC-15.1010**: `GET /asset-models/{id}` must answer 404 "Asset model" when the id does not exist in the caller's
   tenant, including when it exists in another tenant.
-- **SPEC-15.1011**: `PUT /asset-models/{id}` must update only the fields present in the body (an absent or null field
-  keeps its stored value), apply the same bounds as create, reject a foreign `asset_type_id` as in SPEC-15.1007, answer
+- **SPEC-15.1011**: `PUT /asset-models/{id}` must update only the fields present in the body (an absent field keeps its
+  stored value; an explicit null clears `warranty_months`, `end_of_life_months`, `default_department`,
+  `default_license_vendor`, `default_tags` and `image_url`, while a null `manufacturer`, `model`, `asset_type_id` or
+  `specs` is treated as absent because those columns are NOT NULL), apply the same bounds as create, reject a foreign `asset_type_id` as in SPEC-15.1007, answer
   409 "Another catalog row already has this manufacturer / model / type." when the change collides with another row,
   answer 404 "Asset model" when no row matches, and otherwise return the refreshed row.
 - **SPEC-15.1012**: `DELETE /asset-models/{id}` must answer 204 and remove the row, must keep assets that referenced it
@@ -9892,10 +9896,13 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   caller's tenant.
 - **SPEC-15.1015**: `POST /asset-templates` must validate `name` as 1..=150 characters, `department` at most 100 and
   `license_seat_count` as 0..=100000. It must answer 404 "Asset model" when `asset_model_id` is not a model of the
-  caller's tenant, record the calling user as `created_by`, answer 409 "A template with this name already exists." on a
-  duplicate name, and answer 201 with the joined template row.
-- **SPEC-15.1016**: `PUT /asset-templates/{id}` must update only the fields present in the body, answer 404 "Asset
-  model" for a foreign `asset_model_id`, answer 409 "Another template already uses this name." on a name collision,
+  caller's tenant, answer 422 on `company_id`, `site_id` or `default_assigned_user_id` when the id does not exist in
+  the caller's tenant, record the calling user as `created_by`, answer 409 "A template with this name already exists."
+  on a duplicate name, and answer 201 with the joined template row.
+- **SPEC-15.1016**: `PUT /asset-templates/{id}` must update only the fields present in the body (an explicit null clears
+  `company_id`, `site_id`, `default_assigned_user_id`, `department`, `tags`, `notes` and `license_seat_count`; a null
+  `name` or `asset_model_id` is treated as absent), answer 404 "Asset model" for a foreign `asset_model_id`, answer 422
+  on `company_id`, `site_id` or `default_assigned_user_id` when a supplied id does not exist in the caller's tenant, answer 409 "Another template already uses this name." on a name collision,
   answer 404 "Asset template" when no row matches, and otherwise return the refreshed joined row.
 - **SPEC-15.1017**: `DELETE /asset-templates/{id}` must answer 204 and remove the template, or 404 "Asset template" when
   no row matches in the caller's tenant.
@@ -9914,13 +9921,16 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   and must answer 422 on a `sort` parameter because the endpoint is unsorted.
 - **SPEC-15.1023**: `POST /asset-types` must require an admin, validate `name` as 1..=100 characters and `itil_category`
   as at most 50, default `is_active` to true, store the type in the caller's tenant with an audit entry in the same
-  transaction, and return the stored type.
+  transaction, and return the stored type. A `parent_type_id` must name a type of the caller's tenant, otherwise 422 on
+  `parent_type_id`.
 - **SPEC-15.1024**: `PUT /asset-types/{id}` must require an admin and replace `name`, `icon`, `parent_type_id`,
   `is_active` and `itil_category` with the body values (an omitted `icon`, `parent_type_id` or `itil_category` becomes
-  null, an omitted `is_active` becomes true), and must answer 404 "Asset type" when no row of the caller's tenant
-  matches.
-- **SPEC-15.1025**: `DELETE /asset-types/{id}` must require an admin and answer 404 "Asset type" when no row of the
-  caller's tenant matches.
+  null, an omitted `is_active` becomes true), write an audit entry holding the prior and new row in the same
+  transaction, and must answer 404 "Asset type" when no row of the caller's tenant matches. A `parent_type_id` must
+  name a type of the caller's tenant other than the type itself and not one of its descendants, otherwise 422 on
+  `parent_type_id`.
+- **SPEC-15.1025**: `DELETE /asset-types/{id}` must require an admin, write an audit entry holding the prior row in the
+  same transaction, and answer 404 "Asset type" when no row of the caller's tenant matches.
 - **SPEC-15.1026**: `GET /assets` must accept a staff caller with an authenticated user, or a contact caller holding the
   `assets:read` capability (loaded from the database per request). For a contact caller it must force the `company_id`
   filter to the contact's own company whatever the query says, and must answer with the contact projection (id,
@@ -10039,7 +10049,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1063**: `POST /assets/exists` must validate `serials` as 1..=500 entries, ignore blank entries after
   trimming, match case-insensitively against assets of the given company in the caller's tenant, and return only the
   matching serials, trimmed, in first-occurrence order with duplicates collapsed. It must not depend on a feature
-  toggle.
+  toggle. Serial uniqueness is a per-company pre-flight read, not a database invariant: no UNIQUE constraint exists on
+  `assets.serial_number`, so the same serial may exist on assets of different companies.
 - **SPEC-15.1064**: `POST /assets/bulk-create` must answer 404 "This endpoint is not enabled on this deployment" before
   any database access when the `AssetsCatalog` feature is off, and otherwise answer 201 with `created` (the full asset
   responses) and `count`.
@@ -10062,9 +10073,11 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1070**: Each bulk-created asset must have status "active", the model's manufacturer, model and asset type,
   the model link, a server-issued asset tag (consecutive in request order), and the name given or "<manufacturer>
   <model> #<serial>".
-- **SPEC-15.1071**: A bulk create where any serial collides with an existing asset must answer 422 on field
-  `serials[<i>].serial_number` ("serial `<serial>` is already assigned to an asset in this tenant") and must persist no
-  asset of the batch. Any other insert error must be returned and must persist no asset of the batch.
+- **SPEC-15.1071**: A bulk create whose server-issued asset tag collides with an existing asset (the
+  `uq_assets_tenant_asset_tag_ci` unique index) must answer 422 on field `serials[<i>].asset_tag` ("asset tag `<tag>` is
+  already assigned to an asset in this tenant") and must persist no asset of the batch. Any other insert error,
+  including any other unique violation, must be returned unchanged and must persist no asset of the batch. A duplicate
+  serial is not detected here; it is only reported by the `POST /assets/exists` pre-flight (SPEC-15.1063).
 - **SPEC-15.1072**: Bulk create must write one `created` asset audit-log row per asset, add the batch size to the
   model's `uses_count` and, when a template was used, to the template's `uses_count`, all in the transaction that
   inserts the assets.
@@ -10077,8 +10090,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1075**: The reported ticket's title must be the trimmed `summary`, or "Reported issue: <asset name>" when
   the summary is missing or blank, and its description the trimmed `description`, or none when blank.
 - **SPEC-15.1076**: A contact's report must create a ticket with source `portal`, the contact as requester and the
-  asset's company, link it to the asset, and return the refreshed ticket; a failure to link must answer an internal
-  server error whose message begins "stamp asset_id on report-issue ticket" or "commit asset_id stamp".
+  asset's company, link it to the asset in the same insert that creates the ticket (so a failure leaves no unlinked
+  ticket behind), and return the ticket.
 - **SPEC-15.1077**: A staff report must create an `internal` ticket for the asset's company with `asset_id` set, created
   by the calling user, and return the refreshed ticket.
 - **SPEC-15.1078**: Asset secrets (configuration item values and credential username, password and notes) must be
@@ -10261,7 +10274,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   both tallies from the stored votes, store them on the article, answer 404 "KB article" when absent in the tenant, and
   return `id`, both counts and `my_vote` (null after a removal).
 - **SPEC-15.1134**: `GET /kb/articles/{id}/vote` must return the article's stored counts and the caller's current vote
-  without changing anything, and answer 404 "KB article" when absent in the tenant.
+  without changing anything, and answer 404 "KB article" when absent in the tenant. The stored count columns are
+  nullable; a null count must read as 0.
 - **SPEC-15.1135**: `DELETE /kb/articles/{id}` must require a manager, answer 404 "KB article" when absent in the
   tenant, write an audit entry holding the prior row in the same transaction, and after commit delete the stored blobs
   of the article's attachments.
@@ -10283,7 +10297,9 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   see. A staff render must not count a view.
 - **SPEC-15.1140**: `GET /kb/articles/{id}/comments` must require the knowledge base module, answer 404 "KB article"
   when absent in the tenant, and return root comments oldest first, each with its replies oldest first; a deleted
-  comment must keep its place with `deleted` true and an empty body.
+  comment must keep its place with `deleted` true and an empty body. A reply whose root is absent from the result is
+  dropped, which cannot occur while the `parent_id` foreign key holds (a root is never removed while a reply refers to
+  it), so no orphan handling exists.
 - **SPEC-15.1141**: `POST /kb/articles/{id}/comments` must validate `body` as 1..=20000 characters, store it trimmed,
   answer 404 "KB article" when absent, and answer 201 with the comment. A reply must answer a live top-level comment of
   the same article or be rejected with 422 on `parent_id` ("a reply answers a top-level comment on this article"), and
@@ -10316,13 +10332,15 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1149**: `GET /companies/{company_id}/documentation` must require the assets module and an authenticated
   user, and must return an object with exactly the lists `assets`, `credentials` and `articles`.
 - **SPEC-15.1150**: The `assets` list must hold the first page of at most 100 assets of the caller's tenant for the
-  company, ordered by name, and the response must carry no total for it.
+  company, ordered by name, and the response must carry `total_assets`, the full count, so a truncated list is
+  detectable.
 - **SPEC-15.1151**: The `credentials` list must hold every credential reference of the tenant for the company, both
   asset-linked and company-scoped, ordered by name, with no username, password or notes and no 100-item limit.
 - **SPEC-15.1152**: The `articles` list must hold at most 100 articles of the tenant whose company list contains the
-  company, newest update first, in every status, and must not depend on the `knowledge_base` module flag.
+  company, newest update first, in every status, and must not depend on the `knowledge_base` module flag. The response
+  must carry `total_articles`, the full count.
 - **SPEC-15.1153**: A company id that does not exist in the caller's tenant, including one belonging to another tenant,
-  must produce a 200 response with three empty lists, because no company existence check is made.
+  must answer 404 "Company".
 - **SPEC-15.1154**: The three lists must be read concurrently; if any read fails the request must fail with that error
   and return no partial body.
 
