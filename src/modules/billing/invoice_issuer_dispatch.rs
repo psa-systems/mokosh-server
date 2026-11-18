@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -728,12 +728,14 @@ impl IssuerDispatcher {
         let xero_lines: Vec<XeroLineItemInput> = request
             .lines
             .iter()
-            .map(|l| XeroLineItemInput {
-                description: l.description.clone(),
-                quantity_hundredths: decimal_to_hundredths(l.quantity),
-                unit_price_minor: decimal_to_minor(l.unit_price),
+            .map(|l| {
+                Ok(XeroLineItemInput {
+                    description: l.description.clone(),
+                    quantity_hundredths: decimal_to_hundredths(l.quantity)?,
+                    unit_price_minor: decimal_to_minor(l.unit_price)?,
+                })
             })
-            .collect();
+            .collect::<AppResult<_>>()?;
 
         let xero_request = XeroIssueInvoiceRequest {
             contact_id,
@@ -815,7 +817,7 @@ impl IssuerDispatcher {
             qbo_lines.push(
                 crate::modules::billing::provider_invoice::quickbooks::QuickBooksLineItemInput {
                     description: line.description.clone(),
-                    amount_minor: decimal_to_minor(line.quantity * line.unit_price),
+                    amount_minor: decimal_to_minor(line.quantity * line.unit_price)?,
                     item_id: mapping.external_item_id.clone(),
                 },
             );
@@ -877,9 +879,10 @@ impl IssuerDispatcher {
     /// provider showing it owing, and the accountant reconciled against a
     /// balance wrong by the amount paid.
     ///
-    /// `None` when there is nothing to tell: no dispatcher, the switch
-    /// off, or a bill no provider holds. Each missing mapping is a
-    /// `Conflict` naming the route that sets it, as every other push
+    /// Returns the provider's id for the payment it recorded. The caller
+    /// decides whether there is anything to tell (a dispatcher, the switch
+    /// on, a bill a provider holds) before calling. Each missing mapping is
+    /// a `Conflict` naming the route that sets it, as every other push
     /// here is.
     pub async fn pay_bill_in_provider(
         &self,
@@ -1081,13 +1084,18 @@ impl IssuerDispatcher {
                     lines: shape
                         .lines
                         .iter()
-                        .map(|l| XeroLineItemInput {
-                            description: l.description.clone(),
-                            quantity_hundredths: decimal_to_hundredths(l.quantity),
-                            unit_price_minor: decimal_to_minor(l.unit_price),
+                        .map(|l| {
+                            Ok(XeroLineItemInput {
+                                description: l.description.clone(),
+                                quantity_hundredths: decimal_to_hundredths(l.quantity)?,
+                                unit_price_minor: decimal_to_minor(l.unit_price)?,
+                            })
                         })
-                        .collect(),
+                        .collect::<AppResult<_>>()?,
                 };
+                // Before the create, so an unrepresentable total refuses the
+                // dispatch while the provider still holds nothing.
+                let total_minor = decimal_to_minor(shape.total)?;
                 let reference = self.xero.issue_credit_note(&creds, &request).await?;
                 let allocation = match self
                     .xero
@@ -1096,7 +1104,7 @@ impl IssuerDispatcher {
                         &reference.external_credit_note_id,
                         &XeroAllocateCreditRequest {
                             invoice_id,
-                            amount_minor: decimal_to_minor(shape.total),
+                            amount_minor: total_minor,
                             date: shape.issue_date,
                         },
                     )
@@ -1156,12 +1164,13 @@ impl IssuerDispatcher {
                     lines.push(
                         crate::modules::billing::provider_invoice::quickbooks::QuickBooksLineItemInput {
                             description: line.description.clone(),
-                            amount_minor: decimal_to_minor(line.quantity * line.unit_price),
+                            amount_minor: decimal_to_minor(line.quantity * line.unit_price)?,
                             item_id: mapping.external_item_id.clone(),
                         },
                     );
                 }
 
+                let total_minor = decimal_to_minor(shape.total)?;
                 let reference = self
                     .quickbooks
                     .issue_credit_memo(
@@ -1182,7 +1191,7 @@ impl IssuerDispatcher {
                             customer_id: customer_mapping.external_customer_id.clone(),
                             invoice_id: shape.external_invoice_id.to_string(),
                             credit_memo_id: reference.external_credit_note_id.clone(),
-                            amount_minor: decimal_to_minor(shape.total),
+                            amount_minor: total_minor,
                             applied_on: shape.issue_date,
                         },
                     )
@@ -1386,8 +1395,23 @@ impl IssuerDispatcher {
     ) -> AppResult<(IntegrationCredentialBlob, bool)> {
         let key = SecretKey::integration(*tenant_id, provider.as_str());
         let stored = self.secrets.get(&key).await?;
-        let mut blob = parse_blob(stored.as_deref(), provider)?;
+        let blob = parse_blob(stored.as_deref(), provider)?;
 
+        let now = Utc::now();
+        // Fast path: a token that is not near expiry needs no lock.
+        if !blob_near_expiry(&blob, now) {
+            return Ok((blob, false));
+        }
+        // Serialise the refresh per tenant and provider, then re-read: a
+        // concurrent caller may have rotated the token while this one waited,
+        // and refreshing from the old refresh token would fail with
+        // `invalid_grant`. The lock is released when `_guard` drops.
+        let _guard = self
+            .mappings
+            .lock_credential_refresh(tenant_id, provider)
+            .await?;
+        let stored = self.secrets.get(&key).await?;
+        let mut blob = parse_blob(stored.as_deref(), provider)?;
         let now = Utc::now();
         let refreshed = match &mut blob {
             IntegrationCredentialBlob::Xero(x) => {
@@ -1424,9 +1448,41 @@ impl IssuerDispatcher {
 
         if refreshed {
             let raw = serialize_blob(&blob)?;
-            self.secrets.put(&key, &raw).await?;
+            // The provider has already rotated the refresh token, so a failed
+            // write-back loses the only copy of the new one: say so loudly and
+            // distinctly from an ordinary secret-store error.
+            if let Err(e) = self.secrets.put(&key, &raw).await {
+                tracing::error!(
+                    tenant_id = %tenant_id,
+                    provider = provider.as_str(),
+                    error = ?e,
+                    "invoice-issuer refresh succeeded but the rotated credentials could not be stored; the tenant must reconnect"
+                );
+                return Err(AppError::internal(format!(
+                    "refreshed {} credentials could not be stored; reconnect the integration",
+                    provider.as_str()
+                )));
+            }
         }
         Ok((blob, refreshed))
+    }
+}
+
+/// Whether the stored access token is close enough to expiry to refresh.
+fn blob_near_expiry(blob: &IntegrationCredentialBlob, now: DateTime<Utc>) -> bool {
+    match blob {
+        IntegrationCredentialBlob::Xero(x) => {
+            crate::modules::billing::provider_invoice::xero::access_token_near_expiry(
+                x.access_token_expires_at,
+                now,
+            )
+        }
+        IntegrationCredentialBlob::Quickbooks(q) => {
+            crate::modules::billing::provider_invoice::quickbooks::access_token_near_expiry(
+                q.access_token_expires_at,
+                now,
+            )
+        }
     }
 }
 
@@ -1511,33 +1567,23 @@ pub struct CreateInvoiceRequestShape<'a> {
 /// here and `123` in the row that was already sent to the customer,
 /// causing the dispatched provider total to diverge from the issued
 /// invoice. Use `MidpointAwayFromZero` explicitly.
-fn decimal_to_minor(d: Decimal) -> i64 {
-    let scaled = (d * Decimal::from(100))
-        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
-    match scaled.to_i64() {
-        Some(v) => v,
-        None => {
-            // PMS-1660 finding: out-of-range values used to become 0
-            // via `.unwrap_or_default()`, sending a zero-value line
-            // to the provider with no trace. A `Decimal` whose minor
-            // units overflow i64 is a bookkeeping mistake upstream
-            // (invoice total > i64 cents, roughly $92 quadrillion);
-            // keep the 0 fallback so the dispatch does not panic
-            // mid-send, but log the offending value at error so an
-            // operator can find the row and refuse the dispatch.
-            tracing::error!(
-                decimal = %d,
-                "decimal_to_minor: value does not fit in i64 minor units; using 0 as placeholder"
-            );
-            0
-        }
-    }
+fn decimal_to_minor(d: Decimal) -> AppResult<i64> {
+    (d * Decimal::from(100))
+        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+        .to_i64()
+        .ok_or_else(|| {
+            // Roughly 92 quadrillion in major units: a bookkeeping mistake
+            // upstream. Refuse the dispatch rather than send a zero-value line.
+            AppError::internal(format!(
+                "amount {d} does not fit in i64 minor units; refusing to send it to the provider"
+            ))
+        })
 }
 
 /// Convert a `Decimal` quantity to hundredths (matches
 /// `invoice_lines.quantity_hundredths` and the Xero line
 /// `quantity_hundredths` input).
-fn decimal_to_hundredths(d: Decimal) -> i64 {
+fn decimal_to_hundredths(d: Decimal) -> AppResult<i64> {
     decimal_to_minor(d)
 }
 
@@ -1547,11 +1593,11 @@ mod tests {
 
     #[test]
     fn decimal_to_minor_handles_the_common_cases() {
-        assert_eq!(decimal_to_minor(Decimal::from(0)), 0);
-        assert_eq!(decimal_to_minor(Decimal::from(1)), 100);
-        assert_eq!(decimal_to_minor(Decimal::new(1234, 2)), 1234);
-        assert_eq!(decimal_to_minor(Decimal::new(-1234, 2)), -1234);
-        assert_eq!(decimal_to_minor(Decimal::new(5, 1)), 50);
+        assert_eq!(decimal_to_minor(Decimal::from(0)).unwrap(), 0);
+        assert_eq!(decimal_to_minor(Decimal::from(1)).unwrap(), 100);
+        assert_eq!(decimal_to_minor(Decimal::new(1234, 2)).unwrap(), 1234);
+        assert_eq!(decimal_to_minor(Decimal::new(-1234, 2)).unwrap(), -1234);
+        assert_eq!(decimal_to_minor(Decimal::new(5, 1)).unwrap(), 50);
     }
 
     /// A fractional cent rounds half-away-from-zero, matching the
@@ -1560,11 +1606,16 @@ mod tests {
     /// drift from the row's own total column.
     #[test]
     fn decimal_to_minor_rounds_half_away_from_zero() {
-        assert_eq!(decimal_to_minor(Decimal::new(1235, 3)), 124); // 1.235 -> 1.24
-        assert_eq!(decimal_to_minor(Decimal::new(-1235, 3)), -124);
+        assert_eq!(decimal_to_minor(Decimal::new(1235, 3)).unwrap(), 124); // 1.235 -> 1.24
+        assert_eq!(decimal_to_minor(Decimal::new(-1235, 3)).unwrap(), -124);
     }
 
-    /// PMS-1660: the old `round_dp(0)` defaulted to banker's rounding,
+    #[test]
+    fn decimal_to_minor_refuses_an_amount_that_overflows() {
+        assert!(decimal_to_minor(Decimal::MAX).is_err());
+    }
+
+    /// The old `round_dp(0)` defaulted to banker's rounding,
     /// which agreed with half-away-from-zero at `.235` (last-rounded
     /// digit was odd either way) but disagreed on even-digit midpoints:
     /// `1.225` landed on `122` under banker's and `123` under
@@ -1573,9 +1624,9 @@ mod tests {
     /// regression trips here.
     #[test]
     fn decimal_to_minor_rounds_even_midpoints_away_from_zero() {
-        assert_eq!(decimal_to_minor(Decimal::new(1225, 3)), 123); // 1.225 -> 1.23
-        assert_eq!(decimal_to_minor(Decimal::new(-1225, 3)), -123);
-        assert_eq!(decimal_to_minor(Decimal::new(1245, 3)), 125); // 1.245 -> 1.25
-        assert_eq!(decimal_to_minor(Decimal::new(-1245, 3)), -125);
+        assert_eq!(decimal_to_minor(Decimal::new(1225, 3)).unwrap(), 123); // 1.225 -> 1.23
+        assert_eq!(decimal_to_minor(Decimal::new(-1225, 3)).unwrap(), -123);
+        assert_eq!(decimal_to_minor(Decimal::new(1245, 3)).unwrap(), 125); // 1.245 -> 1.25
+        assert_eq!(decimal_to_minor(Decimal::new(-1245, 3)).unwrap(), -125);
     }
 }
