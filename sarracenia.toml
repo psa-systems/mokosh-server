@@ -1,0 +1,9 @@
+# Publishes this repo's docs to docs.a8n.systems under /docs/mokosh-server.
+source = "mokosh-server"
+base_path = "/docs/mokosh-server"
+include = ["README.md", "src/**/*.rs", "**/src/**/*.rs"]
+exclude = ["CLAUDE.md", "docs/**", "common/**", "tests/**", "**/tests/**", "target/**", "**/target/**"]
+
+[storefront]
+url = "https://docs.a8n.systems"
+site = "docs"
