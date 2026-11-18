@@ -17,6 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::utils::error::{AppError, AppResult};
+
 // SPEC-13.1000: closed provider set
 /// The set of external invoice-issuer providers Mokosh will delegate to
 /// (MAPPS-1099). The string form is what the `invoices.external_provider`
@@ -103,7 +105,7 @@ pub struct ExternalSettlement {
     pub voided: bool,
 }
 
-// SPEC-13.1001, SPEC-13.1002: truncating parse; unreadable part reads as 0
+// SPEC-13.1001, SPEC-13.1002: truncating parse; an unreadable amount is an error
 /// A provider's decimal amount (`"120.50"`, or a JSON number rendered as
 /// one) in minor units, truncating rather than rounding.
 ///
@@ -111,20 +113,37 @@ pub struct ExternalSettlement {
 /// third decimal from a provider is a precision Mokosh's columns do not
 /// hold, and rounding it up would record a payment larger than the one
 /// that was made.
-pub fn decimal_string_to_minor(raw: &str) -> i64 {
+pub fn decimal_string_to_minor(raw: &str) -> AppResult<i64> {
+    let malformed = || {
+        AppError::external_service(
+            "invoice-issuer",
+            format!("provider sent an amount that is not a decimal number: {raw:?}"),
+        )
+    };
     let trimmed = raw.trim();
     let (sign, digits) = match trimmed.strip_prefix('-') {
         Some(rest) => (-1i64, rest),
         None => (1i64, trimmed),
     };
     let (whole, frac) = digits.split_once('.').unwrap_or((digits, ""));
-    let whole: i64 = whole.parse().unwrap_or(0);
-    let mut cents = 0i64;
-    for (i, c) in frac.chars().take(2).enumerate() {
-        let d = c.to_digit(10).unwrap_or(0) as i64;
-        cents += if i == 0 { d * 10 } else { d };
+    if whole.is_empty() && frac.is_empty() {
+        return Err(malformed());
     }
-    sign * (whole.saturating_mul(100).saturating_add(cents))
+    let whole: i64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().map_err(|_| malformed())?
+    };
+    let mut cents = 0i64;
+    for (i, c) in frac.chars().enumerate() {
+        let d = c.to_digit(10).ok_or_else(malformed)? as i64;
+        match i {
+            0 => cents += d * 10,
+            1 => cents += d,
+            _ => {}
+        }
+    }
+    Ok(sign * (whole.saturating_mul(100).saturating_add(cents)))
 }
 
 /// What a provider calls the reimbursement it now holds (PMS-1541).
@@ -279,24 +298,25 @@ mod tests {
     /// than the one the provider made.
     #[test]
     fn a_provider_amount_becomes_minor_units() {
-        assert_eq!(decimal_string_to_minor("70"), 7000);
-        assert_eq!(decimal_string_to_minor("70.00"), 7000);
+        assert_eq!(decimal_string_to_minor("70").unwrap(), 7000);
+        assert_eq!(decimal_string_to_minor("70.00").unwrap(), 7000);
         assert_eq!(
-            decimal_string_to_minor("70.5"),
+            decimal_string_to_minor("70.5").unwrap(),
             7050,
             "one decimal is tenths"
         );
-        assert_eq!(decimal_string_to_minor(" 1234.56 "), 123456);
+        assert_eq!(decimal_string_to_minor(" 1234.56 ").unwrap(), 123456);
         assert_eq!(
-            decimal_string_to_minor("70.999"),
+            decimal_string_to_minor("70.999").unwrap(),
             7099,
             "a third decimal is dropped, never rounded up"
         );
-        assert_eq!(decimal_string_to_minor("-5.00"), -500);
-        assert_eq!(
-            decimal_string_to_minor("not a number"),
-            0,
-            "an unreadable amount is nothing rather than a panic: the caller is a webhook"
+        assert_eq!(decimal_string_to_minor("-5.00").unwrap(), -500);
+        assert!(
+            decimal_string_to_minor("not a number").is_err(),
+            "an unreadable amount is an error, never a zero-value settlement"
         );
+        assert!(decimal_string_to_minor("").is_err());
+        assert!(decimal_string_to_minor("1.x5").is_err());
     }
 }
