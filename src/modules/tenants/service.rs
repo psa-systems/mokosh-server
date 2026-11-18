@@ -7,7 +7,6 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::notifications::NotificationsService;
-use crate::utils::crypto::{generate_token, hash_password, sha256_hex};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::validation::slugify;
 

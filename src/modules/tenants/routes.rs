@@ -26,8 +26,8 @@ use validator::Validate;
 use super::logo::{logo_path, TenantLogoConfig, TenantLogoStore};
 use super::organization::organization_update;
 use super::{
-    CreateTenantRequest, OrganizationProfileRequest, TenantAdminInfo, TenantResponse,
-    TenantService, TenantUsage, UpdateTenantAdminRequest, UpdateTenantRequest,
+    CreateTenantRequest, OrganizationProfileRequest, TenantResponse, TenantService, TenantUsage,
+    UpdateTenantRequest,
 };
 use crate::modules::auth::{
     AuthService, CurrentUser, RequireAdmin, RequireAuth, RequireAuthState, TenantId, TenantScoped,

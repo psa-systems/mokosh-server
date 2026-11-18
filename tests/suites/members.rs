@@ -432,7 +432,10 @@ async fn list_members_q_escapes_wildcards_and_filters_unplaced_guests(pool: PgPo
     seed_user(&pool, "plain@acme.example", "Plain", "Person", "technician").await;
     let grant_a = seed_grant(&pool, Uuid::new_v4(), "finance").await;
     let grant_b = seed_grant(&pool, Uuid::new_v4(), "finance").await;
-    for (id, mail) in [(grant_a, "guest-a@elsewhere.example"), (grant_b, "guest-b@elsewhere.example")] {
+    for (id, mail) in [
+        (grant_a, "guest-a@elsewhere.example"),
+        (grant_b, "guest-b@elsewhere.example"),
+    ] {
         sqlx::query("UPDATE mokosh_bunyip_grants SET grantee_email = $2 WHERE id = $1")
             .bind(id)
             .bind(mail)
@@ -444,7 +447,11 @@ async fn list_members_q_escapes_wildcards_and_filters_unplaced_guests(pool: PgPo
     let token = common::login(&app, &email, &password).await;
 
     let body = get_members(&app, &token, "q=%25").await;
-    assert_eq!(body["total"].as_u64(), Some(1), "a bare % matches only a literal %");
+    assert_eq!(
+        body["total"].as_u64(),
+        Some(1),
+        "a bare % matches only a literal %"
+    );
     assert_eq!(body["rows"][0]["email"].as_str(), Some("pct@acme.example"));
 
     let body = get_members(&app, &token, "q=guest-a").await;
