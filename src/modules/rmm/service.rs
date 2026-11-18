@@ -174,11 +174,7 @@ impl RmmService {
         )
         .await?;
         tx.commit().await?;
-        // PMS-1665: the response `created_at` used to be
-        // `chrono::Utc::now()` from the handler, which drifted from the
-        // stored row value (DEFAULT NOW()) by whatever the INSERT took.
-        // Return it from the RETURNING above so the response matches
-        // what a subsequent GET will show.
+        // `created_at` comes from RETURNING so it matches a later GET.
         Ok(RmmConnectionResponse {
             id,
             name: request.name.clone(),
@@ -323,23 +319,28 @@ impl RmmService {
                 .map_err(|e| e.to_string()),
             Err(e) => Err(e),
         };
-        let summary = match result {
-            Ok(status) => serde_json::json!({"reachable": true, "status": status}),
-            Err(e) => serde_json::json!({"reachable": false, "error": e}),
+        let (summary, last_error) = match result {
+            Ok(status) => (
+                serde_json::json!({"reachable": true, "status": status}),
+                None,
+            ),
+            Err(e) => (serde_json::json!({"reachable": false, "error": e}), Some(e)),
         };
-        let last_sync_status = if summary["reachable"].as_bool().unwrap_or(false) {
+        let last_sync_status = if last_error.is_none() {
             "success"
         } else {
             "failed"
         };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
-            r#"UPDATE rmm_connections SET sync_status = $3, last_sync_at = NOW(), updated_at = NOW()
+            r#"UPDATE rmm_connections
+               SET sync_status = $3, last_error = $4, last_sync_at = NOW(), updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
         .bind(tenant_id)
         .bind(id)
         .bind(last_sync_status)
+        .bind(&last_error)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -739,8 +740,26 @@ impl RmmService {
         &self,
         tenant_id: TenantId,
         request: &IngestAlertRequest,
-    ) -> AppResult<u64> {
+    ) -> AppResult<IngestSummary> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // The signed webhook authenticates against the stored secret, which
+        // outlives deactivation, so refuse here.
+        let connection_active: Option<Option<bool>> = sqlx::query_scalar(
+            "SELECT is_active FROM rmm_connections WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(request.rmm_connection_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match connection_active {
+            None => return Err(AppError::NotFound("RMM connection".to_string())),
+            Some(active) if !active.unwrap_or(false) => {
+                return Err(AppError::Forbidden(
+                    "RMM connection is inactive; alert refused".to_string(),
+                ));
+            }
+            Some(_) => {}
+        }
         let rules: Vec<AlertRuleRow> = sqlx::query_as(
             r#"SELECT id, rmm_connection_id, NULL::text AS rmm_connection_name, name, alert_type,
                       auto_create_ticket, assign_to_id, queue_id, is_active, ticket_template,
@@ -777,100 +796,138 @@ impl RmmService {
             "rmm_connection_id": request.rmm_connection_id.to_string(),
         });
 
-        let mut created = 0u64;
+        let mut summary = IngestSummary::default();
+        let mut first_error: Option<AppError> = None;
         for rule in rules {
-            if !rule.auto_create_ticket.unwrap_or(false) {
-                continue;
-            }
-            let Some(company_id) = mapping_company else {
-                tracing::warn!(
-                    rule = %rule.name,
-                    rmm_connection_id = %request.rmm_connection_id,
-                    "no mapped company for device",
-                );
-                continue;
-            };
-            if alert_suppressed(rule.suppression_rules.as_ref(), request) {
-                tracing::debug!(
-                    rule = %rule.name,
-                    alert_type = %request.alert_type,
-                    severity = ?request.severity,
-                    "rmm alert suppressed by rule.suppression_rules",
-                );
-                continue;
-            }
-
-            // Render title / description from the template if the rule
-            // supplies one; otherwise use the raw alert body.
-            let (title, description) =
-                render_alert_fields(rule.ticket_template.as_ref(), request, &context);
-
-            // Dedupe: skip if an OPEN ticket with the same source/title
-            // exists within the dedupe window. Closed tickets are
-            // re-eligible so a recurring problem can re-open a ticket.
-            if let Some(window) = dedupe_window_minutes(rule.suppression_rules.as_ref()) {
-                let mut dedupe_tx = self.db.begin_with_tenant(tenant_id).await?;
-                let dup: Option<Uuid> = sqlx::query_scalar(
-                    r#"SELECT t.id
-                       FROM tickets t
-                       JOIN ticket_statuses s ON t.status_id = s.id
-                       WHERE t.tenant_id = $1 AND t.source = 'rmm'
-                         AND t.company_id = $2 AND t.title = $3
-                         AND s.is_closed = FALSE
-                         AND t.created_at >= NOW() - ($4 * INTERVAL '1 minute')
-                       LIMIT 1"#,
-                )
-                .bind(tenant_id)
-                .bind(company_id)
-                .bind(&title)
-                .bind(window)
-                .fetch_optional(&mut *dedupe_tx)
-                .await?;
-                drop(dedupe_tx);
-                if dup.is_some() {
-                    tracing::debug!(
+            match self
+                .ingest_for_rule(tenant_id, &rule, request, &context, mapping_company)
+                .await
+            {
+                Ok(true) => summary.created += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    // One rule failing must not hide the tickets earlier rules
+                    // already created, nor stop the later rules.
+                    tracing::error!(
                         rule = %rule.name,
-                        window_min = window,
-                        "rmm alert dropped by dedupe window",
+                        rmm_connection_id = %request.rmm_connection_id,
+                        error = %e,
+                        "rmm alert rule failed to create its ticket",
                     );
-                    continue;
+                    summary.failed += 1;
+                    first_error.get_or_insert(e);
                 }
             }
-
-            let Some(default_creator) = self.default_creator(tenant_id).await? else {
-                tracing::warn!(
-                    rule = %rule.name,
-                    rmm_connection_id = %request.rmm_connection_id,
-                    "no default ticket creator",
-                );
-                continue;
-            };
-            let req = CreateTicketRequest {
-                title: title.clone(),
-                description: Some(description.clone()),
-                queue_id: rule.queue_id,
-                source: TicketSource::Rmm,
-                company_id,
-                assigned_to_id: rule.assign_to_id,
-                is_billable: false,
-                ..Default::default()
-            };
-            // RMM ingest is a background path (no AuditCtx extractor);
-            // attribute the auto-created ticket to the system actor.
-            // `TicketService` is on `TenantId`, so the scope flows
-            // straight through; `AuditCtx::system` is still a `Uuid`
-            // context bag, so unwrap only there.
-            self.tickets
-                .create_ticket(
-                    tenant_id,
-                    default_creator,
-                    &req,
-                    &crate::modules::audit::AuditCtx::system(tenant_id.get()),
-                )
-                .await?;
-            created += 1;
         }
-        Ok(created)
+        // Nothing created and something failed: surface the error so the
+        // sender retries; with a partial success a retry would duplicate.
+        if summary.created == 0 {
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Apply one alert rule. `Ok(true)` when a ticket was created.
+    async fn ingest_for_rule(
+        &self,
+        tenant_id: TenantId,
+        rule: &AlertRuleRow,
+        request: &IngestAlertRequest,
+        context: &serde_json::Value,
+        mapping_company: Option<Uuid>,
+    ) -> AppResult<bool> {
+        if !rule.auto_create_ticket.unwrap_or(false) {
+            return Ok(false);
+        }
+        let Some(company_id) = mapping_company else {
+            tracing::warn!(
+                rule = %rule.name,
+                rmm_connection_id = %request.rmm_connection_id,
+                "no mapped company for device",
+            );
+            return Ok(false);
+        };
+        if alert_suppressed(rule.suppression_rules.as_ref(), request) {
+            tracing::debug!(
+                rule = %rule.name,
+                alert_type = %request.alert_type,
+                severity = ?request.severity,
+                "rmm alert suppressed by rule.suppression_rules",
+            );
+            return Ok(false);
+        }
+
+        // Render title / description from the template if the rule
+        // supplies one; otherwise use the raw alert body.
+        let (title, description) =
+            render_alert_fields(rule.ticket_template.as_ref(), request, context);
+
+        // Dedupe: skip if an OPEN ticket with the same source/title
+        // exists within the dedupe window. Closed tickets are
+        // re-eligible so a recurring problem can re-open a ticket.
+        if let Some(window) = dedupe_window_minutes(rule.suppression_rules.as_ref()) {
+            let mut dedupe_tx = self.db.begin_with_tenant(tenant_id).await?;
+            let dup: Option<Uuid> = sqlx::query_scalar(
+                r#"SELECT t.id
+                   FROM tickets t
+                   JOIN ticket_statuses s ON t.status_id = s.id
+                   WHERE t.tenant_id = $1 AND t.source = 'rmm'
+                     AND t.company_id = $2 AND t.title = $3
+                     AND s.is_closed = FALSE
+                     AND t.created_at >= NOW() - ($4 * INTERVAL '1 minute')
+                   LIMIT 1"#,
+            )
+            .bind(tenant_id)
+            .bind(company_id)
+            .bind(&title)
+            .bind(window)
+            .fetch_optional(&mut *dedupe_tx)
+            .await?;
+            drop(dedupe_tx);
+            if dup.is_some() {
+                tracing::debug!(
+                    rule = %rule.name,
+                    window_min = window,
+                    "rmm alert dropped by dedupe window",
+                );
+                return Ok(false);
+            }
+        }
+
+        let Some(default_creator) = self.default_creator(tenant_id).await? else {
+            tracing::warn!(
+                rule = %rule.name,
+                rmm_connection_id = %request.rmm_connection_id,
+                "no default ticket creator",
+            );
+            return Ok(false);
+        };
+        let req = CreateTicketRequest {
+            title: title.clone(),
+            description: Some(description.clone()),
+            queue_id: rule.queue_id,
+            source: TicketSource::Rmm,
+            company_id,
+            assigned_to_id: rule.assign_to_id,
+            is_billable: false,
+            ..Default::default()
+        };
+        // RMM ingest is a background path (no AuditCtx extractor);
+        // attribute the auto-created ticket to the system actor.
+        // `TicketService` is on `TenantId`, so the scope flows
+        // straight through; `AuditCtx::system` is still a `Uuid`
+        // context bag, so unwrap only there.
+        self.tickets
+            .create_ticket(
+                tenant_id,
+                default_creator,
+                &req,
+                &crate::modules::audit::AuditCtx::system(tenant_id.get()),
+            )
+            .await?;
+        Ok(true)
     }
 
     async fn default_creator(&self, tenant_id: TenantId) -> AppResult<Option<Uuid>> {
@@ -911,6 +968,13 @@ impl RmmService {
             &self.encryption_key,
         )?))
     }
+}
+
+/// Outcome of one alert ingest across every matching rule.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IngestSummary {
+    pub created: u64,
+    pub failed: u64,
 }
 
 #[derive(sqlx::FromRow)]

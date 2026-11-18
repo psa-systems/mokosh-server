@@ -10470,7 +10470,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   connectwise | ninja_rmm", and must reject a `name` outside 1-100 characters or an `api_url` that is not a URL with a
   validation error.
 - **SPEC-15.1541**: `POST /rmm/connections` must store `api_key` and any `api_secret` as AES-256-GCM ciphertext under
-  the deployment key, must default `is_active` to false and `sync_interval_minutes` to 60, must answer with sync status
+  the deployment key, must default `is_active` to false and `sync_interval_minutes` to 60 and reject a value below 1 (on update as well) with
+  a validation error, must answer with sync status
   `never` and no last sync time, and must write a `create` audit record in the same transaction.
 - **SPEC-15.1542**: No RMM response may contain `api_key` or `api_secret`; a connection response must carry only id,
   name, provider, api_url, is_active, sync_interval_minutes, last_sync_at, sync_status, last_error and created_at.
@@ -10488,7 +10489,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   target is blocked as private; each case must log a warning naming the connection id.
 - **SPEC-15.1547**: The connection test must answer 200 with `{"reachable": true, "status": <http status>}` for any HTTP
   response received, and `{"reachable": false, "error": <text>}` when no response was received, and must record
-  `sync_status` `success` or `failed` and `last_sync_at` now on the connection.
+  `sync_status` `success` or `failed`, `last_sync_at` now and `last_error` (the error text, or null after a probe that
+  received a response) on the connection.
 - **SPEC-15.1548**: `POST /rmm/device-mappings` must require `rmm_device_id` of 1-255 characters, must write a `create`
   audit record in the same transaction, and must answer with the mapping including the owning connection's name and a
   sync status of `pending` unless one is stored.
@@ -10504,7 +10506,9 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   likewise.
 - **SPEC-15.1552**: `POST /rmm/alerts` must not require a session; it must take the tenant from the `X-Tenant-Id` header
   and authenticate the body with an `X-Signature` header holding the standard-alphabet base64 of the HMAC-SHA256 of the
-  exact received body bytes keyed by the connection's decrypted `api_secret`, compared in constant time.
+  exact received body bytes keyed by the connection's decrypted `api_secret`, compared in constant time. Field validation
+  must run only after the signature is verified, and a verified alert for a connection whose `is_active` is false must
+  be refused with 403 and create no ticket.
 - **SPEC-15.1553**: `POST /rmm/alerts` must answer 401 without detail when the body is not a valid alert JSON document,
   the `X-Signature` header is missing, the `X-Tenant-Id` header is missing or not a UUID, the connection does not exist
   in that tenant, the connection has no `api_secret`, or the signature does not match.
@@ -10530,8 +10534,9 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   `queue_id` and `assign_to_id`, `is_billable` false, an audit actor of the tenant's system, and the oldest active user
   of role `super_admin`, `admin` or `manager` as creator; with no such user the rule must be skipped with a warning
   naming the rule and connection.
-- **SPEC-15.1561**: If a ticket creation fails during alert ingest, the request must fail with that error and the
-  remaining rules must not be processed; tickets already created for earlier rules in the same request must remain.
+- **SPEC-15.1561**: If a ticket creation fails for one rule during alert ingest, the remaining rules must still be
+  processed and the failure logged; the response must carry `rules_failed` beside `tickets_created`. When no ticket was
+  created and a rule failed, the request must fail with that error so the sender retries.
 - **SPEC-15.1562**: The provider factory must return the Tactical RMM provider for `tactical_rmm` and, for every other
   provider value, a provider whose every operation fails with an internal error "RMM provider '<name>' is not
   implemented yet".
@@ -10597,7 +10602,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   date from 30 days before the caller's today onward, in ascending date order, omitting dates with no tickets.
 - **SPEC-15.1582**: `GET /reports/tickets` must default `from` to 30 days before the caller's today and `to` to the
   caller's today, include both bounds, and return `opened_by_status` (tickets created in range, by status name in name
-  order), `closed_total` (tickets whose `closed_at` falls in range) and `opened_by_assignee` (id, name and count).
+  order), `closed_total` (tickets whose `closed_at` falls in range) and `opened_by_assignee` (id, name and count, highest
+  count first). Dates must be taken in the caller's time zone, and a `from` later than `to` must be refused with 422.
 - **SPEC-15.1583**: In `opened_by_assignee` the name must be the assignee's full name, else the email, and must be
   absent for an unassigned ticket; an assignee id whose name did not resolve must be logged by id and must not be logged
   for an unassigned ticket.
@@ -10665,8 +10671,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1601**: A custom report with dimensions must group and order by all of them in the given order, and its row
   limit must default to 100 and be clamped into 1 to 1000.
 - **SPEC-15.1602**: A custom report response must carry `columns` (dimension labels then measure labels), `rows` of
-  nullable strings, and `totals` mapping each measure label to the sum of that column over the returned rows
-  (non-numeric cells ignored), written without a fractional part when whole and with two decimals otherwise.
+  nullable strings, and `totals` mapping each measure label to the value of that measure aggregated in the
+  database over every row matching the filters, before the row limit (so a ratio measure is the ratio of the sums).
 - **SPEC-15.1603**: `POST /reports/custom` with `"format": "csv"` must answer `text/csv; charset=utf-8` containing the
   column labels as a header line then one line per row with null cells empty and cells quoted per the CSV rule; any
   other `format` value must answer the JSON envelope.
@@ -10692,17 +10698,17 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   caller as author, and must not check `entity_type` against the supported entities until the report is executed.
 - **SPEC-15.1611**: `PATCH /reports/saved/{id}` must be allowed only for the author; any other user, including one who
   can see the report because it is shared, must receive 404 "Saved report". It must change only the supplied fields
-  among name (1-200 characters), description, filters, columns, group_by, sort and is_shared, must not change
+  among name (1-200 characters), description (an explicit `null` clears it), filters, columns, group_by, sort and is_shared, must not change
   `entity_type`, and must answer with the updated report.
 - **SPEC-15.1612**: `DELETE /reports/saved/{id}` must be allowed only for the author, answering `{"deleted": true}`, and
   must answer 404 "Saved report" for anyone else or an unknown id.
 - **SPEC-15.1613**: `POST /reports/saved/{id}/execute` must read `page` (default 1) and `per_page` (default 100) from
-  the query string, clamp the effective page size into 1 to 10000, skip `(page - 1) * page size` rows (page 0 behaves as
-  page 1), and answer `rows`, `total` (all matching rows ignoring paging), `page` (as requested), `per_page` (effective)
+  the query string, clamp the effective page size into 1 to 10000, skip `(page - 1) * page size` rows (pages are 1-based, but page 0 reads the first page, offset 0, like page 1), and
+  answer `rows`, `total` (all matching rows ignoring paging), `page` (as requested, so a 0 is echoed back as 0), `per_page` (effective)
   and `aliases` (the ordered display headers).
 - **SPEC-15.1614**: Execution must run the count and row queries inside the caller's tenant-scoped transaction, with the
   tenant condition always the first condition of the generated query and every other value bound as a parameter.
-- **SPEC-15.1615**: Execution must refuse a report whose `entity_type` is not `tickets` with 400 "Unsupported
+- **SPEC-15.1615**: Execution must refuse a report whose `entity_type` is not `tickets` with 422 "Unsupported
   entity_type='<value>'. Phase 2 only supports 'tickets'."
 - **SPEC-15.1616**: The report `columns` must be a JSON array of strings or of objects with a `field` and an optional
   `header`, with the header defaulting to the field. Execution must answer 400 for a non-array ("saved_reports.columns
@@ -10721,14 +10727,15 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   where a repeated header becomes `<header> (2)`, `<header> (3)`, ... and each row must be keyed by its header in the
   declared column order with a missing value as `null`.
 - **SPEC-15.1620**: Report `filters` must be a JSON object of whitelisted field to value, applied together with AND,
-  where a scalar means equality and an array means membership. Execution must answer 400 for an unsupported field
+  where a scalar means equality and an array means membership. Execution must answer 422 for an unsupported field
   ("Unsupported filter field '<field>' for entity 'tickets'."), an empty array, a uuid column whose value is not a valid
   UUID string, a value of a type the column does not accept ("Filter '<field>' has an unexpected value type for its
-  column"), and an array filter on a boolean column.
+  column"), a timestamp column whose value is not an RFC 3339 timestamp, an array filter on a boolean column, and
+  `filters` that is not an object.
 - **SPEC-15.1621**: Report `sort` must be an array of `{field, dir}` with a whitelisted field and `dir` of `asc` (the
-  default) or `desc` in any letter case; execution must answer 400 for an entry that is not an object, lacks `field`,
-  names an unsupported field ("sort[<i>] unsupported field '<field>'") or has another `dir`. An absent, empty or
-  non-array `sort` must order by ticket `updated_at` descending.
+  default) or `desc` in any letter case; execution must answer 422 for an entry that is not an object, lacks `field`,
+  names an unsupported field ("sort[<i>] unsupported field '<field>'") or has another `dir`, or for a `sort` that is
+  not an array. An absent or empty `sort` must order by ticket `updated_at` descending.
 - **SPEC-15.1622**: Execution must include only tickets that have a status, priority, queue and company, and must use
   the same joins for the total as for the rows.
 - **SPEC-15.1623**: When a report selects both a person id column and its name column (`contact_id` and `contact_name`,
@@ -10743,9 +10750,9 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   '<expr>' has no future firings".
 - **SPEC-15.1626**: `GET /reports/saved/{id}/schedules` must require the parent report to be visible to the caller and
   then list all schedules of that report, newest first, whoever owns them.
-- **SPEC-15.1627**: `GET /reports/schedules/{schedule_id}` must return the schedule of the caller's tenant with that id
+- **SPEC-15.1627**: `GET /reports/schedules/{schedule_id}` must return the caller's own schedule with that id
   (cron_expr, channel, format, recipient_email, is_active, last_run_at, next_run_at, last_error, timestamps), and 404
-  "Scheduled report" when there is none.
+  "Scheduled report" when there is none or it belongs to another user.
 - **SPEC-15.1628**: `PATCH /reports/schedules/{schedule_id}` and `DELETE` must be allowed only for the schedule owner,
   and otherwise answer 404 "Scheduled report"; a patch must change only the supplied fields among `cron_expr`,
   `recipient_email` and `is_active`, must recompute `next_run_at` from the current time only when `cron_expr` is
@@ -10796,9 +10803,9 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   '<expr>' has no future firings".
 - **SPEC-15.1644**: `GET /dashboards/{id}/schedules` must require the parent dashboard to belong to the caller (404
   "Dashboard" otherwise) and list its schedules newest first.
-- **SPEC-15.1645**: `GET /dashboards/schedules/{schedule_id}` must return the tenant's schedule with that id (including
-  channel, recipient_email, is_active, last_run_at, next_run_at, last_error) and 404 "Scheduled dashboard" when there is
-  none.
+- **SPEC-15.1645**: `GET /dashboards/schedules/{schedule_id}` must return the caller's own schedule with that id
+  (including channel, recipient_email, is_active, last_run_at, next_run_at, last_error) and 404 "Scheduled dashboard"
+  when there is none or it belongs to another user.
 - **SPEC-15.1646**: `PATCH /dashboards/schedules/{schedule_id}` and `DELETE` must be allowed only for the schedule owner
   and otherwise answer 404 "Scheduled dashboard"; a patch must change only the supplied fields among `cron_expr`,
   `recipient_email` and `is_active`, must recompute `next_run_at` from the current time only when `cron_expr` is
@@ -10810,9 +10817,10 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   was deleted or is not the owner's fails the delivery, and must build a text snapshot "Snapshot of dashboard: <name>"
   followed by a blank line, then either "(no widgets configured)" or "Widgets:" with one line "  - <key>" per widget
   key, then a blank line and "This is an automated scheduled delivery."
-- **SPEC-15.1649**: Widget keys must be collected by walking the whole layout document in order: for every JSON object,
-  its string `widget_key`, else `key`, else `label`; and every string element of every array; a layout of any other
-  shape must yield no keys.
+- **SPEC-15.1649**: Widget keys must be collected in order from the layout's `widgets` array and from the `widgets`
+  array of each entry of its `rows` array: for every object element its string `widget_key`, else `key`, else `label`,
+  and every string element; arrays nested inside a widget are not widgets, and a layout of any other shape must yield no
+  keys. The snapshot lists keys only, not widget data (v1).
 - **SPEC-15.1650**: The worker must address the delivery to the schedule's non-blank `recipient_email`, else to the
   owner's email, failing the delivery with "schedule owner <id> has no email and no recipient override" when neither
   exists, and must insert a `notifications` row of channel `email`, status `pending`, subject "Dashboard: <name> - <UTC

@@ -6,9 +6,9 @@
 //! with a fixed column + filter whitelist; the data shape on the
 //! `saved_reports` row is opaque-on-write so the SPA can iterate
 //! without a server redeploy, and validation happens here at execute
-//! time. Anything the compiler does not recognise surfaces as 400
-//! BadRequest naming the offender (PMS-1665: earlier text said 422,
-//! but every compiler error is `AppError::BadRequest`).
+//! time. Anything the compiler does not recognise surfaces as a 422
+//! validation error naming the offender: the request is well formed,
+//! the stored definition is what cannot be run.
 //!
 //! Why a hand-rolled compiler instead of the existing list endpoint:
 //! the list endpoint shape is fixed (it returns `TicketResponse` rows
@@ -22,6 +22,11 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::utils::error::{AppError, AppResult};
+
+/// Every compiler rejection: a 422 naming the offending part of the definition.
+fn invalid(message: impl Into<String>) -> AppError {
+    AppError::validation_field("definition", message)
+}
 
 /// A compiled report query: ready-to-bind SQL + the ordered list of
 /// bind values + the alias-list the executor uses to shape the
@@ -66,6 +71,7 @@ pub enum BindValue {
     TextList(Vec<String>),
     Int(i64),
     Bool(bool),
+    Timestamp(chrono::DateTime<chrono::Utc>),
 }
 
 // SPEC-15.1615
@@ -89,7 +95,7 @@ pub fn compile(
             pagination_limit,
             pagination_offset,
         ),
-        other => Err(AppError::BadRequest(format!(
+        other => Err(invalid(format!(
             "Unsupported entity_type='{other}'. Phase 2 only supports 'tickets'.",
         ))),
     }
@@ -287,12 +293,8 @@ fn ticket_column(key: &str) -> Option<TicketColumn> {
             requires_join: true,
         },
         "created_by_name" => TicketColumn {
-            // PMS-1665 finding: the old `COALESCE(..., '')` yielded an
-            // empty string for an unresolved creator, so
-            // `log_unresolved_person_names` (which tests for a string)
-            // never reported one. Use `NULLIF(TRIM(...), '')` so a
-            // missing/blank name stays NULL on the wire, matching the
-            // shape the unresolved-person logger expects.
+            // NULL, not '', for an unresolved creator: the unresolved-name
+            // logger only reports a null.
             sql: "NULLIF(TRIM(cu.first_name || ' ' || cu.last_name), '')",
             ty: Text,
             requires_join: true,
@@ -321,7 +323,7 @@ fn compile_tickets(
     let mut aliases: Vec<String> = Vec::with_capacity(column_specs.len());
     for (field, header) in &column_specs {
         let Some(col) = ticket_column(field) else {
-            return Err(AppError::BadRequest(format!(
+            return Err(invalid(format!(
                 "Unsupported column '{field}' for entity 'tickets'. \
                  See the saved-report column whitelist."
             )));
@@ -343,20 +345,16 @@ fn compile_tickets(
     let mut binds: Vec<BindValue> = vec![BindValue::Uuid(tenant_id)];
     let mut where_clauses: Vec<String> = vec!["t.tenant_id = $1".into()];
 
-    // PMS-1665 finding: a `filters` that was not a JSON object (for
-    // example a top-level array or scalar) used to be ignored silently
-    // and the report ran unfiltered. The non-array `columns` case
-    // already 400s; mirror that for `filters` so a shape mistake
-    // surfaces instead of returning the wrong rows.
+    // A non-object `filters` must fail, not run the report unfiltered.
     if !filters.is_null() && !filters.is_object() {
-        return Err(AppError::BadRequest(
+        return Err(invalid(
             "`filters` must be a JSON object keyed by field name".to_string(),
         ));
     }
     if let Some(filter_obj) = filters.as_object() {
         for (field, value) in filter_obj {
             let Some(col) = ticket_column(field) else {
-                return Err(AppError::BadRequest(format!(
+                return Err(invalid(format!(
                     "Unsupported filter field '{field}' for entity 'tickets'."
                 )));
             };
@@ -431,9 +429,7 @@ fn parse_columns(columns: &Value) -> AppResult<Vec<(String, String)>> {
     let Some(arr) = columns.as_array() else {
         // A non-array `columns` blob is a SPA bug; better to 422
         // than silently fall back to defaults.
-        return Err(AppError::BadRequest(
-            "saved_reports.columns must be a JSON array".into(),
-        ));
+        return Err(invalid("saved_reports.columns must be a JSON array"));
     };
     if arr.is_empty() {
         return Ok(default_ticket_columns());
@@ -450,9 +446,7 @@ fn parse_columns(columns: &Value) -> AppResult<Vec<(String, String)>> {
                     .get("field")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| {
-                        AppError::BadRequest(format!(
-                            "columns[{idx}].field is required (got {entry})"
-                        ))
+                        invalid(format!("columns[{idx}].field is required (got {entry})"))
                     })?
                     .to_string();
                 let header = o
@@ -463,18 +457,18 @@ fn parse_columns(columns: &Value) -> AppResult<Vec<(String, String)>> {
                 (field, header)
             }
             _ => {
-                return Err(AppError::BadRequest(format!(
+                return Err(invalid(format!(
                     "columns[{idx}] must be a string or an object (got {entry})"
                 )));
             }
         };
         if header.contains('"') {
-            return Err(AppError::BadRequest(format!(
+            return Err(invalid(format!(
                 "columns[{idx}].header must not contain a double quote"
             )));
         }
         if header.chars().count() > MAX_HEADER_LEN {
-            return Err(AppError::BadRequest(format!(
+            return Err(invalid(format!(
                 "columns[{idx}].header must be at most {MAX_HEADER_LEN} characters"
             )));
         }
@@ -520,7 +514,7 @@ fn compile_filter(
 ) -> AppResult<(String, Vec<BindValue>)> {
     if let Some(arr) = value.as_array() {
         if arr.is_empty() {
-            return Err(AppError::BadRequest(format!(
+            return Err(invalid(format!(
                 "Filter '{field}' is an empty array; remove the key or supply at least one value"
             )));
         }
@@ -555,7 +549,7 @@ fn coerce_bind_scalar(field: &str, ty: ColumnType, value: &Value) -> AppResult<B
     match (ty, value) {
         (ColumnType::Uuid, Value::String(s)) => {
             Uuid::parse_str(s).map(BindValue::Uuid).map_err(|e| {
-                AppError::BadRequest(format!(
+                invalid(format!(
                     "Filter '{field}' expects a UUID; '{s}' is not one ({e})"
                 ))
             })
@@ -564,10 +558,16 @@ fn coerce_bind_scalar(field: &str, ty: ColumnType, value: &Value) -> AppResult<B
         (ColumnType::Int, Value::Number(n)) => n
             .as_i64()
             .map(BindValue::Int)
-            .ok_or_else(|| AppError::BadRequest(format!("Filter '{field}' must fit in i64"))),
+            .ok_or_else(|| invalid(format!("Filter '{field}' must fit in i64"))),
         (ColumnType::Bool, Value::Bool(b)) => Ok(BindValue::Bool(*b)),
-        (ColumnType::Timestamp, Value::String(s)) => Ok(BindValue::Text(s.clone())),
-        _ => Err(AppError::BadRequest(format!(
+        (ColumnType::Timestamp, Value::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|d| BindValue::Timestamp(d.with_timezone(&chrono::Utc)))
+            .map_err(|e| {
+                invalid(format!(
+                    "Filter '{field}' expects an RFC 3339 timestamp; '{s}' is not one ({e})"
+                ))
+            }),
+        _ => Err(invalid(format!(
             "Filter '{field}' has an unexpected value type for its column"
         ))),
     }
@@ -580,10 +580,10 @@ fn coerce_bind_array(field: &str, ty: ColumnType, arr: &[Value]) -> AppResult<Bi
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
                 let s = v.as_str().ok_or_else(|| {
-                    AppError::BadRequest(format!("Filter '{field}' UUID values must be strings"))
+                    invalid(format!("Filter '{field}' UUID values must be strings"))
                 })?;
                 out.push(Uuid::parse_str(s).map_err(|e| {
-                    AppError::BadRequest(format!("Filter '{field}': '{s}' is not a UUID ({e})"))
+                    invalid(format!("Filter '{field}': '{s}' is not a UUID ({e})"))
                 })?);
             }
             Ok(BindValue::UuidList(out))
@@ -591,14 +591,14 @@ fn coerce_bind_array(field: &str, ty: ColumnType, arr: &[Value]) -> AppResult<Bi
         ColumnType::Text | ColumnType::Timestamp => {
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
-                let s = v.as_str().ok_or_else(|| {
-                    AppError::BadRequest(format!("Filter '{field}' values must be strings"))
-                })?;
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| invalid(format!("Filter '{field}' values must be strings")))?;
                 out.push(s.to_string());
             }
             Ok(BindValue::TextList(out))
         }
-        ColumnType::Int | ColumnType::Bool => Err(AppError::BadRequest(format!(
+        ColumnType::Int | ColumnType::Bool => Err(invalid(format!(
             "Filter '{field}' does not support array values for its column type"
         ))),
     }
@@ -661,14 +661,10 @@ pub fn log_unresolved_person_names(surface: &str, output_columns: &[String], row
 /// `{field, dir}` objects. Empty / missing -> default to
 /// `ORDER BY t.updated_at DESC` to give pagination a stable order.
 fn parse_sort(sort: &Value) -> AppResult<String> {
-    // PMS-1665 finding: a `sort` that was not an array (for example a
-    // top-level object or scalar) used to fall through to the default
-    // order silently, hiding a shape mistake behind the fallback. A
-    // malformed entry inside an array already 400s below; mirror that
-    // for the outer shape. `null` + missing + empty-array stay as
-    // the "no sort specified" signal.
+    // A non-array `sort` must fail, not fall back to the default order.
+    // `null` and an empty array stay the "no sort specified" signal.
     if !sort.is_null() && !sort.is_array() {
-        return Err(AppError::BadRequest(
+        return Err(invalid(
             "`sort` must be a JSON array of {field, dir} objects".to_string(),
         ));
     }
@@ -680,16 +676,15 @@ fn parse_sort(sort: &Value) -> AppResult<String> {
     }
     let mut parts: Vec<String> = Vec::with_capacity(arr.len());
     for (idx, entry) in arr.iter().enumerate() {
-        let obj = entry.as_object().ok_or_else(|| {
-            AppError::BadRequest(format!("sort[{idx}] must be an object {{field, dir}}"))
-        })?;
+        let obj = entry
+            .as_object()
+            .ok_or_else(|| invalid(format!("sort[{idx}] must be an object {{field, dir}}")))?;
         let field = obj
             .get("field")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| AppError::BadRequest(format!("sort[{idx}].field is required")))?;
-        let col = ticket_column(field).ok_or_else(|| {
-            AppError::BadRequest(format!("sort[{idx}] unsupported field '{field}'"))
-        })?;
+            .ok_or_else(|| invalid(format!("sort[{idx}].field is required")))?;
+        let col = ticket_column(field)
+            .ok_or_else(|| invalid(format!("sort[{idx}] unsupported field '{field}'")))?;
         let dir = obj
             .get("dir")
             .and_then(|v| v.as_str())
@@ -699,7 +694,7 @@ fn parse_sort(sort: &Value) -> AppResult<String> {
             "asc" => "ASC",
             "desc" => "DESC",
             other => {
-                return Err(AppError::BadRequest(format!(
+                return Err(invalid(format!(
                     "sort[{idx}].dir must be 'asc' or 'desc' (got '{other}')"
                 )));
             }
@@ -778,6 +773,33 @@ mod tests {
         .expect("ok");
         assert!(q.sql.contains("= ANY($2::uuid[])"));
         assert!(matches!(q.binds[1], BindValue::UuidList(ref v) if v.len() == 1));
+    }
+
+    #[test]
+    fn timestamp_filter_binds_a_timestamp_and_rejects_garbage() {
+        let q = compile(
+            tenant(),
+            "tickets",
+            &json!({ "created_at": "2026-01-02T03:04:05Z" }),
+            &json!([{"field": "ticket_number"}]),
+            &json!([]),
+            50,
+            0,
+        )
+        .expect("ok");
+        assert!(matches!(q.binds[1], BindValue::Timestamp(_)));
+
+        let err = compile(
+            tenant(),
+            "tickets",
+            &json!({ "created_at": "yesterday" }),
+            &json!([{"field": "ticket_number"}]),
+            &json!([]),
+            50,
+            0,
+        )
+        .expect_err("not a timestamp");
+        assert!(matches!(err, AppError::Validation { .. }), "{err:?}");
     }
 
     #[test]
