@@ -3332,8 +3332,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.427**: portal_login_link must drop a next value that does not start with a single "/", starts with "//", or
   contains any of ? # & space or backslash, returning the bare login link without failing.
 - **SPEC-5.428**: The contact-plane middleware must read the access token from an Authorization header of the form
-  "Bearer <token>" and, only when that yields nothing, from the first non-empty mokosh:contact_token cookie in the
-  Cookie header; with neither present it must attach an unauthenticated state and still run the handler.
+  "Bearer <token>" only; it must not read any cookie. With no Bearer token it must attach an unauthenticated state and
+  still run the handler.
 - **SPEC-5.429**: A token must be accepted only when it is an HS256 JWT signed with the server secret, unexpired, and
   carrying typ "contact"; a token with a bad signature, an expired token, or a token of another typ (such as a staff
   token) must yield an unauthenticated state, so protected routes answer 401.
