@@ -101,6 +101,16 @@ jobs:
           # or Storefront's validator calls its own canonical_root_name helper.
           let bin = $"($env.GITHUB_WORKSPACE)/($env.BINARY_FILE)"
           cd docs/public
+          # Belt-and-suspenders: the include glob `**/*.md` is relative to
+          # sarracenia's walk root (cwd). If a future edit drops the `cd`
+          # above, cwd would be the repo root and the walk would match every
+          # markdown file in the repo (invariants, dev-docs, specification,
+          # ROADMAP, the lot). Fail loudly instead of pushing hundreds of
+          # pages to Storefront.
+          if not ($env.PWD | str ends-with "/docs/public") {
+            print --stderr $"guard: publish-docs expects cwd to end in /docs/public, got ($env.PWD)"
+            exit 1
+          }
           ^$bin push --no-media
 
       - name: Report job metrics
