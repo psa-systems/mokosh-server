@@ -11,6 +11,7 @@
 //! configurable capability set.
 
 pub mod capabilities;
+pub mod limiter;
 pub mod links;
 pub mod middleware;
 pub mod models;
