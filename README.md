@@ -20,10 +20,10 @@ Everything else is in [`docs/`](docs/README.md), indexed there in full:
 
 - [quickstart.md](docs/quickstart.md) - get a fresh clone running on a Linux host
 - [architecture.md](docs/architecture.md) - runtime shape, repository layout, migrations, images
-- [binaries.md](docs/binaries.md) - the two binaries and the operator subcommands they dispatch
+- [binaries.md](docs/public/binaries.md) - the two binaries and the operator subcommands they dispatch
 - [configuration.md](docs/configuration.md) - every environment variable, whether it is required, the release that added it, and recent configuration changes
 - [recipes.md](docs/recipes.md) - the task runner, recipe by recipe
-- [runbooks/release-and-deploy.md](docs/runbooks/release-and-deploy.md) - cutting and deploying a release across the three-repo chain (Mokosh server, Mokosh apps, Bunyip)
+- [public/operations/release-and-deploy.md](docs/public/operations/release-and-deploy.md) - cutting and deploying a release across the three-repo chain (Mokosh server, Mokosh apps, Bunyip)
 
 Conventions for AI agents working in this repository are in [CLAUDE.md](CLAUDE.md).
 
