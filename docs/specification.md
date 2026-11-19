@@ -5900,6 +5900,9 @@ Every migration under `migrations/` is embedded at compile time via `sqlx::migra
 - **SPEC-9.1003**: migrations/298_widen_bill_payment_method_paypal.sql widens the `bill_payments.payment_method` CHECK to include
   `'paypal'`, closing the gap migration 287 opened by copying the pre-paypal `payments` vocabulary without picking up the `'paypal'` the
   earlier migration 233 had already added to `payments`. The two tables' method vocabularies are now in step again.
+- **SPEC-9.1004**: migrations/299_delivery_outcome_benign_redelivery.sql widens `payment_webhook_deliveries.outcome` to
+  VARCHAR(32) and adds `'benign_redelivery'` to its CHECK, for a delivery whose payment a prior delivery already
+  recorded.
 
 ## 10. Build, CI and deployment
 
@@ -7758,8 +7761,8 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   before any parsed content is acted on.
 - **SPEC-13.760**: A `PaymentSucceeded` event whose tenant differs from the tenant in the URL must be rejected with
   `Unauthorized` (recorded as `refused`); otherwise it must be recorded as a gateway payment for the URL tenant, with
-  outcome `accepted` when the payment was recorded and `unreconciled` when it was not, and the invoice id recorded in
-  both cases.
+  outcome `accepted` when the payment was recorded, `benign_redelivery` when a prior delivery already recorded it, and
+  `unreconciled` when it was refused, and the invoice id recorded in every case.
 - **SPEC-13.761**: A `Refunded` event must be recorded through the gateway refund path for the URL tenant, and a failure
   there must be returned as an error (recorded `failed`) so the provider retries.
 - **SPEC-13.762**: A `RequiresCapture` event must call the provider's capture for the order id and write no payment
@@ -8157,9 +8160,11 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   and organisation id and no delivery row, and must not stop the remaining events.
 - **SPEC-13.1088**: For an event naming a delegated invoice, the webhook must read the provider's current invoice state
   rather than trust the payload: `paid` with a balance due above zero must record a payment of the whole balance due in
-  the invoice currency keyed by the external invoice id and result in `accepted` when recorded and `unreconciled` when
-  not; `paid` with no balance due, and `open`, must result in `ignored`; `voided` must void the local invoice and result
-  in `accepted`.
+  the invoice currency keyed by the external invoice id and result in `accepted` when recorded, `benign_redelivery` when
+  a prior delivery already recorded it, and `unreconciled` when refused; `paid` with no balance due must result in
+  `benign_redelivery`; `open` must result in `ignored`; `voided` must void the local invoice and result in `accepted`.
+  `benign_redelivery` is a non-alerting outcome: nothing for a human to do, and distinct from `ignored`, which is an
+  event that named nothing Mokosh holds.
 - **SPEC-13.1089**: For an event naming no delegated invoice, the webhook must try a delegated bill of the tenant and
   result in `ignored` when there is none or when the provider does not hold the id as a bill; otherwise it must
   reconcile the provider's paid running total against the bill using today's UTC date and a system audit context,
@@ -8167,7 +8172,7 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
 - **SPEC-13.1090**: When the provider reports a delegated bill voided, the webhook must not void the local bill, must
   log a warn carrying the bill id, and must result in `unreconciled`.
 - **SPEC-13.1091**: After each processed event a delivery row must be recorded for the tenant and provider with outcome
-  `accepted`, `ignored`, `unreconciled` or `failed`; for `failed` the row must carry the error text and the handler must
+  `accepted`, `ignored`, `unreconciled`, `benign_redelivery` or `failed`; for `failed` the row must carry the error text and the handler must
   stop at that event and return its error status (so the provider retries), while a failure to write the row must be
   logged at warn and must not change the response.
 - **SPEC-13.1092**: A delivery whose events all processed without error must answer 200 with an empty body.
