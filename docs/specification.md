@@ -311,9 +311,9 @@ the error envelope in `src/utils/error.rs`. Authentication extractors and the pe
   `application/json` or `application/<x>+json` (parameters such as charset ignored, case-insensitive), or when the
   header is not visible ASCII, so the extractor rejects it.
 - **SPEC-2.69**: The sanitiser must forward a JSON request unchanged and unbuffered when its Content-Length header is
-  greater than 25 MiB (26,214,400 bytes); the route's own body limit then decides acceptance.
+  greater than 2 MiB (2,097,152 bytes); the route's own body limit then decides acceptance.
 - **SPEC-2.70**: The sanitiser must answer 413 with code `PAYLOAD_TOO_LARGE` and message `The request body could not be
-  read.` when a JSON body with a missing or understated Content-Length cannot be buffered within 25 MiB, and must log a
+  read.` when a JSON body with a missing or understated Content-Length cannot be buffered within 2 MiB, and must log a
   warning naming the path and the cause.
 - **SPEC-2.71**: The sanitiser must forward an empty body, or a body that is not valid JSON, with its original bytes, so
   the `Json` extractor produces the 400.
@@ -1503,7 +1503,8 @@ and are not reused.
   hop's URL (the website probe and the automation webhook sender do).
 - **SPEC-4.11**: `PrivateTargetAllowlist::parse` must treat an entry that parses as an IP address or CIDR as a network
   exemption and any other non-blank entry as an exact (case-insensitive) hostname exemption; an empty or all-blank
-  input must produce an allowlist that exempts nothing (fail closed). A host named by `allows_host` must be exempted
+  input must produce an allowlist that exempts nothing (fail closed). An entry containing `/` that does not parse as a
+  CIDR must still be stored as a hostname and must log at warn naming the entry and the parse error. A host named by `allows_host` must be exempted
   from resolution and screening entirely.
 - **SPEC-4.12**: `utils::net::loggable_url_authority` must reduce a URL-shaped string to its authority (`host[:port]`),
   stripping any scheme, userinfo, path, query and fragment, even when the input does not parse as a URL at all, so the
@@ -1607,7 +1608,7 @@ and are not reused.
   and only if at least one byte changed.
 - **SPEC-4.38**: `utils::text::sanitize_json_body` must forward the request body untouched when the path matches a
   `RAW_BODY_PATHS` prefix, when the `Content-Type` is not JSON, or when a declared `Content-Length` exceeds
-  `MAX_SANITIZED_JSON_BYTES` (25 MB); on a body that parses as JSON it must store the parsed (and possibly
+  `MAX_SANITIZED_JSON_BYTES` (2 MiB); on a body that parses as JSON it must store the parsed (and possibly
   sanitized) tree as a `ParsedJsonBody` request extension, replace the body with an empty one and remove
   `Content-Length`; on an empty or unparseable body it must forward the original bytes untouched.
 
@@ -1965,7 +1966,7 @@ is cited at its code site with a `// SPEC-4.<n>` comment.
   `verify_password` returns `Ok(false)` only for a wrong password and an `Internal` error for an unparseable stored
   hash, and `verify_password_call_count` counts every verification including the dummy one (src/utils/crypto.rs).
 - **SPEC-4.1010**: `sanitize_json_body` sanitizes only `application/json` and `application/*+json` bodies, and
-  answers HTTP 413 `PAYLOAD_TOO_LARGE` when a body without a declared length exceeds the 25 MiB buffer cap
+  answers HTTP 413 `PAYLOAD_TOO_LARGE` when a body without a declared length exceeds the 2 MiB buffer cap
   (src/utils/text.rs).
 - **SPEC-4.1011**: `slugify` keeps Unicode alphanumerics, turns every other character into a separator, and joins the
   non-empty groups with a single `-`, so leading and trailing separators never appear (src/utils/validation.rs).
@@ -2685,7 +2686,7 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   with 403 `Access to this organization is not active` when the slug resolves to no tenant; a slug lookup or grantee
   lookup error on the local-state path must request userinfo instead.
 - **SPEC-5.172**: The grantee role must be `map_grant_role(mokosh_grant_role)` (`admin`, `manager`, `technician`,
-  `finance`, `read_only` mapping to Technician); an absent or unknown value must log at info and be refused with 403
+  `finance`, `read_only` mapping to ReadOnly); an absent or unknown value must log at info and be refused with 403
   `Access to this organization is not active`; a stored role that differs must be updated best effort (warn on failure)
   while the request uses the grant role. (This `read_only` Bunyip grant role is distinct from the first-class
   `UserRole::ReadOnly` whose write refusal is SPEC-5.423a.)
@@ -2773,22 +2774,23 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   "Unsupported event `<event>`.".
 - **SPEC-5.213**: `mokosh_grant_changed` must treat `state` `granted` as valid only with a `role`, refusing a missing
   role with 400 "A granted event must carry a role."; must treat `state` `revoked` as revoked at the event's `at`; and
-  must refuse any other state with 400 "Unknown grant state `<state>`.".
+  must refuse any other state with 400 "Unknown grant state `<state>`."; a `granted` event whose `role` is not one of
+  the SPEC-5.217 vocabulary must be refused with 400 "Unknown grant role `<role>`." before the mirror is written.
 - **SPEC-5.214**: `mokosh_grant_changed` must refuse an event whose `at` is more than five minutes ahead of the server
   clock with 400 "Event timestamp is too far in the future." and must not write the mirror row in that case.
 - **SPEC-5.215**: A valid `mokosh_grant_changed` event must be upserted into the grant mirror (a revoked event for a
   grant the mirror never saw is inserted directly as revoked) and the endpoint must answer 200 with
   `{"ok": true, "grant_id", "state"}` whether or not the upsert changed a row. A database error from the upsert must
   propagate as an error response, not 200.
-- **SPEC-5.216**: When a `revoked` event changed the mirror row, the receiver must also set `deleted_at` (keeping an
-  existing value) and `updated_at` on the `users` rows whose `bunyip_user_id` is the grantee in the tenant whose slug
-  equals `mokosh_account_id`; an unknown slug must change nothing. A failure of that statement must be logged as a
-  warning naming the grantee and account and must not change the 200 answer. A `granted` event, or a revoked event that
-  changed no mirror row, must not touch `users`.
+- **SPEC-5.216**: On every `revoked` event, whether or not it changed the mirror row, the receiver must also set
+  `deleted_at` and `updated_at` on the not-yet-tombstoned `users` rows (an existing `deleted_at` is kept) whose
+  `bunyip_user_id` is the grantee in the tenant whose slug equals `mokosh_account_id`; an unknown slug must change
+  nothing. Running it on a redelivery is what lets a later delivery heal a failed attempt. A failure of that statement
+  must be logged as a warning naming the grantee and account and must not change the 200 answer. A `granted` event
+  must not touch `users`.
 - **SPEC-5.217**: `map_grant_role` must map the Bunyip role names `admin`, `manager`, `technician` and `finance` to the
-  Mokosh roles of the same name, must map `read_only` to the Technician role, and must return `None` for any other
-  value so the caller refuses placement. (The distinct first-class `UserRole::ReadOnly` role's write refusal is
-  SPEC-5.423a.)
+  Mokosh roles of the same name, must map `read_only` to the ReadOnly role, and must return `None` for any other
+  value so the caller refuses placement.
 - **SPEC-5.218**: `MokoshBunyipGrantService::is_grant_active` must return true only when a `mokosh_bunyip_grants` row
   exists for the (grantee, `mokosh_account_id`) pair with `revoked_at` NULL and a non-NULL role; it must return false
   for no row and for a revoked row, and must propagate a database error rather than return false.
@@ -2833,7 +2835,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.231**: `find_pending_by_tenant` must return the tenant's rows with status `pending`, newest `invited_at`
   first, and no other tenant's rows.
 - **SPEC-5.232**: `find_pending_for_invitee` must return, across all tenants, rows with `invitee_bunyip_user_id`
-  equal to the given id, status `pending` and `expires_at` in the future, newest `invited_at` first.
+  equal to the given id, or with a NULL `invitee_bunyip_user_id` whose `invitee_email` equals, ignoring case, the
+  email of the `users` row carrying the given id (the SPEC-5.242 rule), status `pending` and `expires_at` in the future, newest `invited_at` first.
 - **SPEC-5.233**: `GrantInvitationsService::cancel` must move a row to `canceled` (setting `canceled_at` and
   `updated_at`) only when it matches the given id and tenant and is `pending`, and return true then. It must return
   false, without distinguishing them, for an unknown id, another tenant's id, and a row that is not pending.
@@ -2908,8 +2911,11 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   endpoint may return the plaintext token.
 - **SPEC-5.254**: `GET /api/v1/grants/invitations` must return the caller's tenant's pending invitations, newest
   first, each with `tenant_slug` filled by one batched tenant lookup, and without any accept token.
-- **SPEC-5.255**: `GET /api/v1/my-grants/invitations` must return the pending, unexpired invitations whose
-  `invitee_bunyip_user_id` equals the authenticated caller's id, across all tenants, newest first, with `tenant_slug`.
+- **SPEC-5.255**: `GET /api/v1/my-grants/invitations` must return the pending, unexpired invitations addressed to the
+  authenticated caller per SPEC-5.232 (by `invitee_bunyip_user_id`, or by email for a NULL one), across all tenants,
+  newest first, with `tenant_slug`. The handler passes `caller.id` as the Bunyip user id; for a Bunyip-issued session
+  `caller.id` is the `sub`, while for a legacy session it can differ from the `users.bunyip_user_id` that the by-id
+  routes (SPEC-5.260) resolve, so the inbox and the by-id routes can disagree for a legacy session.
 - **SPEC-5.256**: `DELETE /api/v1/grants/invitations/{id}` must answer 204 whether or not a row was canceled, so an
   unknown id and another tenant's id are indistinguishable, and must answer an error response when the service fails.
 - **SPEC-5.257**: `GET /api/v1/grants/invitations/by-token/{token}` must answer 404 "invitation" for a malformed,
@@ -3333,8 +3339,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.427**: portal_login_link must drop a next value that does not start with a single "/", starts with "//", or
   contains any of ? # & space or backslash, returning the bare login link without failing.
 - **SPEC-5.428**: The contact-plane middleware must read the access token from an Authorization header of the form
-  "Bearer <token>" and, only when that yields nothing, from the first non-empty mokosh:contact_token cookie in the
-  Cookie header; with neither present it must attach an unauthenticated state and still run the handler.
+  "Bearer <token>" only; it must not read any cookie. With no Bearer token it must attach an unauthenticated state and
+  still run the handler.
 - **SPEC-5.429**: A token must be accepted only when it is an HS256 JWT signed with the server secret, unexpired, and
   carrying typ "contact"; a token with a bad signature, an expired token, or a token of another typ (such as a staff
   token) must yield an unauthenticated state, so protected routes answer 401.
@@ -3378,7 +3384,12 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   to the seconds remaining, never less than 1, and must do so before the password is checked.
 - **SPEC-5.444**: A wrong password must answer 401 Unauthorized, write audit portal.login_failed, and increment
   portal_failed_login_count, which on reaching 5 or more must set portal_locked_until to 5 minutes ahead; a failure to
-  write the counter must be logged at error with tenant_id, contact_id and the error and must not change the 401.
+  write the counter must be logged at error with tenant_id, contact_id and the error and must not change the 401. The
+  lockout is per contact. In addition, POST /auth/login and POST /auth/login-link/redeem must share one per-client-IP
+  budget of CONTACT_LOGIN_IP_RATE_MAX attempts (default 10) per CONTACT_LOGIN_IP_RATE_WINDOW_SECS seconds (default 60),
+  keyed by the trusted-proxy-aware client IP and checked before any email or token lookup, so an unknown email spends it
+  like a known one and a success does not reset it. An attempt past the budget must answer 429 with Retry-After rounded
+  up per SPEC-5.103 and must log at info naming the IP.
 - **SPEC-5.445**: When portal_mfa_enabled is true and neither mfa_code nor recovery_code is non-blank after trimming,
   login with a correct password must answer 200 with mfa_required true, empty access_token and refresh_token, contact
   null, and must create no session.
@@ -3394,9 +3405,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   portal_locked_until, stamp portal_last_login_at (a failure of that write must be logged at warn with contact_id and
   must not fail the login), insert a contact_sessions row whose family_id equals its own id, and return access_token,
   refresh_token, expires_at and the contact object with mfa_required false.
-- **SPEC-5.449**: Login, refresh and a magic-link redeem that mints a session must set the cookie
-  mokosh:contact_token=<refresh token> with HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth; Max-Age=2592000,
-  adding Domain=<value> only when configuration PORTAL_COOKIE_DOMAIN is non-blank after trimming.
+- **SPEC-5.449**: Login, refresh and a magic-link redeem that mints a session must not set any cookie; the refresh
+  token travels only in the response body.
 - **SPEC-5.450**: POST /api/v1/contact/auth/refresh must answer 401 when the token does not parse as
   {session-uuid}.{secret}, names no contact_sessions row, or carries a secret that does not verify against the stored
   hash, and a secret that did not verify must revoke nothing.
@@ -3411,10 +3421,10 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   portal.refresh_replay_detected and answer 401.
 - **SPEC-5.454**: A successful refresh must insert a new session row with a new id in the presented row's family, mint
   an access token whose caps claim is loaded fresh and whose email is the contact's current lower-cased email, and
-  return it with a new refresh token, the contact object, mfa_required false and the cookie.
-- **SPEC-5.455**: POST /api/v1/contact/auth/logout must answer 204 and clear the mokosh:contact_token cookie (same
-  attributes and Domain as when set, Max-Age=0) for a malformed, unknown or wrong-secret token without revoking
-  anything, and for a token whose secret verifies must revoke the whole rotation family and write audit portal.logout.
+  return it with a new refresh token, the contact object, mfa_required false.
+- **SPEC-5.455**: POST /api/v1/contact/auth/logout must answer 204 and clear the legacy mokosh:contact_token cookie
+  (HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth; Max-Age=0, with the PORTAL_COOKIE_DOMAIN Domain when
+  configured) for a malformed, unknown or wrong-secret token without revoking anything, and for a token whose secret verifies must revoke the whole rotation family and write audit portal.logout.
 - **SPEC-5.456**: Revoking a rotation family must set revoked_at on every unrevoked contact_sessions row sharing the
   family_id, and this must be the single mechanism used by logout, replay detection, a portal-access-revoked refresh and
   the revoke-session route.
@@ -3651,7 +3661,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   `audit_log` rows whose entity type and entity id equal the request, plus a `total` computed with the same predicate as
   the page.
 - **SPEC-5.521**: For `entity_type` `tickets`, the history must also include `ticket_notes` rows whose action is not
-  `create` and whose `new_values.ticket_id` equals the ticket id as text. `ticket_notes` rows with action `create` must
+  `create` and whose `new_values.ticket_id` or `old_values.ticket_id` equals the ticket id as text (so a deleted note, whose
+  `new_values` is NULL, still appears). `ticket_notes` rows with action `create` must
   not be included, and each entry must report its own `entity_type` and `entity_id`.
 - **SPEC-5.522**: A history entry's `user_name` must be the actor's trimmed full name from a user of the same tenant,
   falling back to the user's email when both names are blank, and `null` only when `user_id` is NULL or the user row is
@@ -3687,8 +3698,8 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.531**: `kind=user` must return only native users without a grant, `kind=guest` must return users with a grant
   plus unplaced guests, and `kind` absent or `everyone` must return both.
 - **SPEC-5.532**: `q` (ignored when empty) must keep only user rows whose email, first name or last name contains it
-  case-insensitively; the characters `%` and `_` in `q` must be treated as wildcards. `q` must not filter unplaced
-  guests.
+  case-insensitively, and the characters `%` and `_` in `q` must match literally. `q` must also keep only unplaced
+  guests whose `grantee_email` contains it.
 - **SPEC-5.533**: `role` must keep user rows whose own `users.role` equals it and unplaced guests whose grant `role`
   equals it.
 - **SPEC-5.534**: `team_id` must keep only users who are members of that team in the tenant and must exclude all
@@ -3738,13 +3749,14 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   `team_id`), or `None`. It must be called only from the pre-session login path and never from a route handler.
 - **SPEC-5.549**: Accepting an invitation must set its status to `accepted` with `accepted_at` and `accepted_by` only
   while its status is still `pending`. When no row was updated (already accepted or revoked) it must roll back, return
-  success, and enrol nobody.
+  success, enrol nobody and write no audit row. Otherwise it must write an `update` audit row for `tenant_invitations`
+  with a system context (no actor) in the same transaction.
 - **SPEC-5.550**: Accepting an invitation that names a team must, in the same transaction, add the accepting user to
   that team with role `member`, only when the team is active and belongs to the invitation's tenant. An existing
   membership must be left unchanged. A missing or archived team must not fail the acceptance.
 - **SPEC-5.551**: Revoking must set the status of a `pending` invitation of the caller's tenant to `revoked` and answer
-  200 with an empty body. An unknown id, an id from another tenant, or an invitation that is not pending must answer 404
-  `Invitation not found`.
+  200 with an empty body, writing an `update` audit row for `tenant_invitations` in the same transaction. An unknown id,
+  an id from another tenant, or an invitation that is not pending must answer 404 `Invitation not found`.
 
 #### Teams
 
@@ -3911,7 +3923,7 @@ the value as given.
 - **SPEC-6.20**: The file configuration provider must hold a key's value as the file's contents with exactly one
   trailing newline (`\r\n` or `\n`) removed and every other character preserved. A file that exists but cannot be read
   must be logged at error, naming the path and the key, and the key must be treated as not held. A file whose name is
-  not a declared key must be ignored.
+  not a declared key must be ignored and logged at warn, once per file.
 - **SPEC-6.21**: The file configuration provider's `set` and `delete` must refuse a bootstrap-tier key with a
   configuration error "{KEY} is a bootstrap-tier key and cannot be written to the file configuration provider" (or
   "deleted from"), before touching the filesystem. `set` on a provider with no directory must fail with "file
@@ -3941,8 +3953,9 @@ the value as given.
   external-service error that names `BUNYIP_CONFIG_CLIENT_ID` and `bunyip-api machine-client rotate`. A 403 must fail
   the build with an error that names the key and `bunyip-api machine-client register --name mokosh-host-config
   --config-key {remote key}`. Any other non-2xx status must fail the build with "bunyip answered {status} for {key}:
-  {body}". A transport failure must fail the build with "could not reach bunyip at {url}: {cause}. Check
-  BUNYIP_CONFIG_URL and that bunyip is reachable from this host.". The value is `data.value` of the response envelope,
+  {body}". A transport failure on one key must log at error "could not reach bunyip at {url}: {cause}. Check
+  BUNYIP_CONFIG_URL and that bunyip is reachable from this host." and leave that key unheld, and the remaining keys
+  must still be read. The value is `data.value` of the response envelope,
   trimmed, and a blank or absent value leaves the key unheld.
 - **SPEC-6.26**: The Bunyip configuration provider's `set` and `delete` must always fail with a configuration error
   ("bunyip provider write is not implemented" for `set`, "bunyip provider does not support deletes" for `delete`), so
@@ -4030,10 +4043,11 @@ the value as given.
 - **SPEC-6.46**: A set-but-unparseable `PORT` (a `u16`), `RUN_MIGRATIONS` (a boolean) or `MOKOSH_MAX_TENANTS` (a
   positive `usize`) must end boot with the `parse_optional` or `parse_positive` message of SPEC-6.27 or SPEC-6.28, and a
   set-but-unparseable `OIDC_DEFAULT_TENANT_ID` (a UUID) or feature flag must end boot with the message of SPEC-6.29 or
-  SPEC-6.32. A failure inside `AppConfig::from_env` must stop the process with a panic whose message begins "Failed to
-  load configuration".
+  SPEC-6.32. A failure inside `AppConfig::from_env` must end boot with a non-zero exit and an error whose message begins
+  "Failed to load configuration"; it must not panic.
 - **SPEC-6.47**: Boot must fail when the listen address "{HOST}:{PORT}" does not parse as a socket address, and when the
-  address cannot be bound, with a non-zero exit and the underlying cause.
+  address cannot be bound, with a non-zero exit and the underlying cause. The parse error must name `HOST`, `PORT` and
+  the combined value.
 - **SPEC-6.48**: When `RUN_MIGRATIONS` is true, boot must run the embedded migrations before serving, and a failed
   migration must log at error "Failed to run database migrations: {cause}" and end boot with a non-zero exit.
   `RUN_MIGRATIONS=false` must skip the step.
@@ -4056,8 +4070,8 @@ the value as given.
   check must be the exact string `production`, and the demo-seed gate must compare `production` case-insensitively
   (SPEC-15.2053).
 - **SPEC-6.53**: `HOST` (application, since `v0.1.0`) must default to `0.0.0.0` and `PORT` (application, since `v0.1.0`)
-  must default to `8080` only when the variable is unset or `PORT` is blank; a blank `HOST` must be used as given and
-  fail the socket address parse of SPEC-6.47.
+  must default to `8080` only when the variable is unset or blank, so a blank `HOST` must read as unset like every other optional variable.
+  A blank `CLIENT_ORIGIN` or `BASE_URL` must likewise read as unset and take its default.
 - **SPEC-6.54**: `RUN_MIGRATIONS` (application, since `v0.1.0`) must default to true when unset or blank and must accept
   only the literals `true` and `false`, so `1`, `yes` and `TRUE` must end boot with "RUN_MIGRATIONS is set to \"{raw}\",
   which is not a valid value: provided string was not `true` or `false`".
@@ -4078,8 +4092,8 @@ the value as given.
   an unset or blank value must mean none: the tenant logo is then omitted from client-facing email (SPEC-15.519).
 - **SPEC-6.60**: `ABUSE_CONTACT_EMAIL` (application, since `v0.12.0`) must be trimmed, and an unset or blank value must
   mean none: the abuse-report line is then omitted from request-form email, and no other address is substituted.
-- **SPEC-6.61**: `PORTAL_COOKIE_DOMAIN` (application, since `v0.19.0`) must add a `Domain` attribute to the portal
-  refresh cookie only when it is non-blank after trimming (SPEC-5.449).
+- **SPEC-6.61**: `PORTAL_COOKIE_DOMAIN` (application, since `v0.19.0`) must add a `Domain` attribute to the legacy portal
+  cookie cleared at logout only when it is non-blank after trimming (SPEC-5.449).
 - **SPEC-6.62**: `MOKOSH_MAX_TENANTS` (application, since `v0.14.0`) must be read once at boot as a positive integer; an
   unset or blank value must leave tenant creation uncapped (SPEC-5.332), and a malformed or non-positive value must end
   boot (SPEC-6.46). A change takes effect on the next restart.
@@ -4148,10 +4162,11 @@ the value as given.
 - **SPEC-6.78**: `OIDC_ISSUER` and `OIDC_AUDIENCE` (application, since `v0.3.0`) must mount the identity-provider token
   verifier only when both are present. An absent one must fail the verifier configuration with "OIDC_ISSUER must be set
   (e.g. {url})" or "OIDC_AUDIENCE must be set (e.g. {url})", the issuer's trailing `/` must be removed (SPEC-5.113,
-  SPEC-5.114), and boot must log at info "Bunyip RS verifier disabled" with the reason and continue.
+  SPEC-5.114). Both unset or blank must log at info "Bunyip RS verifier disabled" and boot must continue; exactly one
+  set must end boot with an error naming the missing variable, and a blank value must read as unset.
 - **SPEC-6.79**: `OIDC_JWKS_CACHE_TTL_SECS` (since `v0.3.0`) must default to 600 and `OIDC_LEEWAY_SECONDS` (since
   `v0.3.0`) to 30, both parsed as `u64` seconds; a set value that does not parse must be an error naming the key and the
-  raw value (SPEC-5.115) and the verifier must then be disabled.
+  raw value (SPEC-5.115) and boot must end with "Bunyip RS verifier config invalid: {reason}".
 - **SPEC-6.80**: `OIDC_DEFAULT_TENANT_ID` (application, since `v0.3.0`) must be a UUID, checked at boot by SPEC-6.29.
   The tenant a first-seen identity-provider user lands in must be this UUID, else the UUID
   `00000000-0000-0000-0000-000000000001`, and an unparseable value seen after boot must log at warn and use that
@@ -4221,8 +4236,8 @@ the value as given.
   with a configuration error and must not end boot.
 - **SPEC-6.99**: `IP2LOCATION_DB_PATH` (application, since `v0.7.0`) must be trimmed and a blank or unset value must
   disable login-location alerts, logging at info "IP2LOCATION_DB_PATH unset; login-location alerts disabled". A path
-  whose database cannot be loaded must log at warn "Failed to load IP2Location DB; login-location alerts disabled" with
-  the path and cause, and boot must continue (SPEC-4.5).
+  whose database cannot be loaded must log at warn "Failed to load IP2Location DB; login-location alerts disabled"
+  with the path and cause, and boot must continue; login must be unaffected.
 - **SPEC-6.100**: `IP2PROXY_DB_PATH` (application, since `v0.11.0`) must be trimmed and a blank or unset value must
   disable IP enrichment, logging at info "IP2PROXY_DB_PATH unset; IP enrichment disabled". A path whose database cannot
   be loaded must log at warn "Failed to load IP2Proxy DB; IP enrichment disabled" with the path and cause, and boot must
@@ -4234,6 +4249,8 @@ the value as given.
   exempts private outbound targets" with the number of hosts and networks.
 - **SPEC-6.103**: `STRIPE_API_BASE` (application, since `v0.10.0`) and `PAYPAL_API_BASE` (application, since `v0.14.0`)
   must override the payment API base URL when non-blank (SPEC-13.714, SPEC-13.734).
+- **SPEC-6.104**: `CONTACT_LOGIN_IP_RATE_MAX` and `CONTACT_LOGIN_IP_RATE_WINDOW_SECS` (application, since `v0.18.0`) must
+  default to 10 and 60, be parsed with `parse_positive`, and refuse boot when malformed, zero or negative (SPEC-5.444).
 
 ## 7. Service desk
 
@@ -5883,6 +5900,9 @@ Every migration under `migrations/` is embedded at compile time via `sqlx::migra
 - **SPEC-9.1003**: migrations/298_widen_bill_payment_method_paypal.sql widens the `bill_payments.payment_method` CHECK to include
   `'paypal'`, closing the gap migration 287 opened by copying the pre-paypal `payments` vocabulary without picking up the `'paypal'` the
   earlier migration 233 had already added to `payments`. The two tables' method vocabularies are now in step again.
+- **SPEC-9.1004**: migrations/299_delivery_outcome_benign_redelivery.sql widens `payment_webhook_deliveries.outcome` to
+  VARCHAR(32) and adds `'benign_redelivery'` to its CHECK, for a delivery whose payment a prior delivery already
+  recorded.
 
 ## 10. Build, CI and deployment
 
@@ -6150,7 +6170,7 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
 ### 10.29 CI gate scripts: documentation and configuration consistency
 
 - **SPEC-10.180** `check-doc-links.nu` must resolve every Markdown link, image, reference-definition, and HTML `href`/`src` target in every `git ls-files "*.md"` file (skipping anchors, protocol-relative and scheme URLs, fenced code, and HTML comments), root-relative for a leading `/` and else relative to the containing file; any target that does not resolve on disk exits 1 naming `<file>:<line>`.
-- **SPEC-10.181** `check-doc-recipes.nu` must check a fixed set of docs (`README.md`, `docs/README.md`, `docs/quickstart.md`, `docs/architecture.md`, `docs/binaries.md`, `docs/configuration.md`, `docs/recipes.md`, `docs/invariants/ci-release.md`, `docs/invariants/config-providers.md`) for every `just <recipe>` invocation and fail if the named recipe is absent from the union of `justfile`'s non-`[private]` recipes and `just --summary`'s resolved (imported) recipes; a missing submodule import failure must direct the operator to `git submodule update --init`.
+- **SPEC-10.181** `check-doc-recipes.nu` must check a fixed set of docs (`README.md`, `docs/README.md`, `docs/quickstart.md`, `docs/architecture.md`, `docs/public/binaries.md`, `docs/configuration.md`, `docs/recipes.md`, `docs/invariants/ci-release.md`, `docs/invariants/config-providers.md`) for every `just <recipe>` invocation and fail if the named recipe is absent from the union of `justfile`'s non-`[private]` recipes and `just --summary`'s resolved (imported) recipes; a missing submodule import failure must direct the operator to `git submodule update --init`.
 - **SPEC-10.182** `check-config-doc-paths.nu` must scan `.env.example`, `compose.dev.yml`, and `justfile` for bare `docs/...`-shaped path references and exit 1 listing any that do not resolve on disk.
 - **SPEC-10.183** `check-claude-md.nu` must exit 1 when `CLAUDE.md` exceeds `20000` UTF-8 bytes, when any non-fenced line exceeds `400` characters, or when a `](docs/...)` link's target or `#anchor` does not resolve; it must name `CLAUDE.md:<line>` for any violation.
 - **SPEC-10.184** `check-build-target-storage.nu` must resolve cargo's target directory in cargo's own precedence (`CARGO_TARGET_DIR`, then `CARGO_BUILD_TARGET_DIR`, then `build.target-dir` in the repo's `.cargo/config.toml`, then in `~/.cargo/config.toml`, then `<repo>/target`), determine its filesystem type via `stat --file-system --format=%T`, and exit 1 when that type is `tmpfs` or `ramfs` unless `MOKOSH_ALLOW_TMPFS_TARGET` is `1`/`true`/`yes`.
@@ -6707,6 +6727,8 @@ each route tree and the layers every request passes through.
 - **SPEC-12.2**: A `GET` request that none of the seven trees handles, including `GET /`, must answer `404` with an HTML
   page whose title is `API endpoint`, whose heading is `This is an API endpoint.`, that carries `<meta name="robots"
   content="noindex">`, and that lists no route.
+  A non-`GET` request to a path no tree handles must answer `405` with an `Allow` header, not the `404` page, because
+  the fallback is a `GET`-only handler.
 - **SPEC-12.3**: The fallback page must link to `https://` followed by the remainder of the `Host` header when the
   header begins with `api.msp.`, and otherwise (including when `Host` is absent or not visible ASCII) to the client
   origin passed to `create_api_router`; no domain may be hard-coded.
@@ -6726,9 +6748,9 @@ each route tree and the layers every request passes through.
 - **SPEC-12.8**: JSON body sanitising must run on the full pre-nesting path and must forward the body unchanged for
   paths beginning `/api/v1/bunyip/`, `/api/v1/rmm/alerts`, `/api/v1/rmm/status`, `/api/v1/stripe/`, `/api/v1/paypal/`
   and `/api/v1/webhooks/`, whose signatures cover the raw bytes (SPEC-4.38).
-- **SPEC-12.9**: A JSON request whose declared `Content-Length` is at most 25 MiB must be read in full by the sanitiser
+- **SPEC-12.9**: A JSON request whose declared `Content-Length` is at most 2 MiB must be read in full by the sanitiser
   whatever default body limit the route carries; one declaring more must be forwarded unread to the route's extractor; a
-  body of unknown length that exceeds 25 MiB must be answered `413` with a message containing `The request body could
+  body of unknown length that exceeds 2 MiB must be answered `413` with a message containing `The request body could
   not be read.` and a `warn` log naming the path.
 - **SPEC-12.10**: Each route that accepts a file must carry its own body limit equal to its logical size cap plus 64 KiB
   of multipart framing (SPEC-4.24): ticket attachments and inline images, the tenant logo, KB article images, vCard
@@ -6739,7 +6761,8 @@ each route tree and the layers every request passes through.
 
 - **SPEC-12.11**: The CORS layer must allow the methods `GET`, `POST`, `PUT`, `DELETE`, `PATCH` and `OPTIONS`, the
   request headers `Authorization`, `Content-Type`, `Accept` and `X-Forwarded-Host`, must allow credentials, must cache
-  preflight answers for 600 seconds, and must expose no response headers.
+  preflight answers for 600 seconds, and must expose the response headers `Retry-After`, `WWW-Authenticate` and
+  `Content-Disposition` so a cross-origin browser client can read them.
 - **SPEC-12.12**: A request whose `Origin` matches no `CORS_ORIGIN` entry, or that has none, must receive no
   `Access-Control-Allow-Origin` header and must still be processed by the route; CORS is not an access control on the
   server side.
@@ -6949,7 +6972,9 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited and balance_due.
 - **SPEC-13.17**: A stored invoice status, invoice line type or payment method that is not a member of its known set
   must not be silently presented or acted on as a different value (draft, service or other): the read, edit, void,
-  write-off, credit or amend must fail with an error naming the offending value and the row.
+  write-off, credit or amend must fail with an error naming the offending value and the row. The same holds for the
+  response layer: converting an invoice, invoice line, payment, credit note, credit note line or statement row into its
+  response fails the read with the row id and value rather than substituting a fallback.
 - **SPEC-13.18**: POST `/invoices` must reject with 422 a body with no lines, a payment_terms longer than 20 characters,
   a currency longer than 3 characters, or a due_date earlier than invoice_date (reported on field due_date as "due_date
   must be on or after invoice_date"); a missing due_date is allowed, and quantity and unit_price may be negative
@@ -7410,7 +7435,8 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   the row), write the plaintext to the secret provider with put_if_absent at the (tenant, provider) address, then read
   it back and require equality (otherwise a Configuration error and the row left as is), and only then set
   config_encrypted to NULL with an update that matches only while it is not null; when the address was already claimed
-  the column must be cleared without overwriting the store.
+  the column must be cleared without overwriting the store, and the legacy value is not compared with the stored one, so
+  a differing older credential is dropped.
 - **SPEC-13.138**: The gateway credential move must be known to the one-shot runner by the name
   "gateway_credential_move".
 - **SPEC-13.139**: Every product read (list, detail, create and update responses) must carry in_use, true exactly when
@@ -7737,8 +7763,8 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   before any parsed content is acted on.
 - **SPEC-13.760**: A `PaymentSucceeded` event whose tenant differs from the tenant in the URL must be rejected with
   `Unauthorized` (recorded as `refused`); otherwise it must be recorded as a gateway payment for the URL tenant, with
-  outcome `accepted` when the payment was recorded and `unreconciled` when it was not, and the invoice id recorded in
-  both cases.
+  outcome `accepted` when the payment was recorded, `benign_redelivery` when a prior delivery already recorded it, and
+  `unreconciled` when it was refused, and the invoice id recorded in every case.
 - **SPEC-13.761**: A `Refunded` event must be recorded through the gateway refund path for the URL tenant, and a failure
   there must be returned as an error (recorded `failed`) so the provider retries.
 - **SPEC-13.762**: A `RequiresCapture` event must call the provider's capture for the order id and write no payment
@@ -8136,9 +8162,11 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   and organisation id and no delivery row, and must not stop the remaining events.
 - **SPEC-13.1088**: For an event naming a delegated invoice, the webhook must read the provider's current invoice state
   rather than trust the payload: `paid` with a balance due above zero must record a payment of the whole balance due in
-  the invoice currency keyed by the external invoice id and result in `accepted` when recorded and `unreconciled` when
-  not; `paid` with no balance due, and `open`, must result in `ignored`; `voided` must void the local invoice and result
-  in `accepted`.
+  the invoice currency keyed by the external invoice id and result in `accepted` when recorded, `benign_redelivery` when
+  a prior delivery already recorded it, and `unreconciled` when refused; `paid` with no balance due must result in
+  `benign_redelivery`; `open` must result in `ignored`; `voided` must void the local invoice and result in `accepted`.
+  `benign_redelivery` is a non-alerting outcome: nothing for a human to do, and distinct from `ignored`, which is an
+  event that named nothing Mokosh holds.
 - **SPEC-13.1089**: For an event naming no delegated invoice, the webhook must try a delegated bill of the tenant and
   result in `ignored` when there is none or when the provider does not hold the id as a bill; otherwise it must
   reconcile the provider's paid running total against the bill using today's UTC date and a system audit context,
@@ -8146,7 +8174,7 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
 - **SPEC-13.1090**: When the provider reports a delegated bill voided, the webhook must not void the local bill, must
   log a warn carrying the bill id, and must result in `unreconciled`.
 - **SPEC-13.1091**: After each processed event a delivery row must be recorded for the tenant and provider with outcome
-  `accepted`, `ignored`, `unreconciled` or `failed`; for `failed` the row must carry the error text and the handler must
+  `accepted`, `ignored`, `unreconciled`, `benign_redelivery` or `failed`; for `failed` the row must carry the error text and the handler must
   stop at that event and return its error status (so the provider retries), while a failure to write the row must be
   logged at warn and must not change the response.
 - **SPEC-13.1092**: A delivery whose events all processed without error must answer 200 with an empty body.
@@ -8470,11 +8498,12 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
   2 decimals below 100,000,000, or the request must fail with 422. `default_billable` and `is_active` must default to
   true and `sort_order` to 0 when omitted.
 - **SPEC-14.5**: Creating a work type must write an audit row in the same transaction as the insert. Updating or
-  deleting a work type that does not exist in the tenant must fail with 404 "Work type"; update must replace every field
-  of the work type with the request values.
-- **SPEC-14.6**: `POST /time-entries` by a caller who is not `super_admin` or `admin` must record the entry against the
-  caller's own user id, replacing any other `user_id` in the body without raising an error. An admin may name any
-  `user_id`.
+  deleting a work type must also write an audit row in the same transaction (update carrying the row before and after,
+  delete the row before); one that does not exist in the tenant must fail with 404 "Work type"; update must replace
+  every field of the work type with the request values.
+- **SPEC-14.6**: `POST /time-entries` naming a `user_id` other than the caller's must be refused with 403 unless the
+  caller is `super_admin`, `admin` or `manager`, who may attribute time to any user. The body is never silently
+  rewritten.
 - **SPEC-14.7**: A time entry request must be refused with 422 when `duration_minutes` or `worked_minutes` is outside
   1..=1440, when `billable_minutes` is outside 0..=1440, or when `hourly_rate` is negative, has more than 2 decimals or
   is 100,000,000 or more.
@@ -8530,8 +8559,9 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
   check, and must fail with 403 "Cannot edit another user's time entry" or "Cannot delete another user's time entry"
   when the caller is not `super_admin` or `admin` and the entry belongs to another user.
 - **SPEC-14.23**: An update must keep the stored value of `date`, `notes`, `work_type_id` and `task_id` when omitted. It
-  must set `ticket_id` and `project_id` to exactly the request values (an omitted one becomes null) and re-derive
-  `work_category` from them. `entry_kind` and `company_id` must never change. Attaching a ticket to an `employee` entry
+  must also keep the stored `ticket_id` and `project_id` when omitted, and re-derive `work_category` from the resulting
+  values. A supplied `project_id` or `task_id` that belongs to another tenant must fail with 404. An update and a delete
+  must each write an audit row in the same transaction. `entry_kind` and `company_id` must never change. Attaching a ticket to an `employee` entry
   must fail with 400.
 - **SPEC-14.24**: On update the worked minutes must be the request's `worked_minutes`, else `duration_minutes`, else the
   minutes between the resulting start and end times, else the current worked minutes. Billable minutes must be the
@@ -8594,7 +8624,7 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
 - **SPEC-14.41**: A rounding rule's `rounding_method` must be `up`, `down` or `nearest`, else the request must fail with
   400 "rounding_method `<value>` invalid; expected up | down | nearest". Saving a rule with `is_default` true must clear
   `is_default` on every other rule of the tenant in the same transaction, and updating or deleting an unknown rule must
-  fail with 404 "Time rounding rule". Creating a rule must write an audit row.
+  fail with 404 "Time rounding rule". Creating, updating and deleting a rule must each write an audit row in the same transaction.
 - **SPEC-14.42**: `POST /workday/clock-in` must open a `work` segment for the caller on the body's `date` or, when
   absent, on today in the caller's own time zone; a missing body must be treated as an empty one. While the caller has
   any open segment of any date it must fail with 409 whose message names the open segment's date and elapsed time as
@@ -8636,8 +8666,9 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
   any of `user_id`, `ticket_id`, `project_id`, `date_from` and `date_to` (inclusive), ordered by date descending unless
   an allowed `sort` is given, with a total counting only the filtered set; an unknown `sort` field must be refused with
   422. `GET /mileage-entries/{id}` must fail with 404 "Mileage entry" when absent.
-- **SPEC-14.51**: `POST /mileage-entries` by a caller who is not `super_admin` or `admin` must record the entry against
-  the caller's own user id, replacing any other `user_id` without an error. `distance_miles` must be greater than 0,
+- **SPEC-14.51**: `POST /mileage-entries` naming a `user_id` other than the caller's must be refused with 403 unless
+  the caller is `super_admin`, `admin` or `manager`; the body is never silently rewritten. A supplied `project_id`,
+  `task_id` or `contract_id` that belongs to another tenant must fail with 404. `distance_miles` must be greater than 0,
   have at most 2 decimals and be below 1,000,000, and `rate_per_mile` must be non-negative with at most 4 decimals and
   below 10,000, or the request must fail with 422; a service-level distance of 0 or less must fail with 400
   "distance_miles must be greater than 0".
@@ -8652,10 +8683,12 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
   permission check, and 403 "Cannot edit another user's mileage entry" or "Cannot delete another user's mileage entry"
   when the caller is not `super_admin` or `admin` and the entry belongs to another user.
 - **SPEC-14.56**: A mileage update must keep the stored `date`, `start_address`, `end_address`, `notes` and `task_id`
-  when omitted, but set `ticket_id` and `project_id` to exactly the request values (an omitted one becomes null). The
+  `ticket_id`, `project_id` and `task_id` when omitted. The
   resulting distance must be greater than 0 (400 otherwise), a supplied ticket must belong to the tenant (404 "Ticket"),
-  and the total must be recomputed from the resulting rate, distance and billability. The update must not change the
-  billing status.
+  and the total must be recomputed from the resulting rate, distance and billability. A supplied `project_id` or
+  `task_id` that belongs to another tenant must fail with 404. The update must resolve the billing status from the
+  resulting billability as time entries do: non-billable becomes `not_billed`, billable becomes `ready_to_bill`, and a
+  `billed` entry stays `billed`.
 
 ### 14.3 Expenses
 
@@ -8700,7 +8733,8 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
   for this transition."
 - **SPEC-14.68**: `GET /bills` must list the tenant's bills ordered by issue date then creation time descending,
   paginated (a `sort` parameter gives 422). The optional `status` (up to 20 characters, blank ignored) must filter by
-  exact status, an unknown value returning an empty page, and `q` (up to 200 characters, blank ignored) must match the
+  exact status, an unknown value answering 200 with an empty page (deliberate: a status filter is a lookup, not a
+  closed vocabulary the caller must already know, matching `GET /invoices`), and `q` (up to 200 characters, blank ignored) must match the
   bill number or the vendor name case-insensitively as a substring; the total must count the filtered set.
 - **SPEC-14.69**: `GET /bills/{id}` must return the bill with its lines ordered by position then creation time, failing
   with 404 "Bill" when absent.
@@ -8732,7 +8766,7 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
 - **SPEC-14.76**: `GET /expenses` must list only the caller's own claims unless the caller is `super_admin`, `admin` or
   `finance`, who see every claim; the scope must not be settable by a query parameter and the total must count the same
   scope. Results must be ordered by `incurred_on` then creation time descending, paginated (a `sort` parameter gives
-  422), filtered by exact `status` (unknown value giving an empty page) and by `q` matching claim notes or line
+  422), filtered by exact `status` (an unknown value answers 200 with an empty page, deliberately, as for `GET /bills`) and by `q` matching claim notes or line
   descriptions case-insensitively.
 - **SPEC-14.77**: `GET /expenses/{id}` must return the claim with its lines ordered by position, failing with 404
   "Expense" for an unknown id before any ownership check and with 403 "That expense claim belongs to somebody else" when
@@ -8741,7 +8775,7 @@ Normative requirements for `src/modules/time_tracking/`, `mileage_tracking/`, `e
   (403 "That expense claim belongs to somebody else" otherwise, 404 for an unknown id) and move a `draft` claim to
   `submitted`; approve, reject and reimburse must require the `super_admin`, `admin` or `finance` role.
 - **SPEC-14.79**: Approve must move a `submitted` claim to `approved` recording the approver and approval time, reject
-  must move a `submitted` claim to `rejected`, and reimburse must move an `approved` claim to `reimbursed` recording the
+  must move a `submitted` claim to `rejected` recording the rejecting user in `approver_id`, and reimburse must move an `approved` claim to `reimbursed` recording the
   reimbursement time; each must lock the row, and any other source status must fail with 409.
 - **SPEC-14.80**: A refused expense transition must answer 409 with: for `rejected` "This expense was rejected, which is
   terminal. File a new expense instead."; for `reimbursed` "A reimbursed expense is immutable. File a reversing expense
@@ -9291,7 +9325,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   ID and app-specific password. ...", a throttle must fail 409 "Apple is asking us to wait before checking this account
   again. ...", and any other source failure must fail 400 with the failure message.
 - **SPEC-15.531**: The failure redirect for a failed callback must be `{SPA
-  base}/settings/integrations/google-contacts?contact_sync=failed`, with no provider text in it.
+  base}/settings/integrations/<provider>-contacts?contact_sync=failed`, where `<provider>` is `microsoft` for a Microsoft
+  callback and `google` otherwise, with no provider text in it.
 - **SPEC-15.532**: The overview must read each provider's enabled switch from the tenant's settings, report `configured`
   as whether the host holds a Google client and `microsoft_configured` as whether it holds a Microsoft client, and read
   each live connection scoped to the tenant.
@@ -9350,7 +9385,7 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   by `connection_id`. When the record waits in more than one source and none is named it must fail with a validation
   error on `connection_id` ("this record is waiting in more than one source; name the one you are answering"). It must
   fail 409 when the source's switch is off (the file-upload source is exempt), and when no source is found it must first
-  fail 409 if the Google switch is off, else 404 "Review item".
+  fail 409 if the Google, iCloud or Microsoft switch is off, else 404 "Review item".
 - **SPEC-15.549**: A resolve whose link or create hits a conflict because a sync linked the record meanwhile must fail
   409 "This record was linked by a sync while it was waiting for review. Reload the queue.".
 - **SPEC-15.550**: Reading a contact's provenance must fail 404 "Contact" for a contact outside the tenant, and
@@ -9851,9 +9886,11 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1003**: `GET /asset-models/signature-detector` must be served by the signature handler and never parsed as
   an `{id}` of `/asset-models/{id}`.
 - **SPEC-15.1004**: `GET /asset-models` must reject a `q` longer than 200 characters with a validation error. A
-  non-empty `q`, trimmed and lowercased, must match case-insensitively as a substring of `manufacturer + " " + model`.
+  non-empty `q`, trimmed and lowercased, must match case-insensitively as a literal substring of `manufacturer + " " +
+  model`: a typed `%` or `_` must match itself and not act as a wildcard.
 - **SPEC-15.1005**: `GET /asset-models` must apply `limit` default 10 when omitted and clamp any supplied value to the
-  range 1..=50.
+  range 1..=50. A value outside that range must be clamped silently, never rejected with a validation error; this is
+  the intended contract, not an oversight.
 - **SPEC-15.1006**: `GET /asset-models` with a missing, empty or whitespace-only `q` must return the caller tenant's
   models without filtering. Results must be ordered by `uses_count` descending, then lowercased manufacturer, then
   lowercased model.
@@ -9867,8 +9904,10 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1009**: `POST /asset-models` must store `specs` as the empty JSON object `{}` when the field is omitted.
 - **SPEC-15.1010**: `GET /asset-models/{id}` must answer 404 "Asset model" when the id does not exist in the caller's
   tenant, including when it exists in another tenant.
-- **SPEC-15.1011**: `PUT /asset-models/{id}` must update only the fields present in the body (an absent or null field
-  keeps its stored value), apply the same bounds as create, reject a foreign `asset_type_id` as in SPEC-15.1007, answer
+- **SPEC-15.1011**: `PUT /asset-models/{id}` must update only the fields present in the body (an absent field keeps its
+  stored value; an explicit null clears `warranty_months`, `end_of_life_months`, `default_department`,
+  `default_license_vendor`, `default_tags` and `image_url`, while a null `manufacturer`, `model`, `asset_type_id` or
+  `specs` is treated as absent because those columns are NOT NULL), apply the same bounds as create, reject a foreign `asset_type_id` as in SPEC-15.1007, answer
   409 "Another catalog row already has this manufacturer / model / type." when the change collides with another row,
   answer 404 "Asset model" when no row matches, and otherwise return the refreshed row.
 - **SPEC-15.1012**: `DELETE /asset-models/{id}` must answer 204 and remove the row, must keep assets that referenced it
@@ -9880,10 +9919,13 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   caller's tenant.
 - **SPEC-15.1015**: `POST /asset-templates` must validate `name` as 1..=150 characters, `department` at most 100 and
   `license_seat_count` as 0..=100000. It must answer 404 "Asset model" when `asset_model_id` is not a model of the
-  caller's tenant, record the calling user as `created_by`, answer 409 "A template with this name already exists." on a
-  duplicate name, and answer 201 with the joined template row.
-- **SPEC-15.1016**: `PUT /asset-templates/{id}` must update only the fields present in the body, answer 404 "Asset
-  model" for a foreign `asset_model_id`, answer 409 "Another template already uses this name." on a name collision,
+  caller's tenant, answer 422 on `company_id`, `site_id` or `default_assigned_user_id` when the id does not exist in
+  the caller's tenant, record the calling user as `created_by`, answer 409 "A template with this name already exists."
+  on a duplicate name, and answer 201 with the joined template row.
+- **SPEC-15.1016**: `PUT /asset-templates/{id}` must update only the fields present in the body (an explicit null clears
+  `company_id`, `site_id`, `default_assigned_user_id`, `department`, `tags`, `notes` and `license_seat_count`; a null
+  `name` or `asset_model_id` is treated as absent), answer 404 "Asset model" for a foreign `asset_model_id`, answer 422
+  on `company_id`, `site_id` or `default_assigned_user_id` when a supplied id does not exist in the caller's tenant, answer 409 "Another template already uses this name." on a name collision,
   answer 404 "Asset template" when no row matches, and otherwise return the refreshed joined row.
 - **SPEC-15.1017**: `DELETE /asset-templates/{id}` must answer 204 and remove the template, or 404 "Asset template" when
   no row matches in the caller's tenant.
@@ -9902,13 +9944,16 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   and must answer 422 on a `sort` parameter because the endpoint is unsorted.
 - **SPEC-15.1023**: `POST /asset-types` must require an admin, validate `name` as 1..=100 characters and `itil_category`
   as at most 50, default `is_active` to true, store the type in the caller's tenant with an audit entry in the same
-  transaction, and return the stored type.
+  transaction, and return the stored type. A `parent_type_id` must name a type of the caller's tenant, otherwise 422 on
+  `parent_type_id`.
 - **SPEC-15.1024**: `PUT /asset-types/{id}` must require an admin and replace `name`, `icon`, `parent_type_id`,
   `is_active` and `itil_category` with the body values (an omitted `icon`, `parent_type_id` or `itil_category` becomes
-  null, an omitted `is_active` becomes true), and must answer 404 "Asset type" when no row of the caller's tenant
-  matches.
-- **SPEC-15.1025**: `DELETE /asset-types/{id}` must require an admin and answer 404 "Asset type" when no row of the
-  caller's tenant matches.
+  null, an omitted `is_active` becomes true), write an audit entry holding the prior and new row in the same
+  transaction, and must answer 404 "Asset type" when no row of the caller's tenant matches. A `parent_type_id` must
+  name a type of the caller's tenant other than the type itself and not one of its descendants, otherwise 422 on
+  `parent_type_id`.
+- **SPEC-15.1025**: `DELETE /asset-types/{id}` must require an admin, write an audit entry holding the prior row in the
+  same transaction, and answer 404 "Asset type" when no row of the caller's tenant matches.
 - **SPEC-15.1026**: `GET /assets` must accept a staff caller with an authenticated user, or a contact caller holding the
   `assets:read` capability (loaded from the database per request). For a contact caller it must force the `company_id`
   filter to the contact's own company whatever the query says, and must answer with the contact projection (id,
@@ -10027,7 +10072,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1063**: `POST /assets/exists` must validate `serials` as 1..=500 entries, ignore blank entries after
   trimming, match case-insensitively against assets of the given company in the caller's tenant, and return only the
   matching serials, trimmed, in first-occurrence order with duplicates collapsed. It must not depend on a feature
-  toggle.
+  toggle. Serial uniqueness is a per-company pre-flight read, not a database invariant: no UNIQUE constraint exists on
+  `assets.serial_number`, so the same serial may exist on assets of different companies.
 - **SPEC-15.1064**: `POST /assets/bulk-create` must answer 404 "This endpoint is not enabled on this deployment" before
   any database access when the `AssetsCatalog` feature is off, and otherwise answer 201 with `created` (the full asset
   responses) and `count`.
@@ -10050,9 +10096,11 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1070**: Each bulk-created asset must have status "active", the model's manufacturer, model and asset type,
   the model link, a server-issued asset tag (consecutive in request order), and the name given or "<manufacturer>
   <model> #<serial>".
-- **SPEC-15.1071**: A bulk create where any serial collides with an existing asset must answer 422 on field
-  `serials[<i>].serial_number` ("serial `<serial>` is already assigned to an asset in this tenant") and must persist no
-  asset of the batch. Any other insert error must be returned and must persist no asset of the batch.
+- **SPEC-15.1071**: A bulk create whose server-issued asset tag collides with an existing asset (the
+  `uq_assets_tenant_asset_tag_ci` unique index) must answer 422 on field `serials[<i>].asset_tag` ("asset tag `<tag>` is
+  already assigned to an asset in this tenant") and must persist no asset of the batch. Any other insert error,
+  including any other unique violation, must be returned unchanged and must persist no asset of the batch. A duplicate
+  serial is not detected here; it is only reported by the `POST /assets/exists` pre-flight (SPEC-15.1063).
 - **SPEC-15.1072**: Bulk create must write one `created` asset audit-log row per asset, add the batch size to the
   model's `uses_count` and, when a template was used, to the template's `uses_count`, all in the transaction that
   inserts the assets.
@@ -10065,8 +10113,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1075**: The reported ticket's title must be the trimmed `summary`, or "Reported issue: <asset name>" when
   the summary is missing or blank, and its description the trimmed `description`, or none when blank.
 - **SPEC-15.1076**: A contact's report must create a ticket with source `portal`, the contact as requester and the
-  asset's company, link it to the asset, and return the refreshed ticket; a failure to link must answer an internal
-  server error whose message begins "stamp asset_id on report-issue ticket" or "commit asset_id stamp".
+  asset's company, link it to the asset in the same insert that creates the ticket (so a failure leaves no unlinked
+  ticket behind), and return the ticket.
 - **SPEC-15.1077**: A staff report must create an `internal` ticket for the asset's company with `asset_id` set, created
   by the calling user, and return the refreshed ticket.
 - **SPEC-15.1078**: Asset secrets (configuration item values and credential username, password and notes) must be
@@ -10249,7 +10297,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   both tallies from the stored votes, store them on the article, answer 404 "KB article" when absent in the tenant, and
   return `id`, both counts and `my_vote` (null after a removal).
 - **SPEC-15.1134**: `GET /kb/articles/{id}/vote` must return the article's stored counts and the caller's current vote
-  without changing anything, and answer 404 "KB article" when absent in the tenant.
+  without changing anything, and answer 404 "KB article" when absent in the tenant. The stored count columns are
+  nullable; a null count must read as 0.
 - **SPEC-15.1135**: `DELETE /kb/articles/{id}` must require a manager, answer 404 "KB article" when absent in the
   tenant, write an audit entry holding the prior row in the same transaction, and after commit delete the stored blobs
   of the article's attachments.
@@ -10271,7 +10320,9 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   see. A staff render must not count a view.
 - **SPEC-15.1140**: `GET /kb/articles/{id}/comments` must require the knowledge base module, answer 404 "KB article"
   when absent in the tenant, and return root comments oldest first, each with its replies oldest first; a deleted
-  comment must keep its place with `deleted` true and an empty body.
+  comment must keep its place with `deleted` true and an empty body. A reply whose root is absent from the result is
+  dropped, which cannot occur while the `parent_id` foreign key holds (a root is never removed while a reply refers to
+  it), so no orphan handling exists.
 - **SPEC-15.1141**: `POST /kb/articles/{id}/comments` must validate `body` as 1..=20000 characters, store it trimmed,
   answer 404 "KB article" when absent, and answer 201 with the comment. A reply must answer a live top-level comment of
   the same article or be rejected with 422 on `parent_id` ("a reply answers a top-level comment on this article"), and
@@ -10304,13 +10355,15 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1149**: `GET /companies/{company_id}/documentation` must require the assets module and an authenticated
   user, and must return an object with exactly the lists `assets`, `credentials` and `articles`.
 - **SPEC-15.1150**: The `assets` list must hold the first page of at most 100 assets of the caller's tenant for the
-  company, ordered by name, and the response must carry no total for it.
+  company, ordered by name, and the response must carry `total_assets`, the full count, so a truncated list is
+  detectable.
 - **SPEC-15.1151**: The `credentials` list must hold every credential reference of the tenant for the company, both
   asset-linked and company-scoped, ordered by name, with no username, password or notes and no 100-item limit.
 - **SPEC-15.1152**: The `articles` list must hold at most 100 articles of the tenant whose company list contains the
-  company, newest update first, in every status, and must not depend on the `knowledge_base` module flag.
+  company, newest update first, in every status, and must not depend on the `knowledge_base` module flag. The response
+  must carry `total_articles`, the full count.
 - **SPEC-15.1153**: A company id that does not exist in the caller's tenant, including one belonging to another tenant,
-  must produce a 200 response with three empty lists, because no company existence check is made.
+  must answer 404 "Company".
 - **SPEC-15.1154**: The three lists must be read concurrently; if any read fails the request must fail with that error
   and return no partial body.
 
@@ -10440,7 +10493,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   connectwise | ninja_rmm", and must reject a `name` outside 1-100 characters or an `api_url` that is not a URL with a
   validation error.
 - **SPEC-15.1541**: `POST /rmm/connections` must store `api_key` and any `api_secret` as AES-256-GCM ciphertext under
-  the deployment key, must default `is_active` to false and `sync_interval_minutes` to 60, must answer with sync status
+  the deployment key, must default `is_active` to false and `sync_interval_minutes` to 60 and reject a value below 1 (on update as well) with
+  a validation error, must answer with sync status
   `never` and no last sync time, and must write a `create` audit record in the same transaction.
 - **SPEC-15.1542**: No RMM response may contain `api_key` or `api_secret`; a connection response must carry only id,
   name, provider, api_url, is_active, sync_interval_minutes, last_sync_at, sync_status, last_error and created_at.
@@ -10458,7 +10512,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   target is blocked as private; each case must log a warning naming the connection id.
 - **SPEC-15.1547**: The connection test must answer 200 with `{"reachable": true, "status": <http status>}` for any HTTP
   response received, and `{"reachable": false, "error": <text>}` when no response was received, and must record
-  `sync_status` `success` or `failed` and `last_sync_at` now on the connection.
+  `sync_status` `success` or `failed`, `last_sync_at` now and `last_error` (the error text, or null after a probe that
+  received a response) on the connection.
 - **SPEC-15.1548**: `POST /rmm/device-mappings` must require `rmm_device_id` of 1-255 characters, must write a `create`
   audit record in the same transaction, and must answer with the mapping including the owning connection's name and a
   sync status of `pending` unless one is stored.
@@ -10474,7 +10529,9 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   likewise.
 - **SPEC-15.1552**: `POST /rmm/alerts` must not require a session; it must take the tenant from the `X-Tenant-Id` header
   and authenticate the body with an `X-Signature` header holding the standard-alphabet base64 of the HMAC-SHA256 of the
-  exact received body bytes keyed by the connection's decrypted `api_secret`, compared in constant time.
+  exact received body bytes keyed by the connection's decrypted `api_secret`, compared in constant time. Field validation
+  must run only after the signature is verified, and a verified alert for a connection whose `is_active` is false must
+  be refused with 403 and create no ticket.
 - **SPEC-15.1553**: `POST /rmm/alerts` must answer 401 without detail when the body is not a valid alert JSON document,
   the `X-Signature` header is missing, the `X-Tenant-Id` header is missing or not a UUID, the connection does not exist
   in that tenant, the connection has no `api_secret`, or the signature does not match.
@@ -10500,8 +10557,9 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   `queue_id` and `assign_to_id`, `is_billable` false, an audit actor of the tenant's system, and the oldest active user
   of role `super_admin`, `admin` or `manager` as creator; with no such user the rule must be skipped with a warning
   naming the rule and connection.
-- **SPEC-15.1561**: If a ticket creation fails during alert ingest, the request must fail with that error and the
-  remaining rules must not be processed; tickets already created for earlier rules in the same request must remain.
+- **SPEC-15.1561**: If a ticket creation fails for one rule during alert ingest, the remaining rules must still be
+  processed and the failure logged; the response must carry `rules_failed` beside `tickets_created`. When no ticket was
+  created and a rule failed, the request must fail with that error so the sender retries.
 - **SPEC-15.1562**: The provider factory must return the Tactical RMM provider for `tactical_rmm` and, for every other
   provider value, a provider whose every operation fails with an internal error "RMM provider '<name>' is not
   implemented yet".
@@ -10567,7 +10625,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   date from 30 days before the caller's today onward, in ascending date order, omitting dates with no tickets.
 - **SPEC-15.1582**: `GET /reports/tickets` must default `from` to 30 days before the caller's today and `to` to the
   caller's today, include both bounds, and return `opened_by_status` (tickets created in range, by status name in name
-  order), `closed_total` (tickets whose `closed_at` falls in range) and `opened_by_assignee` (id, name and count).
+  order), `closed_total` (tickets whose `closed_at` falls in range) and `opened_by_assignee` (id, name and count, highest
+  count first). Dates must be taken in the caller's time zone, and a `from` later than `to` must be refused with 422.
 - **SPEC-15.1583**: In `opened_by_assignee` the name must be the assignee's full name, else the email, and must be
   absent for an unassigned ticket; an assignee id whose name did not resolve must be logged by id and must not be logged
   for an unassigned ticket.
@@ -10635,8 +10694,8 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.1601**: A custom report with dimensions must group and order by all of them in the given order, and its row
   limit must default to 100 and be clamped into 1 to 1000.
 - **SPEC-15.1602**: A custom report response must carry `columns` (dimension labels then measure labels), `rows` of
-  nullable strings, and `totals` mapping each measure label to the sum of that column over the returned rows
-  (non-numeric cells ignored), written without a fractional part when whole and with two decimals otherwise.
+  nullable strings, and `totals` mapping each measure label to the value of that measure aggregated in the
+  database over every row matching the filters, before the row limit (so a ratio measure is the ratio of the sums).
 - **SPEC-15.1603**: `POST /reports/custom` with `"format": "csv"` must answer `text/csv; charset=utf-8` containing the
   column labels as a header line then one line per row with null cells empty and cells quoted per the CSV rule; any
   other `format` value must answer the JSON envelope.
@@ -10662,17 +10721,17 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   caller as author, and must not check `entity_type` against the supported entities until the report is executed.
 - **SPEC-15.1611**: `PATCH /reports/saved/{id}` must be allowed only for the author; any other user, including one who
   can see the report because it is shared, must receive 404 "Saved report". It must change only the supplied fields
-  among name (1-200 characters), description, filters, columns, group_by, sort and is_shared, must not change
+  among name (1-200 characters), description (an explicit `null` clears it), filters, columns, group_by, sort and is_shared, must not change
   `entity_type`, and must answer with the updated report.
 - **SPEC-15.1612**: `DELETE /reports/saved/{id}` must be allowed only for the author, answering `{"deleted": true}`, and
   must answer 404 "Saved report" for anyone else or an unknown id.
 - **SPEC-15.1613**: `POST /reports/saved/{id}/execute` must read `page` (default 1) and `per_page` (default 100) from
-  the query string, clamp the effective page size into 1 to 10000, skip `(page - 1) * page size` rows (page 0 behaves as
-  page 1), and answer `rows`, `total` (all matching rows ignoring paging), `page` (as requested), `per_page` (effective)
+  the query string, clamp the effective page size into 1 to 10000, skip `(page - 1) * page size` rows (pages are 1-based, but page 0 reads the first page, offset 0, like page 1), and
+  answer `rows`, `total` (all matching rows ignoring paging), `page` (as requested, so a 0 is echoed back as 0), `per_page` (effective)
   and `aliases` (the ordered display headers).
 - **SPEC-15.1614**: Execution must run the count and row queries inside the caller's tenant-scoped transaction, with the
   tenant condition always the first condition of the generated query and every other value bound as a parameter.
-- **SPEC-15.1615**: Execution must refuse a report whose `entity_type` is not `tickets` with 400 "Unsupported
+- **SPEC-15.1615**: Execution must refuse a report whose `entity_type` is not `tickets` with 422 "Unsupported
   entity_type='<value>'. Phase 2 only supports 'tickets'."
 - **SPEC-15.1616**: The report `columns` must be a JSON array of strings or of objects with a `field` and an optional
   `header`, with the header defaulting to the field. Execution must answer 400 for a non-array ("saved_reports.columns
@@ -10691,14 +10750,15 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   where a repeated header becomes `<header> (2)`, `<header> (3)`, ... and each row must be keyed by its header in the
   declared column order with a missing value as `null`.
 - **SPEC-15.1620**: Report `filters` must be a JSON object of whitelisted field to value, applied together with AND,
-  where a scalar means equality and an array means membership. Execution must answer 400 for an unsupported field
+  where a scalar means equality and an array means membership. Execution must answer 422 for an unsupported field
   ("Unsupported filter field '<field>' for entity 'tickets'."), an empty array, a uuid column whose value is not a valid
   UUID string, a value of a type the column does not accept ("Filter '<field>' has an unexpected value type for its
-  column"), and an array filter on a boolean column.
+  column"), a timestamp column whose value is not an RFC 3339 timestamp, an array filter on a boolean column, and
+  `filters` that is not an object.
 - **SPEC-15.1621**: Report `sort` must be an array of `{field, dir}` with a whitelisted field and `dir` of `asc` (the
-  default) or `desc` in any letter case; execution must answer 400 for an entry that is not an object, lacks `field`,
-  names an unsupported field ("sort[<i>] unsupported field '<field>'") or has another `dir`. An absent, empty or
-  non-array `sort` must order by ticket `updated_at` descending.
+  default) or `desc` in any letter case; execution must answer 422 for an entry that is not an object, lacks `field`,
+  names an unsupported field ("sort[<i>] unsupported field '<field>'") or has another `dir`, or for a `sort` that is
+  not an array. An absent or empty `sort` must order by ticket `updated_at` descending.
 - **SPEC-15.1622**: Execution must include only tickets that have a status, priority, queue and company, and must use
   the same joins for the total as for the rows.
 - **SPEC-15.1623**: When a report selects both a person id column and its name column (`contact_id` and `contact_name`,
@@ -10713,9 +10773,9 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   '<expr>' has no future firings".
 - **SPEC-15.1626**: `GET /reports/saved/{id}/schedules` must require the parent report to be visible to the caller and
   then list all schedules of that report, newest first, whoever owns them.
-- **SPEC-15.1627**: `GET /reports/schedules/{schedule_id}` must return the schedule of the caller's tenant with that id
+- **SPEC-15.1627**: `GET /reports/schedules/{schedule_id}` must return the caller's own schedule with that id
   (cron_expr, channel, format, recipient_email, is_active, last_run_at, next_run_at, last_error, timestamps), and 404
-  "Scheduled report" when there is none.
+  "Scheduled report" when there is none or it belongs to another user.
 - **SPEC-15.1628**: `PATCH /reports/schedules/{schedule_id}` and `DELETE` must be allowed only for the schedule owner,
   and otherwise answer 404 "Scheduled report"; a patch must change only the supplied fields among `cron_expr`,
   `recipient_email` and `is_active`, must recompute `next_run_at` from the current time only when `cron_expr` is
@@ -10766,9 +10826,9 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   '<expr>' has no future firings".
 - **SPEC-15.1644**: `GET /dashboards/{id}/schedules` must require the parent dashboard to belong to the caller (404
   "Dashboard" otherwise) and list its schedules newest first.
-- **SPEC-15.1645**: `GET /dashboards/schedules/{schedule_id}` must return the tenant's schedule with that id (including
-  channel, recipient_email, is_active, last_run_at, next_run_at, last_error) and 404 "Scheduled dashboard" when there is
-  none.
+- **SPEC-15.1645**: `GET /dashboards/schedules/{schedule_id}` must return the caller's own schedule with that id
+  (including channel, recipient_email, is_active, last_run_at, next_run_at, last_error) and 404 "Scheduled dashboard"
+  when there is none or it belongs to another user.
 - **SPEC-15.1646**: `PATCH /dashboards/schedules/{schedule_id}` and `DELETE` must be allowed only for the schedule owner
   and otherwise answer 404 "Scheduled dashboard"; a patch must change only the supplied fields among `cron_expr`,
   `recipient_email` and `is_active`, must recompute `next_run_at` from the current time only when `cron_expr` is
@@ -10780,9 +10840,10 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
   was deleted or is not the owner's fails the delivery, and must build a text snapshot "Snapshot of dashboard: <name>"
   followed by a blank line, then either "(no widgets configured)" or "Widgets:" with one line "  - <key>" per widget
   key, then a blank line and "This is an automated scheduled delivery."
-- **SPEC-15.1649**: Widget keys must be collected by walking the whole layout document in order: for every JSON object,
-  its string `widget_key`, else `key`, else `label`; and every string element of every array; a layout of any other
-  shape must yield no keys.
+- **SPEC-15.1649**: Widget keys must be collected in order from the layout's `widgets` array and from the `widgets`
+  array of each entry of its `rows` array: for every object element its string `widget_key`, else `key`, else `label`,
+  and every string element; arrays nested inside a widget are not widgets, and a layout of any other shape must yield no
+  keys. The snapshot lists keys only, not widget data (v1).
 - **SPEC-15.1650**: The worker must address the delivery to the schedule's non-blank `recipient_email`, else to the
   owner's email, failing the delivery with "schedule owner <id> has no email and no recipient override" when neither
   exists, and must insert a `notifications` row of channel `email`, status `pending`, subject "Dashboard: <name> - <UTC

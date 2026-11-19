@@ -455,7 +455,7 @@ impl AppSecretsSelection {
     /// this tier's `file` and `environment` providers could not be selected on
     /// any deployment that boots. Two of the four were decoration.
     ///
-    /// `docs/operator-provider-runbook.md` walked an operator through setting
+    /// `docs/public/operations/provider-runbook.md` walked an operator through setting
     /// `SECRET_BACKEND=file` and restarting, which would have taken the server
     /// down.
     ///

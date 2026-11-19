@@ -271,7 +271,7 @@ async fn editing_an_entry_moves_the_balance_with_it(pool: PgPool) {
     let longer: mokosh_types::time_tracking::UpdateTimeEntryRequest =
         serde_json::from_value(serde_json::json!({ "duration_minutes": 180 }))
             .expect("build update");
-    svc.update_time_entry(tenant, entry.id, &longer)
+    svc.update_time_entry(tenant, entry.id, &longer, &ctx)
         .await
         .expect("lengthen");
     assert_eq!(
@@ -283,7 +283,7 @@ async fn editing_an_entry_moves_the_balance_with_it(pool: PgPool) {
     // And turning it non-billable gives the whole draw back.
     let unbillable: mokosh_types::time_tracking::UpdateTimeEntryRequest =
         serde_json::from_value(serde_json::json!({ "is_billable": false })).expect("build update");
-    svc.update_time_entry(tenant, entry.id, &unbillable)
+    svc.update_time_entry(tenant, entry.id, &unbillable, &ctx)
         .await
         .expect("unbill");
     assert_eq!(
@@ -319,7 +319,7 @@ async fn deleting_an_entry_returns_its_hours(pool: PgPool) {
         Some((Decimal::from(4), Decimal::from(6)))
     );
 
-    svc.delete_time_entry(tenant, entry.id)
+    svc.delete_time_entry(tenant, entry.id, &ctx)
         .await
         .expect("delete");
     assert_eq!(
@@ -364,7 +364,7 @@ async fn hours_past_the_block_are_overage_and_only_the_applied_part_returns(pool
         "the entry records what it took, not what it worked"
     );
 
-    svc.delete_time_entry(tenant, entry.id)
+    svc.delete_time_entry(tenant, entry.id, &ctx)
         .await
         .expect("delete");
     assert_eq!(
@@ -707,6 +707,7 @@ async fn releasing_a_draw_makes_the_entry_billable_again_in_full(pool: PgPool) {
         tenant,
         entry.id,
         &update(serde_json::json!({ "duration_minutes": 300 })),
+        &ctx,
     )
     .await
     .expect("shorten");
@@ -723,6 +724,7 @@ async fn releasing_a_draw_makes_the_entry_billable_again_in_full(pool: PgPool) {
         tenant,
         entry.id,
         &update(serde_json::json!({ "is_billable": false })),
+        &ctx,
     )
     .await
     .expect("make non-billable");
@@ -739,6 +741,7 @@ async fn releasing_a_draw_makes_the_entry_billable_again_in_full(pool: PgPool) {
         tenant,
         entry.id,
         &update(serde_json::json!({ "is_billable": true })),
+        &ctx,
     )
     .await
     .expect("make billable");
@@ -884,7 +887,7 @@ async fn editing_an_entrys_date_past_contract_coverage_refuses_the_draw(pool: Pg
     let august_5 = NaiveDate::from_ymd_opt(2026, 8, 5).unwrap();
     let move_to_august: mokosh_types::time_tracking::UpdateTimeEntryRequest =
         serde_json::from_value(serde_json::json!({ "date": august_5 })).expect("build update");
-    svc.update_time_entry(tenant, entry.id, &move_to_august)
+    svc.update_time_entry(tenant, entry.id, &move_to_august, &ctx)
         .await
         .expect("correct the date");
 
@@ -965,7 +968,7 @@ async fn editing_an_entrys_date_into_another_contracts_window_redraws_there(pool
     let april_10 = NaiveDate::from_ymd_opt(2026, 4, 10).unwrap();
     let move_to_april: mokosh_types::time_tracking::UpdateTimeEntryRequest =
         serde_json::from_value(serde_json::json!({ "date": april_10 })).expect("build update");
-    svc.update_time_entry(tenant, entry.id, &move_to_april)
+    svc.update_time_entry(tenant, entry.id, &move_to_april, &ctx)
         .await
         .expect("correct the date");
 

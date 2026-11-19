@@ -156,13 +156,15 @@ mod server_impl {
     use axum::middleware::Next;
     use axum::response::{IntoResponse, Response};
 
-    /// Largest JSON body the sanitizer buffers, matching the largest the server
-    /// accepts anywhere (`data_transfer::IMPORT_MAX_BYTES`, 25 MB). A body that
-    /// declares more via `Content-Length` is forwarded untouched rather than
-    /// buffered, so the route's own `DefaultBodyLimit` stays the single
-    /// authority on what is accepted and the sanitizer never holds bytes it
-    /// would only reject.
-    const MAX_SANITIZED_JSON_BYTES: usize = 25 * 1024 * 1024;
+    /// Largest JSON body the sanitizer buffers before routing and
+    /// authentication, equal to axum's 2 MiB `DefaultBodyLimit` so an
+    /// unauthenticated caller cannot make the server hold more than a route
+    /// would accept by default. A body that declares more via
+    /// `Content-Length` is forwarded untouched rather than buffered, so the
+    /// route's own `DefaultBodyLimit` stays the single authority on what is
+    /// accepted; a route that needs more (the tenant data import) raises its
+    /// own layer limit.
+    const MAX_SANITIZED_JSON_BYTES: usize = 2 * 1024 * 1024;
 
     /// Request paths the sanitizer must not rewrite, matched as a prefix
     /// against the full (pre-nesting) path.

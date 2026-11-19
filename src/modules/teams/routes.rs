@@ -181,8 +181,12 @@ async fn get_team(
 /// the accountable owner of a team can self-manage it without needing an
 /// admin role at the tenant level. Every other user, including a
 /// `UserRole::Manager` whose row's `manager_id` is set to somebody else, is
-/// refused with 403 (leaked as the same generic message so a non-owner
-/// probing the team_id cannot tell a real team from a wrong role).
+/// refused with 403.
+///
+/// A missing team propagates `get_team`'s 404 and an existing team with
+/// the wrong role returns 403, so a non-owner can tell the two apart.
+/// The split matches the rest of the module (unknown id -> 404 same as
+/// any other read); what leaks is that a team exists, not its contents.
 ///
 /// Called INLINE from each write handler that needs it, not as an extractor,
 /// because the check needs the team row's `manager_id`, and reading the row

@@ -14,11 +14,11 @@
 //! installation's own webhook secret, written to `SecretKind::Integration`
 //! during OAuth consent in the Phase 2c reconnect flow.
 //!
-//! Nothing mounts routes yet; the signatures of these helpers match
-//! the shape every provider webhook in `src/modules/billing/webhook.rs`
-//! already uses (`verify_and_parse_webhook` on `PaymentProvider`), so
-//! Phase 3b's receiver code calls these verifiers directly without
-//! re-shaping them.
+//! The receiver routes are mounted at `/api/v1/webhooks/xero` and
+//! `/api/v1/webhooks/quickbooks`; the helpers here are the verifiers the
+//! handler calls, shaped like the ones every provider webhook in
+//! `src/modules/billing/webhook.rs` uses (`verify_and_parse_webhook` on
+//! `PaymentProvider`).
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -177,7 +177,7 @@ use uuid::Uuid;
 use crate::modules::auth::TenantId;
 use crate::modules::billing::invoice_issuer::InvoiceProviderKind;
 use crate::modules::billing::invoice_issuer_dispatch::{ExternalInvoiceState, IssuerDispatcher};
-use crate::modules::billing::service::BillingService;
+use crate::modules::billing::service::{BillingService, GatewayPaymentOutcome};
 use crate::utils::error::{AppError, AppResult};
 
 /// State for one invoice-issuer webhook mount.
@@ -367,15 +367,12 @@ fn verify(provider: InvoiceProviderKind, body: &[u8], signature: &str, key: &str
 }
 
 // SPEC-13.1083, SPEC-13.1092: actual mount is /api/v1/webhooks/<provider>
-/// `POST /api/v1/{xero,quickbooks}/webhooks/{tenant_id}`.
+/// `POST /api/v1/webhooks/xero` and `POST /api/v1/webhooks/quickbooks`.
 ///
-/// The tenant is in the path, which is the shape the payment receivers
-/// already use (`provider_webhook_handler`). MAPPS-1099 proposed a path
-/// with no tenant in it, which forces the receiver to parse an unverified
-/// body to find out whose key to verify with. Each tenant registers their
-/// own provider app here, so each configures their own webhook URL, and
-/// putting the tenant in the path means the signature is checked before a
-/// single field of the body is believed.
+/// There is no tenant in the path: the signing key belongs to the deployment's
+/// provider application, so the signature is checked first and each event then
+/// names its own organisation, which resolves the tenant. The signature is
+/// checked before a single field of the body is believed.
 ///
 /// Every outcome is recorded before the answer goes back (PMS-1182), so
 /// "they never called", "we refused it" and "we took it and it matched
@@ -487,6 +484,9 @@ enum Outcome {
     /// Verified, the invoice is ours, and the money could not be recorded.
     /// A human has to look; the provider retrying will not change it.
     Unreconciled,
+    /// Verified, and a prior delivery already recorded this payment. Nothing
+    /// for a human to do, and not the same as an unrelated event.
+    BenignRedelivery,
 }
 
 impl Outcome {
@@ -495,6 +495,7 @@ impl Outcome {
             Outcome::Accepted => "accepted",
             Outcome::Ignored => "ignored",
             Outcome::Unreconciled => "unreconciled",
+            Outcome::BenignRedelivery => "benign_redelivery",
         }
     }
 }
@@ -613,7 +614,7 @@ async fn apply_one(
                 // being unlucky. There is no money to record, so there is
                 // nothing to do.
                 if local.balance_due <= rust_decimal::Decimal::ZERO {
-                    return Ok(Outcome::Ignored);
+                    return Ok(Outcome::BenignRedelivery);
                 }
                 // The money went to the provider, so Mokosh records what
                 // the provider collected and lets the one writer derive the
@@ -636,16 +637,14 @@ async fn apply_one(
                         }),
                     )
                     .await?;
-                outcome = if recorded {
-                    Outcome::Accepted
-                } else if matches!(outcome, Outcome::Ignored) {
-                    // Already recorded by a prior delivery, or refused by a
-                    // guard. The first is the common case and is not a
-                    // problem; both are states a human can read off the
-                    // delivery row rather than states to retry.
-                    Outcome::Unreconciled
-                } else {
-                    outcome
+                outcome = match recorded {
+                    GatewayPaymentOutcome::Recorded => Outcome::Accepted,
+                    // A prior delivery already recorded it: benign, nothing
+                    // for a human to do.
+                    GatewayPaymentOutcome::AlreadyRecorded => Outcome::BenignRedelivery,
+                    // Refused by a guard: a state a human can read off the
+                    // delivery row rather than one to retry.
+                    GatewayPaymentOutcome::Refused => Outcome::Unreconciled,
                 };
             }
             ExternalInvoiceState::Voided => {

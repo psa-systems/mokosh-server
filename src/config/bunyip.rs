@@ -191,10 +191,20 @@ impl BunyipProvider {
         let mut values = BTreeMap::new();
         for (local, remote) in SERVED_KEYS {
             match fetch_value(&http, config, remote).await {
-                Ok(Some(value)) => {
+                Ok(Fetched::Value(value)) => {
                     values.insert((*local).to_string(), value);
                 }
-                Ok(None) => {
+                Ok(Fetched::Unreachable(err)) => {
+                    // The provider itself is fine; one key could not be asked
+                    // for, so it stays unheld and the next key is still tried.
+                    tracing::error!(
+                        key = *local,
+                        bunyip_key = *remote,
+                        error = %err,
+                        "bunyip transport failure; {local} stays unheld"
+                    );
+                }
+                Ok(Fetched::Unheld) => {
                     // 404: bunyip serves this key but holds no value for it,
                     // which is a fact about bunyip's own configuration and
                     // leaves the key unheld here.
@@ -247,9 +257,18 @@ impl ConfigProvider for BunyipProvider {
     }
 }
 
+/// What one key's read came to, short of a hard provider error.
+enum Fetched {
+    Value(String),
+    /// 404: bunyip serves the key but holds no value for it.
+    Unheld,
+    /// The request never got an answer (DNS, connect, timeout).
+    Unreachable(AppError),
+}
+
 /// One key, read with the machine credential as HTTP Basic.
 ///
-/// `Ok(None)` only for a 404, which is bunyip saying it holds no value for a
+/// `Fetched::Unheld` only for a 404, which is bunyip saying it holds no value for a
 /// key it does serve. A refused credential and a refused key are errors
 /// naming their own remedy, because they are fixed in bunyip and in two
 /// different places.
@@ -260,27 +279,30 @@ async fn fetch_value(
     http: &reqwest::Client,
     config: &BunyipConfig,
     key: &str,
-) -> AppResult<Option<String>> {
+) -> AppResult<Fetched> {
     let url = format!("{}{HOST_CONFIG_PREFIX}{key}", config.base_url);
-    let resp = http
+    let resp = match http
         .get(&url)
         .basic_auth(&config.client_id, Some(&config.client_secret))
         .header("Accept", "application/json")
         .send()
         .await
-        .map_err(|e| {
-            AppError::external_service(
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Ok(Fetched::Unreachable(AppError::external_service(
                 "bunyip-config",
                 format!(
                     "could not reach bunyip at {url}: {e}. Check BUNYIP_CONFIG_URL and that \
                      bunyip is reachable from this host."
                 ),
-            )
-        })?;
+            )))
+        }
+    };
     let status = resp.status();
     // SPEC-2.214
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
+        return Ok(Fetched::Unheld);
     }
     // SPEC-2.215
     if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -325,7 +347,7 @@ async fn fetch_value(
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string))
+        .map_or(Fetched::Unheld, |value| Fetched::Value(value.to_string())))
 }
 
 #[cfg(test)]
@@ -341,6 +363,21 @@ mod tests {
             values: BTreeMap::new(),
         };
         assert_eq!(provider.name(), "bunyip");
+    }
+
+    /// A transport failure on every key leaves the keys unheld rather than
+    /// failing the build.
+    #[tokio::test]
+    async fn a_transport_failure_leaves_keys_unheld_and_builds() {
+        let config = BunyipConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+        };
+        let provider = BunyipProvider::load(&config)
+            .await
+            .expect("transport failure must not fail the build");
+        assert!(provider.values.is_empty());
     }
 
     /// A blank / unset URL builds no config: `from_env` returns `Ok(None)`

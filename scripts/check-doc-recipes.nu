@@ -23,7 +23,7 @@ const DOCS = [
     "docs/README.md"
     "docs/quickstart.md"
     "docs/architecture.md"
-    "docs/binaries.md"
+    "docs/public/binaries.md"
     "docs/configuration.md"
     "docs/recipes.md"
     "docs/invariants/ci-release.md"

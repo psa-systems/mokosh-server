@@ -566,6 +566,11 @@ services:
       OIDC_LEEWAY_SECONDS: ${OIDC_LEEWAY_SECONDS:-}
       OIDC_DEFAULT_TENANT_ID: ${OIDC_DEFAULT_TENANT_ID:-}
 
+      # Contact-portal login and magic-link redeem per-IP budget; empty keeps
+      # the built-in 10 attempts per 60s.
+      CONTACT_LOGIN_IP_RATE_MAX: ${CONTACT_LOGIN_IP_RATE_MAX:-}
+      CONTACT_LOGIN_IP_RATE_WINDOW_SECS: ${CONTACT_LOGIN_IP_RATE_WINDOW_SECS:-}
+
       # Stripe REST base, overridable so a test can point checkout at a stub;
       # empty uses https://api.stripe.com.
       STRIPE_API_BASE: ${STRIPE_API_BASE:-}

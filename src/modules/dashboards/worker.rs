@@ -89,9 +89,7 @@ impl ScheduledDashboardsWorker {
             let cron_expr: String = row.try_get("cron_expr")?;
             let recipient_email: Option<String> = row.try_get("recipient_email")?;
 
-            // PMS-1665 F: nested transaction so a failed delivery
-            // does not poison the outer tick's tx (see the matching
-            // comment in saved_reports/worker.rs).
+            // A savepoint isolates each delivery (see saved_reports/worker.rs).
             let outcome = {
                 let mut inner = tx.begin().await?;
                 let result = self
@@ -280,8 +278,7 @@ fn render_snapshot(name: &str, layout: &serde_json::Value) -> String {
 ///   - `{ "widgets": ["...", ...] }`
 ///   - `{ "rows": [{"widgets": [...]}, ...] }`
 ///
-/// This pulls keys from any of the shapes; unknown shapes return an
-/// empty Vec so the snapshot still renders. The raw key is rendered
+/// Unknown shapes return an empty Vec so the snapshot still renders. The raw key is rendered
 /// rather than a catalog title because the widget catalog lives in the
 /// SPA, not here.
 fn extract_widget_keys(layout: &serde_json::Value) -> Vec<String> {
@@ -291,33 +288,37 @@ fn extract_widget_keys(layout: &serde_json::Value) -> Vec<String> {
 }
 
 // SPEC-15.1649
+/// Only the `widgets` arrays (top level, or inside each `rows` entry) are
+/// read: a widget's own `tags` or `options` array is not a widget.
 fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
-    match v {
-        serde_json::Value::Object(map) => {
-            // `widget_key` is what the SPA's WidgetSpec serialises; `key`
-            // and `label` stay as fallbacks for hand-authored blobs.
-            let name = map
-                .get("widget_key")
-                .and_then(|v| v.as_str())
-                .or_else(|| map.get("key").and_then(|v| v.as_str()))
-                .or_else(|| map.get("label").and_then(|v| v.as_str()));
-            if let Some(name) = name {
-                out.push(name.to_string());
-            }
-            for child in map.values() {
-                walk(child, out);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                if let Some(s) = item.as_str() {
-                    out.push(s.to_string());
-                } else {
-                    walk(item, out);
+    let Some(map) = v.as_object() else {
+        return;
+    };
+    if let Some(items) = map.get("widgets").and_then(|w| w.as_array()) {
+        for item in items {
+            match item {
+                serde_json::Value::String(s) => out.push(s.clone()),
+                serde_json::Value::Object(widget) => {
+                    // `widget_key` is what the SPA's WidgetSpec serialises;
+                    // `key` and `label` stay as fallbacks for hand-authored
+                    // blobs.
+                    let name = widget
+                        .get("widget_key")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| widget.get("key").and_then(|v| v.as_str()))
+                        .or_else(|| widget.get("label").and_then(|v| v.as_str()));
+                    if let Some(name) = name {
+                        out.push(name.to_string());
+                    }
                 }
+                _ => {}
             }
         }
-        _ => {}
+    }
+    if let Some(rows) = map.get("rows").and_then(|r| r.as_array()) {
+        for row in rows {
+            walk(row, out);
+        }
     }
 }
 
@@ -375,6 +376,24 @@ mod tests {
         );
         assert!(populated.contains("open_tickets"));
         assert!(!populated.contains("no widgets configured"));
+    }
+
+    /// A widget's own array (`tags`) is not a widget.
+    #[test]
+    fn snapshot_ignores_arrays_inside_a_widget() {
+        let layout = json!({
+            "widgets": [{"widget_key": "open_tickets", "tags": ["not-a-widget"]}]
+        });
+        let snap = render_snapshot("Tagged", &layout);
+        assert!(snap.contains("open_tickets"));
+        assert!(!snap.contains("not-a-widget"));
+    }
+
+    #[test]
+    fn snapshot_reads_widgets_inside_rows() {
+        let layout = json!({ "rows": [{"widgets": [{"key": "a"}]}, {"widgets": ["b"]}] });
+        let snap = render_snapshot("Rows", &layout);
+        assert!(snap.contains("  - a\n") && snap.contains("  - b\n"));
     }
 
     #[test]

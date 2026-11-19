@@ -328,15 +328,20 @@ fn push_union(
         " AND u.email NOT LIKE 'system+%@mokosh.local' \
           AND u.deleted_at IS NULL",
     );
-    if let Some(q) = filter.q.as_deref().filter(|q| !q.is_empty()) {
-        let pattern = format!("%{}%", q);
+    // `%` and `_` in the search text match literally (SPEC-5.532).
+    let q_pattern = filter
+        .q
+        .as_deref()
+        .filter(|q| !q.is_empty())
+        .map(|q| format!("%{}%", crate::utils::text::escape_like_wildcards(q)));
+    if let Some(pattern) = q_pattern.as_ref() {
         qb.push(" AND (u.email ILIKE ");
         qb.push_bind(pattern.clone());
-        qb.push(" OR u.first_name ILIKE ");
+        qb.push(" ESCAPE '\\' OR u.first_name ILIKE ");
         qb.push_bind(pattern.clone());
-        qb.push(" OR u.last_name ILIKE ");
-        qb.push_bind(pattern);
-        qb.push(")");
+        qb.push(" ESCAPE '\\' OR u.last_name ILIKE ");
+        qb.push_bind(pattern.clone());
+        qb.push(" ESCAPE '\\')");
     }
     if let Some(role) = filter.role.as_deref() {
         qb.push(" AND u.role = ");
@@ -391,6 +396,12 @@ fn push_union(
         if let Some(role) = filter.role.as_deref() {
             qb.push(" AND g.role = ");
             qb.push_bind(role.to_string());
+        }
+        // An unplaced guest has only a grantee email to search.
+        if let Some(pattern) = q_pattern {
+            qb.push(" AND g.grantee_email ILIKE ");
+            qb.push_bind(pattern);
+            qb.push(" ESCAPE '\\'");
         }
     }
 }

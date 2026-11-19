@@ -388,8 +388,10 @@ impl QuotesService {
         let rows = q.fetch_all(&mut *tx).await?;
         let total = cq.fetch_one(&mut *tx).await?;
         drop(tx);
-        let mut resp: Vec<QuoteResponse> =
-            rows.into_iter().map(|r| r.into_response(today)).collect();
+        let mut resp: Vec<QuoteResponse> = rows
+            .into_iter()
+            .map(|r| r.into_response(today))
+            .collect::<AppResult<_>>()?;
         self.enrich_quotes(tenant_id, &mut resp).await?;
         Ok((resp, total as u64))
     }
@@ -428,8 +430,13 @@ impl QuotesService {
         .await?;
         drop(tx);
 
-        let mut resp = row.into_response(today);
-        resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
+        let mut resp = row.into_response(today)?;
+        resp.lines = Some(
+            line_rows
+                .into_iter()
+                .map(QuoteLineResponse::try_from)
+                .collect::<AppResult<Vec<_>>>()?,
+        );
         self.enrich_quotes(tenant_id, std::slice::from_mut(&mut resp))
             .await?;
         Ok(resp)
@@ -1081,7 +1088,7 @@ impl QuotesService {
         .bind(quote_id)
         .fetch_one(&mut **tx)
         .await?;
-        Ok(row.into_response(today))
+        row.into_response(today)
     }
 
     // SPEC-13.1383
@@ -1355,7 +1362,7 @@ impl QuotesService {
     ) -> AppResult<(Vec<QuoteResponse>, u64)> {
         let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i64;
-        let order_by = pagination.order_by("created_at", mokosh_types::sort::QUOTE_REQUESTS)?;
+        let order_by = pagination.order_by("created_at", mokosh_types::sort::QUOTES)?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, QuoteRow>(&format!(
@@ -1384,8 +1391,10 @@ impl QuotesService {
         .await?;
         drop(tx);
 
-        let mut resp: Vec<QuoteResponse> =
-            rows.into_iter().map(|r| r.into_response(today)).collect();
+        let mut resp: Vec<QuoteResponse> = rows
+            .into_iter()
+            .map(|r| r.into_response(today))
+            .collect::<AppResult<_>>()?;
         self.enrich_quotes(tenant_id, &mut resp).await?;
         Ok((resp, total as u64))
     }
@@ -1903,26 +1912,23 @@ struct QuoteLineRow {
     is_taxable: bool,
 }
 
-impl From<QuoteLineRow> for QuoteLineResponse {
-    fn from(r: QuoteLineRow) -> Self {
-        // PMS-1661 F3: an unknown stored line_type used to map to
-        // Service with no trace. The From impl cannot propagate;
-        // keep the Service fallback (the response must still render)
-        // but WARN with the line id + stored value so the drift is
-        // findable, mirroring the enum-decode WARN shape in
-        // PMS-1662/1663/1664.
-        let line_type = {
-            let parsed = QuoteLineType::from_str(&r.line_type);
-            if parsed.is_none() {
-                tracing::warn!(
-                    line_id = %r.id,
-                    stored = %r.line_type,
-                    "quote_lines.line_type is not one of the known values; reading as Service"
-                );
-            }
-            parsed.unwrap_or(QuoteLineType::Service)
-        };
-        Self {
+impl TryFrom<QuoteLineRow> for QuoteLineResponse {
+    type Error = AppError;
+
+    fn try_from(r: QuoteLineRow) -> AppResult<Self> {
+        // An unknown stored line_type is corruption; surface it, never mask as Service.
+        let line_type = QuoteLineType::from_str(&r.line_type).ok_or_else(|| {
+            tracing::warn!(
+                line_id = %r.id,
+                stored = %r.line_type,
+                "quote_lines.line_type is not one of the known values; refusing the read"
+            );
+            AppError::Internal(format!(
+                "quote line {} has an unknown stored line_type {:?}",
+                r.id, r.line_type
+            ))
+        })?;
+        Ok(Self {
             id: r.id,
             line_type,
             description: r.description,
@@ -1931,7 +1937,7 @@ impl From<QuoteLineRow> for QuoteLineResponse {
             total: r.total,
             sort_order: r.sort_order.unwrap_or(0),
             is_taxable: r.is_taxable,
-        }
+        })
     }
 }
 
@@ -1974,9 +1980,20 @@ impl QuoteRow {
     /// `today` is the caller's day (PMS-1027): read-time expiry has to compare
     /// `valid_until` with the day it is where the reader is, so this is not a
     /// `From` impl, which could only ask the UTC clock.
-    fn into_response(self, today: NaiveDate) -> QuoteResponse {
+    fn into_response(self, today: NaiveDate) -> AppResult<QuoteResponse> {
         let r = self;
-        QuoteResponse {
+        let stored = QuoteStatus::from_str(&r.status).ok_or_else(|| {
+            tracing::warn!(
+                quote_id = %r.id,
+                stored = %r.status,
+                "quotes.status is not one of the known values on row-to-response; refusing the read"
+            );
+            AppError::Internal(format!(
+                "quote {} has an unknown stored status {:?}",
+                r.id, r.status
+            ))
+        })?;
+        Ok(QuoteResponse {
             id: r.id,
             tenant_id: r.tenant_id,
             quote_number: r.quote_number,
@@ -1990,20 +2007,8 @@ impl QuoteRow {
             // `valid_until` reports as `expired` even though the stored
             // column still says `sent`. See `effective_status`.
             // SPEC-13.1357
-            // WARN on unknown stored status rather than silently
-            // reading as Draft; this row-to-response path cannot
-            // propagate the error.
-            status: {
-                let stored = QuoteStatus::from_str(&r.status).unwrap_or_else(|| {
-                    tracing::warn!(
-                        quote_id = %r.id,
-                        stored = %r.status,
-                        "quotes.status is not one of the known values on row-to-response; reading as Draft"
-                    );
-                    QuoteStatus::Draft
-                });
-                effective_status(stored, r.valid_until, today)
-            },
+            // SPEC-13.1357
+            status: effective_status(stored, r.valid_until, today),
             valid_until: r.valid_until,
             subtotal: r.subtotal,
             tax_amount: r.tax_amount,
@@ -2026,7 +2031,7 @@ impl QuoteRow {
             delivered_by_name: None,
             emailed_to: r.emailed_to,
             emailed_at: r.emailed_at,
-        }
+        })
     }
 }
 
@@ -2309,5 +2314,22 @@ mod tests {
             assert_eq!(QuoteLineType::from_str(t.as_str()), Some(t));
         }
         assert_eq!(QuoteLineType::from_str("nonsense"), None);
+    }
+
+    #[test]
+    fn unknown_line_type_fails_the_read() {
+        let row = |line_type: &str| QuoteLineRow {
+            id: Uuid::nil(),
+            line_type: line_type.to_string(),
+            description: "d".into(),
+            quantity: Decimal::ONE,
+            unit_price: Decimal::ONE,
+            total: Decimal::ONE,
+            sort_order: None,
+            is_taxable: true,
+        };
+        assert!(QuoteLineResponse::try_from(row("service")).is_ok());
+        let err = QuoteLineResponse::try_from(row("nonsense")).unwrap_err();
+        assert!(err.to_string().contains("nonsense"));
     }
 }

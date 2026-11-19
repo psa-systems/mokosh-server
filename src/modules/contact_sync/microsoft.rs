@@ -242,8 +242,21 @@ impl MicrosoftContactsProvider {
                 });
             }
 
-            // Only reason tokens are read out of the body, never kept.
-            let body = response.text().await.unwrap_or_default();
+            // Only reason tokens are read out of the body, never kept. An
+            // unreadable body is logged, since it hides the throttle and
+            // stale-token reasons from the classification below.
+            let body = match response.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        url,
+                        status,
+                        error = %e,
+                        "Microsoft Graph error body unreadable; classifying without reason tokens"
+                    );
+                    String::new()
+                }
+            };
             let stale_token = body.contains("syncStateNotFound")
                 || body.contains("syncStateInvalid")
                 || body.contains("resyncRequired");
@@ -254,13 +267,14 @@ impl MicrosoftContactsProvider {
                 400 if stale_token => return Ok(None),
                 401 => return Err(SourceError::Unauthorized),
                 403 if !rate_limited => return Err(SourceError::Unauthorized),
-                429 | 503 if last => return Err(SourceError::Throttled),
+                // A 403 reaching here names a throttle (the arm above took the rest).
+                429 | 503 | 403 if last => return Err(SourceError::Throttled),
                 500..=599 if last => {
                     return Err(SourceError::Failed(format!(
                         "Microsoft Graph answered {status} after {attempt} attempts."
                     )))
                 }
-                429 | 500..=599 => {
+                429 | 403 | 500..=599 => {
                     tokio::time::sleep(self.retry.delay(attempt, retry_after)).await;
                 }
                 _ => {

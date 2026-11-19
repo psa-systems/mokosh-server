@@ -305,10 +305,16 @@ pub async fn mokosh_grant_changed(
 
     let revoked_at = match payload.state.as_str() {
         "granted" => {
-            if payload.role.is_none() {
+            let Some(role) = payload.role.as_deref() else {
                 return Err(AppError::BadRequest(
                     "A granted event must carry a role.".to_string(),
                 ));
+            };
+            // Refuse at ingest so an unknown role never reaches the mirror, where map_grant_role consumers would fail later.
+            if super::mokosh_bunyip_grants::map_grant_role(role).is_none() {
+                return Err(AppError::BadRequest(format!(
+                    "Unknown grant role `{role}`."
+                )));
             }
             None
         }
@@ -326,7 +332,7 @@ pub async fn mokosh_grant_changed(
         ));
     }
 
-    let changed = MokoshBunyipGrantService::upsert(
+    MokoshBunyipGrantService::upsert(
         &state.pool,
         payload.grant_id,
         payload.owner_bunyip_user_id,
@@ -357,10 +363,11 @@ pub async fn mokosh_grant_changed(
     // grantee's first request (there is no email or name in the
     // webhook payload to seed the row with).
     // SPEC-5.216: best-effort tombstone, warn on failure
-    if changed && payload.state == "revoked" {
+    // Runs on every revoked delivery, not only when the mirror row changed: a redelivery sees changed=false, so gating on it left a failed tombstone unhealable.
+    if payload.state == "revoked" {
         if let Err(e) = sqlx::query(
-            "UPDATE users SET deleted_at = COALESCE(deleted_at, NOW()), updated_at = NOW() \
-             WHERE bunyip_user_id = $1 \
+            "UPDATE users SET deleted_at = NOW(), updated_at = NOW() \
+             WHERE bunyip_user_id = $1 AND deleted_at IS NULL \
                AND tenant_id = (SELECT id FROM tenants WHERE slug = $2)",
         )
         .bind(payload.grantee_bunyip_user_id)

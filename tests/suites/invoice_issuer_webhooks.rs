@@ -522,13 +522,47 @@ async fn a_paid_event_records_what_the_provider_collected(pool: PgPool) {
     );
     assert_eq!(
         deliveries(&pool).await.last().map(|d| d.1.clone()),
-        Some("ignored".to_string()),
+        Some("benign_redelivery".to_string()),
         "and the second delivery says it changed nothing, rather than claiming a payment"
     );
     assert_eq!(
         *script.fetches.lock().unwrap(),
         2,
         "each delivery asked Xero"
+    );
+}
+
+/// The same event twice leaves two delivery rows: the first did the work, the
+/// second is a benign redelivery and reads as such, not as an unrelated event.
+#[mokosh_test]
+async fn a_redelivered_paid_event_is_recorded_as_a_benign_redelivery(pool: PgPool) {
+    let (script, base) = start_stub().await;
+    common::seed_admin(&pool).await;
+    let invoice_id = seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
+    let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
+    *script.xero_status.lock().unwrap() = "PAID".to_string();
+
+    for _ in 0..2 {
+        let status = deliver(
+            &router,
+            InvoiceProviderKind::Xero,
+            &xero_delivery(XERO_INVOICE_ID),
+            SIGNING_KEY,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    assert_eq!(payment_count(&pool, invoice_id).await, 1);
+    assert_eq!(
+        deliveries(&pool).await,
+        vec![
+            ("xero".to_string(), "accepted".to_string()),
+            ("xero".to_string(), "benign_redelivery".to_string()),
+        ],
+        "the second row is the redelivery, and the CHECK accepts its value"
     );
 }
 

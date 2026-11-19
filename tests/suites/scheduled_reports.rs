@@ -248,7 +248,7 @@ async fn worker_tick_skips_disabled_schedule(pool: PgPool) {
     assert_eq!(pending.0, 0, "disabled schedule produces no notification");
 }
 
-/// PMS-1665: `schedule_update` and `schedule_delete` already filtered by
+/// `schedule_update` and `schedule_delete` filter by
 /// user_id, but GET /reports/schedules/{id} used to return any schedule
 /// in the tenant, so a tenant member who could see the shared parent
 /// report could read another user's schedule - its recipient address,
@@ -293,7 +293,7 @@ async fn get_schedule_by_id_hides_another_users_schedule(pool: PgPool) {
     .await;
     let token_b = common::login(&app, &email_b, &password_b).await;
 
-    // Before PMS-1665 this returned 200 with the schedule's recipient
+    // This used to return 200 with the schedule recipient
     // email and cron; after, B 404s like update/delete already did.
     let resp = app
         .client

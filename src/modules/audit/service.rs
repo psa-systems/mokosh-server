@@ -324,14 +324,16 @@ impl AuditService {
 /// children's for the one parent-child pair that has one. `$1` tenant, `$2`
 /// entity type, `$3` entity id, `$4` the same id as text. Shared by the count
 /// and the page so the two cannot disagree about what is in the list. The
-/// child arm compares the ticket id inside the JSONB snapshot as text, which
-/// migration 205 indexes; the id is bound twice rather than cast in SQL so
+/// child arm compares the ticket id inside the JSONB snapshot as text (the
+/// new snapshot, or the old one for a delete row whose new snapshot is NULL),
+/// which migration 205 indexes for the new side; the id is bound twice rather than cast in SQL so
 /// the parameter's type is never inferred two ways.
 // SPEC-5.520, SPEC-5.521: own rows plus a ticket's non-create note rows.
 const HISTORY_WHERE: &str = "al.tenant_id = $1 AND ( \
        (al.entity_type = $2 AND al.entity_id = $3) \
     OR ($2 = 'tickets' AND al.entity_type = 'ticket_notes' AND al.action <> 'create' \
-        AND (al.new_values ->> 'ticket_id') = $4) \
+        AND ((al.new_values ->> 'ticket_id') = $4 \
+             OR (al.old_values ->> 'ticket_id') = $4)) \
    )";
 
 /// Entity types whose change history may be read through the non-admin

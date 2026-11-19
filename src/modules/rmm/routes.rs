@@ -286,7 +286,6 @@ async fn ingest_alert(
     // secret lookup) but keep `body` for the HMAC compare below.
     let req: IngestAlertRequest =
         serde_json::from_slice(&body).map_err(|_| AppError::Unauthorized)?;
-    req.validate()?;
     let signature = headers
         .get("X-Signature")
         .and_then(|h| h.to_str().ok())
@@ -322,6 +321,13 @@ async fn ingest_alert(
         return Err(AppError::Unauthorized);
     }
 
-    let created = s.service.ingest_alert(tenant_id, &req).await?;
-    Ok(Json(serde_json::json!({"tickets_created": created})))
+    // Validation follows authentication so an unsigned caller never learns
+    // field-validation results.
+    req.validate()?;
+
+    let summary = s.service.ingest_alert(tenant_id, &req).await?;
+    Ok(Json(serde_json::json!({
+        "tickets_created": summary.created,
+        "rules_failed": summary.failed,
+    })))
 }

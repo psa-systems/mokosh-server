@@ -154,16 +154,23 @@ pub async fn ensure_company_prefix(
             Ok(result) if result.rows_affected() == 1 => return Ok(candidate),
             // Nobody updated: another writer assigned one first. Read theirs.
             Ok(_) => {
-                let theirs: Option<String> = sqlx::query_scalar(
+                let theirs: Option<Option<String>> = sqlx::query_scalar(
                     "SELECT invoice_prefix FROM companies WHERE id = $1 AND tenant_id = $2",
                 )
                 .bind(company_id)
                 .bind(tenant_id)
                 .fetch_optional(&mut *tx)
-                .await?
-                .flatten();
-                if let Some(prefix) = theirs {
-                    return Ok(prefix);
+                .await?;
+                match theirs {
+                    Some(Some(prefix)) => return Ok(prefix),
+                    // The row is gone, so no draw can ever land: say so rather
+                    // than ending in the "several attempts" error below.
+                    None => {
+                        return Err(AppError::internal(format!(
+                            "company {company_id} no longer exists, so no invoice prefix can be assigned"
+                        )));
+                    }
+                    Some(None) => {}
                 }
             }
             // A unique violation is another company holding this draw.

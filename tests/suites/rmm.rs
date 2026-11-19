@@ -23,9 +23,7 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
-use mokosh_server::modules::rmm::{
-    IngestAlertRequest, ProviderAlert, ProviderDevice, RmmProvider, RmmSyncWorker,
-};
+use mokosh_server::modules::rmm::{IngestAlertRequest, ProviderDevice, RmmProvider, RmmSyncWorker};
 use mokosh_server::utils::crypto;
 use mokosh_server::Database;
 use mokosh_test::mokosh_test;
@@ -48,12 +46,6 @@ struct StaticProvider {
 impl RmmProvider for StaticProvider {
     async fn list_devices(&self) -> mokosh_server::utils::error::AppResult<Vec<ProviderDevice>> {
         Ok(self.devices.clone())
-    }
-    async fn list_alerts(
-        &self,
-        _since: DateTime<Utc>,
-    ) -> mokosh_server::utils::error::AppResult<Vec<ProviderAlert>> {
-        Ok(vec![])
     }
     async fn ping(&self) -> mokosh_server::utils::error::AppResult<()> {
         Ok(())

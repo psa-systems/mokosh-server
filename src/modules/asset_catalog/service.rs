@@ -159,9 +159,11 @@ impl AssetCatalogService {
         Ok(row)
     }
 
-    /// MR2: partial update. Each field is Option; absent fields leave
-    /// the column untouched via `COALESCE($N, col)`. The unique index on
-    /// `(tenant_id, lower(manufacturer), lower(model), asset_type_id)`
+    /// MR2: partial update. An absent key leaves the column untouched; for
+    /// the nullable columns an explicit `null` clears it (`Option<Option<T>>`
+    /// on the DTO). Each nullable column pairs a "was supplied" flag with the
+    /// value so a clear and a no-op stay distinguishable in SQL. The unique
+    /// index on `(tenant_id, lower(manufacturer), lower(model), asset_type_id)`
     /// may raise 23505 when a rename moves two models into the same
     /// shape; mapped to 409 at the HTTP layer the same way `create_model`
     /// does.
@@ -182,13 +184,13 @@ impl AssetCatalogService {
                 manufacturer = COALESCE($3, manufacturer), \
                 model = COALESCE($4, model), \
                 asset_type_id = COALESCE($5, asset_type_id), \
-                warranty_months = COALESCE($6, warranty_months), \
-                end_of_life_months = COALESCE($7, end_of_life_months), \
-                default_department = COALESCE($8, default_department), \
-                default_license_vendor = COALESCE($9, default_license_vendor), \
-                default_tags = COALESCE($10, default_tags), \
-                specs = COALESCE($11, specs), \
-                image_url = COALESCE($12, image_url), \
+                warranty_months = CASE WHEN $6 THEN $7 ELSE warranty_months END, \
+                end_of_life_months = CASE WHEN $8 THEN $9 ELSE end_of_life_months END, \
+                default_department = CASE WHEN $10 THEN $11 ELSE default_department END, \
+                default_license_vendor = CASE WHEN $12 THEN $13 ELSE default_license_vendor END, \
+                default_tags = CASE WHEN $14 THEN $15 ELSE default_tags END, \
+                specs = COALESCE($16, specs), \
+                image_url = CASE WHEN $17 THEN $18 ELSE image_url END, \
                 updated_at = NOW() \
              WHERE tenant_id = $1 AND id = $2",
         )
@@ -197,13 +199,19 @@ impl AssetCatalogService {
         .bind(&request.manufacturer)
         .bind(&request.model)
         .bind(request.asset_type_id)
-        .bind(request.warranty_months)
-        .bind(request.end_of_life_months)
-        .bind(&request.default_department)
-        .bind(&request.default_license_vendor)
-        .bind(&request.default_tags)
+        .bind(request.warranty_months.is_some())
+        .bind(request.warranty_months.flatten())
+        .bind(request.end_of_life_months.is_some())
+        .bind(request.end_of_life_months.flatten())
+        .bind(request.default_department.is_some())
+        .bind(request.default_department.clone().flatten())
+        .bind(request.default_license_vendor.is_some())
+        .bind(request.default_license_vendor.clone().flatten())
+        .bind(request.default_tags.is_some())
+        .bind(request.default_tags.clone().flatten())
         .bind(&request.specs)
-        .bind(&request.image_url)
+        .bind(request.image_url.is_some())
+        .bind(request.image_url.clone().flatten())
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -314,6 +322,13 @@ impl AssetCatalogService {
         // Model must be in-tenant. The INSERT's FK would catch it too but
         // the message would read as a generic DB error.
         self.get_model(tenant_id, request.asset_model_id).await?;
+        self.assert_template_refs_in_tenant(
+            tenant_id,
+            request.company_id,
+            request.site_id,
+            request.default_assigned_user_id,
+        )
+        .await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: (Uuid,) = sqlx::query_as(
             "INSERT INTO asset_templates (tenant_id, name, asset_model_id, company_id, site_id, \
@@ -361,18 +376,27 @@ impl AssetCatalogService {
         if let Some(model_id) = request.asset_model_id {
             self.get_model(tenant_id, model_id).await?;
         }
+        // Only a value being set needs the tenant check; a clear (`null`)
+        // references nothing.
+        self.assert_template_refs_in_tenant(
+            tenant_id,
+            request.company_id.flatten(),
+            request.site_id.flatten(),
+            request.default_assigned_user_id.flatten(),
+        )
+        .await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             "UPDATE asset_templates SET \
                 name = COALESCE($3, name), \
                 asset_model_id = COALESCE($4, asset_model_id), \
-                company_id = COALESCE($5, company_id), \
-                site_id = COALESCE($6, site_id), \
-                default_assigned_user_id = COALESCE($7, default_assigned_user_id), \
-                department = COALESCE($8, department), \
-                tags = COALESCE($9, tags), \
-                notes = COALESCE($10, notes), \
-                license_seat_count = COALESCE($11, license_seat_count), \
+                company_id = CASE WHEN $5 THEN $6 ELSE company_id END, \
+                site_id = CASE WHEN $7 THEN $8 ELSE site_id END, \
+                default_assigned_user_id = CASE WHEN $9 THEN $10 ELSE default_assigned_user_id END, \
+                department = CASE WHEN $11 THEN $12 ELSE department END, \
+                tags = CASE WHEN $13 THEN $14 ELSE tags END, \
+                notes = CASE WHEN $15 THEN $16 ELSE notes END, \
+                license_seat_count = CASE WHEN $17 THEN $18 ELSE license_seat_count END, \
                 updated_at = NOW() \
              WHERE tenant_id = $1 AND id = $2",
         )
@@ -380,13 +404,20 @@ impl AssetCatalogService {
         .bind(id)
         .bind(&request.name)
         .bind(request.asset_model_id)
-        .bind(request.company_id)
-        .bind(request.site_id)
-        .bind(request.default_assigned_user_id)
-        .bind(&request.department)
-        .bind(&request.tags)
-        .bind(&request.notes)
-        .bind(request.license_seat_count)
+        .bind(request.company_id.is_some())
+        .bind(request.company_id.flatten())
+        .bind(request.site_id.is_some())
+        .bind(request.site_id.flatten())
+        .bind(request.default_assigned_user_id.is_some())
+        .bind(request.default_assigned_user_id.flatten())
+        .bind(request.department.is_some())
+        .bind(request.department.clone().flatten())
+        .bind(request.tags.is_some())
+        .bind(request.tags.clone().flatten())
+        .bind(request.notes.is_some())
+        .bind(request.notes.clone().flatten())
+        .bind(request.license_seat_count.is_some())
+        .bind(request.license_seat_count.flatten())
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -509,6 +540,40 @@ impl AssetCatalogService {
                 "asset_type_id",
                 "asset type does not exist in this tenant",
             ));
+        }
+        Ok(())
+    }
+
+    // SPEC-15.1015, SPEC-15.1016: the template's company, site and default
+    // assignee must belong to the caller's tenant. The FKs only prove the row
+    // exists somewhere, so a foreign tenant's id would otherwise be accepted.
+    async fn assert_template_refs_in_tenant(
+        &self,
+        tenant_id: TenantId,
+        company_id: Option<Uuid>,
+        site_id: Option<Uuid>,
+        user_id: Option<Uuid>,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        for (field, table, label, id) in [
+            ("company_id", "companies", "company", company_id),
+            ("site_id", "sites", "site", site_id),
+            ("default_assigned_user_id", "users", "user", user_id),
+        ] {
+            let Some(id) = id else { continue };
+            let found: Option<Uuid> = sqlx::query_scalar(&format!(
+                "SELECT id FROM {table} WHERE tenant_id = $1 AND id = $2"
+            ))
+            .bind(*tenant_id)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if found.is_none() {
+                return Err(AppError::validation_field(
+                    field,
+                    format!("{label} does not exist in this tenant"),
+                ));
+            }
         }
         Ok(())
     }

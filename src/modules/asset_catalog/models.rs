@@ -58,9 +58,11 @@ fn default_specs() -> serde_json::Value {
     serde_json::json!({})
 }
 
-/// `PUT /api/v1/asset-models/{id}`. Every field is Option; absent fields
-/// leave the column untouched. (MR1 ships CREATE only; this type is
-/// filed for MR2 so the models stay colocated.)
+/// `PUT /api/v1/asset-models/{id}`. Absent keys leave the column
+/// untouched. The nullable columns use `Option<Option<T>>` so an
+/// explicit `null` clears the column; `manufacturer`, `model`,
+/// `asset_type_id` and `specs` are NOT NULL, so a `null` there is
+/// treated as absent.
 // SPEC-15.1011: update-model bounds
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -71,16 +73,32 @@ pub struct UpdateAssetModelRequest {
     pub model: Option<String>,
     pub asset_type_id: Option<Uuid>,
     #[validate(range(min = 0, max = 600))]
-    pub warranty_months: Option<i32>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub warranty_months: Option<Option<i32>>,
     #[validate(range(min = 0, max = 600))]
-    pub end_of_life_months: Option<i32>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub end_of_life_months: Option<Option<i32>>,
     #[validate(length(max = 100))]
-    pub default_department: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub default_department: Option<Option<String>>,
     #[validate(length(max = 150))]
-    pub default_license_vendor: Option<String>,
-    pub default_tags: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub default_license_vendor: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub default_tags: Option<Option<Vec<String>>>,
     pub specs: Option<serde_json::Value>,
-    pub image_url: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub image_url: Option<Option<String>>,
+}
+
+/// Makes `Option<Option<T>>` distinguish an absent key (`None`) from an
+/// explicit `null` (`Some(None)`) and a value (`Some(Some(v))`).
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
 }
 
 /// `GET /api/v1/asset-models?q=&limit=` query shape. The typeahead
@@ -171,31 +189,58 @@ pub struct CreateAssetTemplateRequest {
     pub license_seat_count: Option<i32>,
 }
 
-/// `PUT /api/v1/asset-templates/{id}` body. Every field Option; absent
-/// fields leave the column untouched via `COALESCE($N, col)`. The
-/// column stays non-null for `name` and `asset_model_id`; everything
-/// else is nullable in `asset_templates` (migration 271), so a value
-/// sets the column and an omitted key leaves it alone.
-///
-/// PMS-1664 F1: the previous comment claimed `company_id` and friends
-/// were `Option<Option<T>>` so the SPA could clear them; the fields
-/// are plain `Option<T>` and the UPDATE uses `COALESCE`, so clearing
-/// an already-set column back to null is not supported through this
-/// endpoint. Comment now matches the behavior; the restoration path
-/// for clearing lands when the SPA needs it.
+/// `PUT /api/v1/asset-templates/{id}` body. An absent key leaves the
+/// column untouched. `name` and `asset_model_id` are NOT NULL, so they stay
+/// plain `Option<T>` (a `null` is treated as absent); every other column is
+/// nullable in `asset_templates` (migration 271) and uses `Option<Option<T>>`
+/// so an explicit `null` clears it.
 // SPEC-15.1016: update-template bounds
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateAssetTemplateRequest {
     #[validate(length(min = 1, max = 150))]
     pub name: Option<String>,
     pub asset_model_id: Option<Uuid>,
-    pub company_id: Option<Uuid>,
-    pub site_id: Option<Uuid>,
-    pub default_assigned_user_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub company_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub site_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub default_assigned_user_id: Option<Option<Uuid>>,
     #[validate(length(max = 100))]
-    pub department: Option<String>,
-    pub tags: Option<Vec<String>>,
-    pub notes: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub department: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub tags: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub notes: Option<Option<String>>,
     #[validate(range(min = 0, max = 100_000))]
-    pub license_seat_count: Option<i32>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub license_seat_count: Option<Option<i32>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_model_distinguishes_absent_null_and_value() {
+        let absent: UpdateAssetModelRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.warranty_months, None);
+        let cleared: UpdateAssetModelRequest =
+            serde_json::from_str(r#"{"warranty_months": null, "image_url": null}"#).unwrap();
+        assert_eq!(cleared.warranty_months, Some(None));
+        assert_eq!(cleared.image_url, Some(None));
+        let set: UpdateAssetModelRequest =
+            serde_json::from_str(r#"{"warranty_months": 12}"#).unwrap();
+        assert_eq!(set.warranty_months, Some(Some(12)));
+    }
+
+    #[test]
+    fn update_template_null_clears_and_absent_keeps() {
+        let req: UpdateAssetTemplateRequest =
+            serde_json::from_str(r#"{"company_id": null, "notes": "n"}"#).unwrap();
+        assert_eq!(req.company_id, Some(None));
+        assert_eq!(req.site_id, None);
+        assert_eq!(req.notes, Some(Some("n".to_string())));
+    }
 }
