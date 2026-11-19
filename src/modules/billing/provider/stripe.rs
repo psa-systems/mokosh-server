@@ -535,6 +535,15 @@ fn parse_stripe_payment_session(
     let (Some(tenant_id), Some(invoice_id), Some(amount_total)) =
         (tenant_id, invoice_id, amount_total)
     else {
+        // A paid session we cannot tie to an invoice is a real payment nobody
+        // will reconcile, so it must not read like an unrelated event.
+        tracing::warn!(
+            %kind,
+            has_tenant = tenant_id.is_some(),
+            has_invoice = invoice_id.is_some(),
+            has_amount = amount_total.is_some(),
+            "stripe paid session lacks the metadata or amount needed to reconcile it; ignoring"
+        );
         return Ok(PaymentEvent::Ignored { kind });
     };
     // PMS-1660 finding: an absent `currency` used to be defaulted to

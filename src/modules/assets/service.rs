@@ -123,6 +123,7 @@ impl AssetsService {
     ) -> AppResult<AssetTypeResponse> {
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        assert_parent_type_valid(&mut tx, tenant_id, id, request.parent_type_id).await?;
         sqlx::query(
             r#"INSERT INTO asset_types
                    (id, tenant_id, name, icon, parent_type_id, is_active, itil_category)
@@ -173,8 +174,20 @@ impl AssetsService {
         tenant_id: TenantId,
         id: Uuid,
         request: &UpsertAssetTypeRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<AssetTypeResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM asset_types t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if before.is_none() {
+            return Err(AppError::NotFound("Asset type".to_string()));
+        }
+        assert_parent_type_valid(&mut tx, tenant_id, id, request.parent_type_id).await?;
         let n = sqlx::query(
             r#"UPDATE asset_types SET name = $3, icon = $4, parent_type_id = $5,
                    is_active = $6, itil_category = $7, updated_at = NOW()
@@ -193,6 +206,24 @@ impl AssetsService {
         if n == 0 {
             return Err(AppError::NotFound("Asset type".to_string()));
         }
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM asset_types t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "asset_types",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
         tx.commit().await?;
         Ok(AssetTypeResponse {
             id,
@@ -206,8 +237,20 @@ impl AssetsService {
 
     // SPEC-15.1025
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_asset_type(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+    pub async fn delete_asset_type(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM asset_types t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let n = sqlx::query("DELETE FROM asset_types WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -217,6 +260,17 @@ impl AssetsService {
         if n == 0 {
             return Err(AppError::NotFound("Asset type".to_string()));
         }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "asset_types",
+            Some(id),
+            before,
+            None,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -368,7 +422,10 @@ impl AssetsService {
         }
         let where_clause = conditions.join(" AND ");
 
-        let q_pattern = filter.q.as_ref().map(|s| format!("%{s}%"));
+        let q_pattern = filter
+            .q
+            .as_ref()
+            .map(|s| format!("%{}%", crate::utils::text::escape_like_wildcards(s)));
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let count_query = format!("SELECT COUNT(*) FROM assets a WHERE {where_clause}");
@@ -512,7 +569,10 @@ impl AssetsService {
         // time because the facets below usually pare the set first.
         if let Some(q) = req.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             wb.push_clause("a.search_haystack ILIKE ");
-            wb.push_bind_json(serde_json::Value::String(format!("%{}%", q.to_lowercase())));
+            wb.push_bind_json(serde_json::Value::String(format!(
+                "%{}%",
+                crate::utils::text::escape_like_wildcards(&q.to_lowercase())
+            )));
         }
         for filter in &req.filters {
             wb.apply_filter(filter);
@@ -603,7 +663,10 @@ impl AssetsService {
             wb.push_bind_tenant(tenant_id);
             if let Some(q) = req.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 wb.push_clause("a.search_haystack ILIKE ");
-                wb.push_bind_json(serde_json::Value::String(format!("%{}%", q.to_lowercase())));
+                wb.push_bind_json(serde_json::Value::String(format!(
+                    "%{}%",
+                    crate::utils::text::escape_like_wildcards(&q.to_lowercase())
+                )));
             }
             for filter in &req.filters {
                 wb.apply_filter(filter);
@@ -1004,20 +1067,23 @@ impl AssetsService {
             .execute(&mut *tx)
             .await;
             if let Err(e) = insert {
-                // Map the two most common failure modes to a field-
-                // scoped 422 naming the row that failed so the SPA
-                // can anchor the hint to the right line.
+                // The only tenant-scoped UNIQUE on `assets` is the
+                // case-insensitive asset tag (migration 275). Serial
+                // uniqueness is NOT a database invariant: it is the
+                // per-company `assets_exists` pre-flight read. Route a
+                // tag collision to a field-scoped 422 naming the row and
+                // let any other 23505 propagate as the normal error.
                 if let Some(dbe) = e.as_database_error() {
-                    if let Some(code) = dbe.code() {
-                        if code == "23505" {
-                            return Err(AppError::validation_field(
-                                format!("serials[{idx}].serial_number"),
-                                format!(
-                                    "serial `{}` is already assigned to an asset in this tenant",
-                                    s.serial_number
-                                ),
-                            ));
-                        }
+                    if dbe.code().as_deref() == Some("23505")
+                        && dbe.constraint() == Some("uq_assets_tenant_asset_tag_ci")
+                    {
+                        return Err(AppError::validation_field(
+                            format!("serials[{idx}].asset_tag"),
+                            format!(
+                                "asset tag `{}` is already assigned to an asset in this tenant",
+                                asset_tags[idx]
+                            ),
+                        ));
                     }
                 }
                 return Err(e.into());
@@ -2894,6 +2960,64 @@ const ASSET_TAG_WIDTH: usize = 3;
 /// tenant's `assets.asset_tag` so an export/import round-trip keeps
 /// issuing non-colliding tags.
 // SPEC-15.1032
+/// SPEC-15.1023, SPEC-15.1024: a parent type must belong to the caller's
+/// tenant, must not be the type itself, and must not be one of the type's own
+/// descendants (which would close a cycle). The FK only proves the parent row
+/// exists somewhere.
+async fn assert_parent_type_valid(
+    tx: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    type_id: Uuid,
+    parent_type_id: Option<Uuid>,
+) -> AppResult<()> {
+    let Some(parent_id) = parent_type_id else {
+        return Ok(());
+    };
+    if parent_id == type_id {
+        return Err(AppError::validation_field(
+            "parent_type_id",
+            "an asset type cannot be its own parent",
+        ));
+    }
+    let found: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM asset_types WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(parent_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if found.is_none() {
+        return Err(AppError::validation_field(
+            "parent_type_id",
+            "parent asset type does not exist in this tenant",
+        ));
+    }
+    // Walk the proposed parent's ancestors; reaching `type_id` means the new
+    // edge would make the type its own ancestor.
+    let cycle: bool = sqlx::query_scalar(
+        r#"WITH RECURSIVE ancestors(id, parent_type_id) AS (
+               SELECT id, parent_type_id FROM asset_types
+                WHERE tenant_id = $1 AND id = $2
+               UNION
+               SELECT t.id, t.parent_type_id FROM asset_types t
+                 JOIN ancestors a ON t.id = a.parent_type_id
+                WHERE t.tenant_id = $1
+           )
+           SELECT EXISTS(SELECT 1 FROM ancestors WHERE id = $3)"#,
+    )
+    .bind(tenant_id)
+    .bind(parent_id)
+    .bind(type_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if cycle {
+        return Err(AppError::validation_field(
+            "parent_type_id",
+            "parent asset type would create a cycle",
+        ));
+    }
+    Ok(())
+}
+
 async fn reserve_asset_tags(
     conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,

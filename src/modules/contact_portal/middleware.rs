@@ -2,8 +2,7 @@
 //! request extractors.
 //!
 //! Runs on the `/api/v1/contact/*` sub-router. Reads the Bearer token
-//! (from `Authorization: Bearer ...`) OR the `mokosh:contact_token`
-//! cookie (see routes.rs for the cookie-setting side), verifies it,
+//! (from `Authorization: Bearer ...`; no cookie is read), verifies it,
 //! ensures the tenant is still active, and stashes a
 //! `ContactAuthState` in request extensions for downstream extractors.
 //!
@@ -64,7 +63,7 @@ pub async fn portal_contact_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let auth_state = match bearer(&request).or_else(|| cookie(&request)) {
+    let auth_state = match bearer(&request) {
         Some(token) => match state.service.decode_token(token) {
             Ok(claims) => {
                 // PMS-1222: gate on the same conditions `login` checks
@@ -166,27 +165,6 @@ fn bearer(req: &Request) -> Option<&str> {
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")
-}
-
-/// mokosh-contact-login prompt 004: parse `mokosh:contact_token=<value>`
-/// out of the Cookie header. Same shape the staff Google-OAuth path
-/// uses; no cookie crate dep.
-// SPEC-5.428
-fn cookie(req: &Request) -> Option<&str> {
-    let raw = req
-        .headers()
-        .get(axum::http::header::COOKIE)?
-        .to_str()
-        .ok()?;
-    for pair in raw.split(';') {
-        let pair = pair.trim();
-        if let Some(value) = pair.strip_prefix("mokosh:contact_token=") {
-            if !value.is_empty() {
-                return Some(value);
-            }
-        }
-    }
-    None
 }
 
 /// mokosh-contact-login prompt 004: extractor that yields the

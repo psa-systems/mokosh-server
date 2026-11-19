@@ -2,9 +2,9 @@
 //!
 //! Scans rendered Markdown line-by-line and returns one `ParsedStep`
 //! per task-list item it finds. The two accepted shapes are the
-//! unordered `- [ ] text` / `- [x] text` and the ordered
-//! `1. [ ] text` / `1. [x] text` (any digit run before the dot). The
-//! `x` is case-insensitive. Any other line is not a step.
+//! unordered `- [ ] text` / `- [x] text` (`-`, `*` or `+` marker) and the
+//! ordered `1. [ ] text` / `1) [x] text` (any digit run before a `.` or a
+//! `)`). The `x` is case-insensitive. Any other line is not a step.
 //!
 //! A fenced code block (``` or ~~~) is tracked and its contents are
 //! skipped, so a code example that happens to contain `- [ ] foo`

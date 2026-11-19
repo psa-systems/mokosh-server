@@ -44,7 +44,9 @@
 //! # Idempotency and teardown
 //!
 //! [`qa_seed`] is idempotent: if any `QA-` company already exists in the
-//! tenant it skips without inserting, so re-running never duplicates.
+//! tenant it skips without inserting, so re-running never duplicates. A seed
+//! that failed part-way leaves a partial dataset that this guard then treats
+//! as complete: run [`qa_teardown`] first, then seed again.
 //! [`qa_teardown`] removes the dataset (and the QA lookup rows it created) in
 //! FK-dependency order, leaving the tenant's stock configuration intact.
 

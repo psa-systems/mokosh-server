@@ -57,7 +57,7 @@ use governor::{Quota, RateLimiter};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
-use super::oidc_rs::{LogoutClaims, Verifier};
+use super::oidc_rs::{LogoutClaims, Verifier, VerifyError};
 use crate::utils::client_ip::{extract_client_ip, trusted_proxies};
 use crate::utils::error::rate_limited_response;
 
@@ -306,6 +306,17 @@ pub async fn backchannel_logout(
         Ok(claims) => claims,
         Err(e) => {
             tracing::error!(error = %e, "back-channel logout token did not verify");
+            // An OP fetch outage is our fault, not the sender's: 5xx so the OP retries delivery. A forged token stays 400.
+            if matches!(
+                e,
+                VerifyError::JwksFetch(_) | VerifyError::DiscoveryFetch(_)
+            ) {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "identity provider temporarily unavailable",
+                )
+                    .into_response();
+            }
             return (StatusCode::BAD_REQUEST, "invalid logout token").into_response();
         }
     };

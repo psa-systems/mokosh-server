@@ -112,19 +112,10 @@ async fn contact_full_flow_setup_login_me(pool: PgPool) {
         reqwest::StatusCode::OK,
         "prompt 004: valid credentials must return 200"
     );
-    // Set-Cookie carries the refresh token.
-    let cookie_header = resp
-        .headers()
-        .get("set-cookie")
-        .expect("Set-Cookie on login response")
-        .to_str()
-        .expect("header text")
-        .to_string();
+    // SPEC-5.449: the refresh token travels in the body only.
     assert!(
-        cookie_header.contains("mokosh:contact_token=")
-            && cookie_header.contains("HttpOnly")
-            && cookie_header.contains("SameSite=Lax"),
-        "prompt 004: login must Set-Cookie with HttpOnly + SameSite=Lax, got {cookie_header}"
+        resp.headers().get("set-cookie").is_none(),
+        "login must not Set-Cookie"
     );
     let body: serde_json::Value = resp.json().await.expect("login JSON");
     let access = body["access_token"]

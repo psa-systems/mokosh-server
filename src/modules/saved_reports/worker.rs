@@ -69,7 +69,7 @@ impl ScheduledReportsWorker {
 
         let rows = sqlx::query(
             "SELECT id, tenant_id, saved_report_id, user_id, cron_expr, \
-                    recipient_email, last_run_at \
+                    recipient_email, format, last_run_at \
              FROM scheduled_reports \
              WHERE is_active = true AND next_run_at <= NOW() \
              ORDER BY next_run_at \
@@ -89,16 +89,10 @@ impl ScheduledReportsWorker {
             let user_id: Uuid = row.try_get("user_id")?;
             let cron_expr: String = row.try_get("cron_expr")?;
             let recipient_email: Option<String> = row.try_get("recipient_email")?;
+            let format: String = row.try_get("format")?;
 
-            // PMS-1665 F: run the delivery under a nested
-            // transaction (savepoint) so a failed notifications INSERT
-            // does NOT poison the outer tick's tx. Previously an SQL
-            // error from the notifications INSERT aborted the outer tx
-            // and the subsequent schedule UPDATE failed with `?`,
-            // rolling back every schedule in the tick and repeating
-            // them on the next tick in a loop. The savepoint pattern
-            // isolates each schedule's delivery and keeps the
-            // last_error semantics the module comment promises.
+            // A savepoint isolates each delivery: a failed notifications INSERT
+            // would otherwise abort the tick's tx and roll back every schedule.
             let outcome = {
                 let mut inner = tx.begin().await?;
                 let result = self
@@ -108,6 +102,7 @@ impl ScheduledReportsWorker {
                         saved_report_id,
                         user_id,
                         recipient_email.as_deref(),
+                        &format,
                     )
                     .await;
                 match result {
@@ -190,7 +185,15 @@ impl ScheduledReportsWorker {
         saved_report_id: Uuid,
         user_id: Uuid,
         recipient_override: Option<&str>,
+        format: &str,
     ) -> AppResult<()> {
+        // The column's CHECK admits only csv today; a future value the worker
+        // cannot render must fail the delivery visibly, not be sent as CSV.
+        if format != "csv" {
+            return Err(crate::utils::error::AppError::BadRequest(format!(
+                "The scheduled report format '{format}' is not supported; only csv is delivered."
+            )));
+        }
         // execute() runs against the service's own pool, not the
         // worker's tx. That's intentional: the row-fetch can be
         // multi-megabyte and we do NOT want it inside the FOR UPDATE
@@ -201,15 +204,8 @@ impl ScheduledReportsWorker {
             .execute(tenant_id, user_id, saved_report_id, 1, PER_PAGE)
             .await?;
         let csv = render_csv(&result.aliases, &result.rows);
-        // PMS-1665 finding: the second get() used to silently fall
-        // back to "Scheduled report" on any error, so a report whose
-        // execution succeeded above but whose row vanished between
-        // execute() and here (deleted mid-flight, DB fault, etc.)
-        // sent an email titled "Scheduled report" with no trace.
-        // WARN with the ids + cause; the delivery still goes out
-        // with the fallback title (the CSV body is valuable on its
-        // own and dropping the delivery would re-queue on the next
-        // tick).
+        // The delivery still goes out under a fallback title: the CSV body is
+        // worth sending, and failing would re-queue it.
         let report_name = match self.reports.get(tenant_id, user_id, saved_report_id).await {
             Ok(r) => r.name,
             Err(e) => {

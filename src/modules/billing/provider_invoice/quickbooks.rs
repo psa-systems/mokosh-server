@@ -31,7 +31,9 @@
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 use crate::modules::billing::invoice_issuer::{
     decimal_string_to_minor, ExternalBillRef, ExternalCreditNoteRef, ExternalExpenseRef,
@@ -157,6 +159,32 @@ pub enum QuickBooksInvoiceStatus {
 /// QBO's single-invoice envelope. `invoice.Line` carries the lines; we
 /// pick the fields the dispatcher cares about so a new QBO field does
 /// not break the parse.
+/// Reads a QuickBooks money field into a `Decimal` through its decimal text,
+/// never an `f64`: a JSON number is taken at the text serde_json gives it and a
+/// string is parsed as is. Absent or null stays `None`.
+fn money_decimal<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let text = match value {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::String(s)) => s,
+        Some(other) => {
+            return Err(D::Error::custom(format!(
+                "money field is not a number: {other}"
+            )))
+        }
+    };
+    let trimmed = text.trim();
+    Decimal::from_str(trimmed)
+        .or_else(|_| Decimal::from_scientific(trimmed))
+        .map(Some)
+        .map_err(|e| D::Error::custom(format!("money field {text:?} is not a decimal: {e}")))
+}
+
 #[derive(Debug, Deserialize)]
 struct QuickBooksInvoiceEnvelope {
     #[serde(rename = "Invoice")]
@@ -171,10 +199,10 @@ struct QuickBooksInvoiceDto {
     sync_token: Option<String>,
     #[serde(rename = "DocNumber", default)]
     doc_number: Option<String>,
-    #[serde(rename = "TotalAmt", default)]
-    total_amt: Option<f64>,
-    #[serde(rename = "Balance", default)]
-    balance: Option<f64>,
+    #[serde(rename = "TotalAmt", default, deserialize_with = "money_decimal")]
+    total_amt: Option<Decimal>,
+    #[serde(rename = "Balance", default, deserialize_with = "money_decimal")]
+    balance: Option<Decimal>,
     #[serde(rename = "PrivateNote", default)]
     private_note: Option<String>,
 }
@@ -188,10 +216,10 @@ struct QuickBooksBillSettlementEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct QuickBooksBillSettlementDto {
-    #[serde(rename = "TotalAmt", default)]
-    total_amt: Option<f64>,
-    #[serde(rename = "Balance", default)]
-    balance: Option<f64>,
+    #[serde(rename = "TotalAmt", default, deserialize_with = "money_decimal")]
+    total_amt: Option<Decimal>,
+    #[serde(rename = "Balance", default, deserialize_with = "money_decimal")]
+    balance: Option<Decimal>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1214,8 +1242,8 @@ impl QuickBooksClient {
             Err(e) => return Err(e),
         };
         let bill = envelope.bill;
-        let total_minor = decimal_string_to_minor(&format!("{:.2}", bill.total_amt.unwrap_or(0.0)));
-        let balance_minor = decimal_string_to_minor(&format!("{:.2}", bill.balance.unwrap_or(0.0)));
+        let total_minor = decimal_string_to_minor(&bill.total_amt.unwrap_or_default().to_string())?;
+        let balance_minor = decimal_string_to_minor(&bill.balance.unwrap_or_default().to_string())?;
         Ok(Some(ExternalSettlement {
             paid_minor: total_minor.saturating_sub(balance_minor),
             total_minor,
@@ -1312,7 +1340,7 @@ impl QuickBooksClient {
 /// voided, and a `TotalAmt` of zero without that marker is a draft.
 // SPEC-13.792
 fn classify_status(invoice: &QuickBooksInvoiceDto) -> QuickBooksInvoiceStatus {
-    let total = invoice.total_amt.unwrap_or(0.0);
+    let total = invoice.total_amt.unwrap_or(Decimal::ZERO);
     let balance = invoice.balance.unwrap_or(total);
     // PMS-1660 finding: the invoice-void marker was matched case
     // sensitively (`Voided`) while the credit memo marker below (line
@@ -1323,7 +1351,7 @@ fn classify_status(invoice: &QuickBooksInvoiceDto) -> QuickBooksInvoiceStatus {
         .as_deref()
         .map(|note| note.to_ascii_lowercase().contains("voided"))
         .unwrap_or(false);
-    if voided_marker || (total == 0.0 && invoice.sync_token.is_some() && balance == 0.0) {
+    if voided_marker || (total.is_zero() && invoice.sync_token.is_some() && balance.is_zero()) {
         if voided_marker {
             return QuickBooksInvoiceStatus::Voided;
         }
@@ -1332,11 +1360,11 @@ fn classify_status(invoice: &QuickBooksInvoiceDto) -> QuickBooksInvoiceStatus {
         // does not report "paid in full" for a $0 placeholder.
         return QuickBooksInvoiceStatus::Draft;
     }
-    if balance == 0.0 && total > 0.0 {
+    if balance.is_zero() && total > Decimal::ZERO {
         QuickBooksInvoiceStatus::Paid
-    } else if balance < total && balance > 0.0 {
+    } else if balance < total && balance > Decimal::ZERO {
         QuickBooksInvoiceStatus::PartiallyPaid
-    } else if balance >= total && total > 0.0 {
+    } else if balance >= total && total > Decimal::ZERO {
         QuickBooksInvoiceStatus::Sent
     } else {
         QuickBooksInvoiceStatus::Draft
@@ -1395,10 +1423,27 @@ mod tests {
             id: "1".to_string(),
             sync_token: sync_token.map(|s| s.to_string()),
             doc_number: None,
-            total_amt: total,
-            balance,
+            total_amt: total.map(|v| Decimal::from_str(&v.to_string()).unwrap()),
+            balance: balance.map(|v| Decimal::from_str(&v.to_string()).unwrap()),
             private_note: private_note.map(|s| s.to_string()),
         }
+    }
+
+    #[test]
+    fn money_reads_through_decimal_text_not_a_float() {
+        let dto: QuickBooksBillSettlementDto =
+            serde_json::from_str(r#"{"TotalAmt": 1234567.89, "Balance": "0.10"}"#).unwrap();
+        assert_eq!(
+            dto.total_amt,
+            Some(Decimal::from_str("1234567.89").unwrap())
+        );
+        assert_eq!(dto.balance, Some(Decimal::from_str("0.10").unwrap()));
+        let none: QuickBooksBillSettlementDto =
+            serde_json::from_str(r#"{"Balance": null}"#).unwrap();
+        assert_eq!((none.total_amt, none.balance), (None, None));
+        assert!(
+            serde_json::from_str::<QuickBooksBillSettlementDto>(r#"{"TotalAmt": true}"#).is_err()
+        );
     }
 
     #[test]

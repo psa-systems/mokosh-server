@@ -73,12 +73,13 @@ async fn create_mileage_entry(
     State(state): State<MileageTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     ctx: crate::modules::audit::AuditCtx,
-    Json(mut request): Json<CreateMileageEntryRequest>,
+    Json(request): Json<CreateMileageEntryRequest>,
 ) -> AppResult<Json<MileageEntryResponse>> {
-    // SPEC-14.51: owner rewrite for non-admins, then distance and rate validation (422).
-    // Non-admins can only log mileage for themselves.
-    if !user.role.is_admin() && request.user_id != user.id {
-        request.user_id = user.id;
+    // SPEC-14.51: only a manager or above may attribute mileage to another user; anyone else is refused.
+    if !user.role.can_manage_users() && request.user_id != user.id {
+        return Err(crate::utils::error::AppError::Forbidden(
+            "Only a manager or above can log mileage for another user".to_string(),
+        ));
     }
     request.validate()?;
     Ok(Json(

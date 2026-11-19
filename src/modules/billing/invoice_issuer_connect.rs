@@ -286,14 +286,32 @@ impl InvoiceIssuerConnectService {
             }
         };
 
-        self.secrets
-            .put(
-                &SecretKey::integration(*tenant_id, provider.as_str()),
-                &serialize_blob(&blob)?,
-            )
-            .await?;
-        self.record_connection(tenant_id, provider, &organisation_id)
-            .await?;
+        let key = SecretKey::integration(*tenant_id, provider.as_str());
+        // Keep what was there: when the upsert is refused (including the
+        // cross-tenant organisation conflict) a tenant with a working
+        // connection to another organisation must keep its blob, not end up
+        // with the refused organisation's credentials beside a row that still
+        // names the old one.
+        let prior = self.secrets.get(&key).await?;
+        self.secrets.put(&key, &serialize_blob(&blob)?).await?;
+        if let Err(e) = self
+            .record_connection(tenant_id, provider, &organisation_id)
+            .await
+        {
+            let restored = match prior {
+                Some(old) => self.secrets.put(&key, &old).await,
+                None => self.secrets.delete(&key).await,
+            };
+            if let Err(restore_err) = restored {
+                tracing::error!(
+                    tenant_id = %tenant_id,
+                    provider = provider.as_str(),
+                    error = ?restore_err,
+                    "connect: the connection was refused and the previous credentials could not be restored; the tenant must reconnect"
+                );
+            }
+            return Err(e);
+        }
 
         Ok(format!(
             "{}/settings/integrations",

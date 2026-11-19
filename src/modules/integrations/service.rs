@@ -779,12 +779,8 @@ fn compose(
     // understand. Reading it as `error` is the honest answer: something is
     // wrong with this integration and an operator should look.
     //
-    // PMS-1665: the fallback used to happen silently - the operator saw
-    // `error` with no hint that the stored string was the drift cause,
-    // and the log carried no record of the offending value. Warn with
-    // the provider and the unrecognised string so schema/enum drift is
-    // findable and the operator can file the mismatch against the
-    // right migration or build.
+    // The warning names the provider and the stored value so the drift is
+    // findable.
     response.status = IntegrationStatus::from_str(&row.status).unwrap_or_else(|| {
         tracing::warn!(
             provider = %row.provider,

@@ -251,6 +251,7 @@ impl KbService {
             )));
         }
         let id = Uuid::new_v4();
+        validate_category_parent(&mut tx, tenant_id, id, request.parent_id).await?;
         sqlx::query(
             r#"INSERT INTO kb_categories
                (id, tenant_id, name, description, parent_id, slug, visibility, sort_order)
@@ -325,6 +326,7 @@ impl KbService {
                 request.slug
             )));
         }
+        validate_category_parent(&mut tx, tenant_id, id, request.parent_id).await?;
         let n = sqlx::query(
             r#"UPDATE kb_categories SET
                   name = $3, description = $4, parent_id = $5, slug = $6,
@@ -2710,4 +2712,62 @@ impl KbService {
                 .then(|| total_minutes.unwrap_or(0) as f64 / ticket_count as f64),
         })
     }
+}
+
+/// SPEC-15.1116, SPEC-15.1117: a category parent must belong to the caller's
+/// tenant, must not be the category itself, and must not be one of its own
+/// descendants (which would close a cycle). The FK only proves the parent row
+/// exists somewhere.
+async fn validate_category_parent(
+    tx: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    category_id: Uuid,
+    parent_id: Option<Uuid>,
+) -> AppResult<()> {
+    let Some(parent_id) = parent_id else {
+        return Ok(());
+    };
+    if parent_id == category_id {
+        return Err(AppError::validation_field(
+            "parent_id",
+            "a category cannot be its own parent",
+        ));
+    }
+    let found: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM kb_categories WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(parent_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if found.is_none() {
+        return Err(AppError::validation_field(
+            "parent_id",
+            "parent category does not exist in this tenant",
+        ));
+    }
+    // Walk the proposed parent's ancestors; reaching `category_id` means the
+    // new edge would make the category its own ancestor.
+    let cycle: bool = sqlx::query_scalar(
+        r#"WITH RECURSIVE ancestors(id, parent_id) AS (
+               SELECT id, parent_id FROM kb_categories
+                WHERE tenant_id = $1 AND id = $2
+               UNION
+               SELECT c.id, c.parent_id FROM kb_categories c
+                 JOIN ancestors a ON c.id = a.parent_id
+                WHERE c.tenant_id = $1
+           )
+           SELECT EXISTS(SELECT 1 FROM ancestors WHERE id = $3)"#,
+    )
+    .bind(tenant_id)
+    .bind(parent_id)
+    .bind(category_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if cycle {
+        return Err(AppError::validation_field(
+            "parent_id",
+            "parent category would create a cycle",
+        ));
+    }
+    Ok(())
 }
