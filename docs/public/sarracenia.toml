@@ -1,0 +1,16 @@
+# Publishes mokosh-server's user-facing docs to docs.a8n.systems/docs/mokosh-server.
+# The publish-docs workflow cd's into this directory before running sarracenia
+# push, so docs/public/ is the walk root. The sidebar on docs.a8n.systems shows
+# content directly under "Mokosh server" with no "Docs" or "Public" intermediate
+# layers. docs/ outside public/ (invariants/, dev-docs/, specification.md,
+# ROADMAP.md, architecture.md, providers.md, etc.) is internal engineering
+# material and is NOT published.
+source = "mokosh-server"
+base_path = "/docs/mokosh-server"
+title = "Mokosh server"
+include = ["**/*.md"]
+exclude = []
+
+[storefront]
+url = "https://docs.a8n.systems"
+site = "docs"
