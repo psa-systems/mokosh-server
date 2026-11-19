@@ -1154,7 +1154,10 @@ impl BillingService {
         let rows = q.fetch_all(&mut *tx).await?;
         let total = cq.fetch_one(&mut *tx).await?;
         drop(tx);
-        let mut resp: Vec<InvoiceResponse> = rows.into_iter().map(Into::into).collect();
+        let mut resp = rows
+            .into_iter()
+            .map(InvoiceResponse::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
         for invoice in &mut resp {
             invoice.mark_overdue(today);
         }
@@ -4512,7 +4515,10 @@ impl BillingService {
         let rows = q.fetch_all(&mut *tx).await?;
         let total = cq.fetch_one(&mut *tx).await?;
         drop(tx);
-        let mut resp: Vec<PaymentResponse> = rows.into_iter().map(Into::into).collect();
+        let mut resp = rows
+            .into_iter()
+            .map(PaymentResponse::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
         self.enrich_payments(tenant_id, &mut resp).await?;
         Ok((resp, total as u64))
     }
@@ -6866,7 +6872,7 @@ impl BillingService {
         .fetch_all(&mut **tx)
         .await?;
 
-        let mut resp: InvoiceResponse = row.into();
+        let mut resp = InvoiceResponse::try_from(row)?;
         // PMS-1334: what replaced this invoice, derived rather than stored. The
         // newest amendment wins, because an amendment can itself be amended and
         // the question a reader is asking is "where did this end up".
@@ -6896,7 +6902,12 @@ impl BillingService {
         // PMS-1037: overdue is the tenant's day, not the reader's clock.
         let zone = read_tenant_zone(tx, tenant_id).await?;
         resp.mark_overdue(mokosh_types::datetime::user_local_date(Utc::now(), &zone));
-        resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
+        resp.lines = Some(
+            line_rows
+                .into_iter()
+                .map(InvoiceLineResponse::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        );
         resp.company_name =
             sqlx::query_scalar("SELECT name FROM companies WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)
@@ -7882,12 +7893,12 @@ impl BillingService {
         .fetch_all(&mut **tx)
         .await?;
 
-        let mut response = CreditNoteResponse::from(row);
+        let mut response = CreditNoteResponse::try_from(row)?;
         response.lines = Some(
             lines
                 .into_iter()
-                .map(CreditNoteLineResponse::from)
-                .collect(),
+                .map(CreditNoteLineResponse::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
         );
         Ok(response)
     }
@@ -7947,7 +7958,9 @@ impl BillingService {
         .await?;
 
         Ok((
-            rows.into_iter().map(CreditNoteResponse::from).collect(),
+            rows.into_iter()
+                .map(CreditNoteResponse::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
             total.max(0) as u64,
         ))
     }
@@ -8234,8 +8247,14 @@ impl BillingService {
             period_start: query.period_start,
             period_end: query.period_end,
             opening_balance,
-            invoices: invoices.into_iter().map(Into::into).collect(),
-            payments: payments.into_iter().map(Into::into).collect(),
+            invoices: invoices
+                .into_iter()
+                .map(StatementInvoiceLine::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            payments: payments
+                .into_iter()
+                .map(StatementPaymentLine::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
             refunds: refunds.into_iter().map(Into::into).collect(),
             credit_notes: credit_notes.into_iter().map(Into::into).collect(),
             write_offs: write_offs.into_iter().map(Into::into).collect(),
@@ -8939,26 +8958,6 @@ fn parse_stored<T>(
     })
 }
 
-/// Infallible-conversion twin of [`parse_stored`] for `From<Row>` impls that
-/// cannot return an error: keeps the conservative fallback but logs at error
-/// level with the row id so a bad row is findable.
-fn read_stored_or<T>(
-    parsed: Option<T>,
-    fallback: T,
-    kind: &str,
-    stored: &str,
-    row_id: impl std::fmt::Display,
-) -> T {
-    parsed.unwrap_or_else(|| {
-        tracing::error!(
-            row_id = %row_id,
-            stored = %stored,
-            "stored {kind} is not a known value; reading it as the fallback"
-        );
-        fallback
-    })
-}
-
 impl From<TaxRateRow> for TaxRateResponse {
     fn from(r: TaxRateRow) -> Self {
         Self {
@@ -9000,9 +8999,11 @@ struct PaymentRow {
 }
 
 // SPEC-13.17
-impl From<PaymentRow> for PaymentResponse {
-    fn from(r: PaymentRow) -> Self {
-        Self {
+impl TryFrom<PaymentRow> for PaymentResponse {
+    type Error = AppError;
+
+    fn try_from(r: PaymentRow) -> Result<Self, Self::Error> {
+        Ok(Self {
             id: r.id,
             tenant_id: r.tenant_id,
             invoice_id: r.invoice_id,
@@ -9011,18 +9012,17 @@ impl From<PaymentRow> for PaymentResponse {
             company_name: None,
             payment_date: r.payment_date,
             amount: r.amount,
-            payment_method: read_stored_or(
+            payment_method: parse_stored(
                 PaymentMethod::from_str(&r.payment_method),
-                PaymentMethod::Other,
                 "payment method",
                 &r.payment_method,
                 r.id,
-            ),
+            )?,
             reference_number: r.reference_number,
             gateway_transaction_id: r.gateway_transaction_id,
             notes: r.notes,
             created_at: r.created_at,
-        }
+        })
     }
 }
 
@@ -9042,18 +9042,19 @@ struct InvoiceLineRow {
 }
 
 // SPEC-13.17
-impl From<InvoiceLineRow> for InvoiceLineResponse {
-    fn from(r: InvoiceLineRow) -> Self {
-        Self {
+impl TryFrom<InvoiceLineRow> for InvoiceLineResponse {
+    type Error = AppError;
+
+    fn try_from(r: InvoiceLineRow) -> Result<Self, Self::Error> {
+        Ok(Self {
             is_taxable: r.is_taxable,
             id: r.id,
-            line_type: read_stored_or(
+            line_type: parse_stored(
                 InvoiceLineType::from_str(&r.line_type),
-                InvoiceLineType::Service,
                 "invoice line type",
                 &r.line_type,
                 r.id,
-            ),
+            )?,
             description: r.description,
             quantity: r.quantity,
             unit_price: r.unit_price,
@@ -9062,7 +9063,7 @@ impl From<InvoiceLineRow> for InvoiceLineResponse {
             project_id: r.project_id,
             sort_order: r.sort_order,
             product_id: r.product_id,
-        }
+        })
     }
 }
 
@@ -9123,9 +9124,11 @@ struct InvoiceRow {
 }
 
 // SPEC-13.17
-impl From<InvoiceRow> for InvoiceResponse {
-    fn from(r: InvoiceRow) -> Self {
-        Self {
+impl TryFrom<InvoiceRow> for InvoiceResponse {
+    type Error = AppError;
+
+    fn try_from(r: InvoiceRow) -> Result<Self, Self::Error> {
+        Ok(Self {
             id: r.id,
             tenant_id: r.tenant_id,
             invoice_number: r.invoice_number,
@@ -9137,13 +9140,12 @@ impl From<InvoiceRow> for InvoiceResponse {
             // rather than once per row.
             billing_contact_name: None,
             contract_id: r.contract_id,
-            status: read_stored_or(
+            status: parse_stored(
                 InvoiceStatus::from_str(&r.status),
-                InvoiceStatus::Draft,
                 "invoice status",
                 &r.status,
                 r.id,
-            ),
+            )?,
             invoice_date: r.invoice_date,
             due_date: r.due_date,
             payment_terms: r.payment_terms,
@@ -9193,7 +9195,7 @@ impl From<InvoiceRow> for InvoiceResponse {
             external_provider: r.external_provider,
             external_invoice_id: r.external_invoice_id,
             external_number: r.external_number,
-        }
+        })
     }
 }
 
@@ -9531,9 +9533,11 @@ struct CreditNoteRow {
 }
 
 // SPEC-13.17
-impl From<CreditNoteRow> for CreditNoteResponse {
-    fn from(r: CreditNoteRow) -> Self {
-        Self {
+impl TryFrom<CreditNoteRow> for CreditNoteResponse {
+    type Error = AppError;
+
+    fn try_from(r: CreditNoteRow) -> Result<Self, Self::Error> {
+        Ok(Self {
             id: r.id,
             tenant_id: r.tenant_id,
             credit_note_number: r.credit_note_number,
@@ -9544,13 +9548,12 @@ impl From<CreditNoteRow> for CreditNoteResponse {
             // An unrecognised value can only come from a row this build did not
             // write, and reading it as `Issued` would count it against an
             // invoice. `Void` is the reading that cannot overstate a credit.
-            status: read_stored_or(
+            status: parse_stored(
                 CreditNoteStatus::from_str(&r.status),
-                CreditNoteStatus::Void,
                 "credit note status",
                 &r.status,
                 r.id,
-            ),
+            )?,
             issue_date: r.issue_date,
             reason: r.reason,
             subtotal: r.subtotal,
@@ -9566,7 +9569,7 @@ impl From<CreditNoteRow> for CreditNoteResponse {
             external_provider: r.external_provider,
             external_credit_note_id: r.external_credit_note_id,
             external_number: r.external_number,
-        }
+        })
     }
 }
 
@@ -9583,24 +9586,25 @@ struct CreditNoteLineRow {
 }
 
 // SPEC-13.17
-impl From<CreditNoteLineRow> for CreditNoteLineResponse {
-    fn from(r: CreditNoteLineRow) -> Self {
-        Self {
+impl TryFrom<CreditNoteLineRow> for CreditNoteLineResponse {
+    type Error = AppError;
+
+    fn try_from(r: CreditNoteLineRow) -> Result<Self, Self::Error> {
+        Ok(Self {
             id: r.id,
-            line_type: read_stored_or(
+            line_type: parse_stored(
                 InvoiceLineType::from_str(&r.line_type),
-                InvoiceLineType::Service,
                 "invoice line type",
                 &r.line_type,
                 r.id,
-            ),
+            )?,
             product_id: r.product_id,
             description: r.description,
             quantity: r.quantity,
             unit_price: r.unit_price,
             total: r.total,
             sort_order: r.sort_order.unwrap_or(0),
-        }
+        })
     }
 }
 
@@ -9617,22 +9621,23 @@ struct StatementInvoiceRow {
 }
 
 // SPEC-13.17
-impl From<StatementInvoiceRow> for StatementInvoiceLine {
-    fn from(r: StatementInvoiceRow) -> Self {
-        Self {
+impl TryFrom<StatementInvoiceRow> for StatementInvoiceLine {
+    type Error = AppError;
+
+    fn try_from(r: StatementInvoiceRow) -> Result<Self, Self::Error> {
+        Ok(Self {
             invoice_id: r.id,
             invoice_number: r.invoice_number,
             invoice_date: r.invoice_date,
             due_date: r.due_date,
-            status: read_stored_or(
+            status: parse_stored(
                 InvoiceStatus::from_str(&r.status),
-                InvoiceStatus::Draft,
                 "invoice status",
                 &r.status,
                 r.id,
-            ),
+            )?,
             total: r.total,
-        }
+        })
     }
 }
 
@@ -9647,22 +9652,23 @@ struct StatementPaymentRow {
 }
 
 // SPEC-13.17
-impl From<StatementPaymentRow> for StatementPaymentLine {
-    fn from(r: StatementPaymentRow) -> Self {
-        Self {
+impl TryFrom<StatementPaymentRow> for StatementPaymentLine {
+    type Error = AppError;
+
+    fn try_from(r: StatementPaymentRow) -> Result<Self, Self::Error> {
+        Ok(Self {
             payment_id: r.id,
             payment_date: r.payment_date,
             amount: r.amount,
-            payment_method: read_stored_or(
+            payment_method: parse_stored(
                 PaymentMethod::from_str(&r.payment_method),
-                PaymentMethod::Other,
                 "payment method",
                 &r.payment_method,
                 r.id,
-            ),
+            )?,
             reference_number: r.reference_number,
             invoice_number: r.invoice_number,
-        }
+        })
     }
 }
 
