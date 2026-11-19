@@ -240,11 +240,11 @@ async fn dispatch(
                     &raw,
                 )
                 .await?;
-            // A redelivery of a recorded payment is benign and has no outcome value
-            // of its own, so it reads `ignored`; only a refusal needs a human.
+            // A redelivery of a recorded payment is benign and reads
+            // `benign_redelivery`; only a refusal needs a human.
             outcome = match recorded {
                 GatewayPaymentOutcome::Recorded => "accepted",
-                GatewayPaymentOutcome::AlreadyRecorded => "ignored",
+                GatewayPaymentOutcome::AlreadyRecorded => "benign_redelivery",
                 GatewayPaymentOutcome::Refused => "unreconciled",
             };
             invoice = Some(invoice_id);

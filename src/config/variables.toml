@@ -307,6 +307,12 @@ action = "No action needed: the server ignores it. Cleanup: delete it from the c
 # `breaking` is "wont-start" (restart fails) or "feature-off" (needs `feature`); either needs `issue` and `action`.
 
 [[change]]
+release = "v0.18.0"
+group = "Added"
+variables = ["CONTACT_LOGIN_IP_RATE_MAX", "CONTACT_LOGIN_IP_RATE_WINDOW_SECS"]
+action = "Optional. The per-IP attempt budget shared by contact-portal login and magic-link redeem; defaults to 10 attempts per 60 seconds, then 429 with Retry-After."
+
+[[change]]
 release = "v0.16.0"
 group = "Added"
 variables = ["BUNYIP_MAILER_URL", "BUNYIP_MAILER_CLIENT_ID", "BUNYIP_MAILER_CLIENT_SECRET"]

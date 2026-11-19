@@ -3385,8 +3385,11 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.444**: A wrong password must answer 401 Unauthorized, write audit portal.login_failed, and increment
   portal_failed_login_count, which on reaching 5 or more must set portal_locked_until to 5 minutes ahead; a failure to
   write the counter must be logged at error with tenant_id, contact_id and the error and must not change the 401. The
-  lockout is per contact only: there is no per-IP throttle on POST /auth/login or on the magic-link redeem route, and a
-  login for an unknown email is never counted.
+  lockout is per contact. In addition, POST /auth/login and POST /auth/login-link/redeem must share one per-client-IP
+  budget of CONTACT_LOGIN_IP_RATE_MAX attempts (default 10) per CONTACT_LOGIN_IP_RATE_WINDOW_SECS seconds (default 60),
+  keyed by the trusted-proxy-aware client IP and checked before any email or token lookup, so an unknown email spends it
+  like a known one and a success does not reset it. An attempt past the budget must answer 429 with Retry-After rounded
+  up per SPEC-5.103 and must log at info naming the IP.
 - **SPEC-5.445**: When portal_mfa_enabled is true and neither mfa_code nor recovery_code is non-blank after trimming,
   login with a correct password must answer 200 with mfa_required true, empty access_token and refresh_token, contact
   null, and must create no session.
@@ -4246,6 +4249,8 @@ the value as given.
   exempts private outbound targets" with the number of hosts and networks.
 - **SPEC-6.103**: `STRIPE_API_BASE` (application, since `v0.10.0`) and `PAYPAL_API_BASE` (application, since `v0.14.0`)
   must override the payment API base URL when non-blank (SPEC-13.714, SPEC-13.734).
+- **SPEC-6.104**: `CONTACT_LOGIN_IP_RATE_MAX` and `CONTACT_LOGIN_IP_RATE_WINDOW_SECS` (application, since `v0.18.0`) must
+  default to 10 and 60, be parsed with `parse_positive`, and refuse boot when malformed, zero or negative (SPEC-5.444).
 
 ## 7. Service desk
 
@@ -5895,6 +5900,9 @@ Every migration under `migrations/` is embedded at compile time via `sqlx::migra
 - **SPEC-9.1003**: migrations/298_widen_bill_payment_method_paypal.sql widens the `bill_payments.payment_method` CHECK to include
   `'paypal'`, closing the gap migration 287 opened by copying the pre-paypal `payments` vocabulary without picking up the `'paypal'` the
   earlier migration 233 had already added to `payments`. The two tables' method vocabularies are now in step again.
+- **SPEC-9.1004**: migrations/299_delivery_outcome_benign_redelivery.sql widens `payment_webhook_deliveries.outcome` to
+  VARCHAR(32) and adds `'benign_redelivery'` to its CHECK, for a delivery whose payment a prior delivery already
+  recorded.
 
 ## 10. Build, CI and deployment
 
@@ -6162,7 +6170,7 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
 ### 10.29 CI gate scripts: documentation and configuration consistency
 
 - **SPEC-10.180** `check-doc-links.nu` must resolve every Markdown link, image, reference-definition, and HTML `href`/`src` target in every `git ls-files "*.md"` file (skipping anchors, protocol-relative and scheme URLs, fenced code, and HTML comments), root-relative for a leading `/` and else relative to the containing file; any target that does not resolve on disk exits 1 naming `<file>:<line>`.
-- **SPEC-10.181** `check-doc-recipes.nu` must check a fixed set of docs (`README.md`, `docs/README.md`, `docs/quickstart.md`, `docs/architecture.md`, `docs/binaries.md`, `docs/configuration.md`, `docs/recipes.md`, `docs/invariants/ci-release.md`, `docs/invariants/config-providers.md`) for every `just <recipe>` invocation and fail if the named recipe is absent from the union of `justfile`'s non-`[private]` recipes and `just --summary`'s resolved (imported) recipes; a missing submodule import failure must direct the operator to `git submodule update --init`.
+- **SPEC-10.181** `check-doc-recipes.nu` must check a fixed set of docs (`README.md`, `docs/README.md`, `docs/quickstart.md`, `docs/architecture.md`, `docs/public/binaries.md`, `docs/configuration.md`, `docs/recipes.md`, `docs/invariants/ci-release.md`, `docs/invariants/config-providers.md`) for every `just <recipe>` invocation and fail if the named recipe is absent from the union of `justfile`'s non-`[private]` recipes and `just --summary`'s resolved (imported) recipes; a missing submodule import failure must direct the operator to `git submodule update --init`.
 - **SPEC-10.182** `check-config-doc-paths.nu` must scan `.env.example`, `compose.dev.yml`, and `justfile` for bare `docs/...`-shaped path references and exit 1 listing any that do not resolve on disk.
 - **SPEC-10.183** `check-claude-md.nu` must exit 1 when `CLAUDE.md` exceeds `20000` UTF-8 bytes, when any non-fenced line exceeds `400` characters, or when a `](docs/...)` link's target or `#anchor` does not resolve; it must name `CLAUDE.md:<line>` for any violation.
 - **SPEC-10.184** `check-build-target-storage.nu` must resolve cargo's target directory in cargo's own precedence (`CARGO_TARGET_DIR`, then `CARGO_BUILD_TARGET_DIR`, then `build.target-dir` in the repo's `.cargo/config.toml`, then in `~/.cargo/config.toml`, then `<repo>/target`), determine its filesystem type via `stat --file-system --format=%T`, and exit 1 when that type is `tmpfs` or `ramfs` unless `MOKOSH_ALLOW_TMPFS_TARGET` is `1`/`true`/`yes`.
@@ -7755,8 +7763,8 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   before any parsed content is acted on.
 - **SPEC-13.760**: A `PaymentSucceeded` event whose tenant differs from the tenant in the URL must be rejected with
   `Unauthorized` (recorded as `refused`); otherwise it must be recorded as a gateway payment for the URL tenant, with
-  outcome `accepted` when the payment was recorded and `unreconciled` when it was not, and the invoice id recorded in
-  both cases.
+  outcome `accepted` when the payment was recorded, `benign_redelivery` when a prior delivery already recorded it, and
+  `unreconciled` when it was refused, and the invoice id recorded in every case.
 - **SPEC-13.761**: A `Refunded` event must be recorded through the gateway refund path for the URL tenant, and a failure
   there must be returned as an error (recorded `failed`) so the provider retries.
 - **SPEC-13.762**: A `RequiresCapture` event must call the provider's capture for the order id and write no payment
@@ -8154,9 +8162,11 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   and organisation id and no delivery row, and must not stop the remaining events.
 - **SPEC-13.1088**: For an event naming a delegated invoice, the webhook must read the provider's current invoice state
   rather than trust the payload: `paid` with a balance due above zero must record a payment of the whole balance due in
-  the invoice currency keyed by the external invoice id and result in `accepted` when recorded and `unreconciled` when
-  not; `paid` with no balance due, and `open`, must result in `ignored`; `voided` must void the local invoice and result
-  in `accepted`.
+  the invoice currency keyed by the external invoice id and result in `accepted` when recorded, `benign_redelivery` when
+  a prior delivery already recorded it, and `unreconciled` when refused; `paid` with no balance due must result in
+  `benign_redelivery`; `open` must result in `ignored`; `voided` must void the local invoice and result in `accepted`.
+  `benign_redelivery` is a non-alerting outcome: nothing for a human to do, and distinct from `ignored`, which is an
+  event that named nothing Mokosh holds.
 - **SPEC-13.1089**: For an event naming no delegated invoice, the webhook must try a delegated bill of the tenant and
   result in `ignored` when there is none or when the provider does not hold the id as a bill; otherwise it must
   reconcile the provider's paid running total against the bill using today's UTC date and a system audit context,
@@ -8164,7 +8174,7 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
 - **SPEC-13.1090**: When the provider reports a delegated bill voided, the webhook must not void the local bill, must
   log a warn carrying the bill id, and must result in `unreconciled`.
 - **SPEC-13.1091**: After each processed event a delivery row must be recorded for the tenant and provider with outcome
-  `accepted`, `ignored`, `unreconciled` or `failed`; for `failed` the row must carry the error text and the handler must
+  `accepted`, `ignored`, `unreconciled`, `benign_redelivery` or `failed`; for `failed` the row must carry the error text and the handler must
   stop at that event and return its error status (so the provider retries), while a failure to write the row must be
   logged at warn and must not change the response.
 - **SPEC-13.1092**: A delivery whose events all processed without error must answer 200 with an empty body.

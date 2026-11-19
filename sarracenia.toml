@@ -1,16 +1,17 @@
-# Publishes mokosh-server's own docs to the Storefront docs site under /docs/mokosh-server.
+# Publishes mokosh-server's user-facing docs to docs.a8n.systems/docs/mokosh-server.
+# Everything under docs/public/ is the published site; nothing outside it is.
+# docs/ outside public/ (invariants/, dev-docs/, specification.md, ROADMAP.md,
+# architecture.md, providers.md, etc.) is internal engineering material and
+# is NOT published.
 source = "mokosh-server"
 base_path = "/docs/mokosh-server"
-# Workspace-aware: `**/src/**/*.rs` picks up every member under `crates/*/src/`,
-# which sarracenia's default `src/**/*.rs` would miss. The bare `src/**/*.rs`
-# stays listed so an implementation that reads `**/src/**` as "under a nested
-# `src/`" still picks up the root crate.
-include = ["README.md", "src/**/*.rs", "**/src/**/*.rs"]
-exclude = ["CLAUDE.md", "docs/**", "common/**", "tests/**", "**/tests/**", "target/**", "**/target/**", "node_modules/**"]
+title = "Mokosh server"
+include = ["docs/public/**/*.md"]
+exclude = []
 
 [storefront]
 url = "https://docs.a8n.systems"
 site = "docs"
 
 [titles]
-"src" = "Module reference"
+"docs/public/operations" = "Operations"

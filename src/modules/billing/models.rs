@@ -604,7 +604,8 @@ pub struct WebhookDeliveryResponse {
     pub id: Uuid,
     pub provider: String,
     pub received_at: DateTime<Utc>,
-    /// `accepted`, `refused`, `ignored` or `failed`.
+    /// `accepted`, `refused`, `ignored`, `failed`, `unreconciled` or
+    /// `benign_redelivery`.
     pub outcome: String,
     /// The provider's own event type, present only once the delivery verified.
     pub event_type: Option<String>,

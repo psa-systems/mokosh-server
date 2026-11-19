@@ -86,6 +86,6 @@ If a release stalls on one of these again after they are reopened or regress, ch
 
 ## See also
 
-- [`docs/architecture.md`](../architecture.md#releases) - this repo's own release mechanics in more depth (the `common`-shared recipe and workflow, changelog format).
-- [`docs/invariants/ci-release.md`](../invariants/ci-release.md) - branch, runner-label, cache, publish-tag, single-build and migration-version conventions that a release PR is held to.
+- [`docs/architecture.md`](../../architecture.md#releases) - this repo's own release mechanics in more depth (the `common`-shared recipe and workflow, changelog format).
+- [`docs/invariants/ci-release.md`](../../invariants/ci-release.md) - branch, runner-label, cache, publish-tag, single-build and migration-version conventions that a release PR is held to.
 - `docker` repo's `docs/runbooks/deploy.md` (DEV-613) - the generic, non-Mokosh-specific restart/rollback runbook this page does not duplicate.

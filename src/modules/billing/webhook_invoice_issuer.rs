@@ -484,6 +484,9 @@ enum Outcome {
     /// Verified, the invoice is ours, and the money could not be recorded.
     /// A human has to look; the provider retrying will not change it.
     Unreconciled,
+    /// Verified, and a prior delivery already recorded this payment. Nothing
+    /// for a human to do, and not the same as an unrelated event.
+    BenignRedelivery,
 }
 
 impl Outcome {
@@ -492,6 +495,7 @@ impl Outcome {
             Outcome::Accepted => "accepted",
             Outcome::Ignored => "ignored",
             Outcome::Unreconciled => "unreconciled",
+            Outcome::BenignRedelivery => "benign_redelivery",
         }
     }
 }
@@ -610,7 +614,7 @@ async fn apply_one(
                 // being unlucky. There is no money to record, so there is
                 // nothing to do.
                 if local.balance_due <= rust_decimal::Decimal::ZERO {
-                    return Ok(Outcome::Ignored);
+                    return Ok(Outcome::BenignRedelivery);
                 }
                 // The money went to the provider, so Mokosh records what
                 // the provider collected and lets the one writer derive the
@@ -636,14 +640,11 @@ async fn apply_one(
                 outcome = match recorded {
                     GatewayPaymentOutcome::Recorded => Outcome::Accepted,
                     // A prior delivery already recorded it: benign, nothing
-                    // for a human to do. Keeps whatever the batch already has.
-                    GatewayPaymentOutcome::AlreadyRecorded => outcome,
+                    // for a human to do.
+                    GatewayPaymentOutcome::AlreadyRecorded => Outcome::BenignRedelivery,
                     // Refused by a guard: a state a human can read off the
                     // delivery row rather than one to retry.
-                    GatewayPaymentOutcome::Refused if matches!(outcome, Outcome::Ignored) => {
-                        Outcome::Unreconciled
-                    }
-                    GatewayPaymentOutcome::Refused => outcome,
+                    GatewayPaymentOutcome::Refused => Outcome::Unreconciled,
                 };
             }
             ExternalInvoiceState::Voided => {
