@@ -40,6 +40,25 @@ impl ContactLoginLimiter {
         })
     }
 
+    /// Build from `CONTACT_LOGIN_IP_RATE_MAX` / `CONTACT_LOGIN_IP_RATE_WINDOW_SECS`,
+    /// defaulting to 10 attempts per 60 seconds. A malformed, zero or negative
+    /// value is an `Err` naming the key, for the caller to refuse boot on.
+    // SPEC-6.104
+    pub fn from_config() -> Result<Arc<Self>, String> {
+        use crate::config::{self, parse::parse_positive, registry as keys};
+        let max = parse_positive::<u32>(
+            &keys::CONTACT_LOGIN_IP_RATE_MAX,
+            config::get(&keys::CONTACT_LOGIN_IP_RATE_MAX),
+        )?
+        .unwrap_or(10);
+        let window = parse_positive::<u64>(
+            &keys::CONTACT_LOGIN_IP_RATE_WINDOW_SECS,
+            config::get(&keys::CONTACT_LOGIN_IP_RATE_WINDOW_SECS),
+        )?
+        .unwrap_or(60);
+        Ok(Self::new(max, window))
+    }
+
     /// Spend one attempt for `ip`. `Err(retry_after_seconds)` when the budget
     /// for the current window is already spent.
     pub fn check(&self, ip: IpAddr) -> Result<(), u64> {

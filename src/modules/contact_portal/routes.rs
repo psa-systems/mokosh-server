@@ -104,7 +104,8 @@ pub fn contact_routes(
         reauth_limiter: crate::modules::auth::rate_limit::ReauthRateLimiter::new(10, 5),
         payment_methods,
         set_password_limiter: crate::modules::auth::rate_limit::AuthRateLimiter::new(10, 3),
-        login_ip_limiter: super::limiter::ContactLoginLimiter::new(10, 60),
+        login_ip_limiter: super::limiter::ContactLoginLimiter::from_config()
+            .unwrap_or_else(|e| panic!("contact login IP budget invalid: {e}")),
     };
     Router::new()
         // SPEC-5.440

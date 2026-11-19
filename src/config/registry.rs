@@ -363,6 +363,9 @@ declare_keys! {
     // everything while this is unset.
     // SPEC-6.81
     Application OIDC_BACKCHANNEL_CLIENT_ID = "OIDC_BACKCHANNEL_CLIENT_ID", since "v0.15.0", optional;
+    // SPEC-6.104
+    Application CONTACT_LOGIN_IP_RATE_MAX = "CONTACT_LOGIN_IP_RATE_MAX", since "v0.18.0", optional;
+    Application CONTACT_LOGIN_IP_RATE_WINDOW_SECS = "CONTACT_LOGIN_IP_RATE_WINDOW_SECS", since "v0.18.0", optional;
     // SPEC-6.82
     Application ADMIN_EMAIL = "ADMIN_EMAIL", since "v0.1.0", optional;
     Application ADMIN_PASSWORD = "ADMIN_PASSWORD", since "v0.1.0", optional;
