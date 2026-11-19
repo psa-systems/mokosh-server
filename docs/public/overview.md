@@ -29,5 +29,5 @@ Mokosh server is a Professional Services Automation (PSA) platform for managed s
 - [Knowledge base](knowledge-base.md): articles, versions, comments.
 - [Contacts](contacts.md): contact-company mirror, note editing, mail audiences, contact sync.
 - [Integrations](integrations.md): Bunyip, Stripe, PayPal, Xero, QuickBooks, Google and Microsoft 365, Infisical.
-- [Operations](operations/README.md): backups, upgrades, logs, first-run onboarding, delegated invoicing setup, Postgres security, provider migration.
+- [Operations](operations/overview.md): backups, upgrades, logs, first-run onboarding, delegated invoicing setup, Postgres security, provider migration.
 - [Troubleshooting](troubleshooting.md): five concrete failures and their fix.
