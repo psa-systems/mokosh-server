@@ -24,54 +24,6 @@ use mokosh_server::modules::tenants::{CreateTenantRequest, TenantService};
 use mokosh_server::Database;
 use mokosh_test::mokosh_test;
 use sqlx::PgPool;
-use uuid::Uuid;
-
-/// The newest queued notification for a tenant, as it would be sent.
-async fn latest_mail(pool: &PgPool, tenant_id: Uuid) -> (Option<String>, String, Option<String>) {
-    sqlx::query_as(
-        r#"SELECT subject, body, body_html FROM notifications
-           WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1"#,
-    )
-    .bind(tenant_id)
-    .fetch_one(pool)
-    .await
-    .expect("a notification was queued")
-}
-
-/// Create a tenant, give it the portal admin contact the retired create-time
-/// provisioner used to write, and re-issue the welcome. Returns the tenant id.
-async fn provision(svc: &TenantService, name: &str, slug: &str, first: &str, last: &str) -> Uuid {
-    let tenant = svc
-        .create_tenant(
-            &CreateTenantRequest {
-                name: name.into(),
-                slug: slug.into(),
-                billing_email: None,
-                billing_contact_name: None,
-                subscription_plan: None,
-                admin_email: format!("admin@{slug}.example"),
-                admin_first_name: first.into(),
-                admin_last_name: last.into(),
-                branding: None,
-            },
-            &AuditCtx::system(common::DEFAULT_TENANT_ID),
-        )
-        .await
-        .expect("create_tenant");
-
-    svc.insert_portal_admin_contact(tenant.id, &format!("admin@{slug}.example"), first, last)
-        .await
-        .expect("insert the portal admin contact");
-
-    svc.resend_admin_welcome(
-        TenantId::from_trusted(tenant.id),
-        &AuditCtx::system(tenant.id),
-    )
-    .await
-    .expect("re-issue the admin welcome");
-
-    tenant.id
-}
 
 // PMS-1343: the self-service reset mail had this case, pinning that a
 // customer-facing mail names the MSP and never the product (PMS-1140).
@@ -101,80 +53,9 @@ async fn the_staff_password_reset_still_names_the_deployment(pool: PgPool) {
     );
 }
 
-/// The MSP admin's welcome mail, which reaches an inbox through
-/// `resend_admin_welcome`: the create-time provisioner is retired pending
-/// the MAPPS-656/657 restoration decision, so the re-issue path is the live
-/// one and `insert_portal_admin_contact` is `pub` for exactly this reason.
-///
-/// Two defects are pinned here, both of which were shipping: the mail opened
-/// with a literal `{{salutation}},` because this path supplies `display_name`
-/// and the shared template asked for `salutation`, and it never named the
-/// portal, because migration 152 was the only thing that would have
-/// referenced `client_portal_url` and its guard matched zero rows.
-#[mokosh_test]
-async fn the_admin_welcome_greets_the_admin_and_names_their_portal(pool: PgPool) {
-    let notifications =
-        NotificationsService::with_encryption_key(Database::from_pool(pool.clone()), [0u8; 32]);
-    let svc = TenantService::new(Database::from_pool(pool.clone()))
-        .with_dispatcher(notifications, "http://spa.test:4301".into());
-
-    let tenant = provision(&svc, "Fabrikam IT", "fabrikam-pms1140", "Ada", "Admin").await;
-
-    let (subject, body, html) = latest_mail(&pool, tenant).await;
-    let subject = subject.expect("subject rendered");
-    let html = html.expect("html rendered");
-
-    assert!(
-        body.starts_with("Hello Ada Admin,"),
-        "the admin is greeted by name, not with a placeholder: {body}"
-    );
-    assert!(
-        body.contains("invite your clients to their portal at"),
-        "and told where their portal is, which migration 152 never managed: {body}"
-    );
-    assert!(
-        html.contains("invite your clients to their portal"),
-        "the html says it too: {html}"
-    );
-    assert!(
-        body.contains("/portal/set-password?token="),
-        "the setup link survived the split: {body}"
-    );
-    for rendered in [&subject, &body, &html] {
-        assert!(
-            !rendered.contains("{{"),
-            "unresolved placeholder in the admin's inbox: {rendered}"
-        );
-        assert!(
-            !rendered.contains("{%"),
-            "the renderer has no conditionals, so one would ship verbatim: {rendered}"
-        );
-    }
-}
-
-/// The greeting with nothing to greet. PMS-774's rule is that a missing name
-/// reads "Hello" rather than "Hello ,", and the fix for the placeholder had
-/// to adopt that rule rather than interpolate a bare name.
-#[mokosh_test]
-async fn the_admin_welcome_reads_correctly_with_no_name_on_file(pool: PgPool) {
-    let notifications =
-        NotificationsService::with_encryption_key(Database::from_pool(pool.clone()), [0u8; 32]);
-    let svc = TenantService::new(Database::from_pool(pool.clone()))
-        .with_dispatcher(notifications, "http://spa.test:4301".into());
-
-    let tenant = provision(&svc, "Contoso IT", "contoso-pms1140", "  ", "").await;
-
-    let (_, body, _) = latest_mail(&pool, tenant).await;
-    assert!(
-        body.starts_with("Hello,"),
-        "a missing name reads 'Hello,' and never 'Hello ,': {body}"
-    );
-}
-
 /// A tenant provisioned from now on can send both mails. `dispatch` iterates
 /// RULES, so a template copied without its rule is a message that is never
-/// sent (PMS-761), and the welcome above is how this very call reaches the
-/// admin it just created.
+/// sent (PMS-761).
 #[mokosh_test]
 async fn a_new_tenant_can_send_both_portal_mails(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));

@@ -1078,40 +1078,7 @@ pub fn create_api_router(
     // See `CorsOriginMatcher::from_entries` for the parse rules.
     // SPEC-12.11, SPEC-12.12, SPEC-12.13: fixed method/header lists, credentials, 600 s preflight cache.
     // SPEC-12.14: the matcher was parsed once above; no match means no allow-origin header.
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(move |origin, _| {
-            cors_matcher.matches(origin.as_bytes())
-        }))
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::PATCH,
-            Method::OPTIONS,
-        ])
-        .allow_headers([
-            header::AUTHORIZATION,
-            header::CONTENT_TYPE,
-            header::ACCEPT,
-            // PMS-729: the SPA attaches `X-Forwarded-Host` on every
-            // portal-side fetch so the server's host-to-tenant
-            // extractor sees the real `{slug}.client.<apex>` value
-            // even when a dev reverse proxy rewrites Host. Without it
-            // in the CORS preflight allow-list, the browser refuses
-            // the actual credentialed POST (magic-link redeem,
-            // set-password, etc.) with `Request header field
-            // x-forwarded-host is not allowed by
-            // Access-Control-Allow-Headers`, and the SPA reports the
-            // failure as "This link is invalid or has expired" even
-            // though the token never reached the server.
-            axum::http::HeaderName::from_static("x-forwarded-host"),
-        ])
-        .allow_credentials(true)
-        // Cache preflight for 10 minutes per docs/cors.md §5 so browsers do not
-        // re-issue an OPTIONS before every credentialed request (PMS-389).
-        // SPEC-2.64
-        .max_age(std::time::Duration::from_secs(600));
+    let cors = build_cors_layer(cors_matcher);
 
     // PMS-591: Bunyip account-deleted webhook. Nested under `/api/v1/bunyip`
     // OUTSIDE the JWT auth chain: this endpoint authenticates itself via a
@@ -1132,16 +1099,11 @@ pub fn create_api_router(
         pool: db.migrator_pool().clone(),
         webhook_secret: bunyip_webhook_secret,
     });
-    // PMS-998: the OIDC back-channel logout receiver, in the same nest and
-    // outside the auth chain for the same reason the webhooks are: the caller
-    // is the OP and carries no session. What authenticates it is the logout
-    // token's own signature over bunyip's key, verified through the same JWKS
-    // the bearer path uses, so it needs no shared secret. Mounted whether or
-    // not the verifier exists; with no verifier there is nothing to verify
-    // against, and the route answering 404 in that deployment would be
-    // indistinguishable from a typo in bunyip's registered URI.
-    // DEFECT: the comment above claims the receiver is "Mounted whether or not the verifier exists", but `logout_verifier.map(...)` below only builds `Some(router)` when `bunyip_verifier` was `Some`; the `match`
-    // further down (around line 1127) merges it into `bunyip_nest` only in that case, so with no verifier the route is NOT mounted and a request to it 404s exactly as the comment says it would not. Not fixed here; see Defects found.
+    // The OIDC back-channel logout receiver, in the same nest and outside the auth chain for the same reason the
+    // webhooks are: the caller is the OP and carries no session. What authenticates it is the logout token's own
+    // signature over bunyip's key, verified through the same JWKS the bearer path uses, so it needs no shared secret.
+    // Mounted only when the verifier exists: with no verifier there is nothing to verify against, so the route is
+    // absent and answers 404 (SPEC-12.40, SPEC-8.4).
     let backchannel_logout = logout_verifier.map(|verifier| {
         let state = Arc::new(
             crate::modules::auth::backchannel_logout::BackchannelLogoutState {
@@ -1192,8 +1154,6 @@ pub fn create_api_router(
     // the OP's own status codes rather than this API's error envelope: a 400
     // it wraps would still be a delivery failure to bunyip, but the body
     // would claim to be a Mokosh error for a caller that is not a client.
-    // DEFECT: this `match` is the actual mount decision for the back-channel logout route; it merges `logout` only when `backchannel_logout` is `Some`,
-    // contradicting the "mounted whether or not the verifier exists" comment above `logout_verifier.map(...)` (around line 1072). Not fixed here; see Defects found.
     // SPEC-12.40: the logout route is merged after the normaliser layer, and only when a verifier exists.
     let bunyip_nest = match backchannel_logout {
         Some(logout) => bunyip_nest.merge(logout),
@@ -1802,6 +1762,50 @@ async fn version_info() -> Json<VersionInfo> {
     Json(VersionInfo::current())
 }
 
+/// The CORS layer: origin matcher, fixed method and header lists, credentials, exposed response headers.
+fn build_cors_layer(cors_matcher: CorsOriginMatcher) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            cors_matcher.matches(origin.as_bytes())
+        }))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            // PMS-729: the SPA attaches `X-Forwarded-Host` on every
+            // portal-side fetch so the server's host-to-tenant
+            // extractor sees the real `{slug}.client.<apex>` value
+            // even when a dev reverse proxy rewrites Host. Without it
+            // in the CORS preflight allow-list, the browser refuses
+            // the actual credentialed POST (magic-link redeem,
+            // set-password, etc.) with `Request header field
+            // x-forwarded-host is not allowed by
+            // Access-Control-Allow-Headers`, and the SPA reports the
+            // failure as "This link is invalid or has expired" even
+            // though the token never reached the server.
+            axum::http::HeaderName::from_static("x-forwarded-host"),
+        ])
+        // SPEC-12.11: without this a cross-origin browser client cannot read these from a response.
+        .expose_headers([
+            header::RETRY_AFTER,
+            header::WWW_AUTHENTICATE,
+            header::CONTENT_DISPOSITION,
+        ])
+        .allow_credentials(true)
+        // Cache preflight for 10 minutes per docs/cors.md §5 so browsers do not
+        // re-issue an OPTIONS before every credentialed request (PMS-389).
+        // SPEC-2.64
+        .max_age(std::time::Duration::from_secs(600))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2103,5 +2107,38 @@ mod tests {
     #[tokio::test]
     async fn gzip_only_client_still_gets_gzip() {
         assert_eq!(negotiated_encoding("gzip").await, "gzip");
+    }
+
+    /// A cross-origin response exposes the headers the SPA reads, so a
+    /// browser can see `Retry-After`, `WWW-Authenticate` and
+    /// `Content-Disposition`.
+    #[tokio::test]
+    async fn cors_response_exposes_the_documented_headers() {
+        use tower::ServiceExt;
+
+        let matcher = CorsOriginMatcher::from_entries(&["https://app.example.test".to_string()]);
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(build_cors_layer(matcher));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header(header::ORIGIN, "https://app.example.test")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        let exposed = response
+            .headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .expect("expose header present")
+            .to_str()
+            .expect("ascii")
+            .to_ascii_lowercase();
+        for name in ["retry-after", "www-authenticate", "content-disposition"] {
+            assert!(exposed.contains(name), "{name} missing from {exposed}");
+        }
     }
 }

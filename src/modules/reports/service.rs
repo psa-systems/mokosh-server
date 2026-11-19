@@ -31,7 +31,7 @@ impl ReportsService {
         spec: &super::custom::CustomSpec,
     ) -> AppResult<super::custom::CustomReportResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        super::custom::run(&mut *tx, tenant_id, spec).await
+        super::custom::run(&mut tx, tenant_id, spec).await
     }
 
     // PMS-95 dashboard --------------------------------------------------------
@@ -162,25 +162,29 @@ impl ReportsService {
             from.unwrap_or_else(|| today - chrono::Duration::days(30)),
             to.unwrap_or(today),
         );
+        reject_inverted_range(from, to)?;
+        let tz_name = mokosh_types::datetime::canonical_tz_name(user_tz);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let opened: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT ts.name, COUNT(*)::bigint
                FROM tickets t INNER JOIN ticket_statuses ts ON t.status_id = ts.id
-               WHERE t.tenant_id = $1 AND t.created_at::date BETWEEN $2 AND $3
+               WHERE t.tenant_id = $1 AND (t.created_at AT TIME ZONE $4)::date BETWEEN $2 AND $3
                GROUP BY ts.name ORDER BY ts.name"#,
         )
         .bind(tenant_id)
         .bind(from)
         .bind(to)
+        .bind(tz_name)
         .fetch_all(&mut *tx)
         .await?;
         let closed: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*)::bigint FROM tickets
-               WHERE tenant_id = $1 AND closed_at::date BETWEEN $2 AND $3"#,
+               WHERE tenant_id = $1 AND (closed_at AT TIME ZONE $4)::date BETWEEN $2 AND $3"#,
         )
         .bind(tenant_id)
         .bind(from)
         .bind(to)
+        .bind(tz_name)
         .fetch_one(&mut *tx)
         .await?;
         // The name travels with the id here rather than being resolved later
@@ -192,12 +196,14 @@ impl ReportsService {
                       COUNT(*)::bigint
                FROM tickets t
                LEFT JOIN users u ON u.id = t.assigned_to_id
-               WHERE t.tenant_id = $1 AND t.created_at::date BETWEEN $2 AND $3
-               GROUP BY t.assigned_to_id, u.first_name, u.last_name, u.email"#,
+               WHERE t.tenant_id = $1 AND (t.created_at AT TIME ZONE $4)::date BETWEEN $2 AND $3
+               GROUP BY t.assigned_to_id, u.first_name, u.last_name, u.email
+               ORDER BY COUNT(*) DESC, t.assigned_to_id NULLS LAST"#,
         )
         .bind(tenant_id)
         .bind(from)
         .bind(to)
+        .bind(tz_name)
         .fetch_all(&mut *tx)
         .await?;
         // PMS-1491: a `Some` assignee id with no resolved name is a failed
@@ -249,6 +255,7 @@ impl ReportsService {
             from.unwrap_or_else(|| today - chrono::Duration::days(30)),
             to.unwrap_or(today),
         );
+        reject_inverted_range(from, to)?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Joined to `users` for the same reason as the ticket assignee query
         // above: the PDF export names the user rather than printing their id
@@ -290,10 +297,8 @@ impl ReportsService {
             .map(|(id, _, _)| *id)
             .collect();
         crate::utils::unresolved_person::log_unresolved_person_names("reports.time", &unresolved);
-        // PMS-1665 finding: the user branch above logs unresolved ids,
-        // but the work-type branch rendered "Unknown work type" with
-        // no log. Mirror the shape: collect the ids whose name is
-        // None and WARN once (SPEC-15.1584).
+        // Same as the user branch: an unresolved work type is logged, not
+        // only rendered as "Unknown work type" (SPEC-15.1584).
         let unresolved_work_types: Vec<Uuid> = by_work_type
             .iter()
             .filter(|(_, name, _)| name.is_none())
@@ -337,12 +342,8 @@ impl ReportsService {
         company_id: Option<Uuid>,
     ) -> AppResult<BillingReportResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        // PMS-1665 finding: an unknown company_id used to fall through
-        // to WHERE filters that yielded zero totals + empty aging, and
-        // the doc comment below claimed the response "covers every
-        // client". A caller hitting a stale company id (deleted, wrong
-        // tenant) learned the mistake only by reading an empty report.
-        // 404 up front so the operator can tell the two apart.
+        // 404 an unknown company id up front so it is not mistaken for an
+        // empty report.
         if let Some(c) = company_id {
             let exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM companies WHERE tenant_id = $1 AND id = $2)",
@@ -381,13 +382,8 @@ impl ReportsService {
         // PMS-1418: the report's own scope, echoed back so the PDF can
         // state which client it covers rather than staying silent.
         //
-        // PMS-1665 F: the old comment claimed `None` was returned both
-        // for "no company_id given" and for "unknown company_id, so the
-        // totals cover every client". That is no longer true; the
-        // `exists` check at line 354 rejects an unknown id with 404
-        // before this point is reached. Reaching here with `Some(c)`
-        // therefore guarantees the company row exists, so the match
-        // below's `None` arm is strictly the "no company_id given" case.
+        // The `exists` check above 404s an unknown id, so `None` here means
+        // only "no company_id given".
         let company_name: Option<String> = match company_id {
             Some(c) => {
                 sqlx::query_scalar(r#"SELECT name FROM companies WHERE tenant_id = $1 AND id = $2"#)
@@ -412,7 +408,14 @@ impl ReportsService {
                FROM invoices
                WHERE tenant_id = $1 AND balance_due > 0
                  AND ($2::uuid IS NULL OR company_id = $2)
-               GROUP BY bucket"#,
+               GROUP BY bucket
+               ORDER BY MIN(CASE
+                    WHEN due_date >= CURRENT_DATE THEN 0
+                    WHEN CURRENT_DATE - due_date <= 30 THEN 1
+                    WHEN CURRENT_DATE - due_date <= 60 THEN 2
+                    WHEN CURRENT_DATE - due_date <= 90 THEN 3
+                    ELSE 4
+                  END)"#,
         )
         .bind(tenant_id)
         .bind(company_id)
@@ -784,6 +787,18 @@ struct RequestTypeDurationRow {
 }
 
 /// First day of the calendar month containing `today`.
+/// A window whose start is after its end is a client mistake, not an empty
+/// report.
+fn reject_inverted_range(from: NaiveDate, to: NaiveDate) -> AppResult<()> {
+    if from > to {
+        return Err(AppError::validation_field(
+            "from",
+            "must not be later than `to`",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn month_start(today: NaiveDate) -> NaiveDate {
     today.with_day(1).unwrap_or(today)
 }
@@ -818,6 +833,7 @@ impl ReportsService {
             from.unwrap_or_else(|| month_start(today)),
             to.unwrap_or(today),
         );
+        reject_inverted_range(from, to)?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, RequestTypeDurationRow>(
@@ -882,3 +898,20 @@ impl ReportsService {
 /// PMS-1238: the SLA clock runs only while a ticket is unresolved, unclosed
 /// and not in a closed status, the same definition the SLA worker uses.
 const SLA_CLOCK_RUNNING: &str = " AND resolved_at IS NULL AND closed_at IS NULL AND NOT COALESCE((SELECT is_closed FROM ticket_statuses s WHERE s.id = status_id), FALSE)";
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    #[test]
+    fn an_inverted_range_is_refused_and_a_single_day_is_not() {
+        let a = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        let b = NaiveDate::from_ymd_opt(2026, 1, 3).unwrap();
+        assert!(reject_inverted_range(a, b).is_ok());
+        assert!(reject_inverted_range(a, a).is_ok());
+        assert!(matches!(
+            reject_inverted_range(b, a),
+            Err(AppError::Validation { .. })
+        ));
+    }
+}

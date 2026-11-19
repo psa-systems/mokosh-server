@@ -465,7 +465,7 @@ async fn approve_expense(
     Ok(Json(e))
 }
 
-// SPEC-14.78, SPEC-14.79: finance role.
+// SPEC-14.78, SPEC-14.79: finance role; the caller is recorded as the deciding approver.
 async fn reject_expense(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -475,7 +475,7 @@ async fn reject_expense(
 ) -> AppResult<Json<Expense>> {
     let e = state
         .service
-        .reject_expense(user.tenant(), id, &ctx)
+        .reject_expense(user.tenant(), id, user.id, &ctx)
         .await?;
     Ok(Json(e))
 }

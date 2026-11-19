@@ -696,10 +696,10 @@ impl ContactSyncEngine {
         // per chunk, with a SAVEPOINT around each record so a single bad
         // record does not poison the chunk (which would silently fail every
         // later record in the chunk and change `report.failed` from an
-        // accurate count into "chunk size minus one"). A chunk of 100 drops
+        // accurate count into "chunk size minus one"). A chunk of 25 drops
         // the begin/commit cost from one pair per record to one pair per
-        // 100, and a run of 500 records falls from 500 begin+commit pairs
-        // to 5 while every per-record outcome keeps the exact shape it had
+        // 25, and a run of 500 records falls from 500 begin+commit pairs
+        // to 20 while every per-record outcome keeps the exact shape it had
         // before (SAVEPOINT isolation and the error branch below).
         //
         // Checkpoints run between chunks so the long-lived chunk tx does
@@ -1951,8 +1951,15 @@ fn from_snapshot(
             items
                 .iter()
                 .filter_map(|p| {
+                    let Some(number) = p.get("number").and_then(|n| n.as_str()) else {
+                        tracing::warn!(
+                            external_id,
+                            "a stored snapshot phone has no readable number and was dropped"
+                        );
+                        return None;
+                    };
                     Some(super::mapping::MappedPhone {
-                        number: p.get("number")?.as_str()?.to_string(),
+                        number: number.to_string(),
                         phone_type: super::mapping::MappedPhoneType::from_label(
                             p.get("phone_type").and_then(|t| t.as_str()),
                         ),
@@ -1965,6 +1972,12 @@ fn from_snapshot(
                 .collect()
         })
         .unwrap_or_default();
+    if text("first_name").is_none() {
+        tracing::warn!(
+            external_id,
+            "a stored snapshot has no first_name; importing it as '(no name)'"
+        );
+    }
     let mapped = MappedContact {
         first_name: text("first_name").unwrap_or_else(|| "(no name)".to_string()),
         last_name: text("last_name").unwrap_or_default(),

@@ -99,6 +99,28 @@ impl InvoiceIssuerMappingService {
         Self { db }
     }
 
+    /// Takes a transaction-scoped advisory lock for one tenant and provider
+    /// and returns the transaction holding it. Dropping or committing the
+    /// transaction releases it. Serialises the OAuth refresh: providers rotate
+    /// the refresh token on every refresh, so two concurrent refreshes from the
+    /// same old token would fail the loser with `invalid_grant`.
+    pub async fn lock_credential_refresh(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+    ) -> AppResult<crate::db::TenantTransaction<'_>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "invoice-issuer-refresh:{}:{}",
+                *tenant_id,
+                provider.as_str()
+            ))
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
+    }
+
     // SPEC-13.1073
     /// Resolve the external customer id for one Mokosh company. Returns
     /// `None` when no mapping has been set for this `(tenant, provider,
@@ -184,7 +206,7 @@ impl InvoiceIssuerMappingService {
     }
 
     // SPEC-13.1075: returns every provider
-    /// Every vendor mapping this tenant holds for one provider, for the
+    /// Every vendor mapping this tenant holds, across every provider, for the
     /// admin surface that lists vendors beside what they are over there.
     pub async fn list_vendor_mappings(&self, tenant_id: TenantId) -> AppResult<Vec<VendorMapping>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;

@@ -59,14 +59,9 @@ impl RmmSyncWorker {
     /// of connections processed.
     #[tracing::instrument(skip_all)]
     pub async fn run_tick(&self) -> AppResult<u64> {
-        // PMS-1665 finding: `in_progress` used to be the terminal
-        // condition for a process crash mid-sync. Once a connection's
-        // status was `in_progress`, the `WHERE sync_status <>
-        // 'in_progress'` predicate here excluded it from every later
-        // tick forever. Expire a stale claim whose `updated_at` is
-        // older than a generous window (one hour; the longest realistic
-        // sync is minutes), so a crash recovers on the next tick
-        // instead of needing an operator to clear the row.
+        // Expire a stale `in_progress` claim (one hour; a sync takes minutes)
+        // so a crash mid-sync does not exclude the connection from every
+        // later tick forever.
         let _ = sqlx::query(
             r#"UPDATE rmm_connections
                SET sync_status = 'failed',
@@ -413,11 +408,8 @@ impl RmmSyncWorker {
         .map_err(|e| AppError::Database(format!("rmm read asset_type: {e}")))?;
         drop(type_tx);
         let Some(asset_type_id) = asset_type_id else {
-            // PMS-1665 finding: a tenant with no asset types used to
-            // silently leave every synced device unlinked. The sync
-            // tick ran clean but the asset list never grew; an admin
-            // had no trace. WARN with the tenant id + RMM device id
-            // (SPEC-15.1574).
+            // Visible, not silent: otherwise every sync leaves company-mapped
+            // devices unlinked with no trace (SPEC-15.1574).
             tracing::warn!(
                 tenant_id = %tenant_id,
                 rmm_device_id = %d.rmm_device_id,

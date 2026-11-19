@@ -1199,7 +1199,7 @@ async fn custom_report_is_tenant_scoped(pool: PgPool) {
     );
 }
 
-/// PMS-1665: `limit`, `format`, and `from`/`to` on a date-less source each
+/// `limit`, `format`, and `from`/`to` on a date-less source each
 /// used to be silently swallowed - limit clamped to 1..=1000, unknown
 /// format fell through to JSON, from/to on `assets` dropped. All three
 /// now 400 before any SQL runs so the caller sees what their spec asked

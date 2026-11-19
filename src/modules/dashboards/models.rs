@@ -29,12 +29,6 @@ pub struct CreateSavedDashboardRequest {
     pub name: String,
     /// SPA-owned layout blob. Defaults to `{}` so the SPA can create an
     /// empty dashboard first and populate widgets in a follow-up PATCH.
-    ///
-    /// PMS-1665 finding: `#[serde(default)]` on a bare `serde_json::Value`
-    /// deserializes a missing key as `null`, not `{}`, so the stored
-    /// row and the response carried `null` rather than the empty object
-    /// the doc promises (SPEC-15.1638). Use `default_empty_layout` so
-    /// a missing layout lands as `{}`.
     #[serde(default = "default_empty_layout")]
     pub layout: serde_json::Value,
     /// When true, the create handler clears any existing default for

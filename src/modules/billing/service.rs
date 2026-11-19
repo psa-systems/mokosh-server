@@ -1533,11 +1533,10 @@ impl BillingService {
     /// entries are flipped to `billing_status = 'billed'` with their
     /// `invoice_id` set, inside the SAME transaction.
     ///
-    /// Tax is left at 0: the existing `create_invoice` does not apply a
-    /// tax rate automatically (callers pass `tax_amount` explicitly), so
-    /// this path mirrors that and leaves tax to a follow-up edit via
-    /// `update_invoice`. Recurring contract-item billing is out of scope
-    /// (depends on the unmerged PMS-64) and is a follow-up.
+    /// Tax is applied through `apply_tax` over every line (time and mileage
+    /// lines are taxable): the request's `tax_rate_id` when named, else the
+    /// tenant's active default rate, else none. Recurring contract-item
+    /// billing is a separate path, [`Self::generate_due_recurring_invoices`].
     // SPEC-13.22, SPEC-13.27, SPEC-13.28, SPEC-13.30, SPEC-13.31, SPEC-13.32, SPEC-13.33
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_invoice_from_time_entries(
@@ -1934,8 +1933,8 @@ impl BillingService {
     ///
     /// For each `active`, non-`one_time` contract in the tenant that is
     /// due for its current billing period as of `now` and carries at
-    /// least one recurring item (`recurring_service` / `retainer`), this
-    /// creates one draft invoice whose lines mirror those items (name,
+    /// least one billable item (`billing_rule` of `every_period`, or `once`
+    /// and not yet billed), this creates one draft invoice whose lines mirror those items (name,
     /// quantity, unit_price). Idempotency is enforced by the
     /// `contract_invoice_runs` ledger: a row keyed UNIQUE on
     /// `(tenant_id, contract_id, period_start)` is inserted in the SAME
@@ -1952,12 +1951,12 @@ impl BillingService {
     /// non-`active` (draft/expired/cancelled/renewed) contracts,
     /// contracts whose `start_date` is in the future, contracts past
     /// their `end_date` for the computed period, and contracts with no
-    /// recurring items.
+    /// billable items.
     ///
     /// Reuses the same gapless `invoice_sequences` row-lock and
     /// invoice + invoice_lines write path as [`create_invoice`], plus
-    /// the in-transaction audit row. Tax / discount are left at 0,
-    /// matching the other invoice-creation paths.
+    /// the in-transaction audit row. The default tenant tax rate is applied
+    /// through `apply_tax` (no rate is named on this path); discount is 0.
     ///
     /// `now` is injected so tests (and the scheduler) drive periods
     /// deterministically. Returns the ids of invoices actually created
@@ -2821,12 +2820,23 @@ impl BillingService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
-        let affected = sqlx::query("DELETE FROM tax_rates WHERE tenant_id = $1 AND id = $2")
+        let result = sqlx::query("DELETE FROM tax_rates WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
             .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            .await;
+        let affected = match result {
+            Ok(r) => r.rows_affected(),
+            Err(e) => {
+                // An invoice still references this rate (FK 23503): 409, not 500.
+                if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23503") {
+                    return Err(AppError::Conflict(
+                        "Tax rate is referenced by invoices".to_string(),
+                    ));
+                }
+                return Err(e.into());
+            }
+        };
         if affected == 0 {
             return Err(AppError::NotFound("Tax rate".to_string()));
         }
@@ -2957,20 +2967,12 @@ impl BillingService {
                     Vec::new()
                 }
             };
-            // An unknown stored provider would silently relabel as
-            // `stripe`; WARN with the row id so a corrupt or new value
-            // surfaces while the list still renders.
-            let provider = {
-                let parsed = GatewayProvider::from_str(&r.provider);
-                if parsed.is_none() {
-                    tracing::warn!(
-                        gateway_id = %r.id,
-                        stored = %r.provider,
-                        "stored gateway provider is not one of the known values; reading as Stripe"
-                    );
-                }
-                parsed.unwrap_or(GatewayProvider::Stripe)
-            };
+            let provider = parse_stored(
+                GatewayProvider::from_str(&r.provider),
+                "gateway provider",
+                &r.provider,
+                r.id,
+            )?;
             gateways.push(PaymentGatewayConfigResponse {
                 id: r.id,
                 provider,
@@ -4203,7 +4205,7 @@ impl BillingService {
         amount: Decimal,
         currency: &str,
         raw: &serde_json::Value,
-    ) -> AppResult<bool> {
+    ) -> AppResult<GatewayPaymentOutcome> {
         // PMS-1235: the resolved provider decides the recorded method, not a
         // literal that assumed every gateway was Stripe. A provider this
         // build does not recognise as a payment method still needs a value
@@ -4223,7 +4225,7 @@ impl BillingService {
         else {
             // Invoice deleted between checkout and webhook. Nothing to
             // reconcile; report handled so the provider stops retrying.
-            return Ok(false);
+            return Ok(GatewayPaymentOutcome::Refused);
         };
         // PMS-999: the webhook twin of the guard in `create_payment`. It
         // should be unreachable, because `create_invoice_checkout_session`
@@ -4242,7 +4244,7 @@ impl BillingService {
                 provider_id,
                 "gateway payment for an invoice that was never sent; not recording it"
             );
-            return Ok(false);
+            return Ok(GatewayPaymentOutcome::Refused);
         }
 
         // PMS-1468: the webhook twin of `create_payment`'s overpayment guard
@@ -4263,7 +4265,7 @@ impl BillingService {
                 provider_id,
                 "gateway payment exceeds invoice balance due; not recording it"
             );
-            return Ok(false);
+            return Ok(GatewayPaymentOutcome::Refused);
         }
 
         let payment_id = Uuid::new_v4();
@@ -4294,7 +4296,7 @@ impl BillingService {
 
         let Some(payment_id) = inserted else {
             // Already recorded by a prior delivery. Idempotent no-op.
-            return Ok(false);
+            return Ok(GatewayPaymentOutcome::AlreadyRecorded);
         };
 
         Self::recompute_invoice_balance(&mut tx, tenant_id, invoice_id).await?;
@@ -4323,7 +4325,7 @@ impl BillingService {
         .await?;
 
         tx.commit().await?;
-        Ok(true)
+        Ok(GatewayPaymentOutcome::Recorded)
     }
 
     /// PMS-711: record one or more refunds from a verified `charge.refunded`
@@ -4347,15 +4349,15 @@ impl BillingService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // Resolve the payment this charge refers to, and its invoice.
-        let payment: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
-            "SELECT id, invoice_id FROM payments \
+        let payment: Option<(Uuid, Option<Uuid>, Decimal)> = sqlx::query_as(
+            "SELECT id, invoice_id, amount FROM payments \
              WHERE tenant_id = $1 AND gateway_transaction_id = $2",
         )
         .bind(tenant_id)
         .bind(provider_reference)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((payment_id, invoice_id)) = payment else {
+        let Some((payment_id, invoice_id, payment_amount)) = payment else {
             tracing::warn!(
                 target: "mokosh_server.billing",
                 %provider_reference,
@@ -4371,6 +4373,34 @@ impl BillingService {
         }
 
         for refund in refunds {
+            // A refund cannot return more than the payment took: capped to what
+            // remains so amount_paid never goes negative, and logged because the
+            // provider and Mokosh now disagree.
+            let already_refunded: Decimal = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(amount), 0) FROM payment_refunds \
+                 WHERE tenant_id = $1 AND payment_id = $2 AND provider_reference <> $3",
+            )
+            .bind(tenant_id)
+            .bind(payment_id)
+            .bind(&refund.provider_reference)
+            .fetch_one(&mut *tx)
+            .await?;
+            let remaining = (payment_amount - already_refunded).max(Decimal::ZERO);
+            let amount = if refund.amount > remaining {
+                tracing::error!(
+                    %payment_id,
+                    refund_reference = %refund.provider_reference,
+                    refund_amount = %refund.amount,
+                    %remaining,
+                    "gateway refund exceeds what is left of the payment; capping it"
+                );
+                remaining
+            } else {
+                refund.amount
+            };
+            if amount <= Decimal::ZERO {
+                continue;
+            }
             sqlx::query(
                 r#"
                 INSERT INTO payment_refunds (
@@ -4385,7 +4415,7 @@ impl BillingService {
             .bind(tenant_id)
             .bind(payment_id)
             .bind(invoice_id)
-            .bind(refund.amount)
+            .bind(amount)
             .bind(currency)
             .bind(provider_id)
             .bind(&refund.provider_reference)
@@ -4773,7 +4803,20 @@ impl BillingService {
         // one of those columns NULL, a row neither dedicated endpoint could
         // then reach: `is_frozen` blocked this method, and `write_off_invoice`
         // requires `sent` or `partially_paid`.
+        // `paid` and `partially_paid` are derived from payment rows by
+        // `recompute_invoice_balance`, so setting them here would claim money
+        // no payment backs.
         if let Some(status) = request.status {
+            if matches!(status, InvoiceStatus::Paid | InvoiceStatus::PartiallyPaid) {
+                return Err(AppError::validation(
+                    "status cannot be set to paid or partially_paid here",
+                    vec![FieldError::new(
+                        "status",
+                        "paid and partially_paid follow from recorded payments; record a payment instead of setting the status",
+                        "invalid_status_transition",
+                    )],
+                ));
+            }
             if matches!(status, InvoiceStatus::Void | InvoiceStatus::WrittenOff) {
                 return Err(AppError::validation(
                     "status cannot be set to void or written_off here",
@@ -4823,7 +4866,12 @@ impl BillingService {
         let Some((amount_paid, locked_status)) = locked else {
             return Err(AppError::NotFound("Invoice".to_string()));
         };
-        let locked_status = InvoiceStatus::from_str(&locked_status).unwrap_or(InvoiceStatus::Draft);
+        let locked_status = parse_stored(
+            InvoiceStatus::from_str(&locked_status),
+            "invoice status",
+            &locked_status,
+            invoice_id,
+        )?;
         if locked_status.is_frozen() {
             return Err(AppError::Conflict(format!(
                 "Invoice in status '{}' cannot be edited",
@@ -4966,8 +5014,12 @@ impl BillingService {
                         .to_string(),
                 ));
             };
-            let original_status =
-                InvoiceStatus::from_str(&original.status).unwrap_or(InvoiceStatus::Draft);
+            let original_status = parse_stored(
+                InvoiceStatus::from_str(&original.status),
+                "invoice status",
+                &original.status,
+                invoice_id,
+            )?;
             if !matches!(original_status, InvoiceStatus::Sent)
                 || original.amount_paid > Decimal::ZERO
                 || original.amount_credited > Decimal::ZERO
@@ -5538,9 +5590,11 @@ impl BillingService {
         let to_name = Self::assert_company_in_tenant(&mut *tx, tenant_id, to).await?;
         // The company it is on now: present by construction, so a missing row
         // is a deleted company rather than a bad request.
-        let from_name = Self::assert_company_in_tenant(&mut *tx, tenant_id, from)
-            .await
-            .unwrap_or_else(|_| "its current company".to_string());
+        let from_name = match Self::assert_company_in_tenant(&mut *tx, tenant_id, from).await {
+            Ok(name) => name,
+            Err(AppError::Validation { .. }) => "its current company".to_string(),
+            Err(e) => return Err(e),
+        };
 
         #[derive(sqlx::FromRow)]
         struct Holds {
@@ -6372,7 +6426,12 @@ impl BillingService {
         let Some((invoice_number, status, balance_due)) = row else {
             return Err(AppError::NotFound("Invoice".to_string()));
         };
-        let status = InvoiceStatus::from_str(&status).unwrap_or(InvoiceStatus::Draft);
+        let status = parse_stored(
+            InvoiceStatus::from_str(&status),
+            "invoice status",
+            &status,
+            invoice_id,
+        )?;
         if !matches!(status, InvoiceStatus::Sent | InvoiceStatus::PartiallyPaid) {
             return Err(AppError::Conflict(format!(
                 "Invoice {invoice_number} cannot be written off in status '{}'",
@@ -6491,7 +6550,12 @@ impl BillingService {
         let Some((number, status, paid, credited, company_id, payment_term_id)) = original else {
             return Err(AppError::NotFound("Invoice".to_string()));
         };
-        let status = InvoiceStatus::from_str(&status).unwrap_or(InvoiceStatus::Draft);
+        let status = parse_stored(
+            InvoiceStatus::from_str(&status),
+            "invoice status",
+            &status,
+            invoice_id,
+        )?;
 
         // PMS-977's rule for every refusal on this surface: say what to do
         // instead, because "cannot be amended" leaves the operator guessing.
@@ -6679,7 +6743,12 @@ impl BillingService {
         let Some((invoice_number, status)) = row else {
             return Err(AppError::NotFound("Invoice".to_string()));
         };
-        let status = InvoiceStatus::from_str(&status).unwrap_or(InvoiceStatus::Draft);
+        let status = parse_stored(
+            InvoiceStatus::from_str(&status),
+            "invoice status",
+            &status,
+            invoice_id,
+        )?;
         if !matches!(status, InvoiceStatus::Draft | InvoiceStatus::Pending) {
             return Err(AppError::Conflict(format!(
                 "Invoice {invoice_number} cannot be voided in status '{}': the customer already \
@@ -6810,11 +6879,20 @@ impl BillingService {
         .bind(invoice_id)
         .fetch_optional(&mut **tx)
         .await?
-        .map(|(id, invoice_number, status)| AmendmentRef {
-            id,
-            invoice_number,
-            status: InvoiceStatus::from_str(&status).unwrap_or(InvoiceStatus::Draft),
-        });
+        .map(|(id, invoice_number, status)| {
+            parse_stored(
+                InvoiceStatus::from_str(&status),
+                "invoice status",
+                &status,
+                id,
+            )
+            .map(|status| AmendmentRef {
+                id,
+                invoice_number,
+                status,
+            })
+        })
+        .transpose()?;
         // PMS-1037: overdue is the tenant's day, not the reader's clock.
         let zone = read_tenant_zone(tx, tenant_id).await?;
         resp.mark_overdue(mokosh_types::datetime::user_local_date(Utc::now(), &zone));
@@ -7006,8 +7084,16 @@ impl BillingService {
         tenant_id: TenantId,
         id: Uuid,
         request: &UpsertPaymentTermRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<PaymentTermResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM payment_terms t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         if request.is_default {
             sqlx::query("UPDATE payment_terms SET is_default = FALSE, updated_at = NOW() WHERE tenant_id = $1 AND is_default = TRUE AND id <> $2")
                 .bind(tenant_id)
@@ -7034,14 +7120,44 @@ impl BillingService {
         let Some(row) = row else {
             return Err(AppError::NotFound("Payment term".to_string()));
         };
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM payment_terms t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "payment_terms",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
         tx.commit().await?;
         Ok(row.into())
     }
 
     // SPEC-13.59
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_payment_term(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+    pub async fn delete_payment_term(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM payment_terms t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let result = sqlx::query("DELETE FROM payment_terms WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -7063,6 +7179,17 @@ impl BillingService {
         if affected == 0 {
             return Err(AppError::NotFound("Payment term".to_string()));
         }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "payment_terms",
+            Some(id),
+            before,
+            None,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -7141,7 +7268,12 @@ impl BillingService {
         // A draft or pending invoice has no correction problem: it can still be
         // edited, and crediting one would leave a document correcting something
         // the customer was never sent.
-        let status = InvoiceStatus::from_str(&invoice.status).unwrap_or(InvoiceStatus::Draft);
+        let status = parse_stored(
+            InvoiceStatus::from_str(&invoice.status),
+            "invoice status",
+            &invoice.status,
+            invoice_id,
+        )?;
         if !status.is_frozen() {
             return Err(AppError::BadRequest(format!(
                 "Invoice in status '{}' can still be edited, so it does not need a credit note",
@@ -8777,6 +8909,56 @@ struct TaxRateRow {
     is_active: bool,
 }
 
+/// What `record_gateway_payment` did, so a webhook can tell an idempotent
+/// redelivery from a payment it refused (SPEC-13.71).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayPaymentOutcome {
+    /// A new payment row was written.
+    Recorded,
+    /// A prior delivery already recorded this provider reference.
+    AlreadyRecorded,
+    /// Not recorded: the invoice is gone, was never sent, or the amount
+    /// exceeds what is owed. A human has to look.
+    Refused,
+}
+
+/// Reads a stored enum value that must parse, naming the value and the row so
+/// an unreadable one is a loud error rather than a legitimate-looking default
+/// (SPEC-13.17).
+fn parse_stored<T>(
+    parsed: Option<T>,
+    kind: &str,
+    stored: &str,
+    row_id: impl std::fmt::Display,
+) -> AppResult<T> {
+    parsed.ok_or_else(|| {
+        tracing::error!(row_id = %row_id, stored = %stored, "stored {kind} is not a known value");
+        AppError::Internal(format!(
+            "stored {kind} '{stored}' on row {row_id} is not a known value"
+        ))
+    })
+}
+
+/// Infallible-conversion twin of [`parse_stored`] for `From<Row>` impls that
+/// cannot return an error: keeps the conservative fallback but logs at error
+/// level with the row id so a bad row is findable.
+fn read_stored_or<T>(
+    parsed: Option<T>,
+    fallback: T,
+    kind: &str,
+    stored: &str,
+    row_id: impl std::fmt::Display,
+) -> T {
+    parsed.unwrap_or_else(|| {
+        tracing::error!(
+            row_id = %row_id,
+            stored = %stored,
+            "stored {kind} is not a known value; reading it as the fallback"
+        );
+        fallback
+    })
+}
+
 impl From<TaxRateRow> for TaxRateResponse {
     fn from(r: TaxRateRow) -> Self {
         Self {
@@ -8829,8 +9011,13 @@ impl From<PaymentRow> for PaymentResponse {
             company_name: None,
             payment_date: r.payment_date,
             amount: r.amount,
-            payment_method: PaymentMethod::from_str(&r.payment_method)
-                .unwrap_or(PaymentMethod::Other),
+            payment_method: read_stored_or(
+                PaymentMethod::from_str(&r.payment_method),
+                PaymentMethod::Other,
+                "payment method",
+                &r.payment_method,
+                r.id,
+            ),
             reference_number: r.reference_number,
             gateway_transaction_id: r.gateway_transaction_id,
             notes: r.notes,
@@ -8860,7 +9047,13 @@ impl From<InvoiceLineRow> for InvoiceLineResponse {
         Self {
             is_taxable: r.is_taxable,
             id: r.id,
-            line_type: InvoiceLineType::from_str(&r.line_type).unwrap_or(InvoiceLineType::Service),
+            line_type: read_stored_or(
+                InvoiceLineType::from_str(&r.line_type),
+                InvoiceLineType::Service,
+                "invoice line type",
+                &r.line_type,
+                r.id,
+            ),
             description: r.description,
             quantity: r.quantity,
             unit_price: r.unit_price,
@@ -8944,7 +9137,13 @@ impl From<InvoiceRow> for InvoiceResponse {
             // rather than once per row.
             billing_contact_name: None,
             contract_id: r.contract_id,
-            status: InvoiceStatus::from_str(&r.status).unwrap_or(InvoiceStatus::Draft),
+            status: read_stored_or(
+                InvoiceStatus::from_str(&r.status),
+                InvoiceStatus::Draft,
+                "invoice status",
+                &r.status,
+                r.id,
+            ),
             invoice_date: r.invoice_date,
             due_date: r.due_date,
             payment_terms: r.payment_terms,
@@ -9345,7 +9544,13 @@ impl From<CreditNoteRow> for CreditNoteResponse {
             // An unrecognised value can only come from a row this build did not
             // write, and reading it as `Issued` would count it against an
             // invoice. `Void` is the reading that cannot overstate a credit.
-            status: CreditNoteStatus::from_str(&r.status).unwrap_or(CreditNoteStatus::Void),
+            status: read_stored_or(
+                CreditNoteStatus::from_str(&r.status),
+                CreditNoteStatus::Void,
+                "credit note status",
+                &r.status,
+                r.id,
+            ),
             issue_date: r.issue_date,
             reason: r.reason,
             subtotal: r.subtotal,
@@ -9382,7 +9587,13 @@ impl From<CreditNoteLineRow> for CreditNoteLineResponse {
     fn from(r: CreditNoteLineRow) -> Self {
         Self {
             id: r.id,
-            line_type: InvoiceLineType::from_str(&r.line_type).unwrap_or(InvoiceLineType::Service),
+            line_type: read_stored_or(
+                InvoiceLineType::from_str(&r.line_type),
+                InvoiceLineType::Service,
+                "invoice line type",
+                &r.line_type,
+                r.id,
+            ),
             product_id: r.product_id,
             description: r.description,
             quantity: r.quantity,
@@ -9413,7 +9624,13 @@ impl From<StatementInvoiceRow> for StatementInvoiceLine {
             invoice_number: r.invoice_number,
             invoice_date: r.invoice_date,
             due_date: r.due_date,
-            status: InvoiceStatus::from_str(&r.status).unwrap_or(InvoiceStatus::Draft),
+            status: read_stored_or(
+                InvoiceStatus::from_str(&r.status),
+                InvoiceStatus::Draft,
+                "invoice status",
+                &r.status,
+                r.id,
+            ),
             total: r.total,
         }
     }
@@ -9436,8 +9653,13 @@ impl From<StatementPaymentRow> for StatementPaymentLine {
             payment_id: r.id,
             payment_date: r.payment_date,
             amount: r.amount,
-            payment_method: PaymentMethod::from_str(&r.payment_method)
-                .unwrap_or(PaymentMethod::Other),
+            payment_method: read_stored_or(
+                PaymentMethod::from_str(&r.payment_method),
+                PaymentMethod::Other,
+                "payment method",
+                &r.payment_method,
+                r.id,
+            ),
             reference_number: r.reference_number,
             invoice_number: r.invoice_number,
         }

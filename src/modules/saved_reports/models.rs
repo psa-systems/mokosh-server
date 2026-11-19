@@ -54,12 +54,24 @@ pub struct CreateSavedReportRequest {
 pub struct UpdateSavedReportRequest {
     #[validate(length(min = 1, max = 200))]
     pub name: Option<String>,
-    pub description: Option<String>,
+    /// Absent leaves the description alone; an explicit `null` clears it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub description: Option<Option<String>>,
     pub filters: Option<serde_json::Value>,
     pub columns: Option<serde_json::Value>,
     pub group_by: Option<serde_json::Value>,
     pub sort: Option<serde_json::Value>,
     pub is_shared: Option<bool>,
+}
+
+/// `Some(None)` for an explicit JSON `null`, `Some(Some(v))` for a value; an
+/// absent key stays `None` via `#[serde(default)]`.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
 }
 
 fn default_empty_object() -> serde_json::Value {
@@ -95,9 +107,9 @@ pub struct ScheduledReportResponse {
 // SPEC-15.1624
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateScheduledReportRequest {
-    /// Standard cron expression. Validated with
-    /// `utils::validation::validate_cron` (cron crate, 6-field form
-    /// with seconds).
+    /// Six-field cron expression with a leading seconds field (cron crate);
+    /// a 5-field expression fails validation. Checked by
+    /// `utils::validation::validate_cron`.
     #[validate(length(min = 1, max = 100), custom(function = crate::utils::validation::validate_cron))]
     pub cron_expr: String,
     /// Override the owning user's email as the delivery target.

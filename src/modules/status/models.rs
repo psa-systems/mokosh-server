@@ -107,7 +107,7 @@ pub struct BackupSuccessRateResponse {
 /// Result of the uptime aggregate. Same "carry the raw counts too"
 /// shape as the backup rate. The definition of "up" is documented at
 /// the service method: currently the fraction of observations whose
-/// outcome was not `failure`.
+/// outcome is `success` or `warning`; `failure` and `unknown` are not up.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UptimeResponse {
     pub company_id: Uuid,

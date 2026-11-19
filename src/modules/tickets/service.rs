@@ -2496,6 +2496,7 @@ impl TicketService {
         description: Option<String>,
         priority_id: Option<Uuid>,
         type_id: Option<Uuid>,
+        asset_id: Option<Uuid>,
     ) -> AppResult<TicketResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let default_creator: Option<Uuid> = sqlx::query_scalar(
@@ -2524,6 +2525,7 @@ impl TicketService {
             description,
             priority_id,
             type_id,
+            asset_id,
             source: TicketSource::Portal,
             company_id,
             contact_id: Some(contact_id),

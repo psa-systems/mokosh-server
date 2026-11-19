@@ -27,7 +27,6 @@ use crate::modules::contact_portal::capabilities as caps;
 use crate::utils::error::{rate_limited_response, AppError, AppResult};
 
 const REFRESH_COOKIE_NAME: &str = "mokosh:contact_token";
-const REFRESH_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60; // 30 days
 
 #[derive(Clone)]
 pub struct ContactRouterState {
@@ -242,10 +241,7 @@ async fn login(
             Some(addr.ip()),
         )
         .await?;
-    Ok(with_refresh_cookie(
-        &resp,
-        Json(resp.clone()).into_response(),
-    ))
+    Ok(Json(resp).into_response())
 }
 
 // SPEC-5.450, SPEC-5.454
@@ -264,10 +260,7 @@ async fn refresh(
         .service
         .refresh(&request.refresh_token, ua.as_deref(), Some(addr.ip()))
         .await?;
-    Ok(with_refresh_cookie(
-        &resp,
-        Json(resp.clone()).into_response(),
-    ))
+    Ok(Json(resp).into_response())
 }
 
 // SPEC-5.455
@@ -393,18 +386,7 @@ async fn redeem_login_link(
             Some(addr.ip()),
         )
         .await?;
-    // Attach the refresh cookie only on the auto-mint path where a
-    // real session was minted (mfa_required = false + tokens set).
-    let cookie = outcome
-        .auto
-        .as_ref()
-        .filter(|r| !r.mfa_required && !r.refresh_token.is_empty())
-        .map(|r| build_refresh_cookie(&r.refresh_token));
-    let mut resp = Json(outcome).into_response();
-    if let Some(c) = cookie {
-        add_cookie(resp.headers_mut(), &c);
-    }
-    Ok(resp)
+    Ok(Json(outcome).into_response())
 }
 
 // MAPPS-637: `select_login_candidate` handler retired alongside the
@@ -761,29 +743,9 @@ async fn resolve_slug_to_portal_id(
 // COOKIE HELPERS
 // ============================================================================
 
-/// mokosh-contact-login prompt 004: attach a `mokosh:contact_token`
-/// cookie carrying the refresh token to a login / refresh response,
-/// so the SPA can survive a hard-refresh cold-load (learns from
-/// MAPPS-564 pain).
-///
-/// HttpOnly = JS cannot read it (XSS-resistant). Secure = TLS-only
-/// (dev over http will still function because most browsers relax
-/// Secure on localhost; production always has TLS). SameSite=Lax =
-/// cross-site GET/POST cannot forge it. Path scoped so the cookie
-/// only travels on `/api/v1/contact/auth/*` where the refresh
-/// endpoint lives.
-fn with_refresh_cookie(resp: &ContactLoginResponse, mut into: Response) -> Response {
-    add_cookie(
-        into.headers_mut(),
-        &build_refresh_cookie(&resp.refresh_token),
-    );
-    into
-}
-
-fn build_refresh_cookie(refresh_token: &str) -> String {
-    build_refresh_cookie_with_domain(refresh_token, portal_cookie_domain().as_deref())
-}
-
+/// The portal no longer sets `mokosh:contact_token`: the SPA keeps its
+/// refresh token itself and nothing read the cookie. Logout still clears it
+/// so a browser holding one from an earlier release drops it.
 fn clear_refresh_cookie() -> String {
     build_clear_cookie_with_domain(portal_cookie_domain().as_deref())
 }
@@ -795,23 +757,6 @@ fn portal_cookie_domain() -> Option<String> {
     crate::config::get(&crate::config::registry::PORTAL_COOKIE_DOMAIN)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-}
-
-/// Pure cookie-builder; `domain` is the `Domain=` attribute to append (or
-/// `None` to omit it). Split out of `build_refresh_cookie` so unit tests can
-/// pin the attribute shape without initialising the config stack.
-// SPEC-5.449
-fn build_refresh_cookie_with_domain(refresh_token: &str, domain: Option<&str>) -> String {
-    let base = format!(
-        "{name}={value}; HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth; Max-Age={max_age}",
-        name = REFRESH_COOKIE_NAME,
-        value = refresh_token,
-        max_age = REFRESH_COOKIE_MAX_AGE_SECS,
-    );
-    match domain {
-        Some(d) if !d.is_empty() => format!("{base}; Domain={d}"),
-        _ => base,
-    }
 }
 
 /// Pure clear-cookie builder; shape mirrors `build_refresh_cookie_with_domain`
@@ -975,44 +920,13 @@ async fn set_default_payment_method(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_clear_cookie_with_domain, build_refresh_cookie_with_domain};
+    use super::build_clear_cookie_with_domain;
 
-    /// Without a Domain the cookie stays host-scoped (dev / same-origin
-    /// deployments). The attribute set stays HttpOnly;Secure;SameSite=Lax so
-    /// a dependency compromise on the SPA cannot read the token out, and the
-    /// Max-Age matches the refresh-token lifetime (30 days).
-    #[test]
-    fn refresh_cookie_has_no_domain_when_config_unset() {
-        let cookie = build_refresh_cookie_with_domain("tok-abc", None);
-        assert!(cookie.starts_with("mokosh:contact_token=tok-abc; "));
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("Secure"));
-        assert!(cookie.contains("SameSite=Lax"));
-        assert!(cookie.contains("Path=/api/v1/contact/auth"));
-        assert!(cookie.contains("Max-Age=2592000"));
-        assert!(
-            !cookie.contains("Domain="),
-            "no Domain attribute when PORTAL_COOKIE_DOMAIN unset: {cookie}"
-        );
-    }
-
-    /// With `PORTAL_COOKIE_DOMAIN=.a8n.run` the cookie carries `Domain=.a8n.run`
-    /// so the SPA on `tenant-*.a8n.run` sends it to the API host on the same
-    /// apex. Browsers require this attribute to cross a subdomain boundary.
-    #[test]
-    fn refresh_cookie_appends_domain_when_set() {
-        let cookie = build_refresh_cookie_with_domain("tok-abc", Some(".a8n.run"));
-        assert!(
-            cookie.contains("; Domain=.a8n.run"),
-            "Domain=.a8n.run appended: {cookie}"
-        );
-    }
-
-    /// The clear-cookie shape must match the set-cookie's attributes
+    /// The clear cookie must keep the attributes an earlier release set
     /// (Path and Domain in particular), or the browser treats the clear as a
-    /// different cookie and the stored one lingers until Max-Age expires.
+    /// different cookie and the stored one lingers until its Max-Age expires.
     #[test]
-    fn clear_cookie_mirrors_the_set_shape() {
+    fn clear_cookie_matches_the_legacy_cookie_shape() {
         let cleared = build_clear_cookie_with_domain(Some(".a8n.run"));
         assert!(cleared.contains("mokosh:contact_token=;"));
         assert!(cleared.contains("Path=/api/v1/contact/auth"));
@@ -1021,11 +935,10 @@ mod tests {
     }
 
     /// An empty Domain string reads the same as unset: a bare `Domain=` would
-    /// render as a syntactic cookie attribute with no value, which some
-    /// browsers reject and others treat as host-scoped. Fall back cleanly.
+    /// render as a cookie attribute with no value.
     #[test]
     fn empty_domain_is_treated_as_unset() {
-        let cookie = build_refresh_cookie_with_domain("tok", Some(""));
-        assert!(!cookie.contains("Domain="));
+        let cleared = build_clear_cookie_with_domain(Some(""));
+        assert!(!cleared.contains("Domain="));
     }
 }

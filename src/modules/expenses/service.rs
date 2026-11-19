@@ -31,6 +31,11 @@ use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult, FieldError};
 use crate::utils::pagination::PaginationParams;
 
+/// ISO 4217 codes are three ASCII letters; `len()` alone counts bytes.
+fn is_iso4217_code(s: &str) -> bool {
+    s.len() == 3 && s.chars().all(|c| c.is_ascii_alphabetic())
+}
+
 fn field_error(field: &str, message: &str) -> AppError {
     AppError::Validation {
         message: message.to_string(),
@@ -38,25 +43,10 @@ fn field_error(field: &str, message: &str) -> AppError {
     }
 }
 
-/// PMS-1662 F16: serialize a snapshot for an audit row, logging the error
-/// if the serialize ever fails rather than writing `null` with no trace.
-///
-/// Every mutation in this module snapshots a row to JSON via
-/// `audit_json("expense_category", &row)`; a single helper
-/// keeps the call sites short and the warn log consistent. Only the
-/// `label` goes into the log so the audit payload itself does not leak.
-fn audit_json<T: Serialize>(label: &str, value: &T) -> Value {
-    match serde_json::to_value(value) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                target = label,
-                error = %e,
-                "expense audit snapshot failed to serialize; writing Null"
-            );
-            Value::Null
-        }
-    }
+/// Serialize a snapshot for an audit row. A failure aborts the mutation so
+/// an audit row never carries a silent `null` in place of the real snapshot.
+fn audit_json<T: Serialize>(value: &T) -> AppResult<Value> {
+    Ok(serde_json::to_value(value)?)
 }
 
 /// Create / update body for a vendor. Name is required and bounded; the
@@ -223,7 +213,7 @@ impl ExpensesService {
         .bind(request.notes.as_deref())
         .fetch_one(&mut *tx)
         .await?;
-        let after: Option<Value> = Some(audit_json("expense_category", &row));
+        let after: Option<Value> = Some(audit_json(&row)?);
         audit_write(
             &mut *tx,
             tenant_id,
@@ -283,7 +273,7 @@ impl ExpensesService {
         .bind(request.notes.as_deref())
         .fetch_one(&mut *tx)
         .await?;
-        let after: Option<Value> = Some(audit_json("expense_category", &row));
+        let after: Option<Value> = Some(audit_json(&row)?);
         audit_write(
             &mut *tx,
             tenant_id,
@@ -681,7 +671,7 @@ impl ExpensesService {
         ctx: &AuditCtx,
     ) -> AppResult<BillWithLines> {
         let currency = request.currency.trim().to_ascii_uppercase();
-        if currency.len() != 3 {
+        if !is_iso4217_code(&currency) {
             return Err(field_error(
                 "currency",
                 "currency is a 3-letter ISO-4217 code",
@@ -794,7 +784,7 @@ impl ExpensesService {
 
         let lines = insert_bill_lines(&mut tx, tenant_id, id, &request.lines).await?;
 
-        let after: Option<Value> = Some(audit_json("bill", &bill));
+        let after: Option<Value> = Some(audit_json(&bill)?);
         audit_write(
             &mut *tx,
             tenant_id,
@@ -882,8 +872,8 @@ impl ExpensesService {
             AuditAction::Update,
             "bills",
             Some(id),
-            Some(audit_json("bill_before", &before)),
-            Some(audit_json("bill_after", &after)),
+            Some(audit_json(&before)?),
+            Some(audit_json(&after)?),
         )
         .await?;
         tx.commit().await?;
@@ -996,7 +986,7 @@ impl ExpensesService {
             "bill_payments",
             Some(payment.id),
             None,
-            Some(audit_json("bill_payment", &payment)),
+            Some(audit_json(&payment)?),
         )
         .await?;
         tx.commit().await?;
@@ -1450,7 +1440,7 @@ impl ExpensesService {
         ctx: &AuditCtx,
     ) -> AppResult<ExpenseWithLines> {
         let currency = request.currency.trim().to_ascii_uppercase();
-        if currency.len() != 3 {
+        if !is_iso4217_code(&currency) {
             return Err(field_error(
                 "currency",
                 "currency is a 3-letter ISO-4217 code",
@@ -1462,6 +1452,15 @@ impl ExpensesService {
         let totals = ExpenseTotals::from_lines(&request.lines);
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM users WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if owner.is_none() {
+            return Err(AppError::NotFound("User".to_string()));
+        }
         let expense: Expense = sqlx::query_as(
             r#"INSERT INTO expenses
                  (id, tenant_id, user_id, incurred_on, currency,
@@ -1493,7 +1492,7 @@ impl ExpensesService {
             "expenses",
             Some(id),
             None,
-            Some(audit_json("expense", &expense)),
+            Some(audit_json(&expense)?),
         )
         .await?;
         tx.commit().await?;
@@ -1543,12 +1542,13 @@ impl ExpensesService {
         .await
     }
 
-    // SPEC-14.79: submitted to rejected.
+    // SPEC-14.79: submitted to rejected, rejecter recorded in approver_id.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, expense_id = %id))]
     pub async fn reject_expense(
         &self,
         tenant_id: TenantId,
         id: Uuid,
+        approver_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<Expense> {
         self.transition_expense(
@@ -1556,7 +1556,7 @@ impl ExpensesService {
             id,
             &["submitted"],
             "rejected",
-            None,
+            Some(approver_id),
             false,
             None,
             ctx,
@@ -1762,8 +1762,8 @@ impl ExpensesService {
             AuditAction::Update,
             "expenses",
             Some(id),
-            Some(audit_json("expense_before", &before)),
-            Some(audit_json("expense_after", &after)),
+            Some(audit_json(&before)?),
+            Some(audit_json(&after)?),
         )
         .await?;
         tx.commit().await?;
@@ -2116,6 +2116,29 @@ impl ExpenseTotals {
     }
 }
 
+/// 404 for a category id that is not this tenant's, so a foreign id cannot
+/// be linked through a line.
+async fn assert_categories_in_tenant(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    category_ids: impl Iterator<Item = Uuid>,
+) -> AppResult<()> {
+    let mut seen = std::collections::HashSet::new();
+    for category_id in category_ids.filter(|id| seen.insert(*id)) {
+        let found: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM expense_categories WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(category_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if found.is_none() {
+            return Err(AppError::NotFound("Expense category".to_string()));
+        }
+    }
+    Ok(())
+}
+
 // SPEC-14.63: stored line total includes tax; position 0 becomes the index.
 async fn insert_bill_lines(
     conn: &mut sqlx::PgConnection,
@@ -2123,6 +2146,12 @@ async fn insert_bill_lines(
     bill_id: Uuid,
     inputs: &[BillLineInput],
 ) -> AppResult<Vec<BillLine>> {
+    assert_categories_in_tenant(
+        &mut *conn,
+        tenant_id,
+        inputs.iter().filter_map(|l| l.category_id),
+    )
+    .await?;
     let mut rows = Vec::with_capacity(inputs.len());
     for (idx, line) in inputs.iter().enumerate() {
         let line_total = line
@@ -2166,6 +2195,12 @@ async fn insert_expense_lines(
     expense_id: Uuid,
     inputs: &[ExpenseLineInput],
 ) -> AppResult<Vec<ExpenseLine>> {
+    assert_categories_in_tenant(
+        &mut *conn,
+        tenant_id,
+        inputs.iter().filter_map(|l| l.category_id),
+    )
+    .await?;
     let mut rows = Vec::with_capacity(inputs.len());
     for (idx, line) in inputs.iter().enumerate() {
         let row: ExpenseLine = sqlx::query_as(
