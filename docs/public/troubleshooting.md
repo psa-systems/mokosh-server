@@ -28,7 +28,7 @@ Five concrete failures operators and admins actually hit, with the underlying ca
 
 - Check the server log. A failed SMTP send logs `warn` with the relay error (DNS, TLS, auth).
 - Verify `SMTP_HOST`, `SMTP_PORT`, credentials and `SMTP_FROM`. Try sending a test mail: a simpler `openssl s_client` or `swaks` from inside the server container fails on the same thing without touching Mokosh.
-- A deployment operator can reach `PUT /api/v1/settings/email` to update credentials without a restart; the live mailer swaps on write. See [first-run onboarding](first-run-onboarding.md).
+- A deployment operator can reach `PUT /api/v1/settings/email` to update credentials without a restart; the live mailer swaps on write. See [first-run onboarding](operations/first-run-onboarding.md).
 - While you fix SMTP, `MAIL_PROVIDER=log` (set on a hot-reload or with a restart) sends mail to the log at `info`, and the operator reads the approval link from the log and gives it to the user. This is a last resort, not a configuration.
 
 Login approval is a security feature. If SMTP is truly down for an extended window, turn `LOGIN_APPROVAL_ENABLED=false` for the duration; every user stops being gated. Re-enable it once mail is back.
