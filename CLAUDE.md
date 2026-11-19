@@ -96,9 +96,9 @@ migrations/             SQLx migrations, embedded at compile time via sqlx::migr
 oci-build/Dockerfile    Production multi-stage Alpine + musl
 Dockerfile              Dev image (debug build, source-mounted)
 compose.dev.yml         Traefik-routed dev stack (per-developer *.a8n.run)
-.forgejo/workflows/     CI (Forgejo); `publish-docs.yml` pushes to docs.a8n.systems on main
-sarracenia.toml         Storefront docs-site push config (README + workspace module docs)
-docs/                   Contributor/user docs; dev-docs/ = internal notes
+.forgejo/workflows/     CI (Forgejo); `publish-docs.yml` pushes docs/public/ to docs.a8n.systems on main
+sarracenia.toml         Storefront push config; narrowed to docs/public/**/*.md only
+docs/                   Internal docs; only docs/public/ is published to docs.a8n.systems
 ```
 
 ### Auth: two independent mechanisms (PMS-295)
@@ -198,7 +198,7 @@ One line per rule, or per group of rules answering one subject, linking its full
 - The Google OAuth client is the host's ([PMS-1430](docs/invariants/config-providers.md#google-client-pms-1340))
 - A one-time correction runs once per boot ([PMS-1320](docs/invariants/config-providers.md#one-shots-pms-1320))
 - Healing one DB role's password never rewrites the other's ([PMS-1469](docs/architecture.md#migration-rules))
-- A feature toggle is a registry entry, off unless a row says otherwise ([PMS-1414](docs/feature-toggles.md))
+- A feature toggle is a registry entry, off unless a row says otherwise ([PMS-1414](docs/public/feature-toggles.md))
 - Every stored object puts its tenant first ([PMS-1318](docs/invariants/config-providers.md#tenant-first-pms-1318))
 - Storage settings are `STORAGE_`-prefixed ([PMS-1317](docs/invariants/config-providers.md#storage-names-pms-1317))
 

@@ -65,7 +65,7 @@ in the 2026-06-12 draft had all moved by the time anyone followed them.
   (wired into `just check`) fails a PR that adds a bare `.pool()` serving call without one.
   In dev and CI without the role split both pools are the same connection, and a superuser or
   `BYPASSRLS` role bypasses RLS unconditionally: role posture, not the policy, is what decides
-  whether the backstop is live. `docs/postgres-security.md` covers the role provisioning.
+  whether the backstop is live. `docs/public/operations/postgres-security.md` covers the role provisioning.
 - **Coverage of the invariant is tested, and the allowlist is where an exemption is decided.**
   `tests/suites/rls_coverage.rs` (PMS-683) introspects the fully-migrated schema and lists every
   `public` table that has a `tenant_id` column but is missing RLS enabled, RLS forced, or a
@@ -194,7 +194,7 @@ plan. Status belongs in YouTrack, not here; follow the issue ids.
    `migrations/038_rls_fail_closed.sql` (PMS-257) for the policy;
    `migrations/094_rls_quotes_backstop.sql` and `095_rls_deferred_tables.sql` (PMS-683) for
    the tables added after the `038` loop ran. The role split is `Database`'s two pools, and
-   the roles themselves are a deployment step (`docs/postgres-security.md`), because roles are
+   the roles themselves are a deployment step (`docs/public/operations/postgres-security.md`), because roles are
    cluster-global and a migration cannot safely create them.
 3. **Cover the no-`tenant_id` tables.** `migrations/041_rls_cover_tenantless_tables.sql`
    (PMS-258) and `migrations/128_rls_tenantless_child_tables.sql` (PMS-874), which also added
