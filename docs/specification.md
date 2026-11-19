@@ -6972,7 +6972,9 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited and balance_due.
 - **SPEC-13.17**: A stored invoice status, invoice line type or payment method that is not a member of its known set
   must not be silently presented or acted on as a different value (draft, service or other): the read, edit, void,
-  write-off, credit or amend must fail with an error naming the offending value and the row.
+  write-off, credit or amend must fail with an error naming the offending value and the row. The same holds for the
+  response layer: converting an invoice, invoice line, payment, credit note, credit note line or statement row into its
+  response fails the read with the row id and value rather than substituting a fallback.
 - **SPEC-13.18**: POST `/invoices` must reject with 422 a body with no lines, a payment_terms longer than 20 characters,
   a currency longer than 3 characters, or a due_date earlier than invoice_date (reported on field due_date as "due_date
   must be on or after invoice_date"); a missing due_date is allowed, and quantity and unit_price may be negative
