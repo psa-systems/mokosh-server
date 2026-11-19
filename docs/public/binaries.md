@@ -13,7 +13,7 @@ The crate builds two binaries, and one of them doubles as an operator CLI.
 
 | Subcommand | Purpose |
 | --- | --- |
-| `bootstrap-infisical` | First-run setup of a fresh Infisical instance. Driven by `just infisical-bootstrap`; see step 7 of [`quickstart.md`](quickstart.md). |
+| `bootstrap-infisical` | First-run setup of a fresh Infisical instance. Driven by `just infisical-bootstrap`; see step 7 of [`quickstart.md`](../quickstart.md). |
 | `qa-seed` | Load the QA walkthrough dataset into the tenant named by `--tenant <uuid>` or `MOKOSH_QA_TENANT_ID`. |
 | `qa-teardown` | Remove that dataset from the same tenant. |
 | `showcase-seed` | Create the richer showcase demo dataset in the tenant named by `--tenant <uuid>` or `MOKOSH_SHOWCASE_TENANT_ID`. |

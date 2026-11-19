@@ -168,7 +168,7 @@ Three issues were filed:
 
 There *was* hidden functionality: `mokosh-bootstrap` dispatches `bootstrap-infisical`,
 `qa-seed`, `qa-teardown`, `dev-seed-portal` and `normalize-company-industries` (see
-[`docs/binaries.md`](binaries.md) for the current set), each wired into `just` recipes. So
+[`docs/public/binaries.md`](../binaries.md) for the current set), each wired into `just` recipes. So
 the binary cannot simply be deleted. The managed-Postgres
 caveats were removed from the issues, since prod always runs Postgres in-container with a
 true superuser available.
