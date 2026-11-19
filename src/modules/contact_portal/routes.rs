@@ -47,6 +47,27 @@ pub struct ContactRouterState {
     /// per-(IP, slug+email) budget that fronted `forgot-password` went with
     /// that endpoint.
     pub set_password_limiter: Arc<crate::modules::auth::rate_limit::AuthRateLimiter>,
+    /// Per-IP budget shared by `POST /auth/login` and
+    /// `POST /auth/login-link/redeem`, spent before any email or token lookup.
+    pub login_ip_limiter: Arc<super::limiter::ContactLoginLimiter>,
+}
+
+/// 429 with the wait when `ip` has spent its login budget. Runs before any
+/// lookup so a refusal says nothing about whether an email exists.
+// SPEC-5.444
+fn login_ip_throttle(
+    state: &ContactRouterState,
+    addr: SocketAddr,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let ip = reauth_client_ip(addr, headers);
+    state.login_ip_limiter.check(ip).err().map(|retry_after| {
+        tracing::info!(%ip, retry_after, "contact login rate limited by IP");
+        rate_limited_response(
+            retry_after,
+            "Too many sign-in attempts, please try again later",
+        )
+    })
 }
 
 /// Layer the `portal_contact_middleware` on a composed `/api/v1/contact/*`
@@ -83,6 +104,8 @@ pub fn contact_routes(
         reauth_limiter: crate::modules::auth::rate_limit::ReauthRateLimiter::new(10, 5),
         payment_methods,
         set_password_limiter: crate::modules::auth::rate_limit::AuthRateLimiter::new(10, 3),
+        login_ip_limiter: super::limiter::ContactLoginLimiter::from_config()
+            .unwrap_or_else(|e| panic!("contact login IP budget invalid: {e}")),
     };
     Router::new()
         // SPEC-5.440
@@ -209,6 +232,9 @@ async fn login(
     Json(request): Json<ContactLoginRequest>,
 ) -> Result<Response, AppError> {
     request.validate()?;
+    if let Some(resp) = login_ip_throttle(&state, addr, &headers) {
+        return Ok(resp);
+    }
     let ua = headers
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())
@@ -372,6 +398,9 @@ async fn redeem_login_link(
     Json(request): Json<ContactRedeemLoginLinkRequest>,
 ) -> Result<Response, AppError> {
     request.validate()?;
+    if let Some(resp) = login_ip_throttle(&state, addr, &headers) {
+        return Ok(resp);
+    }
     let ua = headers
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())

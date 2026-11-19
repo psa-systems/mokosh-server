@@ -3385,8 +3385,11 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
 - **SPEC-5.444**: A wrong password must answer 401 Unauthorized, write audit portal.login_failed, and increment
   portal_failed_login_count, which on reaching 5 or more must set portal_locked_until to 5 minutes ahead; a failure to
   write the counter must be logged at error with tenant_id, contact_id and the error and must not change the 401. The
-  lockout is per contact only: there is no per-IP throttle on POST /auth/login or on the magic-link redeem route, and a
-  login for an unknown email is never counted.
+  lockout is per contact. In addition, POST /auth/login and POST /auth/login-link/redeem must share one per-client-IP
+  budget of CONTACT_LOGIN_IP_RATE_MAX attempts (default 10) per CONTACT_LOGIN_IP_RATE_WINDOW_SECS seconds (default 60),
+  keyed by the trusted-proxy-aware client IP and checked before any email or token lookup, so an unknown email spends it
+  like a known one and a success does not reset it. An attempt past the budget must answer 429 with Retry-After rounded
+  up per SPEC-5.103 and must log at info naming the IP.
 - **SPEC-5.445**: When portal_mfa_enabled is true and neither mfa_code nor recovery_code is non-blank after trimming,
   login with a correct password must answer 200 with mfa_required true, empty access_token and refresh_token, contact
   null, and must create no session.
@@ -4246,6 +4249,8 @@ the value as given.
   exempts private outbound targets" with the number of hosts and networks.
 - **SPEC-6.103**: `STRIPE_API_BASE` (application, since `v0.10.0`) and `PAYPAL_API_BASE` (application, since `v0.14.0`)
   must override the payment API base URL when non-blank (SPEC-13.714, SPEC-13.734).
+- **SPEC-6.104**: `CONTACT_LOGIN_IP_RATE_MAX` and `CONTACT_LOGIN_IP_RATE_WINDOW_SECS` (application, since `v0.18.0`) must
+  default to 10 and 60, be parsed with `parse_positive`, and refuse boot when malformed, zero or negative (SPEC-5.444).
 
 ## 7. Service desk
 
