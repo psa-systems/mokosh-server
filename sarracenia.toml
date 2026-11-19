@@ -12,6 +12,3 @@ exclude = []
 [storefront]
 url = "https://docs.a8n.systems"
 site = "docs"
-
-[titles]
-"docs/public/operations" = "Operations"
