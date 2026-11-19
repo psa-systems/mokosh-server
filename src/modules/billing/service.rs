@@ -10110,3 +10110,193 @@ mod retired_gateway_flag {
         );
     }
 }
+
+#[cfg(test)]
+mod unknown_stored_enum_reads {
+    use super::*;
+
+    fn day() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+    }
+
+    fn expect_internal<T: std::fmt::Debug>(result: AppResult<T>, id: Uuid, value: &str) {
+        match result {
+            Err(AppError::Internal(msg)) => {
+                assert!(msg.contains(&id.to_string()), "row id missing: {msg}");
+                assert!(msg.contains(value), "value missing: {msg}");
+            }
+            other => panic!("expected AppError::Internal, got {other:?}"),
+        }
+    }
+
+    fn invoice_row(id: Uuid, status: &str) -> InvoiceRow {
+        let now = Utc::now();
+        InvoiceRow {
+            id,
+            tenant_id: Uuid::new_v4(),
+            invoice_number: "INV-1".into(),
+            company_id: Uuid::new_v4(),
+            billing_contact_id: None,
+            contract_id: None,
+            status: status.into(),
+            invoice_date: day(),
+            due_date: day(),
+            payment_terms: None,
+            payment_term_id: None,
+            subtotal: Decimal::ZERO,
+            tax_amount: Decimal::ZERO,
+            tax_rate_id: None,
+            tax_rate: None,
+            discount_amount: Decimal::ZERO,
+            total: Decimal::ZERO,
+            amount_paid: Decimal::ZERO,
+            amount_credited: Decimal::ZERO,
+            balance_due: Decimal::ZERO,
+            currency: None,
+            notes: None,
+            po_number: None,
+            sent_at: None,
+            paid_at: None,
+            emailed_at: None,
+            emailed_to: None,
+            written_off_at: None,
+            written_off_by_id: None,
+            write_off_reason: None,
+            write_off_amount: None,
+            voided_at: None,
+            voided_by_id: None,
+            void_reason: None,
+            number_scheme: None,
+            amends_invoice_id: None,
+            created_at: now,
+            updated_at: now,
+            delivery_method: None,
+            delivery_note: None,
+            delivered_by_id: None,
+            external_provider: None,
+            external_invoice_id: None,
+            external_number: None,
+        }
+    }
+
+    #[test]
+    fn invoice_with_unknown_status_fails_the_read() {
+        let id = Uuid::new_v4();
+        expect_internal(
+            InvoiceResponse::try_from(invoice_row(id, "mystery")),
+            id,
+            "mystery",
+        );
+        assert!(InvoiceResponse::try_from(invoice_row(id, "draft")).is_ok());
+    }
+
+    #[test]
+    fn invoice_line_with_unknown_type_fails_the_read() {
+        let id = Uuid::new_v4();
+        let row = |line_type: &str| InvoiceLineRow {
+            id,
+            line_type: line_type.into(),
+            description: String::new(),
+            quantity: Decimal::ONE,
+            unit_price: Decimal::ONE,
+            total: Decimal::ONE,
+            ticket_id: None,
+            project_id: None,
+            sort_order: 0,
+            product_id: None,
+            is_taxable: false,
+        };
+        expect_internal(InvoiceLineResponse::try_from(row("mystery")), id, "mystery");
+        assert!(InvoiceLineResponse::try_from(row("service")).is_ok());
+    }
+
+    #[test]
+    fn payment_with_unknown_method_fails_the_read() {
+        let id = Uuid::new_v4();
+        let row = |method: &str| PaymentRow {
+            id,
+            tenant_id: Uuid::new_v4(),
+            invoice_id: None,
+            company_id: Uuid::new_v4(),
+            payment_date: day(),
+            amount: Decimal::ONE,
+            payment_method: method.into(),
+            reference_number: None,
+            gateway_transaction_id: None,
+            notes: None,
+            created_at: Utc::now(),
+        };
+        expect_internal(PaymentResponse::try_from(row("mystery")), id, "mystery");
+        assert!(PaymentResponse::try_from(row("other")).is_ok());
+    }
+
+    #[test]
+    fn credit_note_with_unknown_status_fails_the_read() {
+        let id = Uuid::new_v4();
+        let row = |status: &str| CreditNoteRow {
+            id,
+            tenant_id: Uuid::new_v4(),
+            credit_note_number: "CN-1".into(),
+            company_id: Uuid::new_v4(),
+            company_name: None,
+            invoice_id: Uuid::new_v4(),
+            invoice_number: None,
+            status: status.into(),
+            issue_date: day(),
+            reason: String::new(),
+            subtotal: Decimal::ZERO,
+            tax_amount: Decimal::ZERO,
+            total: Decimal::ZERO,
+            currency: None,
+            notes: None,
+            created_by_id: None,
+            voided_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            external_provider: None,
+            external_credit_note_id: None,
+            external_number: None,
+        };
+        expect_internal(CreditNoteResponse::try_from(row("mystery")), id, "mystery");
+        assert!(CreditNoteResponse::try_from(row("issued")).is_ok());
+    }
+
+    #[test]
+    fn credit_note_line_with_unknown_type_fails_the_read() {
+        let id = Uuid::new_v4();
+        let row = CreditNoteLineRow {
+            id,
+            line_type: "mystery".into(),
+            product_id: None,
+            description: String::new(),
+            quantity: Decimal::ONE,
+            unit_price: Decimal::ONE,
+            total: Decimal::ONE,
+            sort_order: None,
+        };
+        expect_internal(CreditNoteLineResponse::try_from(row), id, "mystery");
+    }
+
+    #[test]
+    fn statement_rows_with_unknown_values_fail_the_read() {
+        let id = Uuid::new_v4();
+        let invoice = StatementInvoiceRow {
+            id,
+            invoice_number: "INV-1".into(),
+            invoice_date: day(),
+            due_date: day(),
+            status: "mystery".into(),
+            total: Decimal::ZERO,
+        };
+        expect_internal(StatementInvoiceLine::try_from(invoice), id, "mystery");
+        let payment = StatementPaymentRow {
+            id,
+            payment_date: day(),
+            amount: Decimal::ONE,
+            payment_method: "mystery".into(),
+            reference_number: None,
+            invoice_number: None,
+        };
+        expect_internal(StatementPaymentLine::try_from(payment), id, "mystery");
+    }
+}
