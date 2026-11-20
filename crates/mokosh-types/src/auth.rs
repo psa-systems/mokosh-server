@@ -984,6 +984,7 @@ pub struct ApiKeyResponse {
     pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub is_active: bool,
+    pub revoked_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 

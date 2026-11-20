@@ -604,9 +604,11 @@ async fn create_invoice(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
+    scopes: crate::modules::auth::CallerScopes,
     ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateInvoiceRequest>,
 ) -> AppResult<Json<InvoiceResponse>> {
+    scopes.require("invoices:write")?;
     request.validate()?;
     let inv = state
         .service
@@ -698,11 +700,13 @@ async fn invoices_summary(
 async fn list_invoices(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
+    scopes: crate::modules::auth::CallerScopes,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
     Query(mut filter): Query<InvoiceFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<InvoiceResponse>>> {
+    scopes.require("invoices:read")?;
     filter.validate()?;
     let tenant = caller.tenant();
     match &caller {

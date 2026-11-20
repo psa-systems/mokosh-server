@@ -1,4 +1,10 @@
 //! Authentication middleware for Axum
+//!
+//! Scope convention for personal API keys: a route reachable with an API key
+//! must take a [`CallerScopes`] argument and call `require("<resource>:<read|write>")`
+//! before doing work. Session and OIDC callers are not scope-limited, so the
+//! call is a no-op for them. Wired so far: invoices, tickets, users list; every
+//! other route is expected to adopt it as it is touched.
 
 use axum::{
     extract::{Request, State},
@@ -351,7 +357,30 @@ pub async fn auth_middleware(
     let mut principal_rejection: Option<AppError> = None;
     // PMS-769: which bearer outcome the extractors should challenge on.
     let mut outcome = BearerOutcome::Absent;
+    // Set only when a personal API key authenticated this request.
+    let mut api_key_scopes: Option<Vec<String>> = None;
     let auth_state = match bearer(&request) {
+        // A `psa_` bearer is never a JWT, so it skips both JWT paths.
+        Some(token) if token.trim().starts_with("psa_") => {
+            outcome = BearerOutcome::Rejected;
+            match auth_middleware
+                .auth_service
+                .authenticate_api_key(token)
+                .await
+            {
+                Ok((user, scopes)) => {
+                    api_key_scopes = Some(scopes);
+                    let tenant_id = user.tenant_id;
+                    AuthState::authenticated(user.to_current_user(), tenant_id)
+                }
+                Err(AppError::Unauthorized) => AuthState::default(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "api key bearer rejected");
+                    principal_rejection = Some(e);
+                    AuthState::default()
+                }
+            }
+        }
         Some(token) => {
             // A credential was presented; assume it is rejected until a path
             // accepts it (settled after both branches have run).
@@ -571,6 +600,9 @@ pub async fn auth_middleware(
     if auth_state.is_authenticated {
         outcome = BearerOutcome::Accepted;
     }
+    if let (true, Some(scopes)) = (auth_state.is_authenticated, api_key_scopes) {
+        request.extensions_mut().insert(ApiKeyScopes(scopes));
+    }
     request.extensions_mut().insert(auth_state);
     request.extensions_mut().insert(outcome);
 
@@ -639,6 +671,58 @@ fn resolve_tombstone_probe(auth_state: AuthState, sub: Uuid, probe: AppResult<bo
             tracing::warn!(user_id = %sub, error = %e, "tombstone probe failed; treating as not tombstoned");
             auth_state
         }
+    }
+}
+
+/// Scopes of the personal API key that authenticated this request. Absent for
+/// session and OIDC callers, who are not scope-limited.
+#[derive(Clone, Debug)]
+pub struct ApiKeyScopes(pub Vec<String>);
+
+/// Handler-side scope gate. Take it as an argument and call
+/// [`CallerScopes::require`] with the route's `<resource>:<read|write>` scope.
+/// Infallible to extract: authentication is the job of `RequireAuth` and
+/// friends, so an unauthenticated request still answers 401 first.
+#[derive(Clone, Debug)]
+pub struct CallerScopes(Option<Vec<String>>);
+
+impl CallerScopes {
+    /// `Ok` for a session or OIDC caller (no scope limit), or for an API key
+    /// holding `*`, `scope`, or `<resource>:*`. Otherwise 403.
+    pub fn require(&self, scope: &str) -> AppResult<()> {
+        let Some(held) = &self.0 else {
+            return Ok(());
+        };
+        if scope_permits(held, scope) {
+            return Ok(());
+        }
+        tracing::debug!(required = scope, "api key refused: scope not held");
+        Err(AppError::Forbidden(format!(
+            "This API key lacks the '{scope}' scope"
+        )))
+    }
+}
+
+/// Whether `held` covers `needed`: `*`, an exact match, or `<resource>:*`.
+pub fn scope_permits(held: &[String], needed: &str) -> bool {
+    let resource_wildcard = needed.split_once(':').map(|(r, _)| format!("{r}:*"));
+    held.iter()
+        .any(|h| h == "*" || h == needed || resource_wildcard.as_deref() == Some(h.as_str()))
+}
+
+impl<S> axum::extract::FromRequestParts<S> for CallerScopes
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(CallerScopes(
+            parts.extensions.get::<ApiKeyScopes>().map(|s| s.0.clone()),
+        ))
     }
 }
 

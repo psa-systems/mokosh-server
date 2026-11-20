@@ -2443,9 +2443,17 @@ model and migrations", which carries the authoritative SPEC-9.n requirements for
   snapshot, and return the raw key in the response exactly once.
 - **SPEC-5.92**: `list_api_keys(tenant_id, user_id, pagination)` must run under tenant GUC and must exclude the
   `key_hash` column from its row type and response.
-- **SPEC-5.93**: `revoke_api_key(tenant_id, user_id, key_id)` must DELETE the row matched by
-  `(id = $key_id AND tenant_id = $tenant_id AND user_id = $user_id)` and must return `NotFound("API key")` when
-  zero rows were affected.
+- **SPEC-5.93**: `revoke_api_key(tenant_id, user_id, key_id)` must soft-revoke the row matched by
+  `(id = $key_id AND tenant_id = $tenant_id AND user_id = $user_id)` (set `revoked_at`, keep the first timestamp on
+  a repeat, clear `is_active`) and must return `NotFound("API key")` when zero rows were affected.
+- **SPEC-5.572**: A `psa_` bearer must be authenticated by `authenticate_api_key`, never as a JWT. A bearer that is not
+  `psa_` plus exactly 40 ASCII alphanumerics must be refused with `Unauthorized` before any database read or hash
+  comparison. A key whose hash matches but whose `revoked_at` is set, `is_active` is false or `expires_at` has passed
+  must be refused with the same `Unauthorized`. A successful authentication must stamp `last_used_at` without blocking
+  the request.
+- **SPEC-5.573**: A route that must be limited by API-key scope must call `CallerScopes::require(scope)`. A key holding
+  `*`, the exact scope, or `<resource>:*` passes; any other key must be refused with `403 Forbidden`, not 401. A
+  session or OIDC caller carries no scope limit.
 
 ### 5.13 Identity-first login path
 

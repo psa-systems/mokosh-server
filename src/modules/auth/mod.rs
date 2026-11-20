@@ -82,7 +82,7 @@ pub mod tenant;
 pub use caller_context::{load_contact_capabilities, CallerContext, RequireCallerContext};
 #[cfg(feature = "server")]
 pub use middleware::{
-    AdminRoles, AuthMiddleware, FinanceRoles, ManagerRoles, ModuleGate, RequireAdmin,
+    AdminRoles, AuthMiddleware, CallerScopes, FinanceRoles, ManagerRoles, ModuleGate, RequireAdmin,
     RequireAdminUser, RequireAssets, RequireAuth, RequireAuthState, RequireBilling,
     RequireCalendar, RequireContracts, RequireFinance, RequireKnowledgeBase, RequireManager,
     RequireModuleEnabled, RequireProjects, RequireReports, RequireRmm, RequireRole,

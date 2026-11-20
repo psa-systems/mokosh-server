@@ -162,10 +162,12 @@ pub fn ticket_routes(
 async fn list_tickets(
     State(state): State<TicketRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
+    scopes: crate::modules::auth::CallerScopes,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     Query(mut filter): Query<TicketFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketResponse>>> {
+    scopes.require("tickets:read")?;
     // F9: validate filter inputs.
     filter.validate()?;
     // mokosh-contact-login prompt 008: contact-plane callers must hold
@@ -197,10 +199,12 @@ async fn list_tickets(
 async fn create_ticket(
     State(state): State<TicketRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
+    scopes: crate::modules::auth::CallerScopes,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateTicketRequest>,
 ) -> AppResult<Json<TicketResponse>> {
+    scopes.require("tickets:write")?;
     request.validate()?;
     let resp = match &caller {
         CallerContext::Staff(auth) => {
