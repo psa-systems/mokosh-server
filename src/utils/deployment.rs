@@ -1001,8 +1001,8 @@ mod tests {
             // module takes a provider NAME rather than a `DeploymentMode`.
             "src/config/guard.rs",
             // PMS-983: `FlagDefault::PerProfile` needs the hosting profile to
-            // resolve `ORGANIZATIONS_ENABLED` at read time. Not a mail gate,
-            // not a duplicated auth decision: the profile IS one input to the
+            // resolve a flag default at read time. Not a mail gate, not a
+            // duplicated auth decision: the profile IS one input to the
             // flag's default.
             "src/config/flags.rs",
             // PMS-981: the authentication provider selection reads the
