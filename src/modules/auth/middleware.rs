@@ -363,7 +363,11 @@ pub async fn auth_middleware(
         // A `psa_` bearer is never a JWT, so it skips both JWT paths.
         Some(token) if token.trim().starts_with("psa_") => {
             outcome = BearerOutcome::Rejected;
-            match auth_middleware.auth_service.authenticate_api_key(token).await {
+            match auth_middleware
+                .auth_service
+                .authenticate_api_key(token)
+                .await
+            {
                 Ok((user, scopes)) => {
                     api_key_scopes = Some(scopes);
                     let tenant_id = user.tenant_id;
