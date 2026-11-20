@@ -1500,7 +1500,7 @@ and are not reused.
   and refuse the URL with `UrlGuardError::Blocked` if any resolved address is non-public per SPEC-4.8 and not covered
   by an allowlisted network; a resolution failure or a resolution to zero addresses must be reported as
   `UrlGuardError::Dns`. The guard is stateless, so a caller that follows redirects must call it again for every
-  hop's URL (the website probe and the automation webhook sender do).
+  hop's URL (the website probe does).
 - **SPEC-4.11**: `PrivateTargetAllowlist::parse` must treat an entry that parses as an IP address or CIDR as a network
   exemption and any other non-blank entry as an exact (case-insensitive) hostname exemption; an empty or all-blank
   input must produce an allowlist that exempts nothing (fail closed). An entry containing `/` that does not parse as a
@@ -4273,8 +4273,8 @@ Requirements for the service desk modules: `src/modules/tickets`, `ticket_templa
 - **SPEC-7.5**: The ticket insert, the audit row and the ticket.created workflow rules (run_ticket_created) run in one
   transaction, so an error in any of them rolls back all three. The ticket number, default lookups and foreign-id checks
   run before it, each in its own transaction.
-- **SPEC-7.6**: After commit and outside any transaction, create runs the on_create automation rules, then SLA
-  evaluation (a failure of either is logged at warn with the ticket id and does not fail the create), then, when SLA
+- **SPEC-7.6**: After commit and outside any transaction, create runs SLA
+  evaluation (a failure is logged at warn with the ticket id and does not fail the create), then, when SLA
   evaluation left sla_due_date NULL and the tenant's default due business days N is above 0, sets sla_due_date to now
   plus N business days. N = 0 disables the fallback.
 - **SPEC-7.7**: update_ticket issues one UPDATE per field present in the request and none for an omitted field (PATCH
@@ -4291,9 +4291,8 @@ Requirements for the service desk modules: `src/modules/tickets`, `ticket_templa
 - **SPEC-7.10**: run_ticket_status_changed fires only when status_id is present and differs from the stored value, and
   run_ticket_priority_changed only when priority_id is present and differs; each runs in the same transaction as the
   field UPDATE, and an error from either rolls the whole update back.
-- **SPEC-7.11**: After commit and outside any transaction, update runs the on_update automation rules (a failure is
-  logged at warn with tenant and ticket id and does not fail the request), then re-evaluates SLA unconditionally (a
-  failure is logged at warn); the response is read after both.
+- **SPEC-7.11**: After commit and outside any transaction, update re-evaluates SLA unconditionally (a
+  failure is logged at warn); the response is read after it.
 - **SPEC-7.12**: Deleting a ticket still referenced by a RESTRICT foreign key (time entries, child tickets, billing
   rows) answers 400 "Cannot delete ticket with related records (time entries, sub-tickets, or billing); remove them
   first" (SQLSTATE 23503) and rolls back, not a 500. An absent ticket answers 404 "Ticket", the delete and its audit row
@@ -4302,8 +4301,7 @@ Requirements for the service desk modules: `src/modules/tickets`, `ticket_templa
   rows are removed only after it commits. A removal failure is logged at warn with tenant and attachment id and does not
   fail the delete.
 - **SPEC-7.14**: assign_ticket requires the assignee to be a user of the tenant (400 "Referenced users not found in this
-  tenant"), then sets assigned_to_id, last_updated_by_id and updated_at. It writes no audit row and runs no automation
-  or SLA evaluation; an unknown ticket answers 404 from the re-read after the update.
+  tenant"), then sets assigned_to_id, last_updated_by_id and updated_at. It writes no audit row and runs no SLA evaluation; an unknown ticket answers 404 from the re-read after the update.
 - **SPEC-7.15**: TicketSlaResponse exposes only sla_due_date/first_response_due/first_response_at/resolution_due/resolved_at/closed_at/status/status_name; no policy id, escalation chain, or calendar is exposed.
 - **SPEC-7.16**: A ticket's SLA status is computed by the shared compute_sla_status helper in mokosh-types, both in the
   TicketResponse mapping (agent and portal list and detail) and in get_ticket_sla, so those views cannot disagree
@@ -4368,28 +4366,7 @@ Requirements for the service desk modules: `src/modules/tickets`, `ticket_templa
   otherwise; an unset tenant setting and a stored value that does not parse both read as AuthorOrAdmin, not as off.
 - **SPEC-7.38**: AuthorOrAdmin permits the author or a super_admin/admin, AuthorOrManager permits the author or anyone
   with can_manage_users (super_admin, admin, manager), Off never permits anyone including the author.
-- **SPEC-7.39**: set_status/set_priority/assign_to/set_queue/add_note run inside the one transaction that process_rules
-  opens for the whole automation run (rule fetch, ticket read and every DB-writing action), which starts after the
-  triggering ticket mutation has committed (PMS-1246). They update the ticket row directly: no audit row, no
-  closed_at/resolved_at handling and no workflow-rule triggers.
-- **SPEC-7.40**: webhook/send_notification are collected as DeferredAction values while that transaction is open and
-  dispatched only after it has committed, with no transaction open (PMS-1379); a dispatch failure is logged at warn and
-  never aborts the remaining actions.
-- **SPEC-7.41**: The outbound URL passes guard_outbound_url (SSRF guard) before the first request and again before
-  following each redirect hop. A refused target is logged at warn with the rule, host and blocked address, and the
-  action is not delivered.
-- **SPEC-7.42**: Redirect-following stops after WEBHOOK_MAX_HOPS (5) hops: the initial request plus 5 redirects are
-  sent, and a further redirect fails with "more than 5 redirects", logged at warn. A 3xx without a usable Location ends
-  the chain and its status is reported.
-- **SPEC-7.43**: An action with a missing or unusable required parameter is skipped without failing the run.
-  send_notification without a non-empty to, webhook without a url or with an unparsable url, add_note in a tenant with
-  no active admin or manager, and an unknown action type are each logged at warn; set_status, set_priority, assign_to
-  and set_queue with a missing or non-UUID id, and add_note without content, are skipped with no log.
-- **SPEC-7.44**: Supported condition operators are exactly equals/not_equals/contains/starts_with/ends_with/is_null/
-  is_not_null over status (name), priority (name), company_id, assigned_to_id, source and is_billable, compared as
-  strings. All conditions of a rule must hold; a rule with no conditions, or whose conditions JSON does not parse,
-  always matches. An unknown operator or field evaluates false without a log, and an unassigned ticket makes every
-  assigned_to_id condition false, is_null included.
+- **SPEC-7.39**: Ticket automation rules are retired: the ticket_automation_rules table is dropped and ticket create and update run no rules (see the PR that removed the engine).
 - **SPEC-7.45**: The attachment size cap is ATTACHMENT_MAX_BYTES, defaulting to DEFAULT_MAX_BYTES (25 MiB), and an
   inline image is capped at INLINE_MAX_BYTES (5 MiB) at most. An upload over the cap answers 413 "{what} exceeds the
   {cap} byte cap."; each upload route's body limit is its cap plus 64 KiB of multipart framing.
@@ -5466,18 +5443,6 @@ Requirements for the service desk modules: `src/modules/tickets`, `ticket_templa
 - **SPEC-7.1108**: A saved view name is trimmed, 1-100 characters and not blank, and unique per user (409 "A saved view
   with that name already exists." on create and rename). Update changes only the supplied name, filter and sort; the
   list is ordered by name ASC; an absent or foreign view answers 404 "Saved view not found.".
-- **SPEC-7.1109**: process_rules loads the tenant's active rules for the trigger ordered by priority ASC, runs every
-  rule whose conditions all match, and increments run_count and sets last_run_at for each rule that ran. A database
-  error aborts the run and is logged at warn by the create or update caller.
-- **SPEC-7.1110**: An add_note action inserts a note of params.note_type (default internal) with params.content,
-  attributed to the tenant's first active admin or manager.
-- **SPEC-7.1111**: A send_notification action needs params.to, defaults the subject to the app name plus " ticket
-  update" and the body to "A ticket you watch has been updated.", and dispatches the ticket.automation.notify template
-  through the notifications queue or, without a dispatcher, sends through the mailer directly; a failure is logged at
-  warn.
-- **SPEC-7.1112**: A webhook action sends to params.url using params.method (default POST, upper-cased; GET and DELETE
-  send no body and an unknown method sends POST) and params.payload (default a JSON object naming tenant, ticket, rule
-  id and rule name) with a 10-second timeout; a non-2xx response is logged at warn with its status.
 - **SPEC-7.1113**: The agent attachment routes list, upload (multipart part named file; 400 "Missing 'file' part in
   multipart body" when absent), download and delete the attachments of a note. Each first requires the note to belong to
   the ticket in the tenant (404); download also requires the attachment to be on that note (404), and delete answers
