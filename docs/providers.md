@@ -404,7 +404,6 @@ A flag declares a `FlagDefault<T>` beside its key: `Constant(value)` for one def
 
 The current shipping flags:
 
-- `ORGANIZATIONS_ENABLED`: on by default for `saas`, off by default for `self-hosted`.
 - `LOGIN_APPROVAL_ENABLED`: off by default in both profiles (PMS-658 gates a login and stays opt-in).
 
 Existing consumers that cache the flag value at construction (`AuthService::login_approval_enabled`) still take a
