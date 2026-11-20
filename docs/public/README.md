@@ -23,6 +23,7 @@ Mokosh server is a Professional Services Automation (PSA) platform for managed s
 - [Tenancy](tenancy.md): tenants, users, teams, roles, and how the contact plane fits in.
 - [Authentication](authentication.md): Bunyip as the identity provider, API tokens, two-factor, login approval.
 - [API](api.md): the REST surface, grouped by concern.
+- [API conventions](api-conventions.md): route and resource naming rules, and the classification of every route.
 - [Billing](billing.md): invoices, quotes, prepaid blocks, overdue, write-offs, Xero / QuickBooks delegation.
 - [Time tracking](time-tracking.md): entries, timesheets, work days.
 - [Documents](documents.md): invoice and quote PDFs, templates, fonts.

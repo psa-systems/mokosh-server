@@ -1,5 +1,7 @@
 # API
 
+Route and resource naming rules, and the classification of every route, are in [API conventions](api-conventions.md).
+
 Every route lives under `/api/v1`. The server is a REST API: JSON in, JSON out, standard HTTP status codes, no RPC. Authenticate with a Bearer token on every call except the explicitly public tree.
 
 ## Health and version
