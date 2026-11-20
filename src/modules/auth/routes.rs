@@ -867,9 +867,11 @@ async fn list_directory(
 async fn list_users(
     State(state): State<AuthRouterState>,
     manager: RequireManager,
+    scopes: super::CallerScopes,
     Query(filter): Query<ListUsersFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<UserResponse>>> {
+    scopes.require("users:read")?;
     let user = manager.0;
     filter.validate()?;
 

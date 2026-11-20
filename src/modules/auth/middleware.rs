@@ -1,4 +1,10 @@
 //! Authentication middleware for Axum
+//!
+//! Scope convention for personal API keys: a route reachable with an API key
+//! must take a [`CallerScopes`] argument and call `require("<resource>:<read|write>")`
+//! before doing work. Session and OIDC callers are not scope-limited, so the
+//! call is a no-op for them. Wired so far: invoices, tickets, users list; every
+//! other route is expected to adopt it as it is touched.
 
 use axum::{
     extract::{Request, State},
@@ -668,6 +674,53 @@ fn resolve_tombstone_probe(auth_state: AuthState, sub: Uuid, probe: AppResult<bo
 /// session and OIDC callers, who are not scope-limited.
 #[derive(Clone, Debug)]
 pub struct ApiKeyScopes(pub Vec<String>);
+
+/// Handler-side scope gate. Take it as an argument and call
+/// [`CallerScopes::require`] with the route's `<resource>:<read|write>` scope.
+/// Infallible to extract: authentication is the job of `RequireAuth` and
+/// friends, so an unauthenticated request still answers 401 first.
+#[derive(Clone, Debug)]
+pub struct CallerScopes(Option<Vec<String>>);
+
+impl CallerScopes {
+    /// `Ok` for a session or OIDC caller (no scope limit), or for an API key
+    /// holding `*`, `scope`, or `<resource>:*`. Otherwise 403.
+    pub fn require(&self, scope: &str) -> AppResult<()> {
+        let Some(held) = &self.0 else {
+            return Ok(());
+        };
+        if scope_permits(held, scope) {
+            return Ok(());
+        }
+        tracing::debug!(required = scope, "api key refused: scope not held");
+        Err(AppError::Forbidden(format!(
+            "This API key lacks the '{scope}' scope"
+        )))
+    }
+}
+
+/// Whether `held` covers `needed`: `*`, an exact match, or `<resource>:*`.
+pub fn scope_permits(held: &[String], needed: &str) -> bool {
+    let resource_wildcard = needed.split_once(':').map(|(r, _)| format!("{r}:*"));
+    held.iter()
+        .any(|h| h == "*" || h == needed || resource_wildcard.as_deref() == Some(h.as_str()))
+}
+
+impl<S> axum::extract::FromRequestParts<S> for CallerScopes
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(CallerScopes(
+            parts.extensions.get::<ApiKeyScopes>().map(|s| s.0.clone()),
+        ))
+    }
+}
 
 // SPEC-5.139: case-sensitive "Bearer " prefix on a text header.
 fn bearer(req: &Request) -> Option<&str> {
