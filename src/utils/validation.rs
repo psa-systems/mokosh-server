@@ -162,7 +162,7 @@ pub fn validate_contract_type(value: &str) -> Result<(), ValidationError> {
 /// carrying an out-of-set value is rejected with a 422 at the request layer
 /// instead of hitting the constraint and surfacing as a 500 DATABASE_ERROR
 /// (PMS-337).
-pub const CONTRACT_STATUSES: [&str; 5] = ["draft", "active", "expired", "cancelled", "renewed"];
+pub const CONTRACT_STATUSES: [&str; 4] = ["draft", "active", "expired", "cancelled"];
 
 /// Validate a contract status against the set the DB CHECK constraint allows.
 /// The `status` field deserializes as a free `String`, so an unknown value
@@ -581,7 +581,7 @@ mod tests {
         assert!(validate_contract_status("active").is_ok());
         assert!(validate_contract_status("expired").is_ok());
         assert!(validate_contract_status("cancelled").is_ok());
-        assert!(validate_contract_status("renewed").is_ok());
+        assert!(validate_contract_status("renewed").is_err());
         // Values that passed deserialization but caused a 500 before.
         assert!(validate_contract_status("pending").is_err());
         assert!(validate_contract_status("Active").is_err());

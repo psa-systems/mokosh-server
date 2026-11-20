@@ -501,7 +501,7 @@ mod tests {
         assert!(bad_cycle.validate().is_err());
 
         let mut ok = base_update();
-        ok.status = Some("renewed".into());
+        ok.status = Some("expired".into());
         ok.billing_cycle = Some("annually".into());
         assert!(ok.validate().is_ok());
 

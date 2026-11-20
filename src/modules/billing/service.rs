@@ -1951,7 +1951,7 @@ impl BillingService {
     /// The due period is computed from `billing_cycle` + the contract's
     /// `start_date` (see [`current_billing_period`]): the most recent
     /// period boundary on or before `now`. Skipped: `one_time`,
-    /// non-`active` (draft/expired/cancelled/renewed) contracts,
+    /// non-`active` (draft/expired/cancelled) contracts,
     /// contracts whose `start_date` is in the future, contracts past
     /// their `end_date` for the computed period, and contracts with no
     /// billable items.
