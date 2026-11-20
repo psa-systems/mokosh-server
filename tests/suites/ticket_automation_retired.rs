@@ -10,7 +10,11 @@ fn walk(dir: &Path, hits: &mut Vec<String>) {
             walk(&path, hits);
         } else if path.extension().is_some_and(|e| e == "rs") {
             let text = std::fs::read_to_string(&path).expect("read source");
-            for needle in ["ticket_automation_rules", "AutomationEngine", "automation::"] {
+            for needle in [
+                "ticket_automation_rules",
+                "AutomationEngine",
+                "automation::",
+            ] {
                 if text.contains(needle) {
                     hits.push(format!("{}: {needle}", path.display()));
                 }
