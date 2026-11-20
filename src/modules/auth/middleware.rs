@@ -351,7 +351,26 @@ pub async fn auth_middleware(
     let mut principal_rejection: Option<AppError> = None;
     // PMS-769: which bearer outcome the extractors should challenge on.
     let mut outcome = BearerOutcome::Absent;
+    // Set only when a personal API key authenticated this request.
+    let mut api_key_scopes: Option<Vec<String>> = None;
     let auth_state = match bearer(&request) {
+        // A `psa_` bearer is never a JWT, so it skips both JWT paths.
+        Some(token) if token.trim().starts_with("psa_") => {
+            outcome = BearerOutcome::Rejected;
+            match auth_middleware.auth_service.authenticate_api_key(token).await {
+                Ok((user, scopes)) => {
+                    api_key_scopes = Some(scopes);
+                    let tenant_id = user.tenant_id;
+                    AuthState::authenticated(user.to_current_user(), tenant_id)
+                }
+                Err(AppError::Unauthorized) => AuthState::default(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "api key bearer rejected");
+                    principal_rejection = Some(e);
+                    AuthState::default()
+                }
+            }
+        }
         Some(token) => {
             // A credential was presented; assume it is rejected until a path
             // accepts it (settled after both branches have run).
@@ -571,6 +590,9 @@ pub async fn auth_middleware(
     if auth_state.is_authenticated {
         outcome = BearerOutcome::Accepted;
     }
+    if let (true, Some(scopes)) = (auth_state.is_authenticated, api_key_scopes) {
+        request.extensions_mut().insert(ApiKeyScopes(scopes));
+    }
     request.extensions_mut().insert(auth_state);
     request.extensions_mut().insert(outcome);
 
@@ -641,6 +663,11 @@ fn resolve_tombstone_probe(auth_state: AuthState, sub: Uuid, probe: AppResult<bo
         }
     }
 }
+
+/// Scopes of the personal API key that authenticated this request. Absent for
+/// session and OIDC callers, who are not scope-limited.
+#[derive(Clone, Debug)]
+pub struct ApiKeyScopes(pub Vec<String>);
 
 // SPEC-5.139: case-sensitive "Bearer " prefix on a text header.
 fn bearer(req: &Request) -> Option<&str> {

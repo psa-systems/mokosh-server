@@ -2591,6 +2591,84 @@ impl AuthService {
         Ok(())
     }
 
+    /// Authenticate a `psa_` bearer. Returns the owning user and the key's
+    /// scopes. Every refusal is `Unauthorized` (identical to the caller), but
+    /// each cause is logged distinctly at debug.
+    // SPEC-5.572: shape check before any DB or hash work; hash match, then revoked/expired refusal; last_used_at stamped off the request path.
+    pub async fn authenticate_api_key(&self, raw: &str) -> AppResult<(User, Vec<String>)> {
+        let raw = raw.trim();
+        if !is_api_key_shape(raw) {
+            tracing::debug!("api key refused: malformed shape");
+            return Err(AppError::Unauthorized);
+        }
+        let prefix: String = raw.chars().take(10).collect();
+
+        // SAFETY (PMS-285): deliberately tenant-unscoped - the tenant is what
+        // this lookup discovers. Migrator pool because `api_keys` is RLS-covered.
+        let candidates: Vec<ApiKeyAuthRow> = sqlx::query_as(
+            "SELECT id, tenant_id, user_id, key_hash, scopes, expires_at, revoked_at, is_active \
+             FROM api_keys WHERE key_prefix = $1 AND user_id IS NOT NULL",
+        )
+        .bind(&prefix)
+        .fetch_all(self.db.migrator_pool())
+        .await?;
+
+        if candidates.is_empty() {
+            // Burn one hash so an unknown prefix costs what a wrong key costs.
+            verify_password_or_dummy(raw, None).await?;
+            tracing::debug!("api key refused: unknown prefix");
+            return Err(AppError::Unauthorized);
+        }
+
+        let mut matched: Option<ApiKeyAuthRow> = None;
+        for row in candidates {
+            if verify_password(raw, &row.key_hash).await? {
+                matched = Some(row);
+                break;
+            }
+        }
+        let Some(key) = matched else {
+            tracing::debug!("api key refused: hash mismatch");
+            return Err(AppError::Unauthorized);
+        };
+        if key.revoked_at.is_some() || !key.is_active {
+            tracing::debug!(key_id = %key.id, "api key refused: revoked");
+            return Err(AppError::Unauthorized);
+        }
+        if key.expires_at.is_some_and(|at| at <= Utc::now()) {
+            tracing::debug!(key_id = %key.id, "api key refused: expired");
+            return Err(AppError::Unauthorized);
+        }
+        let Some(user_id) = key.user_id else {
+            return Err(AppError::Unauthorized);
+        };
+        let user = self.get_user_by_id(key.tenant_id, user_id).await?;
+        self.ensure_principal_usable(&user).await?;
+
+        let pool = self.db.migrator_pool().clone();
+        let key_id = key.id;
+        tokio::spawn(async move {
+            // SAFETY (PMS-285): keyed on the primary key of a row just authenticated.
+            if let Err(e) = sqlx::query("UPDATE api_keys SET last_used_at = NOW() WHERE id = $1")
+                .bind(key_id)
+                .execute(&pool)
+                .await
+            {
+                tracing::warn!(key_id = %key_id, error = %e, "api key last_used_at update failed");
+            }
+        });
+
+        let scopes = match key.scopes {
+            serde_json::Value::Array(arr) => arr
+                .into_iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            // Fail closed: an unreadable scope set grants nothing.
+            _ => Vec::new(),
+        };
+        Ok((user, scopes))
+    }
+
     /// List users in a tenant, paginated and filterable. Audit F1 +
     /// PMS-4 AC1 closeout. Two parallel WHERE clauses are built so
     /// the data query and the count query can have different param
@@ -4555,6 +4633,26 @@ impl From<UserRow> for User {
             tenant_kind: row.tenant_kind.unwrap_or_default(),
         }
     }
+}
+
+/// `psa_` + 40 ASCII alphanumerics, exactly what `generate_api_key` mints.
+pub fn is_api_key_shape(s: &str) -> bool {
+    s.len() == 44
+        && s.strip_prefix("psa_")
+            .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+#[cfg(feature = "server")]
+#[derive(sqlx::FromRow)]
+struct ApiKeyAuthRow {
+    id: Uuid,
+    tenant_id: Uuid,
+    user_id: Option<Uuid>,
+    key_hash: String,
+    scopes: serde_json::Value,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    revoked_at: Option<chrono::DateTime<Utc>>,
+    is_active: bool,
 }
 
 #[cfg(feature = "server")]
