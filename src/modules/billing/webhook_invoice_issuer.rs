@@ -570,7 +570,7 @@ async fn apply_bill_event(
     } else {
         // Level with the provider already, which is what every redelivery
         // after the first looks like.
-        Outcome::Ignored
+        Outcome::BenignRedelivery
     })
 }
 

@@ -938,6 +938,39 @@ async fn a_bill_paid_in_the_provider_is_recorded_here(pool: PgPool) {
     );
 }
 
+/// A bill event redelivered against a bill already level with the provider
+/// reads as a benign redelivery, not as a dropped event.
+#[mokosh_test]
+async fn a_redelivered_bill_event_is_recorded_as_a_benign_redelivery(pool: PgPool) {
+    let (script, base) = start_stub().await;
+    common::seed_admin(&pool).await;
+    seed_delegated_bill(&pool, "xero", XERO_BILL_ID).await;
+    let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
+    *script.bill_paid.lock().unwrap() = 70.0;
+
+    for _ in 0..2 {
+        let status = deliver(
+            &router,
+            InvoiceProviderKind::Xero,
+            &xero_delivery(XERO_BILL_ID),
+            SIGNING_KEY,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    assert_eq!(
+        deliveries(&pool).await,
+        vec![
+            ("xero".to_string(), "accepted".to_string()),
+            ("xero".to_string(), "benign_redelivery".to_string()),
+        ],
+        "the second row is the redelivery, not an ignored event"
+    );
+}
+
 /// A part payment leaves the bill approved, and the rest of it lands on
 /// the next event rather than being written twice.
 #[mokosh_test]
