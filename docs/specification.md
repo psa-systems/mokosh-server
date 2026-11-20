@@ -8170,7 +8170,7 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
 - **SPEC-13.1089**: For an event naming no delegated invoice, the webhook must try a delegated bill of the tenant and
   result in `ignored` when there is none or when the provider does not hold the id as a bill; otherwise it must
   reconcile the provider's paid running total against the bill using today's UTC date and a system audit context,
-  resulting in `accepted` when a payment was recorded and `ignored` when already level.
+  resulting in `accepted` when a payment was recorded and `benign_redelivery` when already level.
 - **SPEC-13.1090**: When the provider reports a delegated bill voided, the webhook must not void the local bill, must
   log a warn carrying the bill id, and must result in `unreconciled`.
 - **SPEC-13.1091**: After each processed event a delivery row must be recorded for the tenant and provider with outcome
