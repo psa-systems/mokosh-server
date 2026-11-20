@@ -166,7 +166,7 @@ Note: `email_mailboxes` and `payment_gateway_configs` are confirmed **business**
 tables" under PMS-259 below.
 
 lookup: `ticket_queues`, `ticket_statuses`, `ticket_priorities`, `ticket_types`,
-`ticket_categories`, `ticket_automation_rules`, `work_types`, `time_rounding_rules`,
+`ticket_categories`, `work_types`, `time_rounding_rules`,
 `task_statuses`, `sla_policies`, `sla_notifications`, `rate_cards`, `tax_rates`, `asset_types`,
 `kb_categories`, `notification_channels`, `notification_templates`, `notification_rules`,
 `user_notification_preferences` (user_id), `business_hours`, `holiday_calendars`,

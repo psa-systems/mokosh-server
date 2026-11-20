@@ -5,7 +5,6 @@
 #[cfg(feature = "server")]
 pub mod attachments;
 #[cfg(feature = "server")]
-mod automation;
 mod models;
 #[cfg(feature = "server")]
 mod routes;
@@ -18,7 +17,6 @@ pub use attachments::{
     AttachmentConfig, AttachmentResponse, AttachmentService,
 };
 #[cfg(feature = "server")]
-pub use automation::AutomationEngine;
 pub use models::*;
 #[cfg(feature = "server")]
 pub use routes::{contact_notes_routes, ticket_routes};

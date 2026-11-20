@@ -912,78 +912,6 @@ pub struct TicketFilter {
 }
 
 // ============================================================================
-// AUTOMATION TYPES
-// ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AutomationTrigger {
-    OnCreate,
-    OnUpdate,
-    OnSchedule,
-    OnSlaBreach,
-    OnSlaWarning,
-    OnAging,
-}
-
-impl AutomationTrigger {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "on_create" => Some(Self::OnCreate),
-            "on_update" => Some(Self::OnUpdate),
-            "on_schedule" => Some(Self::OnSchedule),
-            "on_sla_breach" => Some(Self::OnSlaBreach),
-            "on_sla_warning" => Some(Self::OnSlaWarning),
-            "on_aging" => Some(Self::OnAging),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::OnCreate => "on_create",
-            Self::OnUpdate => "on_update",
-            Self::OnSchedule => "on_schedule",
-            Self::OnSlaBreach => "on_sla_breach",
-            Self::OnSlaWarning => "on_sla_warning",
-            Self::OnAging => "on_aging",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutomationRule {
-    pub id: Uuid,
-    pub tenant_id: Uuid,
-    pub name: String,
-    pub description: Option<String>,
-    pub is_active: bool,
-    pub trigger_type: AutomationTrigger,
-    pub conditions: serde_json::Value,
-    pub actions: serde_json::Value,
-    pub priority: i32,
-    pub last_run_at: Option<DateTime<Utc>>,
-    pub run_count: i32,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-/// Automation condition
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutomationCondition {
-    pub field: String,
-    pub operator: String,
-    pub value: serde_json::Value,
-}
-
-/// Automation action
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutomationAction {
-    pub action_type: String,
-    pub params: serde_json::Value,
-}
-
-// ============================================================================
 // TICKET SAVED VIEWS (MAPPS-998)
 // ============================================================================
 
@@ -1162,30 +1090,6 @@ mod tests {
         assert_eq!(NoteType::Internal.as_str(), "internal");
         assert_eq!(NoteType::Public.as_str(), "public");
         assert_eq!(NoteType::Resolution.as_str(), "resolution");
-    }
-
-    #[test]
-    fn test_automation_trigger_from_str() {
-        assert_eq!(
-            AutomationTrigger::from_str("on_create"),
-            Some(AutomationTrigger::OnCreate)
-        );
-        assert_eq!(
-            AutomationTrigger::from_str("on_update"),
-            Some(AutomationTrigger::OnUpdate)
-        );
-        assert_eq!(
-            AutomationTrigger::from_str("on_sla_breach"),
-            Some(AutomationTrigger::OnSlaBreach)
-        );
-        assert_eq!(AutomationTrigger::from_str("invalid"), None);
-    }
-
-    #[test]
-    fn test_automation_trigger_as_str() {
-        assert_eq!(AutomationTrigger::OnCreate.as_str(), "on_create");
-        assert_eq!(AutomationTrigger::OnUpdate.as_str(), "on_update");
-        assert_eq!(AutomationTrigger::OnSlaBreach.as_str(), "on_sla_breach");
     }
 
     /// PMS-893: the three conditions that stop the clock, each on its own.

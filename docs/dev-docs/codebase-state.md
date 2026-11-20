@@ -202,8 +202,7 @@ but no handler), `password_reset_tokens`, `tenants` (read).
 
 Files: [`routes.rs`](../../src/modules/tickets/routes.rs) (401),
 [`service.rs`](../../src/modules/tickets/service.rs) (888),
-[`models.rs`](../../src/modules/tickets/models.rs) (733),
-[`automation.rs`](../../src/modules/tickets/automation.rs) (315).
+[`models.rs`](../../src/modules/tickets/models.rs) (733).
 
 **Endpoints:** 11 total.
 
@@ -239,18 +238,11 @@ displays names not UUIDs) will render with blanks. See
 [`routes.rs:71-99,128-159,178-209,231-262,287-318`](../../src/modules/tickets/routes.rs#L71).
 Tracked as **F3** - the highest-impact server fix.
 
-**Open TODOs:** none (re-read 2026-09-22, PMS-831). All four have
-shipped: `create_ticket` and `update_ticket` both call
-`AutomationEngine::process_rules` (`OnCreate`, `OnUpdate`), `add_note`
-acts on `send_email` for a public note, and the engine's
-`send_notification` and `webhook` actions are implemented -
-`notifications` is a real module, not the placeholder this block was
-written against (**F11**).
+**Open TODOs:** none. The ticket automation engine (**F11**) was retired and its table dropped; `add_note` acts on `send_email` for a public note.
 
 **Schema touched:** `tickets`, `ticket_sequences`, `ticket_notes`,
 `ticket_attachments`, `ticket_statuses`, `ticket_priorities`,
-`ticket_queues`, `ticket_types`, `ticket_categories`,
-`ticket_automation_rules`. Joins to `companies`, `contacts`, `users`.
+`ticket_queues`, `ticket_types`, `ticket_categories`. Joins to `companies`, `contacts`, `users`.
 
 #### `contacts` (~1,800 LOC)
 
@@ -298,11 +290,8 @@ what stops the endpoint being an SSRF primitive.
 
 **The same gate everywhere a URL is not hardcoded (PMS-809).** The probe
 was not the only outbound fetch of a caller-supplied URL, so
-`guard_outbound_url` is shared by three callers: the probe (ports pinned
-to 80/443), the ticket-automation `webhook` action
-([`tickets/automation.rs`](../../src/modules/tickets/automation.rs), which
-now follows redirects itself so each hop is re-screened, and logs a
-refusal with the rule id and the blocked address), and
+`guard_outbound_url` is shared by its callers: the probe (ports pinned
+to 80/443) and
 `TacticalRmmProvider`
 ([`rmm/provider.rs`](../../src/modules/rmm/provider.rs), which screens its
 tenant-configured `api_url` before every request, refuses with an
@@ -562,8 +551,7 @@ the infrastructure or shared-helper layer.
    not transitional: the `PaymentResponse` / `TenantUsage` DTO fields and the
    `tenants` update `entity_id` carry a plain `Uuid`; `AuditCtx::system` is a
    `Uuid` context bag (the request-extractor DTO, tolerant of
-   unauthenticated/system callers); and the ticket-automation webhook payload
-   serialises the tenant as a `Uuid`. `tenants::copy_default_config` keeps its
+   unauthenticated/system callers). `tenants::copy_default_config` keeps its
    `Uuid` (it copies from a hardcoded default tenant into a freshly minted one -
    neither is a claim). This item is resolved.
 9. **`validator::Validate` coverage is uneven.** `Create*Request`
@@ -780,18 +768,9 @@ tickets create/list/get/update + add note. `testcontainers`-backed
 Postgres is cleanest, but the dev compose
 `host.docker.internal` already gives a real DB.
 
-### F11. Wire automation triggers (depends on `notifications`) - **DONE (closed 2026-09-22, PMS-831)**
+### F11. Wire automation triggers - **RETIRED**
 
-Implemented: `notifications` is a real module, the ticket service calls
-`process_rules` on create and on update, and the engine's
-`send_notification` and `webhook` actions dispatch. Original note kept
-below for history.
-
-Once `notifications` becomes a real module, have the ticket service
-call `AutomationEngine::process_rules` on `on_create` and `on_update`
-([`tickets/service.rs:132,409`](../../src/modules/tickets/service.rs#L132)
-and [`automation.rs:235,243`](../../src/modules/tickets/automation.rs#L235)).
-Gated on F12.
+The ticket automation engine and its `ticket_automation_rules` table were removed because no code path could author a rule.
 
 ### F12. Skeletons for the remaining placeholder modules
 

@@ -11,7 +11,7 @@
 //! the server connects to it. The mitigation is
 //! [`crate::utils::net::guard_outbound_url`] applied BEFORE the connect and
 //! again for every redirect hop (PMS-809 promoted that gate out of this module
-//! so the automation webhook and the RMM provider share it), plus a port
+//! so the RMM provider shares it), plus a port
 //! allowlist of 80/443, a 5-hop cap, a 5s per-scheme timeout, and never reading
 //! a response body. The residual is stated rather than hidden: a DNS rebinding
 //! attack that changes the answer between the check and the connect is not
@@ -523,7 +523,7 @@ async fn guard_url<F: WebsiteFetcher + ?Sized>(
 // LIVE FETCHER
 // ============================================================================
 
-/// The real network. Mirrors `AutomationEngine::build`'s client construction:
+/// The real network. Builds the client with
 /// an explicit timeout and a named user agent, so an origin operator can see
 /// who is asking.
 pub struct ReqwestFetcher {

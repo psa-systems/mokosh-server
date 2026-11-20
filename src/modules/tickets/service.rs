@@ -15,7 +15,6 @@ use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
-use super::automation::AutomationEngine;
 use super::models::*;
 
 /// PMS-1198 (CF-9): the sentence both the no-dispatcher fallback body below
@@ -34,7 +33,6 @@ const TICKET_NOTE_ADDED_SENTENCE: &str = "has added an update to ticket";
 #[derive(Clone)]
 pub struct TicketService {
     db: Database,
-    automation: AutomationEngine,
     mailer: Arc<dyn Mailer>,
     /// When `Some`, ticket-note emails are enqueued via the
     /// notifications dispatcher (template + worker delivery) instead
@@ -118,14 +116,11 @@ impl TicketService {
     }
 
     /// Build a TicketService wired to a specific mailer. Used from
-    /// `create_api_router` so add-note notifications and the
-    /// automation-rule send_notification action share the SMTP path as
+    /// `create_api_router` so add-note notifications share the SMTP path as
     /// auth's password-reset / welcome emails.
     pub fn with_mailer(db: Database, mailer: Arc<dyn Mailer>) -> Self {
-        let automation = AutomationEngine::with_deps(db.clone(), mailer.clone());
         Self {
             db,
-            automation,
             mailer,
             notifications: None,
             sla: None,
@@ -134,19 +129,15 @@ impl TicketService {
 
     /// Like [`Self::with_mailer`] but additionally wires the
     /// notifications dispatcher. The server uses this constructor in
-    /// `create_api_router` so ticket-note emails and the automation
-    /// engine's `send_notification` action flow through the queue
+    /// `create_api_router` so ticket-note emails flow through the queue
     /// (delivery handled by `DispatcherWorker`).
     pub fn with_dispatcher(
         db: Database,
         mailer: Arc<dyn Mailer>,
         notifications: NotificationsService,
     ) -> Self {
-        let automation =
-            AutomationEngine::with_dispatcher(db.clone(), mailer.clone(), notifications.clone());
         Self {
             db,
-            automation,
             mailer,
             notifications: Some(notifications),
             sla: None,
@@ -508,21 +499,7 @@ impl TicketService {
         .await?;
         tx.commit().await?;
 
-        // SPEC-7.6: on-create automation and SLA evaluation run after commit, outside any open transaction, falling back to the tenant's default due business days when no policy matches.
-        // Audit F11: run on_create automation rules. Failures are logged
-        // but do not abort the ticket creation - a misconfigured rule
-        // shouldn't block legitimate work. Runs before `evaluate_sla`
-        // (PMS-1564): a rule's `set_priority_id` / `set_status_id` action
-        // can change which SLA target applies, so SLA must be evaluated
-        // against the row after automation, not before it.
-        if let Err(e) = self
-            .automation
-            .process_rules(tenant_id, ticket_id, AutomationTrigger::OnCreate)
-            .await
-        {
-            tracing::warn!(?e, %tenant_id, %ticket_id, "on_create automation failed");
-        }
-
+        // SPEC-7.6: SLA evaluation runs after commit, outside any open transaction, falling back to the tenant's default due business days when no policy matches.
         // PMS-1564: evaluate the ticket's SLA through the business-hours-
         // aware evaluator (no-op when no `SlaService` is wired).
         self.evaluate_sla(tenant_id, ticket_id).await;
@@ -991,26 +968,10 @@ impl TicketService {
         }
         tx.commit().await?;
 
-        // SPEC-7.11: on-update automation and SLA re-evaluation run after commit, outside any open transaction.
-        // Audit F11: run on_update automation rules. Same fail-soft
-        // policy as on_create - log but do not surface a 500. Runs
-        // before `evaluate_sla` (PMS-1564): a rule's `set_priority_id` /
-        // `set_status_id` action mutates the row independently of
-        // `request`, so SLA must be evaluated after automation, not
-        // before it, or that mutation keeps stale due dates.
-        if let Err(e) = self
-            .automation
-            .process_rules(tenant_id, ticket_id, AutomationTrigger::OnUpdate)
-            .await
-        {
-            tracing::warn!(?e, %tenant_id, %ticket_id, "on_update automation failed");
-        }
-
+        // SPEC-7.11: SLA re-evaluation runs after commit, outside any open transaction.
         // PMS-1564: re-evaluate SLA unconditionally. This request may
-        // have changed status or priority itself, or the on_update
-        // automation rule just above may have (its `set_status_id` /
-        // `set_priority_id` actions are not gated on `request`'s
-        // fields), so evaluation can no longer key off `request` alone.
+        // have changed status or priority itself, so evaluation cannot
+        // key off `request` alone.
         // `evaluate_for_ticket` is a cheap no-op when neither changed
         // which policy/target applies. Runs after commit so it reads
         // the persisted row (mirrors the post-commit follow-up pattern
