@@ -8205,7 +8205,7 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   contact-plane callers must have no access to them.
 - **SPEC-13.1307**: POST /contracts must reject with a validation error (422) a name outside 1..255 characters, a
   contract_type not in {managed_services, block_hours, time_and_materials, fixed_price, warranty}, a status not in
-  {draft, active, expired, cancelled, renewed}, and a billing_cycle not in {monthly, quarterly, annually, one_time,
+  {draft, active, expired, cancelled}, and a billing_cycle not in {monthly, quarterly, annually, one_time,
   weekly, bi_weekly}. Omitted status must default to "draft", billing_cycle to "monthly" and auto_renew to false.
 - **SPEC-13.1308**: POST /contracts must reject with a validation error keyed on end_date and message "end_date must be
   on or after start_date" when end_date is earlier than start_date; an equal end_date and an absent end_date must be
@@ -8324,10 +8324,10 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   processed before its tenant's local day has passed its end date.
 - **SPEC-13.1346**: A due contract with auto_renew false or null must be set to status "expired" with updated_at
   refreshed and counted in the expired total.
-- **SPEC-13.1347**: A due contract with auto_renew true must be set to status "renewed" with start_date the day after
+- **SPEC-13.1347**: A due contract with auto_renew true must stay status "active" with start_date the day after
   its old end_date and end_date the last day of a term starting then; the term length must be renewal_terms.term_months
   when that is a non-negative integer, else the whole-month difference between the old start_date and end_date (calendar
-  month difference, minimum 1), and the contract must be counted in the renewed total.
+  month difference, minimum 1), and the contract must be counted in the renewed total (a count only, not a status).
 - **SPEC-13.1348**: expire_due_contracts must drain each tenant in transactions of at most 200 contracts (ordered by id,
   rows locked), committing after every batch and stopping when a batch is empty, and each renewed or expired contract
   must get an Update audit row with before and after snapshots and a system actor, written in the same transaction as
