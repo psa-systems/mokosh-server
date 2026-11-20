@@ -2543,7 +2543,7 @@ impl AuthService {
         let rows = sqlx::query_as::<_, ApiKeyRow>(
             r#"
             SELECT id, name, key_prefix, scopes, last_used_at, expires_at,
-                   is_active, created_at
+                   is_active, revoked_at, created_at
             FROM api_keys
             WHERE tenant_id = $1 AND user_id = $2
             ORDER BY created_at DESC
@@ -2560,10 +2560,11 @@ impl AuthService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
-    /// Revoke (hard-delete) an API key. Scoped to the calling user +
-    /// tenant so a stolen session for user A cannot kill user B's keys.
+    /// Revoke an API key (soft: the row stays listed with `revoked_at`).
+    /// Scoped to the calling user + tenant so a stolen session for user A
+    /// cannot kill user B's keys. A repeat keeps the first timestamp.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    // SPEC-5.93: DELETE scoped (id, tenant_id, user_id); 0 rows -> NotFound("API key").
+    // SPEC-5.93: soft revoke scoped (id, tenant_id, user_id); 0 rows -> NotFound("API key").
     pub async fn revoke_api_key(
         &self,
         tenant_id: Uuid,
@@ -2571,14 +2572,17 @@ impl AuthService {
         key_id: Uuid,
     ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let affected =
-            sqlx::query("DELETE FROM api_keys WHERE id = $1 AND tenant_id = $2 AND user_id = $3")
-                .bind(key_id)
-                .bind(tenant_id)
-                .bind(user_id)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
+        let affected = sqlx::query(
+            "UPDATE api_keys \
+             SET revoked_at = COALESCE(revoked_at, NOW()), is_active = FALSE, updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2 AND user_id = $3",
+        )
+        .bind(key_id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         tx.commit().await?;
 
         if affected == 0 {
@@ -4563,6 +4567,7 @@ struct ApiKeyRow {
     last_used_at: Option<chrono::DateTime<Utc>>,
     expires_at: Option<chrono::DateTime<Utc>>,
     is_active: bool,
+    revoked_at: Option<chrono::DateTime<Utc>>,
     created_at: chrono::DateTime<Utc>,
 }
 
@@ -4587,6 +4592,7 @@ impl From<ApiKeyRow> for crate::modules::auth::models::ApiKeyResponse {
             last_used_at: row.last_used_at,
             expires_at: row.expires_at,
             is_active: row.is_active,
+            revoked_at: row.revoked_at,
             created_at: row.created_at,
         }
     }
