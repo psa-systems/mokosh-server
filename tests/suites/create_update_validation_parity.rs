@@ -435,3 +435,41 @@ async fn an_invoice_needs_a_line_on_create_and_on_update(pool: PgPool) {
         resp.status()
     );
 }
+
+#[mokosh_test]
+async fn a_retired_contract_status_is_refused_on_create_and_on_update(pool: PgPool) {
+    let (_admin_id, email, password) = seed_admin(&pool).await;
+    let company_id = seed_company(&pool).await;
+    let app = boot(pool).await;
+    let token = login(&app, &email, &password).await;
+
+    let valid = json!({
+        "name": "Managed Services",
+        "company_id": company_id,
+        "contract_type": "managed_services",
+        "start_date": "2026-01-01",
+    });
+
+    let mut body = valid.clone();
+    body["status"] = json!("renewed");
+    assert_422_naming(
+        post(&app, &token, "/api/v1/contracts", body).await,
+        "status",
+        "creating a contract with the retired `renewed` status",
+    )
+    .await;
+
+    let id = create_id(&app, &token, "/api/v1/contracts", valid).await;
+    assert_422_naming(
+        put(
+            &app,
+            &token,
+            &format!("/api/v1/contracts/{id}"),
+            json!({ "status": "renewed" }),
+        )
+        .await,
+        "status",
+        "updating a contract to the retired `renewed` status",
+    )
+    .await;
+}

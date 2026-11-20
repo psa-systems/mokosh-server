@@ -722,14 +722,14 @@ async fn expire_due_renews_auto_renew_and_expires_others(pool: PgPool) {
     assert_eq!(renewed, 1);
     assert_eq!(expired, 1);
 
-    // Renewed contract: status flipped, dates advanced by 12 months.
+    // Renewed contract: stays active, dates advanced by 12 months.
     let (status, new_start, new_end): (String, NaiveDate, NaiveDate) =
         sqlx::query_as("SELECT status, start_date, end_date FROM contracts WHERE id = $1")
             .bind(renew_id)
             .fetch_one(&pool)
             .await
             .expect("renew row");
-    assert_eq!(status, "renewed");
+    assert_eq!(status, "active");
     assert_eq!(new_start, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
     assert_eq!(new_end, NaiveDate::from_ymd_opt(2026, 12, 31).unwrap());
 
@@ -745,7 +745,7 @@ async fn expire_due_renews_auto_renew_and_expires_others(pool: PgPool) {
     // the `UPDATE ... RETURNING`. `old_values` is the whole pre-update row,
     // `new_values` the whole post-update row.
     for (id, before_status, after_status) in [
-        (renew_id, "active", "renewed"),
+        (renew_id, "active", "active"),
         (expire_id, "active", "expired"),
     ] {
         let (old_values, new_values): (Option<serde_json::Value>, Option<serde_json::Value>) =
