@@ -298,10 +298,7 @@ impl<T: FlagValue + Sync> FlagCheck for Flag<T> {
 /// not be covered by [`check_boot`], so a typo in it would go back to
 /// reading silently as the default; there is no other enforcement that this
 /// list stays complete.
-static ALL_FLAGS: &[&dyn FlagCheck] = &[
-    &LOGIN_APPROVAL_ENABLED,
-    &ALLOW_UNINVITED_BUNYIP_SIGNUP,
-];
+static ALL_FLAGS: &[&dyn FlagCheck] = &[&LOGIN_APPROVAL_ENABLED, &ALLOW_UNINVITED_BUNYIP_SIGNUP];
 
 /// Flags that were declared but never read; setting one refuses boot so an
 /// operator learns the setting does nothing instead of trusting it.
@@ -567,7 +564,8 @@ mod tests {
 
     #[test]
     fn a_retired_flag_refuses_boot_when_set_and_passes_when_blank() {
-        let set = |v: &'static str| move |n: &str| (n == "ORGANIZATIONS_ENABLED").then(|| v.to_string());
+        let set =
+            |v: &'static str| move |n: &str| (n == "ORGANIZATIONS_ENABLED").then(|| v.to_string());
         assert!(check_retired(|_| None).is_ok());
         assert!(check_retired(set("  ")).is_ok());
         let err = check_retired(set("true")).expect_err("retired flag must refuse boot");

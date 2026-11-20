@@ -14,7 +14,8 @@ pub fn validate_channel_type(value: &str) -> Result<(), ValidationError> {
     if SUPPORTED_CHANNEL_TYPES.contains(&value) {
         Ok(())
     } else {
-        Err(ValidationError::new("unsupported_channel_type").with_message(CHANNEL_TYPE_MESSAGE.into()))
+        Err(ValidationError::new("unsupported_channel_type")
+            .with_message(CHANNEL_TYPE_MESSAGE.into()))
     }
 }
 
