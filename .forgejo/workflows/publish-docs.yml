@@ -6,7 +6,7 @@
 # The pushing binary is the `latest` artifact from psa-systems' Forgejo Generic
 # Packages, not a build from HEAD; it lags HEAD by one sarracenia main-push
 # cycle by design. The target site, base path and include/exclude globs live
-# in sarracenia.toml at the repo root; the only values this workflow carries
+# in docs/public/sarracenia.toml; the only values this workflow carries
 # are the runner shape, the publisher binary's registry location, and the
 # secret mapping.
 name: Publish docs

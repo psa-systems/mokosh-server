@@ -97,8 +97,8 @@ oci-build/Dockerfile    Production multi-stage Alpine + musl
 Dockerfile              Dev image (debug build, source-mounted)
 compose.dev.yml         Traefik-routed dev stack (per-developer *.a8n.run)
 .forgejo/workflows/     CI (Forgejo); `publish-docs.yml` pushes docs/public/ to docs.a8n.systems on main
-sarracenia.toml         Storefront push config; narrowed to docs/public/**/*.md only
 docs/                   Internal docs; only docs/public/ is published to docs.a8n.systems
+  public/sarracenia.toml Storefront push config; narrowed to docs/public/**/*.md only
 ```
 
 ### Auth: two independent mechanisms (PMS-295)
