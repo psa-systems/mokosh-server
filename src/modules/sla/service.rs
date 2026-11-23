@@ -753,16 +753,19 @@ impl SlaService {
         // SPEC-7.128: the final UPDATE runs in its own tenant-scoped transaction,
         // separate from and committed independently of the read above.
         // SPEC-7.1039: sla_due_date = resolution_due; NULL hours overwrite the due column with NULL.
+        // Persist the resolved policy id too: a ticket created with no explicit sla_id
+        // under the tenant's default policy keeps its API-visible sla_id null otherwise.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"UPDATE tickets SET first_response_due = $3, resolution_due = $4,
-                   sla_due_date = $4, updated_at = NOW()
+                   sla_due_date = $4, sla_id = $5, updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
         .bind(tenant_id)
         .bind(ticket_id)
         .bind(fr_due)
         .bind(res_due)
+        .bind(policy_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

@@ -714,3 +714,93 @@ async fn reopen_portal_ticket_evaluates_sla(pool: PgPool) {
         "reopen must re-evaluate resolution_due via business hours"
     );
 }
+
+/// A ticket evaluated through `SlaService::evaluate_for_ticket` has its
+/// `sla_id` column reflect the policy that produced its due dates. For a
+/// ticket created with no explicit `sla_id` under a tenant whose default
+/// SLA policy resolves, `sla_id` must be written back to that default
+/// policy's id instead of staying NULL.
+#[mokosh_test]
+async fn evaluate_persists_resolved_default_sla_id(pool: PgPool) {
+    let tenant_id = common::DEFAULT_TENANT_ID;
+    let tenant = TenantId::from_trusted(tenant_id);
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+
+    let company_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'PMS-1644 Co')")
+        .bind(company_id)
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .expect("seed company");
+
+    let queue_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_queues WHERE tenant_id = $1 LIMIT 1")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+            .expect("seeded queue");
+
+    let default_policy_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM sla_policies WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seeded default sla policy");
+
+    let db = Database::from_pool(pool.clone());
+    let sla_service = SlaService::new(db.clone());
+    let ticket_service = TicketService::new(db.clone()).with_sla(Arc::new(sla_service.clone()));
+
+    let request = CreateTicketRequest {
+        title: "PMS-1644 default sla probe".to_string(),
+        description: None,
+        priority_id: None,
+        type_id: None,
+        category_id: None,
+        queue_id: Some(queue_id),
+        source: TicketSource::Api,
+        company_id,
+        contact_id: None,
+        site_id: None,
+        assigned_to_id: None,
+        team_id: None,
+        parent_ticket_id: None,
+        contract_id: None,
+        sla_id: None,
+        scheduled_start: None,
+        scheduled_end: None,
+        estimated_hours: None,
+        is_billable: true,
+        asset_id: None,
+        custom_fields: serde_json::json!({}),
+        tags: vec![],
+        source_kb_article_id: None,
+        procedure_kb_article_id: None,
+        email_message_id: None,
+        email_thread_id: None,
+    };
+    let created = ticket_service
+        .create_ticket(tenant, admin_id, &request, &AuditCtx::system(tenant_id))
+        .await
+        .expect("create ticket");
+    let ticket_id = created.id;
+
+    let persisted_sla: Option<Uuid> =
+        sqlx::query_scalar("SELECT sla_id FROM tickets WHERE id = $1")
+            .bind(ticket_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read back sla_id after create");
+    assert_eq!(
+        persisted_sla,
+        Some(default_policy_id),
+        "ticket created with sla_id=None must have the default policy id persisted after evaluate"
+    );
+    assert_eq!(
+        created.sla_id,
+        Some(default_policy_id),
+        "api response must also carry the resolved sla_id"
+    );
+}
