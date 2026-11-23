@@ -337,6 +337,8 @@ declare_keys! {
     Application SMTP_PASSWORD = "SMTP_PASSWORD", since "v0.2.0", optional;
     Application SMTP_FROM = "SMTP_FROM", since "v0.2.0", optional;
     Application SMTP_TLS = "SMTP_TLS", since "v0.2.0", optional;
+    /// Debug aid: log the composed body of each dispatched email at `info`. Off by default.
+    Application MAIL_LOG_BODY_ON_DISPATCH = "MAIL_LOG_BODY_ON_DISPATCH", since "v0.19.0", optional;
     // SPEC-6.92
     /// PMS-1482: base URL of Bunyip's mailer relay (`POST /v1/mailer/send`,
     /// BUNYIP-602) that `MAIL_PROVIDER=bunyip` sends through instead of SMTP.

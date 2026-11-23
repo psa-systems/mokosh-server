@@ -265,6 +265,13 @@ pub static LOGIN_APPROVAL_ENABLED: Flag<bool> = Flag::new(
     FlagDefault::Constant(false),
 );
 
+/// Logs the composed subject and bodies of each email after a successful SMTP send.
+/// Off by default so message content never reaches production logs unasked.
+pub static MAIL_LOG_BODY_ON_DISPATCH: Flag<bool> = Flag::new(
+    &registry::MAIL_LOG_BODY_ON_DISPATCH,
+    FlagDefault::Constant(false),
+);
+
 // SPEC-6.31
 /// Opts in to JIT-provisioning a personal tenant for a first-sight bunyip
 /// identity whose email the OP has verified. Off by default so production
@@ -298,7 +305,11 @@ impl<T: FlagValue + Sync> FlagCheck for Flag<T> {
 /// not be covered by [`check_boot`], so a typo in it would go back to
 /// reading silently as the default; there is no other enforcement that this
 /// list stays complete.
-static ALL_FLAGS: &[&dyn FlagCheck] = &[&LOGIN_APPROVAL_ENABLED, &ALLOW_UNINVITED_BUNYIP_SIGNUP];
+static ALL_FLAGS: &[&dyn FlagCheck] = &[
+    &LOGIN_APPROVAL_ENABLED,
+    &ALLOW_UNINVITED_BUNYIP_SIGNUP,
+    &MAIL_LOG_BODY_ON_DISPATCH,
+];
 
 /// Flags that were declared but never read; setting one refuses boot so an
 /// operator learns the setting does nothing instead of trusting it.

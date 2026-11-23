@@ -18,6 +18,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 #### Added
 
+- [`MAIL_LOG_BODY_ON_DISPATCH`](#var-mail-log-body-on-dispatch) (Required: no) - Optional. Leave it unset to keep the default.
 - [`PORTAL_COOKIE_DOMAIN`](#var-portal-cookie-domain) (Required: no) - Optional. Leave it unset to keep the default.
 
 <a id="release-v0-18-0"></a>
@@ -327,6 +328,7 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-bunyip-secrets-client-secret"></a>`BUNYIP_SECRETS_CLIENT_SECRET` | no | v0.18.0 | `.env` | Machine-credential client secret this deployment presents to bunyip's host-secrets route, as HTTP Basic, alongside `BUNYIP_SECRETS_URL`. All three must be set together or left unset. (PMS-1537) |
 | <a id="var-contact-login-ip-rate-max"></a>`CONTACT_LOGIN_IP_RATE_MAX` | no | v0.18.0 | `.env` | Attempts one client IP may make per window across contact-portal login and magic-link redeem before a 429. Unset or blank keeps the default of 10; a non-positive or non-numeric value fails startup naming the variable. |
 | <a id="var-contact-login-ip-rate-window-secs"></a>`CONTACT_LOGIN_IP_RATE_WINDOW_SECS` | no | v0.18.0 | `.env` | Length in seconds of the window `CONTACT_LOGIN_IP_RATE_MAX` counts within. Unset or blank keeps the default of 60; a non-positive or non-numeric value fails startup naming the variable. |
+| <a id="var-mail-log-body-on-dispatch"></a>`MAIL_LOG_BODY_ON_DISPATCH` | no | v0.19.0 | `.env` | Off by default, so no email content reaches the logs. When true, `SmtpMailer` logs each sent email (From, To, subject, text and HTML bodies, attachment names and sizes) at `info` after a successful send. Debug aid; leave off in production. |
 
 ## Development stack variables
 
