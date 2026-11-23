@@ -11,7 +11,7 @@ pub mod service;
 pub mod worker;
 
 pub use models::*;
-pub use provider::{build_provider, ProviderAlert, ProviderConfig, ProviderDevice, RmmProvider};
+pub use provider::{build_provider, ProviderConfig, ProviderDevice, RmmProvider};
 pub use routes::rmm_routes;
 pub use service::RmmService;
 pub use worker::RmmSyncWorker;

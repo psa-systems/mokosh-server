@@ -230,11 +230,16 @@ impl VerifierConfig {
         jwks_cache_ttl_secs: Option<String>,
         leeway_seconds: Option<String>,
     ) -> Result<Self, String> {
-        let issuer = issuer
+        // PMS-1655 F3: a compose key forwarded but unset arrives as
+        // Some("") here, while `providers/status/mod.rs` treats blank
+        // as unset. Collapse Some("") to None so a verifier cannot be
+        // mounted with an empty issuer or audience.
+        let blank_is_unset = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+        let issuer = blank_is_unset(issuer)
             .ok_or_else(|| "OIDC_ISSUER must be set (e.g. https://api.a8n.systems)".to_string())?
             .trim_end_matches('/')
             .to_string();
-        let audience = audience.ok_or_else(|| {
+        let audience = blank_is_unset(audience).ok_or_else(|| {
             "OIDC_AUDIENCE must be set (e.g. https://api.msp.a8n.systems)".to_string()
         })?;
         let jwks_cache_ttl_secs =

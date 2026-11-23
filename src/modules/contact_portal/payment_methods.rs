@@ -338,7 +338,7 @@ impl PaymentMethodsService {
         .fetch_one(&mut *tx)
         .await?;
         let is_default = existing_count == 0;
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO contact_payment_methods \
              (tenant_id, contact_id, provider, provider_pm_id, brand, last4, exp_month, exp_year, is_default) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
@@ -355,6 +355,34 @@ impl PaymentMethodsService {
         .bind(is_default)
         .execute(&mut *tx)
         .await?;
+        // DO NOTHING also swallows a card id already owned by another
+        // contact; tell that apart from a same-contact redelivery.
+        if inserted.rows_affected() == 0 {
+            let owner: Option<Uuid> = sqlx::query_scalar(
+                "SELECT contact_id FROM contact_payment_methods \
+                  WHERE tenant_id = $1 AND provider = $2 AND provider_pm_id = $3",
+            )
+            .bind(tenant_id)
+            .bind(provider_id)
+            .bind(provider_pm_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            match owner {
+                Some(owner) if owner != contact_id => tracing::warn!(
+                    tenant_id = %tenant_id,
+                    contact_id = %contact_id,
+                    owner_contact_id = %owner,
+                    provider = provider_id,
+                    "payment method webhook dropped: provider card id already belongs to another contact"
+                ),
+                _ => tracing::debug!(
+                    tenant_id = %tenant_id,
+                    contact_id = %contact_id,
+                    provider = provider_id,
+                    "payment method webhook redelivery for an already recorded card"
+                ),
+            }
+        }
         tx.commit().await?;
         Ok(())
     }

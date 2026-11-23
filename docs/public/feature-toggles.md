@@ -60,7 +60,7 @@ switches it had rather than turning everything off.
 
 ## Not the same thing as `config::flags`
 
-[`src/config/flags.rs`](../src/config/flags.rs) (PMS-983) is for a switch whose value belongs to the
+[`src/config/flags.rs`](../../src/config/flags.rs) (PMS-983) is for a switch whose value belongs to the
 deployment's CONFIGURATION: it comes from the configuration provider, can be set before the database
 exists, and changing it is a deploy. `LOGIN_APPROVAL_ENABLED` is that shape, and nobody should be able to
 flip it from a web page while a suspicious login is in flight.

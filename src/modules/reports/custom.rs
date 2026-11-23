@@ -367,7 +367,7 @@ enum Bind {
 /// run it tenant-scoped. Returns the generic columns / rows / totals
 /// envelope. Every unknown key is a 400 before any SQL is built.
 pub async fn run(
-    executor: impl sqlx::PgExecutor<'_>,
+    conn: &mut sqlx::PgConnection,
     tenant_id: TenantId,
     spec: &CustomSpec,
 ) -> AppResult<CustomReportResponse> {
@@ -456,12 +456,7 @@ pub async fn run(
         selects.push("(t.assigned_to_id)::text".to_string());
     }
 
-    let mut sql = format!(
-        "SELECT {} {} WHERE {} = $1",
-        selects.join(", "),
-        src.from,
-        src.tenant_col
-    );
+    let mut where_sql = format!("{} = $1", src.tenant_col);
 
     // Bound values beyond $1 (tenant), in placement order.
     let mut binds: Vec<Bind> = Vec::new();
@@ -484,25 +479,31 @@ pub async fn run(
                     f.field, src.key
                 ))
             })?;
-        sql.push_str(&format!(" AND {} = ${}", fs.sql, ph));
+        where_sql.push_str(&format!(" AND {} = ${}", fs.sql, ph));
         binds.push(Bind::Text(f.value.clone()));
         ph += 1;
     }
 
     if let Some(dc) = src.date_col {
         if let Some(from) = spec.from {
-            sql.push_str(&format!(" AND {dc}::date >= ${ph}"));
+            where_sql.push_str(&format!(" AND {dc}::date >= ${ph}"));
             binds.push(Bind::Date(from));
             ph += 1;
         }
         if let Some(to) = spec.to {
-            sql.push_str(&format!(" AND {dc}::date <= ${ph}"));
+            where_sql.push_str(&format!(" AND {dc}::date <= ${ph}"));
             binds.push(Bind::Date(to));
             // `ph` is intentionally not advanced here: this is the last
             // placeholder, so nothing reads it afterward.
         }
     }
 
+    let mut sql = format!(
+        "SELECT {} {} WHERE {}",
+        selects.join(", "),
+        src.from,
+        where_sql
+    );
     if !dims.is_empty() {
         let ordinals: Vec<String> = (1..=dims.len()).map(|i| i.to_string()).collect();
         let joined = ordinals.join(", ");
@@ -522,24 +523,34 @@ pub async fn run(
             Bind::Date(d) => q.bind(d),
         };
     }
-    let rows = q.fetch_all(executor).await?;
+    let rows = q.fetch_all(&mut *conn).await?;
+
+    // Totals are one aggregate over the whole filtered set, not a sum of the
+    // limited rows: a limit would drop rows from it, and a ratio measure
+    // (realization) must be the ratio of the sums, not a sum of ratios.
+    let totals_select = measures
+        .iter()
+        .map(|m| format!("({})::text", m.sql))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let totals_sql = format!("SELECT {totals_select} {} WHERE {where_sql}", src.from);
+    let mut tq = sqlx::query(&totals_sql).bind(tenant_id);
+    for b in &binds {
+        tq = match b {
+            Bind::Text(s) => tq.bind(s),
+            Bind::Date(d) => tq.bind(d),
+        };
+    }
+    let totals_row = tq.fetch_one(&mut *conn).await?;
 
     let ncols = dims.len() + measures.len();
     let mut out_rows: Vec<Vec<Option<String>>> = Vec::with_capacity(rows.len());
-    let mut totals_acc: Vec<f64> = vec![0.0; measures.len()];
     let mut unresolved_assignees: Vec<Uuid> = Vec::new();
 
     for row in &rows {
         let mut r: Vec<Option<String>> = Vec::with_capacity(ncols);
         for i in 0..ncols {
             r.push(row.try_get::<Option<String>, _>(i)?);
-        }
-        for (j, _) in measures.iter().enumerate() {
-            if let Some(Some(s)) = r.get(dims.len() + j) {
-                if let Ok(n) = s.parse::<f64>() {
-                    totals_acc[j] += n;
-                }
-            }
         }
         if let Some(idx) = assignee_idx {
             // Raw `t.assigned_to_id`, appended after `ncols` purely for this
@@ -564,7 +575,8 @@ pub async fn run(
 
     let mut totals = BTreeMap::new();
     for (j, m) in measures.iter().enumerate() {
-        totals.insert(m.label.to_string(), fmt_num(totals_acc[j]));
+        let v: Option<String> = totals_row.try_get(j)?;
+        totals.insert(m.label.to_string(), v.unwrap_or_else(|| "0".into()));
     }
 
     Ok(CustomReportResponse {
@@ -572,16 +584,6 @@ pub async fn run(
         rows: out_rows,
         totals,
     })
-}
-
-// SPEC-15.1602
-/// Render a totals number without a needless `.0` on whole values.
-fn fmt_num(n: f64) -> String {
-    if n.fract().abs() < 1e-9 {
-        format!("{}", n as i64)
-    } else {
-        format!("{n:.2}")
-    }
 }
 
 // SPEC-15.1603
@@ -609,7 +611,7 @@ pub fn to_csv(r: &CustomReportResponse) -> String {
 // SPEC-15.1595
 /// Quote a CSV cell if it contains a comma, quote, or newline.
 ///
-/// PMS-1665: cells whose first character is `=`, `+`, `-` or `@` are
+/// Cells whose first character is `=`, `+`, `-` or `@` are
 /// neutralised with a leading `'` (apostrophe) so Excel, LibreOffice
 /// Calc and Google Sheets treat them as literal text instead of a
 /// formula. Without this, a report row carrying a hostile value such
@@ -646,7 +648,7 @@ mod csv_cell_tests {
         assert_eq!(csv_cell("he said \"hi\""), "\"he said \"\"hi\"\"\"");
     }
 
-    /// PMS-1665: a cell starting with a formula-trigger character must be
+    /// A cell starting with a formula-trigger character must be
     /// neutralised so a spreadsheet client does not execute it.
     #[test]
     fn a_formula_prefix_is_neutralised() {
@@ -656,7 +658,7 @@ mod csv_cell_tests {
         assert_eq!(csv_cell("@SUM(A1:A2)"), "'@SUM(A1:A2)");
     }
 
-    /// PMS-1665: a hostile value that both opens with `=` AND carries a
+    /// A hostile value that both opens with `=` AND carries a
     /// comma must get BOTH the apostrophe prefix AND the surrounding
     /// quotes, so parse-time neither the spreadsheet nor the CSV reader
     /// misinterprets it.

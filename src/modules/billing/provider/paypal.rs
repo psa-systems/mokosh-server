@@ -209,7 +209,9 @@ impl PaypalProvider {
                 AppError::external_service("paypal", "token response missing access_token")
             })?
             .to_string();
-        let expires_in = body["expires_in"].as_u64().unwrap_or(0);
+        // PayPal documents `expires_in`; if it is ever absent, assume a conservative
+        // 55 minutes (tokens last about 9 hours) so the token is still cached.
+        let expires_in = body["expires_in"].as_u64().unwrap_or(55 * 60);
         let mut cached = self.token.write().await;
         *cached = Some(AccessToken {
             value: value.clone(),
@@ -593,6 +595,10 @@ fn parse_paypal_event(event: &Value) -> AppResult<PaymentEvent> {
         // SPEC-13.747
         "CHECKOUT.ORDER.APPROVED" => {
             if parse_custom_id(resource["purchase_units"][0]["custom_id"].as_str()).is_none() {
+                tracing::warn!(
+                    event_type = %kind,
+                    "paypal webhook of a handled type cannot be reconciled: custom_id is missing or unparsable; ignoring"
+                );
                 return Ok(PaymentEvent::Ignored { kind });
             }
             match resource["id"].as_str() {
@@ -611,12 +617,24 @@ fn parse_paypal_event(event: &Value) -> AppResult<PaymentEvent> {
             }
             let Some((tenant_id, invoice_id)) = parse_custom_id(resource["custom_id"].as_str())
             else {
+                tracing::warn!(
+                    event_type = %kind,
+                    "paypal webhook of a handled type cannot be reconciled: custom_id is missing or unparsable; ignoring"
+                );
                 return Ok(PaymentEvent::Ignored { kind });
             };
             let Some(provider_reference) = resource["id"].as_str().filter(|s| !s.is_empty()) else {
+                tracing::warn!(
+                    event_type = %kind,
+                    "paypal webhook of a handled type cannot be reconciled: capture id is missing; ignoring"
+                );
                 return Ok(PaymentEvent::Ignored { kind });
             };
             let Some((amount, currency)) = parse_amount(&resource["amount"]) else {
+                tracing::warn!(
+                    event_type = %kind,
+                    "paypal webhook of a handled type cannot be reconciled: amount is missing or unparsable; ignoring"
+                );
                 return Ok(PaymentEvent::Ignored { kind });
             };
             Ok(PaymentEvent::PaymentSucceeded {
@@ -643,12 +661,24 @@ fn parse_paypal_event(event: &Value) -> AppResult<PaymentEvent> {
                 .and_then(|href| href.rsplit('/').next())
                 .filter(|s| !s.is_empty())
             else {
+                tracing::warn!(
+                    event_type = %kind,
+                    "paypal webhook of a handled type cannot be reconciled: the capture link is missing; ignoring"
+                );
                 return Ok(PaymentEvent::Ignored { kind });
             };
             let Some(refund_id) = resource["id"].as_str().filter(|s| !s.is_empty()) else {
+                tracing::warn!(
+                    event_type = %kind,
+                    "paypal webhook of a handled type cannot be reconciled: refund id is missing; ignoring"
+                );
                 return Ok(PaymentEvent::Ignored { kind });
             };
             let Some((amount, currency)) = parse_amount(&resource["amount"]) else {
+                tracing::warn!(
+                    event_type = %kind,
+                    "paypal webhook of a handled type cannot be reconciled: amount is missing or unparsable; ignoring"
+                );
                 return Ok(PaymentEvent::Ignored { kind });
             };
             Ok(PaymentEvent::Refunded {

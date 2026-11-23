@@ -86,6 +86,25 @@ impl KbExecutionService {
         self.assert_ticket_exists(&mut tx, tenant_id, ticket_id)
             .await?;
 
+        // An execution runs the article as published guidance, so a draft or
+        // archived article is refused rather than snapshotted.
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM kb_articles WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(article_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        match status.as_deref() {
+            None => return Err(AppError::NotFound("Article".to_string())),
+            Some("published") => {}
+            Some(_) => {
+                return Err(AppError::validation_field(
+                    "article_id",
+                    "article must be published to start an execution",
+                ));
+            }
+        }
+
         // Snapshot the article's current version id. NULL for the
         // historic case where no `kb_article_versions` row exists; the
         // normal path seeds version 1 on create so this should be
@@ -94,10 +113,12 @@ impl KbExecutionService {
         // versioning if needed.
         let article_version_id: Option<Uuid> = sqlx::query_scalar(
             r#"SELECT v.id FROM kb_article_versions v
-               WHERE v.article_id = $1
+               JOIN kb_articles a ON a.id = v.article_id
+               WHERE a.tenant_id = $1 AND v.article_id = $2
                ORDER BY v.version_number DESC
                LIMIT 1"#,
         )
+        .bind(tenant_id)
         .bind(article_id)
         .fetch_optional(&mut *tx)
         .await?;

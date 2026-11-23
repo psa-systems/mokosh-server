@@ -1174,27 +1174,16 @@ impl XeroClient {
         // document, so an absent value is a shape problem the operator
         // must see; fail naming the bill id. `AmountPaid` stays
         // defaulted to 0 (Xero omits it on an unpaid bill) but a
-        // non-numeric value gets a warn so a silent truncation is
-        // findable.
+        // non-numeric value fails the read.
         let Some(total_raw) = dto.total.as_deref() else {
             return Err(AppError::external_service(
                 "xero",
                 format!("Xero bill {external_bill_id} returned no Total; cannot reconcile"),
             ));
         };
-        let total_minor = decimal_string_to_minor(total_raw);
+        let total_minor = decimal_string_to_minor(total_raw)?;
         let paid_minor = match dto.amount_paid.as_deref() {
-            Some(raw) => {
-                let parsed = decimal_string_to_minor(raw);
-                if parsed == 0 && !raw.trim().chars().all(|c| c == '0' || c == '.' || c == '-') {
-                    tracing::warn!(
-                        bill_id = external_bill_id,
-                        amount_paid = raw,
-                        "xero fetch_bill_settlement: AmountPaid did not parse as a number; treating as 0"
-                    );
-                }
-                parsed
-            }
+            Some(raw) => decimal_string_to_minor(raw)?,
             None => 0,
         };
         Ok(Some(ExternalSettlement {

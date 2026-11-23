@@ -677,8 +677,8 @@ async fn mfa_on_the_magic_link_completes_on_the_second_post(pool: PgPool) {
         .expect("right code");
     assert_eq!(right.status(), reqwest::StatusCode::OK);
     assert!(
-        right.headers().get("set-cookie").is_some(),
-        "refresh cookie rides on the minted response"
+        right.headers().get("set-cookie").is_none(),
+        "no cookie rides on the minted response (SPEC-5.449)"
     );
     let body: serde_json::Value = right.json().await.expect("mint JSON");
     assert_eq!(body["auto"]["mfa_required"].as_bool(), Some(false));

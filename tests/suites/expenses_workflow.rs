@@ -232,7 +232,10 @@ async fn vendor_bill_expense_reimburse_workflow(pool: PgPool) {
                 svc.approve_expense(tenant, expense.expense.id, admin_id, &ctx())
                     .await
             }
-            "reject" => svc.reject_expense(tenant, expense.expense.id, &ctx()).await,
+            "reject" => {
+                svc.reject_expense(tenant, expense.expense.id, admin_id, &ctx())
+                    .await
+            }
             "reimburse" => {
                 svc.reimburse_expense(tenant, expense.expense.id, &ctx())
                     .await
@@ -260,10 +263,11 @@ async fn rejected_expense_cannot_be_reimbursed(pool: PgPool) {
         .await
         .expect("submit");
     let rejected = svc
-        .reject_expense(tenant, expense.expense.id, &ctx())
+        .reject_expense(tenant, expense.expense.id, admin_id, &ctx())
         .await
         .expect("reject");
     assert_eq!(rejected.status, "rejected");
+    assert_eq!(rejected.approver_id, Some(admin_id));
     let reimburse_msg = conflict_message(
         svc.reimburse_expense(tenant, expense.expense.id, &ctx())
             .await,

@@ -221,7 +221,7 @@ in PMS-1012 as subcommands of `mokosh-server`, so an external migration tool can
 Step 6 refuses, per key, unless **both** the provider being purged is disabled **and** the key is verified
 present, live, in the provider now serving it. That interlock is why "I deleted the old copies and email broke"
 cannot happen. There is no `--force` flag on any of the three commands; a refused purge is named with the
-reason and means the migration is not finished. See `docs/operator-provider-runbook.md` for the walk-through
+reason and means the migration is not finished. See `docs/public/operations/provider-runbook.md` for the walk-through
 that turns the six steps into commands.
 
 Not every provider can purge. The environment provider cannot (a process cannot unset a variable for its own
@@ -404,7 +404,6 @@ A flag declares a `FlagDefault<T>` beside its key: `Constant(value)` for one def
 
 The current shipping flags:
 
-- `ORGANIZATIONS_ENABLED`: on by default for `saas`, off by default for `self-hosted`.
 - `LOGIN_APPROVAL_ENABLED`: off by default in both profiles (PMS-658 gates a login and stays opt-in).
 
 Existing consumers that cache the flag value at construction (`AuthService::login_approval_enabled`) still take a

@@ -228,19 +228,19 @@ mod tests {
         assert_eq!(parse_counters::FALLBACK_PARSES.load(Ordering::Relaxed), 0);
     }
 
-    /// Acceptance criterion 2: a 24 MB JSON array of one-character strings,
-    /// under the sanitizer's 25 MB cap, still performs exactly one full-body
+    /// Acceptance criterion 2: a JSON array of one-character strings just
+    /// under the sanitizer's 2 MiB cap still performs exactly one full-body
     /// parse, the same single buffer the pre-PMS-1243 middleware already
     /// held (no second, re-serialized copy and no second parse downstream).
     #[tokio::test]
-    async fn a_24mb_json_array_is_parsed_exactly_once() {
+    async fn a_near_cap_json_array_is_parsed_exactly_once() {
         let _guard = parse_counters::lock().await;
         reset_counters();
-        let items = vec!["a"; 6_300_000];
+        let items = vec!["a"; 500_000];
         let body = serde_json::to_string(&items).unwrap();
         assert!(
-            body.len() > 24 * 1024 * 1024 && body.len() < 25 * 1024 * 1024,
-            "test body ({} bytes) must sit inside the sanitizer's 25 MB cap",
+            body.len() > 1024 * 1024 && body.len() < 2 * 1024 * 1024,
+            "test body ({} bytes) must sit inside the sanitizer's 2 MiB cap",
             body.len()
         );
         let response = app()
@@ -259,6 +259,32 @@ mod tests {
         assert_eq!(parse_counters::FALLBACK_PARSES.load(Ordering::Relaxed), 0);
     }
 
+    /// A 3 MiB JSON body that declares its length is past the pre-auth cap:
+    /// the sanitizer forwards it unread and the route's 2 MiB default limit
+    /// answers 413, so nothing was buffered ahead of authentication.
+    #[tokio::test]
+    async fn a_declared_3mib_json_body_is_refused_with_413() {
+        let _guard = parse_counters::lock().await;
+        reset_counters();
+        let items = vec!["a"; 1_000_000];
+        let body = serde_json::to_string(&items).unwrap();
+        assert!(body.len() > 2 * 1024 * 1024);
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/echo")
+                    .header("content-type", "application/json")
+                    .header("content-length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(parse_counters::MIDDLEWARE_PARSES.load(Ordering::Relaxed), 0);
+    }
+
     /// Acceptance criterion 3: a chunked body with no `Content-Length` is
     /// still bounded by `MAX_SANITIZED_JSON_BYTES` at the `to_bytes` call,
     /// unchanged by PMS-1243. `Body::from_stream` produces exactly that
@@ -270,7 +296,7 @@ mod tests {
         let chunk = Bytes::from(vec![b'a'; 1024 * 1024]);
         let chunks: Vec<Result<Bytes, std::io::Error>> =
             std::iter::repeat_with(|| Ok(chunk.clone()))
-                .take(26)
+                .take(3)
                 .collect();
         let body = Body::from_stream(tokio_stream::iter(chunks));
         let request = Request::builder()

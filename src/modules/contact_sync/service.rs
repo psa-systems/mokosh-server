@@ -125,8 +125,24 @@ struct ConnectionRow {
 
 impl From<ConnectionRow> for ConnectionStatus {
     fn from(row: ConnectionRow) -> Self {
+        // PMS-1663 F: a corrupt stored selection used to render as an
+        // empty list with no trace, which looks like "nothing selected"
+        // and sends plan() down the "no groups" path. A From impl
+        // cannot propagate; WARN with the connection id so the drift
+        // is findable.
+        let selected_groups = match serde_json::from_value(row.selected_groups.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    connection_id = %row.id,
+                    error = %e,
+                    "contact_sync_connections.selected_groups failed to decode; reading as empty"
+                );
+                Vec::new()
+            }
+        };
         Self {
-            selected_groups: serde_json::from_value(row.selected_groups).unwrap_or_default(),
+            selected_groups,
             sync_interval_minutes: row.sync_interval_minutes,
             consecutive_failures: row.consecutive_failures,
             open_reviews: row.open_reviews,
@@ -861,7 +877,7 @@ impl ContactSyncService {
             &code_verifier,
         )
         .await
-        .map_err(AppError::from)?;
+        .map_err(|e| e.into_app_error(MICROSOFT))?;
         let Some(refresh_token) = tokens.refresh_token.clone() else {
             // Microsoft returns a refresh token when `offline_access` is in
             // the granted scope; the SCOPES constant always includes it, so
@@ -1104,10 +1120,15 @@ impl ContactSyncService {
     /// never the provider's text: this lands in a URL bar and a browser
     /// history.
     // SPEC-15.531
-    pub fn failure_redirect(&self) -> String {
+    pub fn failure_redirect(&self, provider: &str) -> String {
         format!(
-            "{}/settings/integrations/google-contacts?contact_sync=failed",
-            self.spa_base_url.trim_end_matches('/')
+            "{}/settings/integrations/{}-contacts?contact_sync=failed",
+            self.spa_base_url.trim_end_matches('/'),
+            if provider == MICROSOFT {
+                "microsoft"
+            } else {
+                "google"
+            }
         )
     }
 
@@ -1213,9 +1234,9 @@ impl ContactSyncService {
             Ok(tokens) => Ok(tokens.access_token),
             Err(TokenError::GrantRevoked) => {
                 self.mark_reconnect_required(tenant_id, connection_id).await;
-                Err(AppError::from(TokenError::GrantRevoked))
+                Err(TokenError::GrantRevoked.into_app_error(MICROSOFT))
             }
-            Err(other) => Err(AppError::from(other)),
+            Err(other) => Err(other.into_app_error(MICROSOFT)),
         }
     }
 
@@ -1841,11 +1862,12 @@ impl ContactSyncService {
             .await
         {
             Err(AppError::NotFound(what)) => {
-                // PMS-1409: the queue spans every live source, and a reviewer
-                // answering an item does not name a provider, so the switch that
-                // could explain an item having vanished is Google's - the only
-                // one an answer can be refused by here.
-                self.assert_enabled(tenant_id, GOOGLE).await?;
+                // No live source holds the item and the answer does not always
+                // name one, so any provider's switch being off could explain the
+                // item having gone: refuse with 409 for that rather than 404.
+                for provider in [GOOGLE, ICLOUD, MICROSOFT] {
+                    self.assert_enabled(tenant_id, provider).await?;
+                }
                 return Err(AppError::NotFound(what));
             }
             other => other?,
@@ -2417,18 +2439,39 @@ impl ContactSyncService {
 
     /// Best effort: a failure to record the state must not mask the token
     /// failure the caller is already handling.
+    ///
+    /// PMS-1663 F: the hard-coded "Google has revoked this connection"
+    /// message was written for every provider, including the Microsoft
+    /// refresh path. Derive the message from the connection's stored
+    /// `provider` so a reconnect prompt is correctly attributed in the
+    /// UI.
     // SPEC-15.559
     async fn mark_reconnect_required(&self, tenant_id: TenantId, connection_id: Uuid) {
         let written = async {
             let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-            sqlx::query(
-                "UPDATE contact_sync_connections \
-                 SET sync_status = 'reconnect_required', \
-                     last_error = 'Google has revoked this connection.', updated_at = NOW() \
+            let provider: Option<String> = sqlx::query_scalar(
+                "SELECT provider FROM contact_sync_connections \
                  WHERE tenant_id = $1 AND id = $2",
             )
             .bind(tenant_id)
             .bind(connection_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let human = match provider.as_deref() {
+                Some("google") => "Google has revoked this connection.",
+                Some("microsoft") => "Microsoft has revoked this connection.",
+                Some("icloud") => "iCloud rejected the app password for this connection.",
+                _ => "The source has revoked this connection.",
+            };
+            sqlx::query(
+                "UPDATE contact_sync_connections \
+                 SET sync_status = 'reconnect_required', \
+                     last_error = $3, updated_at = NOW() \
+                 WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(connection_id)
+            .bind(human)
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;

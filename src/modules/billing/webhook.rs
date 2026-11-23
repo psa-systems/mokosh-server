@@ -40,6 +40,7 @@ use axum::{
 use uuid::Uuid;
 
 use super::provider::PaymentEvent;
+use super::service::GatewayPaymentOutcome;
 use super::BillingService;
 use crate::modules::auth::TenantId;
 use crate::modules::contact_portal::payment_methods::PaymentMethodsService;
@@ -239,7 +240,13 @@ async fn dispatch(
                     &raw,
                 )
                 .await?;
-            outcome = if recorded { "accepted" } else { "unreconciled" };
+            // A redelivery of a recorded payment is benign and reads
+            // `benign_redelivery`; only a refusal needs a human.
+            outcome = match recorded {
+                GatewayPaymentOutcome::Recorded => "accepted",
+                GatewayPaymentOutcome::AlreadyRecorded => "benign_redelivery",
+                GatewayPaymentOutcome::Refused => "unreconciled",
+            };
             invoice = Some(invoice_id);
         }
         // SPEC-13.761

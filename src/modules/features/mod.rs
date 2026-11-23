@@ -9,7 +9,7 @@
 //! the stored rows and the process snapshot, [`job`] is the interval refresh, and
 //! [`routes`] is the operator surface plus the public probe.
 //!
-//! See `docs/feature-toggles.md` for how to add one.
+//! See `docs/public/feature-toggles.md` for how to add one.
 
 pub mod job;
 pub mod registry;
