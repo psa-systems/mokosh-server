@@ -58,7 +58,7 @@
 # stays attributable (`count:k/N` would reassign on every added test file,
 # which makes per-shard timings incomparable across runs).
 #
-# PMS-1652: `classify` (PC-134's shared action, STD-3.1/STD-3.2) precedes
+# PMS-1652: `classify` (PC-134's shared action, PSTD-1.3.1/PSTD-1.3.2) precedes
 # those three. `build` runs only when the result is `code`; `test` and
 # `summary` cascade to `skipped` on anything else, and `summary` treats that
 # the same as `success` so the required check still posts green.
@@ -84,7 +84,7 @@ on:
   # PMS-1652: integration tests read no Markdown and no `docs/` file, so a
   # pull request touching only those paths (or only comments/whitespace in a
   # code file) cannot regress what this suite proves. The `classify` job
-  # below and `build`'s job-level `if:` decide the skip (STD-3.1); no
+  # below and `build`'s job-level `if:` decide the skip (PSTD-1.3.1); no
   # `paths-ignore` here, because a workflow-level path filter makes Forgejo
   # drop the whole workflow and a required check never posts. `check.yml` is
   # NOT treated the same way because several of its guards exist to run on

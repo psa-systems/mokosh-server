@@ -25,7 +25,7 @@
 # gate waits on both. `secrets` keeps its own base-medium job unchanged.
 #
 # PMS-1652: `classify` calls the shared `classify-diff` composite action from
-# `common` (PC-134, STD-3.1/STD-3.2) instead of a local script or a
+# `common` (PC-134, PSTD-1.3.1/PSTD-1.3.2) instead of a local script or a
 # workflow-level path filter. `cargo`'s clippy/unit/doc-test/machete steps run
 # only when the result is `code`; its fmt step runs on anything but
 # `non-code`. `guards` and `secrets` stay ungated: several guards exist to run
@@ -156,7 +156,7 @@ jobs:
 
       # SPEC-10.9 SPEC-10.305: fmt, clippy, unit and doc tests, in this order
       - name: Check formatting
-        # PMS-1652: runs on `code` and `comments-only` alike (STD-3.2); only
+        # PMS-1652: runs on `code` and `comments-only` alike (PSTD-1.3.2); only
         # `non-code` skips it, via the job-level `if:` above.
         run: cargo fmt --all --check
 
@@ -166,7 +166,7 @@ jobs:
         # per PMS-893: without it, mokosh-types' test target silently stops
         # compiling (its fixture lost a field in PMS-730 and no gate caught it
         # until `--workspace` landed on this step).
-        # PMS-1652: STD-3.1 skips compile/test work on `comments-only`.
+        # PMS-1652: PSTD-1.3.1 skips compile/test work on `comments-only`.
         if: needs.classify.outputs.result == 'code'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
