@@ -87,6 +87,11 @@ jobs:
           # the token's env lifetime to this one step.
           SARRACENIA_TOKEN: ${{ secrets.DOCS_A8N_SYSTEMS_SARRACENIA }}
         run: |
+          # sarracenia walks from cwd (src/lib.rs current_dir()); cd into the
+          # docs/public/ directory so docs/public/ is the walk root. The
+          # sidebar then renders content directly under the top-level entry
+          # rather than nested under "Docs > Public" synthetic layers.
+          #
           # --no-media: sarracenia derives the Storefront media library path
           # from base_path (lowercase `docs/mokosh-server`); Storefront's
           # normalize_media_library_path requires the first segment to match
@@ -94,7 +99,18 @@ jobs:
           # sensitively, so the lowercase `docs` is refused 400. Drop this
           # flag once either sarracenia maps base_path to the canonical root
           # or Storefront's validator calls its own canonical_root_name helper.
-          let bin = $"./($env.BINARY_FILE)"
+          let bin = $"($env.GITHUB_WORKSPACE)/($env.BINARY_FILE)"
+          cd docs/public
+          # Belt-and-suspenders: the include glob `**/*.md` is relative to
+          # sarracenia's walk root (cwd). If a future edit drops the `cd`
+          # above, cwd would be the repo root and the walk would match every
+          # markdown file in the repo (invariants, dev-docs, specification,
+          # ROADMAP, the lot). Fail loudly instead of pushing hundreds of
+          # pages to Storefront.
+          if not ($env.PWD | str ends-with "/docs/public") {
+            print --stderr $"guard: publish-docs expects cwd to end in /docs/public, got ($env.PWD)"
+            exit 1
+          }
           ^$bin push --no-media
 
       - name: Report job metrics

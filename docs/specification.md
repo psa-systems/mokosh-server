@@ -711,8 +711,8 @@ Every configuration key is declared once in a registry (`src/config/registry.rs`
   not implemented`), and its `delete` must use the trait default refusal (`bunyip provider does not support deletes`).
 - **SPEC-2.217**: A `Flag<T>` must pair one declared registry key with a typed default (`Constant`, or `PerProfile` with
   a self-hosted and a saas value) and must read through the current generation, so a refresh changes the next read.
-- **SPEC-2.218**: The declared flags and defaults must be: `ORGANIZATIONS_ENABLED` false on self-hosted and true on
-  saas, `LOGIN_APPROVAL_ENABLED` false in both, and `ALLOW_UNINVITED_BUNYIP_SIGNUP` false in both.
+- **SPEC-2.218**: The declared flags and defaults must be: `LOGIN_APPROVAL_ENABLED` false in both profiles and
+  `ALLOW_UNINVITED_BUNYIP_SIGNUP` false in both. `ORGANIZATIONS_ENABLED` is retired and no longer a declared flag.
 - **SPEC-2.219**: `Flag::read` must return the flag default when the key is unheld or blank, and must return the default
   and log at warn (`flag value failed to parse; serving the flag's default`, with the key and the raw value) when the
   value does not parse.
@@ -3975,10 +3975,9 @@ the value as given.
   and must reject every other value. `Flag::read` must return the parsed value; for an unset or blank value it must
   return the flag's default; for a set value that does not parse it must log at warn "flag value failed to parse;
   serving the flag's default" with the key and the raw value and return the default.
-- **SPEC-6.31**: The flag defaults must be: `ORGANIZATIONS_ENABLED` false on `self-hosted` and true on `saas`, resolved
-  against the lenient deployment-mode reader at every read; `LOGIN_APPROVAL_ENABLED` false;
-  `ALLOW_UNINVITED_BUNYIP_SIGNUP` false. No code outside the configuration module reads `ORGANIZATIONS_ENABLED`, so
-  setting it changes no behavior.
+- **SPEC-6.31**: The flag defaults must be: `LOGIN_APPROVAL_ENABLED` false; `ALLOW_UNINVITED_BUNYIP_SIGNUP` false.
+  `ORGANIZATIONS_ENABLED` is retired: it never changed any behavior, and `config::flags::check_boot` refuses boot when
+  it is set to a non-blank value, naming it and stating that it has no replacement.
 - **SPEC-6.32**: `config::flags::check_boot` must run over every declared flag at boot and, when any flag is set to a
   non-blank value that does not parse, fail boot with "boot refused: {n} feature flag(s) set to an unparseable value."
   followed by a blank line and one "{KEY} is set to {raw:?}, which is not a valid value" line per flag. An unset or

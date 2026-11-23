@@ -3,7 +3,25 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use validator::Validate;
+use validator::{Validate, ValidationError};
+
+/// Channel types the worker has a transport for; anything else fails permanently at send time.
+const SUPPORTED_CHANNEL_TYPES: [&str; 2] = ["in_app", "email"];
+
+const CHANNEL_TYPE_MESSAGE: &str = "channel_type must be one of 'in_app' or 'email'";
+
+pub fn validate_channel_type(value: &str) -> Result<(), ValidationError> {
+    if SUPPORTED_CHANNEL_TYPES.contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::new("unsupported_channel_type")
+            .with_message(CHANNEL_TYPE_MESSAGE.into()))
+    }
+}
+
+pub fn validate_channel_types_vec(values: &[String]) -> Result<(), ValidationError> {
+    values.iter().try_for_each(|v| validate_channel_type(v))
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NotificationChannelResponse {
@@ -19,7 +37,7 @@ pub struct NotificationChannelResponse {
 pub struct UpsertNotificationChannelRequest {
     /// "email" | "sms" | "slack" | "teams" | "discord" | "google_chat"
     /// | "mattermost" | "in_app"
-    // SPEC-7.591: channel_type is a free-form String here; nothing in create_channel/update_channel enforces the documented set.
+    #[validate(custom(function = "validate_channel_type"))]
     pub channel_type: String,
     #[validate(length(min = 1, max = 100))]
     pub name: String,
@@ -47,6 +65,7 @@ pub struct UpsertNotificationTemplateRequest {
     #[validate(length(min = 1, max = 100))]
     pub name: String,
     pub event_type: String,
+    #[validate(custom(function = "validate_channel_type"))]
     pub channel_type: String,
     pub subject: Option<String>,
     #[validate(length(min = 1))]
@@ -72,6 +91,7 @@ pub struct UserNotificationPreferenceResponse {
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpsertUserNotificationPreferenceRequest {
     pub event_type: String,
+    #[validate(custom(function = "validate_channel_types_vec"))]
     pub channel_types: Vec<String>,
     // SPEC-7.587: is_enabled defaults to true when omitted from the request JSON.
     #[serde(default = "default_true")]
@@ -159,4 +179,44 @@ pub struct NotificationPreviewResponse {
     pub body_text: String,
     pub body_html: Option<String>,
     pub unresolved: Vec<String>,
+}
+
+#[cfg(test)]
+mod channel_type_tests {
+    use super::*;
+
+    #[test]
+    fn supported_channel_types_pass() {
+        assert!(validate_channel_type("in_app").is_ok());
+        assert!(validate_channel_type("email").is_ok());
+    }
+
+    #[test]
+    fn unsupported_channel_types_fail_with_message() {
+        for v in ["sms", "slack", "teams", "", "random"] {
+            let err = validate_channel_type(v).expect_err(v);
+            assert_eq!(err.message.as_deref(), Some(CHANNEL_TYPE_MESSAGE));
+        }
+    }
+
+    #[test]
+    fn vec_with_one_bad_element_fails() {
+        let ok = vec!["in_app".to_string(), "email".to_string()];
+        assert!(validate_channel_types_vec(&ok).is_ok());
+        let bad = vec!["in_app".to_string(), "sms".to_string()];
+        assert!(validate_channel_types_vec(&bad).is_err());
+    }
+
+    #[test]
+    fn channel_request_validate_rejects_bad_type() {
+        let req = UpsertNotificationChannelRequest {
+            channel_type: "sms".into(),
+            name: "x".into(),
+            config: serde_json::json!({}),
+            is_active: true,
+            is_default: false,
+        };
+        let errors = req.validate().expect_err("sms must fail");
+        assert!(errors.field_errors().contains_key("channel_type"));
+    }
 }

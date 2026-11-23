@@ -250,22 +250,6 @@ impl<T: FlagValue> std::fmt::Debug for Flag<T> {
 
 // SPEC-6.31
 // SPEC-2.218
-/// PMS-983: the organizations feature.
-///
-/// A SaaS deployment has multi-user organizations enabled by
-/// default, matching the current shipping behaviour on the hosted
-/// deployments. A self-hosted deployment starts with organizations
-/// off, matching the single-user default the customer image ships
-/// with today.
-pub static ORGANIZATIONS_ENABLED: Flag<bool> = Flag::new(
-    &registry::ORGANIZATIONS_ENABLED,
-    FlagDefault::PerProfile {
-        self_hosted: false,
-        saas: true,
-    },
-);
-
-// SPEC-6.31
 /// PMS-658 / PMS-983: opt-in gate on the suspicious-login
 /// notify-and-approve flow.
 ///
@@ -314,18 +298,40 @@ impl<T: FlagValue + Sync> FlagCheck for Flag<T> {
 /// not be covered by [`check_boot`], so a typo in it would go back to
 /// reading silently as the default; there is no other enforcement that this
 /// list stays complete.
-static ALL_FLAGS: &[&dyn FlagCheck] = &[
-    &ORGANIZATIONS_ENABLED,
-    &LOGIN_APPROVAL_ENABLED,
-    &ALLOW_UNINVITED_BUNYIP_SIGNUP,
-];
+static ALL_FLAGS: &[&dyn FlagCheck] = &[&LOGIN_APPROVAL_ENABLED, &ALLOW_UNINVITED_BUNYIP_SIGNUP];
+
+/// Flags that were declared but never read; setting one refuses boot so an
+/// operator learns the setting does nothing instead of trusting it.
+const RETIRED_FLAGS: &[&str] = &["ORGANIZATIONS_ENABLED"];
+
+/// Refuse boot when a retired flag is set to a non-blank value. A forwarded
+/// but unset variable arrives as `""` and passes.
+pub fn check_retired(lookup: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    let set: Vec<&str> = RETIRED_FLAGS
+        .iter()
+        .copied()
+        .filter(|name| lookup(name).is_some_and(|v| !v.trim().is_empty()))
+        .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "boot refused: {} retired feature flag(s) set.\n\n{}\n\nThese flags never changed any behavior; remove them from your compose file or environment.",
+        set.len(),
+        set.iter()
+            .map(|name| format!("{name} is retired and has no replacement"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ))
+}
 
 // SPEC-6.32
 // SPEC-2.221
-/// PMS-1577: refuse to start when any declared flag is set but unparseable.
+/// Refuse to start when any declared flag is set but unparseable.
 /// Collects every failing flag into one combined error, mirroring
 /// `main.rs`'s `check_deployment_requirements`.
 pub fn check_boot() -> Result<(), String> {
+    check_retired(|name| std::env::var(name).ok())?;
     let errors: Vec<String> = ALL_FLAGS
         .iter()
         .filter_map(|flag| flag.check().err())
@@ -345,6 +351,16 @@ pub fn check_boot() -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::config::{refresh_test_lock, Tier};
+
+    /// No shipping flag has a per-profile default, so the shape is exercised
+    /// on a test-local flag.
+    static PER_PROFILE_FLAG: Flag<bool> = Flag::new(
+        &registry::LOGIN_APPROVAL_ENABLED,
+        FlagDefault::PerProfile {
+            self_hosted: false,
+            saas: true,
+        },
+    );
 
     /// RAII: remove `keys` on construction and again on drop, then
     /// refresh the configuration generation. A test failure cannot
@@ -401,7 +417,6 @@ mod tests {
     #[test]
     fn every_shipping_flag_names_an_application_tier_key() {
         assert_eq!(LOGIN_APPROVAL_ENABLED.key().tier(), Tier::Application);
-        assert_eq!(ORGANIZATIONS_ENABLED.key().tier(), Tier::Application);
     }
 
     /// The Debug print carries the key name and the SHAPE of the
@@ -415,8 +430,8 @@ mod tests {
         assert!(!printed.contains("true"), "{printed}");
         assert!(!printed.contains("false"), "{printed}");
 
-        let printed = format!("{ORGANIZATIONS_ENABLED:?}");
-        assert!(printed.contains("ORGANIZATIONS_ENABLED"), "{printed}");
+        let printed = format!("{PER_PROFILE_FLAG:?}");
+        assert!(printed.contains("LOGIN_APPROVAL_ENABLED"), "{printed}");
         assert!(printed.contains("PerProfile"), "{printed}");
     }
 
@@ -440,13 +455,13 @@ mod tests {
         let _cleanup = EnvGuard::new(&["MOKOSH_DEPLOYMENT_MODE"]);
 
         assert!(
-            !ORGANIZATIONS_ENABLED.resolved_default(),
+            !PER_PROFILE_FLAG.resolved_default(),
             "unset MOKOSH_DEPLOYMENT_MODE resolves to self-hosted, which takes the self_hosted arm"
         );
 
         std::env::set_var("MOKOSH_DEPLOYMENT_MODE", "saas");
         assert!(
-            ORGANIZATIONS_ENABLED.resolved_default(),
+            PER_PROFILE_FLAG.resolved_default(),
             "saas mode flips the per-profile default to the saas arm"
         );
     }
@@ -545,6 +560,16 @@ mod tests {
         let err = check_boot().expect_err("a typo'd flag must refuse to boot");
         assert!(err.contains("LOGIN_APPROVAL_ENABLED"), "{err}");
         assert!(err.contains("ture"), "{err}");
+    }
+
+    #[test]
+    fn a_retired_flag_refuses_boot_when_set_and_passes_when_blank() {
+        let set =
+            |v: &'static str| move |n: &str| (n == "ORGANIZATIONS_ENABLED").then(|| v.to_string());
+        assert!(check_retired(|_| None).is_ok());
+        assert!(check_retired(set("  ")).is_ok());
+        let err = check_retired(set("true")).expect_err("retired flag must refuse boot");
+        assert!(err.contains("ORGANIZATIONS_ENABLED"), "{err}");
     }
 
     /// `served_by` names the provider that held the flag's raw

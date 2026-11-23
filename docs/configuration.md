@@ -32,6 +32,10 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 - [`CONTACT_LOGIN_IP_RATE_MAX`](#var-contact-login-ip-rate-max) (Required: no) - Optional. The per-IP attempt budget shared by contact-portal login and magic-link redeem; defaults to 10 attempts per 60 seconds, then 429 with Retry-After.
 - [`CONTACT_LOGIN_IP_RATE_WINDOW_SECS`](#var-contact-login-ip-rate-window-secs) (Required: no) - Optional. The per-IP attempt budget shared by contact-portal login and magic-link redeem; defaults to 10 attempts per 60 seconds, then 429 with Retry-After.
 
+#### Removed
+
+- **Breaking: won't start:** [`ORGANIZATIONS_ENABLED`](#var-organizations-enabled) (Required: no) - Retired with no replacement: the flag never changed any behavior. The server now refuses to boot while it is set to a non-blank value; delete it from your compose file or `.env`. (PMS-1578)
+
 <a id="release-v0-17-0"></a>
 
 ### v0.17.0
@@ -254,7 +258,6 @@ No configuration changes.
 
 | Variable | Required | Added in | Where set | Purpose |
 | --- | --- | --- | --- | --- |
-| <a id="var-organizations-enabled"></a>`ORGANIZATIONS_ENABLED` | no, default the hosting profile's (off self-hosted, on saas) | v0.14.0 | `.env` | The organizations feature flag (PMS-983). |
 | <a id="var-ip2location-db-path"></a>`IP2LOCATION_DB_PATH` | no, unset turns country lookup off | v0.7.0 | `.env` | IP2Location database path inside the container, for login-location alerts (PMS-657). |
 | <a id="var-ip2proxy-db-path"></a>`IP2PROXY_DB_PATH` | no, unset turns ASN and VPN enrichment off | v0.11.0 | `.env` | IP2Proxy database path inside the container (BUNYIP-475). |
 | <a id="var-trusted-proxy-cidr"></a>`TRUSTED_PROXY_CIDR` | no, default loopback plus private ranges | v0.7.0 | `.env` | CIDRs whose `X-Forwarded-For` is trusted for the client IP (PMS-587). Tighten it to the proxy subnet in production. |
@@ -303,6 +306,7 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-google-oauth-client-secret"></a>`GOOGLE_OAUTH_CLIENT_SECRET` | no | v0.2.0; removed in v0.14.0 | nowhere | Client secret of the retired Google sign-in routes (PMS-837). |
 | <a id="var-google-oauth-redirect-uri"></a>`GOOGLE_OAUTH_REDIRECT_URI` | no | v0.2.0; removed in v0.14.0 | nowhere | Redirect URI of the retired Google sign-in routes (PMS-837). |
 | <a id="var-oauth-super-admin-emails"></a>`OAUTH_SUPER_ADMIN_EMAILS` | no | v0.3.0; removed in v0.14.0 | nowhere | Super-admin allowlist only the retired Google sign-in read (PMS-837). |
+| <a id="var-organizations-enabled"></a>`ORGANIZATIONS_ENABLED` | no | v0.14.0; removed in v0.18.0 | nowhere | Retired. The flag never had an effect; setting it to a non-blank value now refuses boot. Delete it from your compose file or `.env`. |
 | <a id="var-bunyip-api-base-url"></a>`BUNYIP_API_BASE_URL` | no | v0.16.0 | `.env` | Base URL of the Bunyip API this deployment federates with in SaaS mode; used to call `GET /v1/users/lookup?email=` before creating a pending grant invitation. Unset in standalone mode. |
 | <a id="var-bunyip-directory-client-id"></a>`BUNYIP_DIRECTORY_CLIENT_ID` | no | v0.16.0 | `.env` | Machine-credential client id this deployment presents to Bunyip's `/v1/users/lookup` endpoint, as HTTP Basic. All three (`BUNYIP_API_BASE_URL` + this pair) must be set together or left unset. |
 | <a id="var-bunyip-directory-client-secret"></a>`BUNYIP_DIRECTORY_CLIENT_SECRET` | no | v0.16.0 | `.env` | Machine-credential client secret this deployment presents to Bunyip's `/v1/users/lookup` endpoint, as HTTP Basic. All three (`BUNYIP_API_BASE_URL` + this pair) must be set together or left unset. |
