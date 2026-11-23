@@ -7981,7 +7981,7 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
   one.
 - **SPEC-13.1030**: After a successful exchange, completing a connection must compute the access-token expiry as now
   plus `expires_in` seconds, write the credential blob to the tenant's integration secret key, record the connection,
-  and return `<app base without trailing slashes>/settings/integrations` as the destination.
+  and return `<app base without trailing slashes>/settings/integrations/<provider>?invoice_issuer=connected` as the destination.
 - **SPEC-13.1031**: Recording a connection must upsert the tenant's integration row for the provider with status
   `connected`, enabled capabilities exactly `invoicing` (replacing any previous capability set), the external
   organisation id, `connected_at` set to now and `last_error` cleared.
@@ -8015,9 +8015,10 @@ Normative requirements for `src/modules/billing/`, `src/modules/quotes/` and `sr
 - **SPEC-13.1040**: A `{provider}` path segment other than `xero` or `quickbooks` must fail with 404 `<raw> is not an
   invoice-issuer provider. The providers are: xero, quickbooks`.
 - **SPEC-13.1041**: `GET /api/v1/public/invoice-issuer/{provider}/callback` must require no session and must always
-  answer with a redirect to the SPA (never a JSON body): `<app base>/settings/integrations` after a successful
-  connection and `<app base>/settings/integrations?connect=failed` for every failure, without placing the provider's
-  error text in the URL.
+  answer with a redirect to the SPA (never a JSON body): `<app base>/settings/integrations/<provider>?invoice_issuer=connected`
+  after a successful connection and `<app base>/settings/integrations/<provider>?invoice_issuer=failed` for every
+  failure, or `<app base>/settings/integrations?invoice_issuer=failed` when the provider segment is unknown, without
+  placing the provider's error text in the URL.
 - **SPEC-13.1042**: The callback must redirect to the failure URL, without completing anything, when the provider
   segment is unknown, when the query carries `error` (logged at info with the provider and the reason), or when `code`
   or `state` is missing; when completing fails it must log at warn with the provider and the error and redirect to the

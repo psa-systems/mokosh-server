@@ -226,7 +226,7 @@ async fn connecting_xero_writes_the_credential_and_names_the_organisation(pool: 
         "a connect callback must land on the SPA, not the apex CLIENT_ORIGIN serves: {destination}"
     );
     assert!(
-        destination.ends_with("/settings/integrations"),
+        destination.ends_with("/settings/integrations/xero?invoice_issuer=connected"),
         "{destination}"
     );
 
@@ -388,7 +388,10 @@ async fn a_failed_callback_redirects_to_the_spa(pool: PgPool) {
             location.starts_with(SPA_BASE),
             "a failed connect callback must land on the SPA, not the apex CLIENT_ORIGIN serves: {query} -> {location}"
         );
-        assert!(location.contains("connect=failed"), "{query} -> {location}");
+        assert!(
+            location.ends_with("/settings/integrations/xero?invoice_issuer=failed"),
+            "{query} -> {location}"
+        );
     }
 }
 

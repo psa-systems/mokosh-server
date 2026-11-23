@@ -313,9 +313,10 @@ impl InvoiceIssuerConnectService {
             return Err(e);
         }
 
-        Ok(format!(
-            "{}/settings/integrations",
-            self.app_base.trim_end_matches('/')
+        Ok(settings_destination(
+            &self.app_base,
+            Some(provider),
+            ConnectOutcome::Connected,
         ))
     }
 
@@ -795,6 +796,31 @@ fn authorization_url(
 mod tests {
     use super::*;
 
+    #[test]
+    fn redirect_targets_land_on_the_provider_page_with_the_flag() {
+        let base = "https://app.example/";
+        assert_eq!(
+            settings_destination(
+                base,
+                Some(InvoiceProviderKind::Xero),
+                ConnectOutcome::Connected
+            ),
+            "https://app.example/settings/integrations/xero?invoice_issuer=connected"
+        );
+        assert_eq!(
+            settings_destination(
+                base,
+                Some(InvoiceProviderKind::Quickbooks),
+                ConnectOutcome::Failed
+            ),
+            "https://app.example/settings/integrations/quickbooks?invoice_issuer=failed"
+        );
+        assert_eq!(
+            settings_destination(base, None, ConnectOutcome::Failed),
+            "https://app.example/settings/integrations?invoice_issuer=failed"
+        );
+    }
+
     /// The consent URL carries the host's client id, the exact redirect,
     /// the state and a PKCE challenge, and never the verifier.
     ///
@@ -923,6 +949,35 @@ pub fn invoice_issuer_public_routes(service: Arc<InvoiceIssuerConnectService>) -
         .with_state(InvoiceIssuerConnectRouterState { service })
 }
 
+/// What the SPA is told about a connect round trip.
+#[derive(Clone, Copy)]
+enum ConnectOutcome {
+    Connected,
+    Failed,
+}
+
+// SPEC-13.1041
+/// The provider's own page when there is one; the generic panel is only the
+/// landing for a segment that names no provider.
+fn settings_destination(
+    app_base: &str,
+    provider: Option<InvoiceProviderKind>,
+    outcome: ConnectOutcome,
+) -> String {
+    let flag = match outcome {
+        ConnectOutcome::Connected => "connected",
+        ConnectOutcome::Failed => "failed",
+    };
+    let base = app_base.trim_end_matches('/');
+    match provider {
+        Some(p) => format!(
+            "{base}/settings/integrations/{}?invoice_issuer={flag}",
+            p.as_str()
+        ),
+        None => format!("{base}/settings/integrations?invoice_issuer={flag}"),
+    }
+}
+
 // SPEC-13.1040
 /// The path segment, parsed against the enum rather than passed through.
 fn parse_provider(raw: &str) -> AppResult<InvoiceProviderKind> {
@@ -1024,10 +1079,7 @@ async fn callback(
     Path(provider): Path<String>,
     Query(query): Query<CallbackQuery>,
 ) -> impl IntoResponse {
-    let failure = format!(
-        "{}/settings/integrations?connect=failed",
-        state.service.app_base.trim_end_matches('/')
-    );
+    let app_base = state.service.app_base.clone();
     // PMS-1660 F7: an unknown provider segment used to redirect to
     // the failure URL with no log; an operator seeing "connect failed"
     // in the browser could not find out why. Log the offending
@@ -1039,9 +1091,14 @@ async fn callback(
                 provider_segment = %provider,
                 "invoice-issuer callback: unknown provider segment; redirecting to failure"
             );
-            return Redirect::to(&failure);
+            return Redirect::to(&settings_destination(
+                &app_base,
+                None,
+                ConnectOutcome::Failed,
+            ));
         }
     };
+    let failure = settings_destination(&app_base, Some(provider), ConnectOutcome::Failed);
     if let Some(reason) = query.error.as_deref() {
         tracing::info!(
             provider = provider.as_str(),
@@ -1051,7 +1108,7 @@ async fn callback(
         return Redirect::to(&failure);
     }
     // PMS-1660 F7: a missing `code` or `state` used to redirect to
-    // failure with no log; the operator sees `connect=failed` and
+    // failure with no log; the operator sees the failed flag and
     // nothing explains why. Log which parameter was missing (never
     // log the values themselves: they can be the single-use state
     // secret) before redirecting.
