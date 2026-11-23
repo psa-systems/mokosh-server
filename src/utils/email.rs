@@ -593,6 +593,36 @@ fn build_message(
     Ok(msg)
 }
 
+/// Debug aid behind `MAIL_LOG_BODY_ON_DISPATCH`: record what was composed, after the send succeeded.
+/// Attachments are named and sized, never dumped.
+fn log_dispatched_body(
+    enabled: bool,
+    from: &Mailbox,
+    to: &str,
+    subject: &str,
+    text: &str,
+    html: Option<&str>,
+    attachments: &[EmailAttachment<'_>],
+) {
+    if !enabled {
+        return;
+    }
+    let attachments: Vec<String> = attachments
+        .iter()
+        .map(|a| format!("{} ({} bytes)", a.filename, a.bytes.len()))
+        .collect();
+    tracing::info!(
+        target: "mokosh_server.mailer",
+        from = %from,
+        to = %to,
+        subject = %subject,
+        body_text = %text,
+        body_html = html.unwrap_or(""),
+        attachments = ?attachments,
+        "email dispatched",
+    );
+}
+
 #[async_trait]
 impl Mailer for SmtpMailer {
     async fn send_multipart(
@@ -608,6 +638,15 @@ impl Mailer for SmtpMailer {
         reject_undeliverable_recipient(&to_mailbox)?;
         let msg = build_message(&self.from, to_mailbox, subject, text, html)?;
         self.transport.send(msg).await?;
+        log_dispatched_body(
+            config::flags::MAIL_LOG_BODY_ON_DISPATCH.read(),
+            &self.from,
+            to,
+            subject,
+            text,
+            html,
+            &[],
+        );
         Ok(())
     }
 
@@ -625,6 +664,15 @@ impl Mailer for SmtpMailer {
         let msg =
             build_message_with_attachments(&self.from, to_mailbox, subject, text, attachments)?;
         self.transport.send(msg).await?;
+        log_dispatched_body(
+            config::flags::MAIL_LOG_BODY_ON_DISPATCH.read(),
+            &self.from,
+            to,
+            subject,
+            text,
+            None,
+            attachments,
+        );
         Ok(())
     }
 
@@ -1197,6 +1245,61 @@ mod tests {
     /// PMS-774: the templates append the punctuation, so the helper must never
     /// return a trailing space or comma of its own, and a blank name must not
     /// leave one behind either.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured_dispatch(enabled: bool) -> String {
+        let cap = Capture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            log_dispatched_body(
+                enabled,
+                &test_from(),
+                "to@example.com",
+                "Subject line",
+                "plain body",
+                Some("<p>html body</p>"),
+                &[],
+            );
+        });
+        let out = cap.0.lock().unwrap().clone();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn body_logging_is_silent_when_the_flag_is_off() {
+        assert_eq!(captured_dispatch(false), "");
+    }
+
+    #[test]
+    fn body_logging_emits_exactly_one_line_when_the_flag_is_on() {
+        let out = captured_dispatch(true);
+        assert_eq!(out.lines().count(), 1, "{out}");
+        for needle in ["Subject line", "plain body", "html body", "to@example.com"] {
+            assert!(out.contains(needle), "{needle} missing in {out}");
+        }
+    }
+
     #[test]
     fn salutation_covers_the_blank_and_named_cases() {
         assert_eq!(salutation("David"), "Hello David");
