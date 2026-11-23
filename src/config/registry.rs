@@ -421,11 +421,6 @@ declare_keys! {
     // annotation: an unset key is the flag's default and the boot log stays
     // silent, matching the registry convention.
 
-    // SPEC-6.31: declared flag with no reader outside src/config.
-    /// PMS-983: the organizations feature. Read through
-    /// `crate::config::flags::ORGANIZATIONS_ENABLED`, which defaults per
-    /// hosting profile (off on self-hosted, on for SaaS).
-    Application ORGANIZATIONS_ENABLED = "ORGANIZATIONS_ENABLED", since "v0.14.0", optional;
     // SPEC-6.99, SPEC-6.100
     Application IP2LOCATION_DB_PATH = "IP2LOCATION_DB_PATH", since "v0.7.0", optional;
     Application IP2PROXY_DB_PATH = "IP2PROXY_DB_PATH", since "v0.11.0", optional;
