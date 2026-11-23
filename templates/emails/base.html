@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}{{ subject }}{% endblock %}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#0f172a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;line-height:1.6;color:#e2e8f0;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#0f172a;">
+<tr><td align="center" style="padding:40px 20px;">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;background-color:#1e293b;border:1px solid #334155;border-radius:12px;">
+<tr><td align="center" style="padding:24px;background-color:#0f172a;border-bottom:1px solid #334155;border-radius:12px 12px 0 0;">
+<span style="font-size:26px;line-height:1;font-weight:800;color:#3b82f6;background:linear-gradient(135deg,#3b82f6,#2dd4bf);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;">Mokosh</span>
+</td></tr>
+<tr><td style="padding:32px;color:#e2e8f0;font-size:16px;">
+{% block content %}{% endblock %}
+</td></tr>
+<tr><td align="center" style="padding:16px 32px 24px;color:#94a3b8;font-size:12px;">
+Sent by Mokosh. If you were not expecting this message, you can ignore it.
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

@@ -372,13 +372,15 @@ impl DispatcherWorker {
                     }
                 };
                 // SPEC-7.620: an SMTP send failure via Mailer::send_multipart is always Transient ("smtp: {e}"), so it always gets the backoff ladder rather than an immediate permanent fail.
+                // Branded layout applied here so the stored row stays the template's own text.
+                let subject = row.subject.as_deref().unwrap_or("");
+                let text = crate::utils::email_layout::wrap_text(subject, &row.body);
+                let html = row
+                    .body_html
+                    .as_deref()
+                    .map(|h| crate::utils::email_layout::wrap_html(subject, h));
                 self.mailer
-                    .send_multipart(
-                        &to,
-                        row.subject.as_deref().unwrap_or(""),
-                        &row.body,
-                        row.body_html.as_deref(),
-                    )
+                    .send_multipart(&to, subject, &text, html.as_deref())
                     .await
                     .map_err(|e| DeliveryError::Transient(format!("smtp: {e}")))
             }

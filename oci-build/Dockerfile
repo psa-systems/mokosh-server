@@ -76,6 +76,7 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 # is why they live there rather than in a top-level assets/.)
 # SPEC-10.117
 COPY migrations ./migrations
+COPY templates ./templates
 COPY build.rs ./
 COPY crates ./crates
 COPY src ./src

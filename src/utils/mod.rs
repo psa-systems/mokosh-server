@@ -15,6 +15,7 @@ pub mod datetime;
 // or federates it to Bunyip, which is what makes local-account email moot.
 pub mod deployment;
 pub mod email;
+pub mod email_layout;
 pub mod error;
 pub mod geoip;
 pub mod html;
