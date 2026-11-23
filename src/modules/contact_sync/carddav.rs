@@ -166,7 +166,13 @@ pub fn parse_multistatus(xml: &str) -> SourceResult<MultiStatus> {
             // arrives as `Text("a ")`, `GeneralRef("amp")`, `Text(" b")`. Reading
             // only `Text` would silently drop every `&`, `<` and `>` from a card.
             Ok(Event::Text(e)) => {
-                text.push_str(&e.decode().unwrap_or_default());
+                match e.decode() {
+                    Ok(decoded) => text.push_str(&decoded),
+                    // Dropping the run would hand back a card with a silent hole.
+                    Err(err) => {
+                        tracing::warn!(error = %err, "CardDAV text failed to decode; dropped")
+                    }
+                }
             }
             Ok(Event::GeneralRef(e)) => {
                 if let Ok(Some(ch)) = e.resolve_char_ref() {

@@ -85,7 +85,8 @@ const EXTERNAL_SOURCE_TACTICAL_RMM: &str = "tactical_rmm";
 /// `POST /api/v1/rmm/status`. Machine-authenticated by HMAC over the raw
 /// body: a byte rewritten by any middle layer turns the signature into
 /// a 401, which is why the path is in the sanitizer's `RAW_BODY_PATHS`
-/// list.
+/// list. An unparsable body also answers 401, not 400, so the endpoint does
+/// not tell an unauthenticated caller whether a payload was well-formed.
 // SPEC-15.2109, SPEC-15.2113
 async fn ingest_status(
     State(state): State<StatusRouterState>,
@@ -126,6 +127,14 @@ async fn ingest_status(
     if !constant_time_eq::constant_time_eq(expected_b64.as_bytes(), signature.as_bytes()) {
         return Err(AppError::Unauthorized);
     }
+
+    // PMS-1666 F8: `IngestStatusRequest.system_name` carries
+    // `#[validate(length(min = 1, max = 255))]` but no code path
+    // called `.validate()`, so an empty or oversized name was stored.
+    // Validate AFTER the HMAC check, so a validation 422 is never an
+    // oracle for authenticated vs unauthenticated callers (an
+    // unauthenticated POST still only gets 401).
+    validator::Validate::validate(&request)?;
 
     match state
         .service

@@ -41,7 +41,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::models::QuoteStatus;
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 
 // SPEC-13.1393
 /// What a decision does to a quote in `current`, given how its other
@@ -97,7 +97,16 @@ pub(crate) async fn apply_decision(
     let Some(current) = current else {
         return Ok(None);
     };
-    let current = QuoteStatus::from_str(&current).unwrap_or(QuoteStatus::Draft);
+    let current = QuoteStatus::from_str(&current).ok_or_else(|| {
+        tracing::warn!(
+            quote_id = %quote_id,
+            stored = %current,
+            "quotes.status is not one of the known values on apply_decision; refusing"
+        );
+        AppError::Internal(format!(
+            "quote {quote_id} has an unknown stored status {current:?}"
+        ))
+    })?;
 
     let (pending, rejected): (i64, i64) = sqlx::query_as(
         r#"SELECT COUNT(*) FILTER (WHERE status = 'pending'),

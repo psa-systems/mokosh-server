@@ -6,8 +6,8 @@
 //!     report's `columns` array, with the requested aliases as keys;
 //!   - `?per_page=&page=` pagination overrides work; `total` is the
 //!     full count across all pages;
-//!   - an unsupported entity_type 400s naming the entity;
-//!   - an unknown column 400s naming the column;
+//!   - an unsupported entity_type 422s naming the entity;
+//!   - an unknown column 422s naming the column;
 //!   - filters narrow the result set (equality + IN);
 //!   - the visibility rule on `get` applies: a private report
 //!     authored by another user returns 404 on execute;
@@ -212,7 +212,7 @@ async fn saved_report_execute_round_trip(pool: PgPool) {
         .send()
         .await
         .expect("bad-entity execute");
-    assert_eq!(bad_entity_exec.status().as_u16(), 400);
+    assert_eq!(bad_entity_exec.status().as_u16(), 422);
 
     // Unknown column rejected naming the offender.
     let bad_col: Value = app
@@ -239,7 +239,7 @@ async fn saved_report_execute_round_trip(pool: PgPool) {
         .send()
         .await
         .expect("bad-col execute");
-    assert_eq!(bad_col_exec.status().as_u16(), 400);
+    assert_eq!(bad_col_exec.status().as_u16(), 422);
     let bad_col_body: Value = bad_col_exec.json().await.expect("body");
     assert!(
         bad_col_body.to_string().contains("totally_made_up"),

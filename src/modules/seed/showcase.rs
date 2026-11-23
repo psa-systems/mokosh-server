@@ -42,7 +42,9 @@
 //! # Idempotency, refresh, and teardown
 //!
 //! [`showcase_seed`] is idempotent: if any `SHOWCASE-` company already exists
-//! it skips without inserting, so re-running never duplicates.
+//! it skips without inserting, so re-running never duplicates. A seed that
+//! failed part-way leaves a partial dataset that this guard then treats as
+//! complete: run [`showcase_refresh`] (or teardown first), then seed again.
 //! [`showcase_refresh`] tears the dataset down and re-seeds it in one call so a
 //! recording take can be reset without manual DB surgery. [`showcase_teardown`]
 //! removes the dataset (and the lookup rows it created) in FK-dependency order,

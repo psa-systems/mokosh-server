@@ -303,8 +303,22 @@ removed = "v0.14.0"
 issue = "PMS-837"
 action = "No action needed: the server ignores it. Cleanup: delete it from the compose variables; only the removed Google sign-in path read it."
 
+[[removed]]
+name = "ORGANIZATIONS_ENABLED"
+since = "v0.14.0"
+removed = "v0.18.0"
+issue = "PMS-1578"
+breaking = "wont-start"
+action = "Retired with no replacement: the flag never changed any behavior. The server now refuses to boot while it is set to a non-blank value; delete it from your compose file or `.env`."
+
 # Authored changelog wording, attached to the entry the facts imply; Changed may also be a behavior change.
 # `breaking` is "wont-start" (restart fails) or "feature-off" (needs `feature`); either needs `issue` and `action`.
+
+[[change]]
+release = "v0.18.0"
+group = "Added"
+variables = ["CONTACT_LOGIN_IP_RATE_MAX", "CONTACT_LOGIN_IP_RATE_WINDOW_SECS"]
+action = "Optional. The per-IP attempt budget shared by contact-portal login and magic-link redeem; defaults to 10 attempts per 60 seconds, then 429 with Retry-After."
 
 [[change]]
 release = "v0.16.0"

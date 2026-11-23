@@ -585,7 +585,7 @@ async fn update_preserves_task_id_when_omitted(pool: PgPool) {
     assert_eq!(created.task_id, Some(task_id), "create keeps the task link");
 
     let updated = svc
-        .update_time_entry(tenant, created.id, &notes_only_update("edited"))
+        .update_time_entry(tenant, created.id, &notes_only_update("edited"), &actx())
         .await
         .expect("update notes only");
     assert_eq!(
@@ -619,7 +619,7 @@ async fn update_with_explicit_task_id_changes_link(pool: PgPool) {
     let mut req = notes_only_update("retask");
     req.task_id = Some(second);
     let updated = svc
-        .update_time_entry(tenant, created.id, &req)
+        .update_time_entry(tenant, created.id, &req, &actx())
         .await
         .expect("update task link");
     assert_eq!(
@@ -990,7 +990,7 @@ async fn update_enforces_day_cap_excluding_self(pool: PgPool) {
     // Grow A to 20h: excluding A itself the day holds 0h, so 20h <= 24h is OK.
     // Were A double-counted (10h + 20h = 30h) this would be wrongly rejected.
     let grown = svc
-        .update_time_entry(tenant, a.id, &duration_only_update(20 * 60))
+        .update_time_entry(tenant, a.id, &duration_only_update(20 * 60), &actx())
         .await
         .expect("grow A to 20h excluding self");
     assert_eq!(grown.duration_minutes, 20 * 60);
@@ -1007,7 +1007,7 @@ async fn update_enforces_day_cap_excluding_self(pool: PgPool) {
 
     // Growing B to 5h would push the day to 25h > 24h: rejected.
     let err = svc
-        .update_time_entry(tenant, b.id, &duration_only_update(5 * 60))
+        .update_time_entry(tenant, b.id, &duration_only_update(5 * 60), &actx())
         .await
         .unwrap_err();
     assert!(

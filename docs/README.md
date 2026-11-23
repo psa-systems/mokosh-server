@@ -9,7 +9,7 @@ The public documentation set. The repository [`README.md`](../README.md) is deli
 | [`quickstart.md`](quickstart.md) | Get a fresh clone running on a Linux host: toolchain, generating `.env`, booting the stack, verifying it, and the footguns that bite first. |
 | [`configuration.md`](configuration.md) | Every variable the server reads: whether it is required, the release that added it, where it is set, and a changelog of configuration changes over the last five releases. |
 | [`recipes.md`](recipes.md) | The task runner, recipe by recipe, grouped the way `just --list` groups them. |
-| [`first-run-onboarding.md`](first-run-onboarding.md) | How the very first administrator gets in, in production and in local dev, including with no SMTP configured. |
+| [`public/operations/first-run-onboarding.md`](public/operations/first-run-onboarding.md) | How the very first administrator gets in, in production and in local dev, including with no SMTP configured. |
 
 ## How it is built
 
@@ -18,17 +18,17 @@ The public documentation set. The repository [`README.md`](../README.md) is deli
 | [`architecture.md`](architecture.md) | Runtime shape, module layout, repository layout, database migrations, the two Docker images, how a release is cut, and the auth, contact-plane, routing and migration rules moved out of `CLAUDE.md`. |
 | [`invariants/`](invariants/) | The repo conventions `CLAUDE.md` indexes, one file per topic (billing, documents, time, identity and auth, config and providers, CI and release, KB, contacts), each rule in full with its issue ids. |
 | [`specification.md`](specification.md) | The normative requirement set: numbered `SPEC-<section>.<n>` requirements for the server, cited from the code that implements them. |
-| [`binaries.md`](binaries.md) | The two binaries, and the operator subcommands `mokosh-server` dispatches instead of serving. |
-| [`postgres-security.md`](postgres-security.md) | How Postgres roles are provisioned, extensions installed, and row-level security enforced, kept in the question-and-answer form the design conversation took. |
+| [`public/binaries.md`](public/binaries.md) | The two binaries, and the operator subcommands `mokosh-server` dispatches instead of serving. |
+| [`public/operations/postgres-security.md`](public/operations/postgres-security.md) | How Postgres roles are provisioned, extensions installed, and row-level security enforced, kept in the question-and-answer form the design conversation took. |
 | [`rls-per-user-isolation.md`](rls-per-user-isolation.md) | The per-user data isolation reference: schema inventory, the chosen model, and the table classification. |
 | [`invoice-lifecycle.md`](invoice-lifecycle.md) | The invoice status model, and what void means here as against cancel. |
 | [`e2e.md`](e2e.md) | The end-to-end suite: how it is wired, how to run it, and the failure modes you will actually hit. |
 | [`providers.md`](providers.md) | The selectable-implementation seam every provider follows: provider kinds, the three bootstrap-order tiers, priority, boot classifications, refresh, and the migrate-verify-purge workflow. |
 | [`ROADMAP.md`](ROADMAP.md) | Durable narrative: goals, phases, sequencing and the reasoning behind the order for the provider rollout. |
-| [`upgrade-blocked-by-duplicates.md`](upgrade-blocked-by-duplicates.md) | What to do when an upgrade stops because a migration cannot build a unique index over rows that predate it: the detect and repair queries for all five such indexes, and why the fix cannot live in a migration. |
-| [`operator-provider-runbook.md`](operator-provider-runbook.md) | The six-step operator workflow for moving a governed secret to a new provider. |
-| [`runbooks/release-and-deploy.md`](runbooks/release-and-deploy.md) | Cutting and deploying a release across the three-repo chain (Mokosh server, Mokosh apps, Bunyip): prerequisites, `just create-release`, what merging the PR triggers per repo, image tags and the registry, staging-then-production promotion, and the known 2026-09-18 failure modes. |
-| [`runbooks/delegated-invoicing.md`](runbooks/delegated-invoicing.md) | Turning on delegated invoicing (Xero, QuickBooks): the four gates from deployment app registration to per-client provider mapping, and what each missing gate looks like. |
+| [`public/operations/upgrade-blocked-by-duplicates.md`](public/operations/upgrade-blocked-by-duplicates.md) | What to do when an upgrade stops because a migration cannot build a unique index over rows that predate it: the detect and repair queries for all five such indexes, and why the fix cannot live in a migration. |
+| [`public/operations/provider-runbook.md`](public/operations/provider-runbook.md) | The six-step operator workflow for moving a governed secret to a new provider. |
+| [`public/operations/release-and-deploy.md`](public/operations/release-and-deploy.md) | Cutting and deploying a release across the three-repo chain (Mokosh server, Mokosh apps, Bunyip): prerequisites, `just create-release`, what merging the PR triggers per repo, image tags and the registry, staging-then-production promotion, and the known 2026-09-18 failure modes. |
+| [`public/operations/delegated-invoicing.md`](public/operations/delegated-invoicing.md) | Turning on delegated invoicing (Xero, QuickBooks): the four gates from deployment app registration to per-client provider mapping, and what each missing gate looks like. |
 
 ## Internal notes
 

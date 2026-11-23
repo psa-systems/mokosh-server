@@ -83,9 +83,21 @@ impl ICloudProvider {
 pub fn parse_cards(cards: &[String]) -> (Vec<SourceContact>, Vec<GroupCard>) {
     let mut contacts = Vec::new();
     let mut groups = Vec::new();
-    for card in cards {
-        let Ok(file) = vcard::read_vcards(card.as_bytes(), vcard::Limits::DEFAULT) else {
-            continue;
+    for (index, card) in cards.iter().enumerate() {
+        let file = match vcard::read_vcards(card.as_bytes(), vcard::Limits::DEFAULT) {
+            Ok(file) => file,
+            Err(e) => {
+                // On a full read the card's contact is then absent and the engine
+                // flags it deleted-in-source (surfaced, never acted on), so the
+                // log is what tells an operator it was unreadable instead.
+                tracing::warn!(
+                    index,
+                    bytes = card.len(),
+                    error = %e,
+                    "an iCloud card the vCard reader refused was skipped"
+                );
+                continue;
+            }
         };
         contacts.extend(file.contacts);
         groups.extend(file.group_cards_read);
@@ -146,6 +158,19 @@ pub fn groups_from(contacts: &[SourceContact], group_cards: &[GroupCard]) -> Vec
 /// chosen for PMS-1341 costs one extra walk over the cards.
 // SPEC-15.667
 pub fn apply_membership(contacts: &mut [SourceContact], group_cards: &[GroupCard]) {
+    // The same "grouped" set `groups_from` counts Ungrouped against, so the id it
+    // offers is one a contact actually carries.
+    let grouped: std::collections::HashSet<&str> = group_cards
+        .iter()
+        .flat_map(|card| card.member_ids.iter().map(String::as_str))
+        .collect();
+    for contact in contacts.iter_mut() {
+        if !grouped.contains(contact.external_id.as_str())
+            && !contact.group_ids.iter().any(|g| g == UNGROUPED_ID)
+        {
+            contact.group_ids.push(UNGROUPED_ID.to_string());
+        }
+    }
     for card in group_cards {
         let Some(group_id) = card.id.as_deref() else {
             continue;
@@ -212,7 +237,14 @@ impl ContactSyncProvider for ICloudProvider {
             }
         }
         let cards = self.client.all_cards(&book).await?;
-        let token = self.client.sync_token(&book).await.ok().flatten();
+        // A failed token fetch only costs the next run a full read, but say why.
+        let token = match self.client.sync_token(&book).await {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::warn!(error = ?e, "iCloud sync-token fetch failed; the next run reads in full");
+                None
+            }
+        };
         let (mut contacts, group_cards) = parse_cards(&cards);
         apply_membership(&mut contacts, &group_cards);
         Ok(SourceChanges {
@@ -356,9 +388,10 @@ mod tests {
             .iter()
             .find(|c| c.external_id == "BBBB1111-2222-3333-4444-555566667777")
             .expect("Charles");
-        assert!(
-            charles.group_ids.is_empty(),
-            "Charles is in no group, and must not inherit one"
+        assert_eq!(
+            charles.group_ids,
+            vec![UNGROUPED_ID.to_string()],
+            "Charles is in no group, so he carries only the Ungrouped id"
         );
     }
 

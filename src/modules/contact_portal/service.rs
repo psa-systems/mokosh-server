@@ -1817,12 +1817,21 @@ impl ContactAuthService {
     /// checks stay login-only: they establish a NEW session and have
     /// no per-request analogue to re-check against one already minted.
     ///
-    /// Fails closed: any error (row gone, tenant gone) reads as `false`
-    /// rather than propagating, so a caller only needs one bool check.
+    /// Fails closed on a MISSING or SUSPENDED tenant: `Ok(false)` so the
+    /// caller only needs one bool check. A database fault, by contrast,
+    /// propagates so the middleware's warn path fires (SPEC-5.431) and
+    /// an outage does not read as "tenant inactive".
     // SPEC-5.430, SPEC-5.436
+    //
+    // PMS-1659 F1: the previous `.is_err()` collapsed every error
+    // (including DB faults) into `Ok(false)`, which the middleware
+    // then logged as an ordinary access-check rejection rather than
+    // a fault. Distinguish the two.
     pub async fn contact_access_ok(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<bool> {
-        if self.ensure_tenant_active(tenant_id).await.is_err() {
-            return Ok(false);
+        match self.ensure_tenant_active(tenant_id).await {
+            Ok(()) => {}
+            Err(AppError::Forbidden(_)) | Err(AppError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
         }
         let row: Option<(bool, Option<DateTime<Utc>>)> = sqlx::query_as(
             "SELECT is_portal_user, portal_locked_until FROM contacts \
@@ -2543,7 +2552,13 @@ impl ContactAuthService {
         // the staff plane labels it (PMS-789): a colon inside the name
         // would split the otpauth label once the app decodes it.
         let app = crate::utils::app_name::app_name().replace(':', " ");
-        let label = format!("{app}:{email}");
+        // A contact with no email is labelled by id, not an empty "app:" label.
+        let account = if email.trim().is_empty() {
+            contact_id.to_string()
+        } else {
+            email
+        };
+        let label = format!("{app}:{account}");
         let provisioning_uri = crate::utils::totp::provisioning_uri(&secret_b32, &label, &app);
         self.audit(
             tenant_id,
@@ -3018,9 +3033,9 @@ impl ContactAuthService {
     /// PMS-935: `PUT /api/v1/contact/auth/me`. Persists the contact's
     /// own profile edits (names, phone, mobile, timezone).
     /// Notification preferences live on `contact_notification_preferences`
-    /// (per-event-type rows, migration 120), not directly on the
-    /// contacts row; wiring those through is deferred and the field
-    /// is accepted but not persisted here.
+    /// (per-event-type rows, migration 120), not on the contacts row, so
+    /// a non-null `notification_preferences` is refused with 400 rather
+    /// than accepted and dropped. `timezone` must be an IANA zone name.
     ///
     /// Email is NOT accepted: staff CRM owns portal identity via
     /// `contacts.email`, so a portal contact cannot change their own
@@ -3036,6 +3051,18 @@ impl ContactAuthService {
         contact_id: Uuid,
         request: &super::models::ContactSelfUpdateRequest,
     ) -> AppResult<ContactMe> {
+        if request.notification_preferences.is_some() {
+            return Err(AppError::BadRequest(
+                "notification_preferences cannot be changed through this endpoint".to_string(),
+            ));
+        }
+        if let Some(tz) = request.timezone.as_deref() {
+            if tz.parse::<chrono_tz::Tz>().is_err() {
+                return Err(AppError::BadRequest(format!(
+                    "The timezone must be an IANA zone name (e.g. America/New_York), got {tz}"
+                )));
+            }
+        }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // PMS-1214: a customer correcting their own name on a synced contact
         // is an edit in Mokosh like any other, and locks the same way.

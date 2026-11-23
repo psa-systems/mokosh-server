@@ -495,11 +495,6 @@ services:
       IP2PROXY_DB_PATH: ${IP2PROXY_DB_PATH:-}
       LOGIN_APPROVAL_ENABLED: ${LOGIN_APPROVAL_ENABLED:-}
 
-      # PMS-983: the organizations feature flag. Empty means "use the flag's
-      # per-profile default" (off on self-hosted, on for SaaS). Set to
-      # 1/true/yes or 0/false/no to override.
-      ORGANIZATIONS_ENABLED: ${ORGANIZATIONS_ENABLED:-}
-
       # Let a verified bunyip identity JIT-provision a personal tenant on
       # first sight. Off by default; staging opts in. Parses the same way
       # as LOGIN_APPROVAL_ENABLED.
@@ -565,6 +560,11 @@ services:
       OIDC_JWKS_CACHE_TTL_SECS: ${OIDC_JWKS_CACHE_TTL_SECS:-}
       OIDC_LEEWAY_SECONDS: ${OIDC_LEEWAY_SECONDS:-}
       OIDC_DEFAULT_TENANT_ID: ${OIDC_DEFAULT_TENANT_ID:-}
+
+      # Contact-portal login and magic-link redeem per-IP budget; empty keeps
+      # the built-in 10 attempts per 60s.
+      CONTACT_LOGIN_IP_RATE_MAX: ${CONTACT_LOGIN_IP_RATE_MAX:-}
+      CONTACT_LOGIN_IP_RATE_WINDOW_SECS: ${CONTACT_LOGIN_IP_RATE_WINDOW_SECS:-}
 
       # Stripe REST base, overridable so a test can point checkout at a stub;
       # empty uses https://api.stripe.com.

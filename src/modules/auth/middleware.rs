@@ -1269,11 +1269,9 @@ pub async fn place_bunyip_user_from_local_state(
     // Admin. That is a full-privilege escalation on every request the
     // grantee makes: a `read_only` grant becomes an `admin` users row
     // within one round-trip. PMS-1208 finding 9. `place_grantee_caller`
-    // re-reads the row rather than reusing the resolved principal (its
-    // shape does not yet take a pre-resolved principal, and the DB read
-    // is cheap next to the correctness the branch buys).
+    // reuses the resolved principal when it already sits in the granted
+    // tenant and re-reads only otherwise.
     if claims.mokosh_grant_account_id.is_some() {
-        let _ = principal;
         return LocalPlacement::Placed(Box::new(
             place_grantee_caller(
                 auth_service,
@@ -1286,6 +1284,7 @@ pub async fn place_bunyip_user_from_local_state(
                 None,
                 None,
                 claims,
+                Some(principal),
             )
             .await,
         ));
@@ -1559,6 +1558,7 @@ async fn resolve_grantee_caller(
 /// [`AuthService::place_grantee_user`], which is where the fresh
 /// `users.id` + `bunyip_user_id = sub` axis comes from.
 // SPEC-5.170 SPEC-5.171 SPEC-5.172 SPEC-5.173: grant gate, slug, role mapping, verified-email JIT.
+#[allow(clippy::too_many_arguments)]
 async fn place_grantee_caller(
     auth_service: &Arc<AuthService>,
     sub: uuid::Uuid,
@@ -1567,6 +1567,7 @@ async fn place_grantee_caller(
     given_name: Option<String>,
     family_name: Option<String>,
     claims: &super::oidc_rs::AtClaims,
+    resolved: Option<BunyipPrincipal>,
 ) -> (Option<AuthState>, Option<AppError>) {
     if let Err(e) = auth_service
         .ensure_grant_still_active_if_claimed(claims)
@@ -1627,10 +1628,16 @@ async fn place_grantee_caller(
         }
     };
 
-    let user = match auth_service
-        .find_bunyip_principal_in_tenant(sub, target_tenant)
-        .await
-    {
+    // The pre-resolved principal is only the grantee's row when it was read from the granted tenant.
+    let principal_in_target = match resolved.filter(|p| p.user.tenant_id == target_tenant) {
+        Some(p) => Ok(Some(p)),
+        None => {
+            auth_service
+                .find_bunyip_principal_in_tenant(sub, target_tenant)
+                .await
+        }
+    };
+    let user = match principal_in_target {
         Ok(Some(principal)) => {
             if let Err(e) = auth_service.ensure_principal_usable(&principal.user).await {
                 return (None, Some(e));
@@ -1811,6 +1818,7 @@ pub async fn place_bunyip_user_with_rejection(
             given_name,
             family_name,
             claims,
+            None,
         )
         .await;
     }
@@ -1857,15 +1865,26 @@ async fn place_bunyip_caller(
     let gated_on_resolve = resolved.is_some();
     let placement = match resolved.as_ref() {
         Some(principal) => Some(principal.placement.clone()),
-        None => auth_service.find_user_placement(sub).await.ok().flatten(),
+        None => match auth_service.find_user_placement(sub).await {
+            Ok(p) => p,
+            Err(e) => {
+                // A failed read must not look like "no placement": that path can refuse a real user or provision a personal tenant.
+                tracing::warn!(error = %e, sub = %sub, "place_bunyip_caller: placement lookup failed; failing closed");
+                return (None, None);
+            }
+        },
     };
     let current = placement.as_ref().map(|(t, _)| *t);
 
     // An invite to address X is consumed only by a Bunyip user with verified X.
     let invite = match (invitations, email.as_deref()) {
-        (Some(invs), Some(em)) if email_verified => {
-            invs.newest_pending_for(em).await.ok().flatten()
-        }
+        (Some(invs), Some(em)) if email_verified => match invs.newest_pending_for(em).await {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(error = %e, sub = %sub, "place_bunyip_caller: pending invitation lookup failed; failing closed");
+                return (None, None);
+            }
+        },
         _ => None,
     };
 
@@ -1984,6 +2003,11 @@ async fn place_bunyip_caller(
         Some(user) => user,
         None => match auth_service.get_user_by_id(target, sub).await {
             Ok(user) => user,
+            Err(e) if !matches!(e, AppError::NotFound(_)) => {
+                // Only a missing row may JIT; a DB fault must not mint a row over an existing user.
+                tracing::warn!(error = %e, sub = %sub, tenant_id = %target, "place_bunyip_caller: user lookup failed; rejecting");
+                return (None, None);
+            }
             Err(_) => {
                 // Persist the IdP-supplied email on the JIT insert ONLY when
                 // the IdP reports it verified.

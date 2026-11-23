@@ -406,6 +406,8 @@ impl AppConfig {
             resolve_secret(&keys::ENCRYPTION_KEY, &environment, DEV_ENCRYPTION_KEY)?;
         // SPEC-2.233
         let client_origin = config::get(&keys::CLIENT_ORIGIN)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "http://localhost:4301".to_string());
         // MAPPS-425: falls back to `client_origin` so a single-origin dev
         // stack is unaffected. Deployed environments MUST set it, because
@@ -505,11 +507,16 @@ impl AppConfig {
             app_database_url,
             jwt_secret,
             // SPEC-2.230
-            host: config::get(&keys::HOST).unwrap_or_else(|| "0.0.0.0".to_string()),
+            host: config::get(&keys::HOST)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "0.0.0.0".to_string()),
             port,
             environment,
             // SPEC-2.233
             base_url: config::get(&keys::BASE_URL)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "http://localhost:8080".to_string()),
             run_migrations,
             encryption_key,
@@ -616,6 +623,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_cli(&args).await;
     }
 
+    // The env file has to land before ANYTHING reads a variable: the hosting
+    // profile below chooses the configuration provider, and that provider then
+    // resolves every declared key out of this process's environment.
+    // PMS-1577: a missing `.env` is the documented default (nothing to load);
+    // a malformed one silently discarded every variable it defined, with
+    // nothing logged, so only the not-found case is ignored here.
+    // SPEC-2.18
+    // SPEC-6.36
+    if let Err(e) = dotenvy::dotenv() {
+        if !matches!(e, dotenvy::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(format!(".env could not be loaded: {e}").into());
+        }
+    }
+
     // PMS-504 (M14): do not hardcode debug logging in every environment.
     // Honor RUST_LOG (the dev stack sets `info,mokosh_server=debug`) and fall
     // back to `info` when it is unset so production runs at info, not debug.
@@ -632,21 +654,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SPEC-1.1
     tracing::info!("Running in multi-tenant mode");
-
-    // The env file has to land before ANYTHING reads a variable: the hosting
-    // profile below chooses the configuration provider, and that provider then
-    // resolves every declared key out of this process's environment.
-    // PMS-1577: a missing `.env` is the documented default (nothing to load);
-    // a malformed one silently discarded every variable it defined, with
-    // nothing logged, so only the not-found case is ignored here.
-    // SPEC-2.18
-    // SPEC-6.36
-    if let Err(e) = dotenvy::dotenv() {
-        if !matches!(e, dotenvy::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
-        {
-            return Err(format!(".env could not be loaded: {e}").into());
-        }
-    }
 
     // PMS-1011: the same variable, read strictly, because this answer chooses
     // providers rather than gating mail. Read here so an unrecognised mode
@@ -696,7 +703,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SPEC-2.24
     // SPEC-6.46
-    let config = AppConfig::from_env().expect("Failed to load configuration");
+    // PMS-1655 F1: a configuration refusal used to `.expect()` into
+    // an exit-101 panic, while every other boot refusal above and
+    // below this line returns `Err` and exits 1. The callers that
+    // supervise the binary distinguish the two codes; a panic also
+    // skips the orderly tracing-subscriber flush and drowns the real
+    // cause in a thread-panic payload. Propagate the error so a bad
+    // secret / unparseable PORT / unreadable MOKOSH_MAX_TENANTS lands
+    // on stderr in the same shape as the neighbouring checks.
+    let config = AppConfig::from_env().map_err(|e| format!("Failed to load configuration: {e}"))?;
 
     // PMS-1160: refuse to start when an essential deployment-shape variable
     // is unset outside dev/test. Two incidents in 48 hours came from this
@@ -880,7 +895,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // silently degraded to LogMailer.
     //
     // PMS-1013: the email provider selection is named through `MAIL_PROVIDER`
-    // (`log` or `smtp`), matching `SECRET_BACKEND` / `STORAGE_BACKEND` for the
+    // (`log` or `smtp`), matching `SECRET_PROVIDER` / `STORAGE_PROVIDER` for the
     // adjacent seams. The hosting profile supplies the default; an explicit
     // choice overrides. `MAIL_PROVIDER=smtp` with no `SMTP_HOST` refuses to
     // boot (the class of misconfiguration this seam exists to catch), and the
@@ -932,14 +947,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HS256 cookie path. See
     // docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md.
     // SPEC-2.47
-    let bunyip_verifier = match mokosh_server::modules::auth::oidc_rs::VerifierConfig::from_env() {
-        Ok(cfg) => {
-            tracing::info!(issuer = %cfg.issuer, audience = %cfg.audience, "Bunyip RS verifier mounted");
-            Some(mokosh_server::modules::auth::oidc_rs::Verifier::new(cfg))
-        }
-        Err(reason) => {
-            tracing::info!(reason = %reason, "Bunyip RS verifier disabled");
-            None
+    // PMS-1655 F2: every Err used to log at info "verifier disabled"
+    // and boot continued. The PMS-1577 rule says a set-but-invalid
+    // deployment variable ends boot; a verifier whose TTL did not
+    // parse is set-but-invalid, as is an OIDC_ISSUER paired with no
+    // OIDC_AUDIENCE. Only "both unset" is a legitimate disable.
+    let bunyip_verifier = {
+        let issuer = config::get(&config::registry::OIDC_ISSUER).filter(|s| !s.trim().is_empty());
+        let audience =
+            config::get(&config::registry::OIDC_AUDIENCE).filter(|s| !s.trim().is_empty());
+        match (issuer.is_some(), audience.is_some()) {
+            (false, false) => {
+                tracing::info!("Bunyip RS verifier disabled (OIDC_ISSUER / OIDC_AUDIENCE unset)");
+                None
+            }
+            (true, false) | (false, true) => {
+                return Err(format!(
+                    "OIDC_ISSUER and OIDC_AUDIENCE must be set together; only {} is set",
+                    if issuer.is_some() {
+                        "OIDC_ISSUER"
+                    } else {
+                        "OIDC_AUDIENCE"
+                    }
+                )
+                .into());
+            }
+            (true, true) => {
+                match mokosh_server::modules::auth::oidc_rs::VerifierConfig::from_env() {
+                    Ok(cfg) => {
+                        tracing::info!(issuer = %cfg.issuer, audience = %cfg.audience, "Bunyip RS verifier mounted");
+                        Some(mokosh_server::modules::auth::oidc_rs::Verifier::new(cfg))
+                    }
+                    Err(reason) => {
+                        return Err(format!("Bunyip RS verifier config invalid: {reason}").into())
+                    }
+                }
+            }
         }
     };
 

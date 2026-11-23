@@ -30,8 +30,8 @@ pub struct PortalRole {
 
 /// POST body. The name length cap mirrors `portal_roles.name`
 /// (VARCHAR(80)); 64 stays safely under it and matches the SPA's input
-/// hint. Empty `capabilities` is allowed at create so the operator can
-/// name a shell and fill it in.
+/// hint. `capabilities` defaults to empty on the wire, but create refuses
+/// an empty list with 400; a role must carry at least one capability.
 ///
 /// PMS-929 (prompt 012): `company_id` is optional; `None` mints a
 /// tenant-wide role (existing shape), `Some(id)` mints a role scoped to

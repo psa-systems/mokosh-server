@@ -223,7 +223,7 @@ impl SavedReportsService {
         sqlx::query(
             "UPDATE saved_reports SET \
                  name = COALESCE($4, name), \
-                 description = COALESCE($5, description), \
+                 description = CASE WHEN $11 THEN $5 ELSE description END, \
                  filters = COALESCE($6, filters), \
                  columns = COALESCE($7, columns), \
                  group_by = COALESCE($8, group_by), \
@@ -236,12 +236,13 @@ impl SavedReportsService {
         .bind(id)
         .bind(user_id)
         .bind(req.name)
-        .bind(req.description)
+        .bind(req.description.clone().flatten())
         .bind(req.filters)
         .bind(req.columns)
         .bind(req.group_by)
         .bind(req.sort)
         .bind(req.is_shared)
+        .bind(req.description.is_some())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -420,6 +421,7 @@ where
         TextList(v) => q.bind(v.clone()),
         Int(i) => q.bind(*i),
         Bool(b) => q.bind(*b),
+        Timestamp(t) => q.bind(*t),
     }
 }
 
@@ -551,12 +553,9 @@ impl SavedReportsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// PMS-1665: owner-only. `schedule_update` and `schedule_delete` already
-    /// filter by `user_id`, but GET-by-id used to return any schedule in the
-    /// tenant, so another viewer who could see the parent report could read
-    /// a private schedule's recipient address, cron, last_error and
-    /// is_active. A schedule that does not belong to the caller now 404s
-    /// the same way update/delete do.
+    /// Owner-only, like `schedule_update` and `schedule_delete`: another
+    /// viewer of the parent report gets 404, not the schedule's recipient
+    /// address, cron and last_error.
     // SPEC-15.1627
     pub async fn schedule_get(
         &self,

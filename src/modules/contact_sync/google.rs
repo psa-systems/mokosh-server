@@ -190,7 +190,24 @@ impl GoogleContactsProvider {
             }
 
             // Only the reason tokens are read out of the body, never kept.
-            let body = response.text().await.unwrap_or_default();
+            //
+            // PMS-1663 F: an unreadable error body used to collapse to
+            // "" via `unwrap_or_default`, so a 400/403 whose body refused
+            // to decode was classified without the reason tokens and
+            // nothing said so. Log the body-read failure (without the
+            // body) so an unclassifiable rejection is findable.
+            let body = match response.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        path = path,
+                        status = status,
+                        error = %e,
+                        "Google Contacts error body unreadable; classifying without reason tokens"
+                    );
+                    String::new()
+                }
+            };
             let expired = body.contains("EXPIRED_SYNC_TOKEN");
             let rate_limited = body.contains("RATE_LIMIT_EXCEEDED")
                 || body.contains("rateLimitExceeded")

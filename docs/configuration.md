@@ -29,6 +29,12 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 - [`BUNYIP_SECRETS_CLIENT_ID`](#var-bunyip-secrets-client-id) (Required: no) - Optional, and set together or not at all. A hosted deployment points these at bunyip's host-secrets route and the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is then read from there instead of from this deployment's own provider: an operator sets it once in bunyip under Admin > Mokosh. A URL with only one half of the credential refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says. (PMS-1537)
 - [`BUNYIP_SECRETS_CLIENT_SECRET`](#var-bunyip-secrets-client-secret) (Required: no) - Optional, and set together or not at all. A hosted deployment points these at bunyip's host-secrets route and the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is then read from there instead of from this deployment's own provider: an operator sets it once in bunyip under Admin > Mokosh. A URL with only one half of the credential refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says. (PMS-1537)
 - [`BUNYIP_SECRETS_URL`](#var-bunyip-secrets-url) (Required: no) - Optional, and set together or not at all. A hosted deployment points these at bunyip's host-secrets route and the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is then read from there instead of from this deployment's own provider: an operator sets it once in bunyip under Admin > Mokosh. A URL with only one half of the credential refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says. (PMS-1537)
+- [`CONTACT_LOGIN_IP_RATE_MAX`](#var-contact-login-ip-rate-max) (Required: no) - Optional. The per-IP attempt budget shared by contact-portal login and magic-link redeem; defaults to 10 attempts per 60 seconds, then 429 with Retry-After.
+- [`CONTACT_LOGIN_IP_RATE_WINDOW_SECS`](#var-contact-login-ip-rate-window-secs) (Required: no) - Optional. The per-IP attempt budget shared by contact-portal login and magic-link redeem; defaults to 10 attempts per 60 seconds, then 429 with Retry-After.
+
+#### Removed
+
+- **Breaking: won't start:** [`ORGANIZATIONS_ENABLED`](#var-organizations-enabled) (Required: no) - Retired with no replacement: the flag never changed any behavior. The server now refuses to boot while it is set to a non-blank value; delete it from your compose file or `.env`. (PMS-1578)
 
 <a id="release-v0-17-0"></a>
 
@@ -244,7 +250,7 @@ No configuration changes.
 | <a id="var-allow-uninvited-bunyip-signup"></a>`ALLOW_UNINVITED_BUNYIP_SIGNUP` | no, default off | v0.16.0 | `.env` | Lets a Bunyip identity with a verified email provision a personal tenant on first sight. Production stays invitation-only; staging turns it on (PMS-1457). |
 | <a id="var-bunyip-status-client-id"></a>`BUNYIP_STATUS_CLIENT_ID` | no, unset gates provider status on `RequireAdmin` alone | v0.14.0 | `.env` | Machine credential Bunyip's provider-status aggregator presents as HTTP Basic (PMS-1193). Set together with the secret below. |
 | <a id="var-bunyip-status-client-secret"></a>`BUNYIP_STATUS_CLIENT_SECRET` | no, unset gates provider status on `RequireAdmin` alone | v0.14.0 | `.env` | The secret half, compared in constant time. |
-| <a id="var-admin-email"></a>`ADMIN_EMAIL` | no, unset skips the first-run admin | v0.1.0 | `.env` | Optional first-run super-admin, development only; see [`first-run-onboarding.md`](first-run-onboarding.md). |
+| <a id="var-admin-email"></a>`ADMIN_EMAIL` | no, unset skips the first-run admin | v0.1.0 | `.env` | Optional first-run super-admin, development only; see [`public/operations/first-run-onboarding.md`](public/operations/first-run-onboarding.md). |
 | <a id="var-admin-password"></a>`ADMIN_PASSWORD` | no, unset skips the first-run admin | v0.1.0 | `.env` | Password for the first-run admin above. |
 | <a id="var-login-approval-enabled"></a>`LOGIN_APPROVAL_ENABLED` | no, default off | v0.8.0 | `.env` | The suspicious-login notify-and-approve gate (PMS-658), off by default because it can withhold a login. Unset or blank keeps the default; set to a value that is not a recognized boolean spelling fails startup naming the flag and the value (PMS-1577). |
 
@@ -252,7 +258,6 @@ No configuration changes.
 
 | Variable | Required | Added in | Where set | Purpose |
 | --- | --- | --- | --- | --- |
-| <a id="var-organizations-enabled"></a>`ORGANIZATIONS_ENABLED` | no, default the hosting profile's (off self-hosted, on saas) | v0.14.0 | `.env` | The organizations feature flag (PMS-983). |
 | <a id="var-ip2location-db-path"></a>`IP2LOCATION_DB_PATH` | no, unset turns country lookup off | v0.7.0 | `.env` | IP2Location database path inside the container, for login-location alerts (PMS-657). |
 | <a id="var-ip2proxy-db-path"></a>`IP2PROXY_DB_PATH` | no, unset turns ASN and VPN enrichment off | v0.11.0 | `.env` | IP2Proxy database path inside the container (BUNYIP-475). |
 | <a id="var-trusted-proxy-cidr"></a>`TRUSTED_PROXY_CIDR` | no, default loopback plus private ranges | v0.7.0 | `.env` | CIDRs whose `X-Forwarded-For` is trusted for the client IP (PMS-587). Tighten it to the proxy subnet in production. |
@@ -274,14 +279,14 @@ No configuration changes.
 | <a id="var-storage-s3-path-style"></a>`STORAGE_S3_PATH_STYLE` | no, default `true` | v0.15.0 | `compose.dev.yml` | Path-style addressing, which every non-AWS store serves; `false` selects virtual-hosted. |
 | <a id="var-storage-s3-access-key-id"></a>`STORAGE_S3_ACCESS_KEY_ID` | no, needed when `STORAGE_PROVIDER=s3` | v0.15.0 | `compose.dev.yml` | Access key id. |
 | <a id="var-storage-s3-secret-access-key"></a>`STORAGE_S3_SECRET_ACCESS_KEY` | no, needed when `STORAGE_PROVIDER=s3` | v0.15.0 | `compose.dev.yml` | Secret access key. |
-| <a id="var-storage-backend"></a>`STORAGE_BACKEND` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_PROVIDER` | `compose.dev.yml` | Deprecated alias, honoured only when the new name is unset; using it logs a line naming the replacement, and `mokosh-server provider-status` reports which name supplied each setting. Removal is PMS-1443. |
-| <a id="var-attachment-dir"></a>`ATTACHMENT_DIR` | no | v0.4.0; deprecated in v0.15.0, use `STORAGE_ROOT` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-endpoint"></a>`S3_ENDPOINT` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ENDPOINT` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-bucket"></a>`S3_BUCKET` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_BUCKET` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-region"></a>`S3_REGION` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_REGION` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-path-style"></a>`S3_PATH_STYLE` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_PATH_STYLE` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-access-key-id"></a>`S3_ACCESS_KEY_ID` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ACCESS_KEY_ID` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-secret-access-key"></a>`S3_SECRET_ACCESS_KEY` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_SECRET_ACCESS_KEY` | `compose.dev.yml` | Deprecated alias, as above. |
+| <a id="var-storage-backend"></a>`STORAGE_BACKEND` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_PROVIDER` | `compose.dev.yml` | Retired by PMS-1443: setting it refuses boot and the error names the replacement. Edit your compose file to use the new name. |
+| <a id="var-attachment-dir"></a>`ATTACHMENT_DIR` | no | v0.4.0; deprecated in v0.15.0, use `STORAGE_ROOT` | `compose.dev.yml` | Retired, as above. |
+| <a id="var-s3-endpoint"></a>`S3_ENDPOINT` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ENDPOINT` | `compose.dev.yml` | Retired, as above. |
+| <a id="var-s3-bucket"></a>`S3_BUCKET` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_BUCKET` | `compose.dev.yml` | Retired, as above. |
+| <a id="var-s3-region"></a>`S3_REGION` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_REGION` | `compose.dev.yml` | Retired, as above. |
+| <a id="var-s3-path-style"></a>`S3_PATH_STYLE` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_PATH_STYLE` | `compose.dev.yml` | Retired, as above. |
+| <a id="var-s3-access-key-id"></a>`S3_ACCESS_KEY_ID` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ACCESS_KEY_ID` | `compose.dev.yml` | Retired, as above. |
+| <a id="var-s3-secret-access-key"></a>`S3_SECRET_ACCESS_KEY` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_SECRET_ACCESS_KEY` | `compose.dev.yml` | Retired, as above. |
 | <a id="var-attachment-max-bytes"></a>`ATTACHMENT_MAX_BYTES` | no, default 25 MiB | v0.4.0 | `.env` | Per-attachment size cap in bytes. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
 | <a id="var-kb-attachment-max-bytes"></a>`KB_ATTACHMENT_MAX_BYTES` | no, default 5 MiB | v0.14.0 | `.env` | Cap on an image embedded in a knowledge base article (PMS-923). Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
 | <a id="var-tenant-logo-max-bytes"></a>`TENANT_LOGO_MAX_BYTES` | no, default 1 MiB | v0.12.0 | `.env` | Cap on an uploaded tenant logo. Unset keeps the default; set to a non-numeric or non-positive value fails startup naming the variable and the value (PMS-1577). |
@@ -301,6 +306,7 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-google-oauth-client-secret"></a>`GOOGLE_OAUTH_CLIENT_SECRET` | no | v0.2.0; removed in v0.14.0 | nowhere | Client secret of the retired Google sign-in routes (PMS-837). |
 | <a id="var-google-oauth-redirect-uri"></a>`GOOGLE_OAUTH_REDIRECT_URI` | no | v0.2.0; removed in v0.14.0 | nowhere | Redirect URI of the retired Google sign-in routes (PMS-837). |
 | <a id="var-oauth-super-admin-emails"></a>`OAUTH_SUPER_ADMIN_EMAILS` | no | v0.3.0; removed in v0.14.0 | nowhere | Super-admin allowlist only the retired Google sign-in read (PMS-837). |
+| <a id="var-organizations-enabled"></a>`ORGANIZATIONS_ENABLED` | no | v0.14.0; removed in v0.18.0 | nowhere | Retired. The flag never had an effect; setting it to a non-blank value now refuses boot. Delete it from your compose file or `.env`. |
 | <a id="var-bunyip-api-base-url"></a>`BUNYIP_API_BASE_URL` | no | v0.16.0 | `.env` | Base URL of the Bunyip API this deployment federates with in SaaS mode; used to call `GET /v1/users/lookup?email=` before creating a pending grant invitation. Unset in standalone mode. |
 | <a id="var-bunyip-directory-client-id"></a>`BUNYIP_DIRECTORY_CLIENT_ID` | no | v0.16.0 | `.env` | Machine-credential client id this deployment presents to Bunyip's `/v1/users/lookup` endpoint, as HTTP Basic. All three (`BUNYIP_API_BASE_URL` + this pair) must be set together or left unset. |
 | <a id="var-bunyip-directory-client-secret"></a>`BUNYIP_DIRECTORY_CLIENT_SECRET` | no | v0.16.0 | `.env` | Machine-credential client secret this deployment presents to Bunyip's `/v1/users/lookup` endpoint, as HTTP Basic. All three (`BUNYIP_API_BASE_URL` + this pair) must be set together or left unset. |
@@ -319,6 +325,8 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-bunyip-secrets-url"></a>`BUNYIP_SECRETS_URL` | no | v0.18.0 | `.env` | Base URL of bunyip's host-secrets route. On a hosted deployment, set together with the client id/secret below, the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is read from there instead of from this deployment's own `APP_SECRET_BACKEND` provider; an operator sets it once in bunyip under Admin > Mokosh. Setting only one of the three refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says. (PMS-1537) |
 | <a id="var-bunyip-secrets-client-id"></a>`BUNYIP_SECRETS_CLIENT_ID` | no | v0.18.0 | `.env` | Machine-credential client id this deployment presents to bunyip's host-secrets route, as HTTP Basic, alongside `BUNYIP_SECRETS_URL`. All three must be set together or left unset. (PMS-1537) |
 | <a id="var-bunyip-secrets-client-secret"></a>`BUNYIP_SECRETS_CLIENT_SECRET` | no | v0.18.0 | `.env` | Machine-credential client secret this deployment presents to bunyip's host-secrets route, as HTTP Basic, alongside `BUNYIP_SECRETS_URL`. All three must be set together or left unset. (PMS-1537) |
+| <a id="var-contact-login-ip-rate-max"></a>`CONTACT_LOGIN_IP_RATE_MAX` | no | v0.18.0 | `.env` | Attempts one client IP may make per window across contact-portal login and magic-link redeem before a 429. Unset or blank keeps the default of 10; a non-positive or non-numeric value fails startup naming the variable. |
+| <a id="var-contact-login-ip-rate-window-secs"></a>`CONTACT_LOGIN_IP_RATE_WINDOW_SECS` | no | v0.18.0 | `.env` | Length in seconds of the window `CONTACT_LOGIN_IP_RATE_MAX` counts within. Unset or blank keeps the default of 60; a non-positive or non-numeric value fails startup naming the variable. |
 
 ## Development stack variables
 

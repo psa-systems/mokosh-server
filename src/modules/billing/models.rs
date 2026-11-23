@@ -395,7 +395,8 @@ pub struct UpdateInvoiceRequest {
     /// of the SPA without changing the behaviour of any existing button.
     /// `postal` and `other` freeze the invoice without emailing it; `other`
     /// requires `note` and the service returns a 422 for a missing or blank
-    /// one. `email` and `postal` ignore `note`.
+    /// one. `postal` stores the trimmed `note` when one is given; `email`
+    /// ignores it.
     #[serde(default)]
     pub delivery: Option<DeliveryRequest>,
     /// PMS-1462: catches a client still sending `skip_email`. The service
@@ -442,7 +443,8 @@ impl DeliveryMethod {
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct DeliveryRequest {
     pub method: DeliveryMethod,
-    /// Required (non-blank) on `other`, ignored on `email` / `postal`.
+    /// Required (non-blank) on `other`, stored trimmed when given on `postal`,
+    /// ignored on `email`.
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -602,7 +604,8 @@ pub struct WebhookDeliveryResponse {
     pub id: Uuid,
     pub provider: String,
     pub received_at: DateTime<Utc>,
-    /// `accepted`, `refused`, `ignored` or `failed`.
+    /// `accepted`, `refused`, `ignored`, `failed`, `unreconciled` or
+    /// `benign_redelivery`.
     pub outcome: String,
     /// The provider's own event type, present only once the delivery verified.
     pub event_type: Option<String>,
@@ -695,8 +698,8 @@ pub struct InvoicePaymentReadinessResponse {
     /// connected; one entry is the ordinary case; two is a tenant offering a
     /// choice, and the client renders one button each.
     pub providers: Vec<PaymentProviderOption>,
-    /// True iff `invoice.status` is `pending | sent | partially_paid`
-    /// AND `balance_due > 0`. Draft, void, written_off, and paid
+    /// True iff `invoice.status` is `sent | partially_paid` AND
+    /// `balance_due > 0`. Draft, pending, void, written_off, and paid
     /// invoices are not payable.
     pub invoice_payable: bool,
     /// Currency-formatted `balance_due` in the invoice's own currency,

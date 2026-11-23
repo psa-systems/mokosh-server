@@ -363,6 +363,9 @@ declare_keys! {
     // everything while this is unset.
     // SPEC-6.81
     Application OIDC_BACKCHANNEL_CLIENT_ID = "OIDC_BACKCHANNEL_CLIENT_ID", since "v0.15.0", optional;
+    // SPEC-6.104
+    Application CONTACT_LOGIN_IP_RATE_MAX = "CONTACT_LOGIN_IP_RATE_MAX", since "v0.18.0", optional;
+    Application CONTACT_LOGIN_IP_RATE_WINDOW_SECS = "CONTACT_LOGIN_IP_RATE_WINDOW_SECS", since "v0.18.0", optional;
     // SPEC-6.82
     Application ADMIN_EMAIL = "ADMIN_EMAIL", since "v0.1.0", optional;
     Application ADMIN_PASSWORD = "ADMIN_PASSWORD", since "v0.1.0", optional;
@@ -418,11 +421,6 @@ declare_keys! {
     // annotation: an unset key is the flag's default and the boot log stays
     // silent, matching the registry convention.
 
-    // SPEC-6.31: declared flag with no reader outside src/config.
-    /// PMS-983: the organizations feature. Read through
-    /// `crate::config::flags::ORGANIZATIONS_ENABLED`, which defaults per
-    /// hosting profile (off on self-hosted, on for SaaS).
-    Application ORGANIZATIONS_ENABLED = "ORGANIZATIONS_ENABLED", since "v0.14.0", optional;
     // SPEC-6.99, SPEC-6.100
     Application IP2LOCATION_DB_PATH = "IP2LOCATION_DB_PATH", since "v0.7.0", optional;
     Application IP2PROXY_DB_PATH = "IP2PROXY_DB_PATH", since "v0.11.0", optional;

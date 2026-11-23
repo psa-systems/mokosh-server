@@ -234,7 +234,9 @@ impl GrantInvitationsService {
     /// Every PENDING invite for one bunyip user across all
     /// tenants. This is the grantee inbox; runs cross-tenant so
     /// the caller passes their own `sub` and reads back invites
-    /// from every mokosh account that has invited them.
+    /// from every mokosh account that has invited them. Email-only
+    /// invites (NULL invitee id, standalone mode) match on the caller
+    /// row's email, the same rule `find_by_id_for_grantee` applies.
     pub async fn find_pending_for_invitee(
         pool: &PgPool,
         invitee_bunyip_user_id: Uuid,
@@ -245,7 +247,16 @@ impl GrantInvitationsService {
                    invitee_email, role, status, invited_at, expires_at,
                    accepted_at, declined_at, canceled_at, updated_at
             FROM mokosh_grant_invitations
-            WHERE invitee_bunyip_user_id = $1 AND status = 'pending'
+            WHERE (
+                    invitee_bunyip_user_id = $1
+                    OR (
+                        invitee_bunyip_user_id IS NULL
+                        AND lower(invitee_email) = (
+                            SELECT lower(email) FROM users WHERE bunyip_user_id = $1 LIMIT 1
+                        )
+                    )
+                  )
+              AND status = 'pending'
               AND expires_at > NOW()
             ORDER BY invited_at DESC
             "#,
@@ -447,6 +458,24 @@ impl GrantInvitationsService {
             return Ok(Err(AcceptRefusal::Canceled));
         }
         if invitation.status == "accepted" {
+            // The accepted UPDATE and the mirror upsert are separate statements, so a crash or
+            // upsert failure between them leaves an accepted row with no mirror. A retry by the
+            // same caller re-runs the (idempotent) upsert instead of being refused.
+            if invitation.invitee_bunyip_user_id == Some(caller_bunyip_user_id) {
+                if let Some(accepted_at) = invitation.accepted_at {
+                    if Self::heal_missing_mirror(
+                        pool,
+                        &invitation,
+                        accepted_at,
+                        caller_bunyip_user_id,
+                        owner_bunyip_user_id_fallback,
+                    )
+                    .await?
+                    {
+                        return Ok(Ok(invitation));
+                    }
+                }
+            }
             return Ok(Err(AcceptRefusal::AlreadyAccepted));
         }
         if invitation.status == "declined" {
@@ -610,6 +639,49 @@ impl GrantInvitationsService {
         Ok(Ok(accepted))
     }
 
+    /// Re-run the mirror upsert for an already-accepted invitation whose mirror row is missing.
+    /// Returns `true` when a row was written (the accept is healed), `false` when a mirror row
+    /// already exists for this grantee and account (a genuine duplicate accept).
+    async fn heal_missing_mirror(
+        pool: &PgPool,
+        invitation: &GrantInvitation,
+        accepted_at: DateTime<Utc>,
+        caller_bunyip_user_id: Uuid,
+        owner_bunyip_user_id_fallback: Uuid,
+    ) -> AppResult<bool> {
+        let slug: Option<(String,)> = sqlx::query_as("SELECT slug FROM tenants WHERE id = $1")
+            .bind(invitation.tenant_id)
+            .fetch_optional(pool)
+            .await?;
+        let slug = slug
+            .ok_or_else(|| AppError::internal("Owner tenant vanished during accept"))?
+            .0;
+        let mirrored: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT bunyip_grant_id FROM mokosh_bunyip_grants \
+             WHERE grantee_bunyip_user_id = $1 AND mokosh_account_id = $2",
+        )
+        .bind(caller_bunyip_user_id)
+        .bind(&slug)
+        .fetch_optional(pool)
+        .await?;
+        if mirrored.is_some() {
+            return Ok(false);
+        }
+        super::mokosh_bunyip_grants::MokoshBunyipGrantService::upsert_with_email(
+            pool,
+            invitation.id,
+            owner_bunyip_user_id_fallback,
+            caller_bunyip_user_id,
+            &slug,
+            Some(&invitation.role),
+            accepted_at,
+            None,
+            Some(&invitation.invitee_email),
+        )
+        .await?;
+        Ok(true)
+    }
+
     /// Grantee declines. Same shape as accept minus the mirror
     /// write.
     pub async fn decline(
@@ -665,10 +737,23 @@ impl GrantInvitationsService {
         .bind(caller_bunyip_user_id)
         .fetch_optional(pool)
         .await?;
-        Ok(match updated {
-            Some(inv) => Ok(inv),
-            None => Err(AcceptRefusal::Expired),
-        })
+        let Some(declined) = updated else {
+            // Lost the race: re-read so the refusal names what actually won, as accept does.
+            let status: Option<(String,)> =
+                sqlx::query_as("SELECT status FROM mokosh_grant_invitations WHERE id = $1")
+                    .bind(invitation.id)
+                    .fetch_optional(pool)
+                    .await?;
+            let (status,) =
+                status.ok_or(AppError::internal("Invitation vanished during decline"))?;
+            return Ok(Err(match status.as_str() {
+                "canceled" => AcceptRefusal::Canceled,
+                "accepted" => AcceptRefusal::AlreadyAccepted,
+                "declined" => AcceptRefusal::Declined,
+                _ => AcceptRefusal::Expired,
+            }));
+        };
+        Ok(Ok(declined))
     }
 
     // SPEC-5.244

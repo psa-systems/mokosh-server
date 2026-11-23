@@ -266,13 +266,14 @@ async fn update_payment_term(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(request): Json<UpsertPaymentTermRequest>,
 ) -> AppResult<Json<PaymentTermResponse>> {
     request.validate()?;
     let t = state
         .service
-        .update_payment_term(user.tenant(), id, &request)
+        .update_payment_term(user.tenant(), id, &request, &ctx)
         .await?;
     Ok(Json(t))
 }
@@ -282,9 +283,13 @@ async fn delete_payment_term(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    state.service.delete_payment_term(user.tenant(), id).await?;
+    state
+        .service
+        .delete_payment_term(user.tenant(), id, &ctx)
+        .await?;
     Ok(())
 }
 

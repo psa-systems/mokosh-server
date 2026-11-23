@@ -2,8 +2,7 @@
 //! request extractors.
 //!
 //! Runs on the `/api/v1/contact/*` sub-router. Reads the Bearer token
-//! (from `Authorization: Bearer ...`) OR the `mokosh:contact_token`
-//! cookie (see routes.rs for the cookie-setting side), verifies it,
+//! (from `Authorization: Bearer ...`; no cookie is read), verifies it,
 //! ensures the tenant is still active, and stashes a
 //! `ContactAuthState` in request extensions for downstream extractors.
 //!
@@ -64,7 +63,7 @@ pub async fn portal_contact_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let auth_state = match bearer(&request).or_else(|| cookie(&request)) {
+    let auth_state = match bearer(&request) {
         Some(token) => match state.service.decode_token(token) {
             Ok(claims) => {
                 // PMS-1222: gate on the same conditions `login` checks
@@ -86,21 +85,38 @@ pub async fn portal_contact_middleware(
                         // 15-minute TTL expired. PMS-1259: asked of the
                         // rotation family, so an ordinary refresh does not
                         // count as a revocation.
-                        if state
+                        // PMS-1659 F2: distinguish a DB fault from a
+                        // revocation. The old `.is_err()` folded every
+                        // outcome into the same info "session family is
+                        // revoked" log, so an outage read as a routine
+                        // rejection. Log the fault at warn; still deny
+                        // the request so a failed read never admits a
+                        // caller it should have rejected.
+                        match state
                             .service
                             .ensure_session_active(claims.tid, claims.sid)
                             .await
-                            .is_err()
                         {
-                            tracing::info!(
-                                tenant_id = %claims.tid,
-                                contact_id = %claims.sub,
-                                sid = %claims.sid,
-                                "contact request rejected: session family is revoked",
-                            );
-                            ContactAuthState::default()
-                        } else {
-                            ContactAuthState::authenticated(ContactSession {
+                            Err(e) => {
+                                if matches!(e, AppError::Unauthorized | AppError::NotFound(_)) {
+                                    tracing::info!(
+                                        tenant_id = %claims.tid,
+                                        contact_id = %claims.sub,
+                                        sid = %claims.sid,
+                                        "contact request rejected: session family is revoked",
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        tenant_id = %claims.tid,
+                                        contact_id = %claims.sub,
+                                        sid = %claims.sid,
+                                        error = ?e,
+                                        "contact request rejected: ensure_session_active failed",
+                                    );
+                                }
+                                ContactAuthState::default()
+                            }
+                            Ok(()) => ContactAuthState::authenticated(ContactSession {
                                 id: claims.sub,
                                 tenant_id: claims.tid,
                                 company_id: claims.cid,
@@ -108,7 +124,7 @@ pub async fn portal_contact_middleware(
                                 sid: claims.sid,
                                 role_cache: Default::default(),
                                 timezone_cache: Default::default(),
-                            })
+                            }),
                         }
                     }
                     Ok(false) => {
@@ -149,27 +165,6 @@ fn bearer(req: &Request) -> Option<&str> {
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")
-}
-
-/// mokosh-contact-login prompt 004: parse `mokosh:contact_token=<value>`
-/// out of the Cookie header. Same shape the staff Google-OAuth path
-/// uses; no cookie crate dep.
-// SPEC-5.428
-fn cookie(req: &Request) -> Option<&str> {
-    let raw = req
-        .headers()
-        .get(axum::http::header::COOKIE)?
-        .to_str()
-        .ok()?;
-    for pair in raw.split(';') {
-        let pair = pair.trim();
-        if let Some(value) = pair.strip_prefix("mokosh:contact_token=") {
-            if !value.is_empty() {
-                return Some(value);
-            }
-        }
-    }
-    None
 }
 
 /// mokosh-contact-login prompt 004: extractor that yields the
