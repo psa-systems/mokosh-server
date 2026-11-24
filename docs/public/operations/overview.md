@@ -3,6 +3,7 @@
 The operator-facing side of running Mokosh server.
 
 - [First-run onboarding](first-run-onboarding.md): how the first administrator reaches the system, including the SMTP-not-yet-configured case.
+- [Production deployment](production-deployment.md): the `compose.prod.yml` stack, its variables, and the one-time admin database URL.
 - [Backups](backups.md): what to back up, what order to restore in.
 - [Upgrades](upgrades.md): pulling a new image, migration behavior at startup, what to do when a release fails to boot.
 - [Log inspection](log-inspection.md): log levels, the job runs table, finding a specific tenant's error.
