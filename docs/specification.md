@@ -11253,3 +11253,10 @@ Normative requirements for `src/modules/contacts/`, `contact_sync/`, `assets/`, 
 - **SPEC-15.2130**: POST /data/seed-demo must require an admin and load the demo dataset into the caller's tenant
   through the seed service, answering 200 {seeded: true, message} when loaded and {seeded: false, message} when the
   tenant already has data, and returning the error when seeding fails.
+
+## 16. Adopted profiles
+
+This repository adopts these profiles of `common`; each requirement they state is normative here as written there.
+
+- `common/docs/profile-specification.md`, chapter 1: Rust test build profile.
+- `common/docs/profile-specification.md`, chapter 2: PostgreSQL test profile.
