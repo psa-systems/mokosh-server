@@ -64,6 +64,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# PSPEC-1.1.4: workflow level so every job builds the same artifacts under one cache key;
+# keep identical in check.yml, integration.yml, integration-unsupported.yml and cache-warm.yml.
+env:
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
 # SPEC-10.301: classify gates cargo and guards; secrets always runs
 jobs:
   classify:

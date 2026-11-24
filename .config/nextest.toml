@@ -53,13 +53,15 @@ default-filter = 'not (test(/^suites::s3_storage::/) or test(/^suites::google_cl
 #
 # 8 is chosen against the Postgres service's default `max_connections` of
 # 100, the same budget the old `--test-threads=4` (per binary) comment
-# guarded. Each in-flight `#[sqlx::test]` case holds a per-test database pool
-# (sqlx default max 10) plus the shared sqlx-test maintenance pool, and this
-# is now the ONLY concurrency knob (global, not per-binary), so it is set
-# well under the limit rather than at it. 8 * 10 = 80 leaves headroom under
-# the 100-connection ceiling; 12 did hit `PoolTimedOut` in PR 1276's run 11765
-# (shard 1 tests 624-629, shard 2 tests 494-496 all timed out at 60s pool
-# acquire). Lower further if `PoolTimedOut` returns.
+# guarded. Each in-flight `#[mokosh_test]` case holds a per-test database pool
+# (sqlx default max 10) plus, briefly, one maintenance connection for its
+# CREATE/DROP DATABASE, and this is the ONLY concurrency knob (global, not
+# per-binary), so it is set well under the limit rather than at it (PSPEC-2.3.2):
+# 8 tests * (10 pool + 1 admin) + 1 CI sampler psql connection = 89 < 100;
+# the job's other psql steps finish before the tests start. 12 did hit
+# `PoolTimedOut` in PR 1276's run 11765 (shard 1 tests 624-629, shard 2 tests
+# 494-496 all timed out at 60s pool acquire). Lower further if `PoolTimedOut`
+# returns.
 test-threads = 8
 fail-fast = false
 # SPEC-10.157

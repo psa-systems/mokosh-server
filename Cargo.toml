@@ -341,5 +341,7 @@ codegen-units = 256
 # `debug-assertions` stay ON so a dev-time bug is loud.
 
 # SPEC-10.153: every dependency crate builds optimized even under [profile.dev].
+# PSPEC-1.1.2: the longer cold compile is accepted: argon2/blake2 hashing runs in most tests,
+# and the CI rust-cache and local target volume keep the optimized dependencies warm.
 [profile.dev.package."*"]
 opt-level = 3
