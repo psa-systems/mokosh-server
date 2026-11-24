@@ -1,0 +1,217 @@
+---
+
+# Production deployment for Mokosh Server: same topology and provisioning
+# model as compose.dev.yml (in-compose `postgres` + `server`, roles
+# self-provisioned by the server), minus every dev-only artifact. Operator
+# guide: docs/public/operations/production-deployment.md.
+#
+# Usage: supply the variables below from the production secret store, e.g.
+#   infisical run --env prod -- docker compose --file compose.prod.yml up --detach
+# or a SOPS-decrypted env file passed with `--env-file`. No .env is generated.
+# Every required value uses `${VAR:?...}` so a missing one fails the stack
+# loudly instead of booting misconfigured.
+
+name: mokosh
+
+services:
+
+  # In-compose Postgres. No host port: the server reaches it as `postgres:5432`
+  # on the private network, so the database is never exposed off-box.
+  postgres:
+    container_name: mokosh-postgres
+    # https://hub.docker.com/_/postgres
+    image: postgres:18.2-alpine3.23
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${MOKOSH_PG_DB:-mokosh}
+      POSTGRES_USER: ${MOKOSH_PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${MOKOSH_PG_PASSWORD:?MOKOSH_PG_PASSWORD missing - set it from the production secret store}
+      # Postgres 18 moved the default PGDATA out of the mount; pin it back so
+      # state survives container recreates.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    networks:
+      - private
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: ${MOKOSH_PG_CPUS:-2}
+          memory: ${MOKOSH_PG_MEMORY:-2g}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  # Mokosh API server, from the production release image (oci-build/Dockerfile).
+  # Traefik is the sole ingress and terminates TLS; no host port is published.
+  server:
+    container_name: mokosh-server
+    image: dev.a8n.run/psa-systems-private/mokosh-server:${MOKOSH_SERVER_VERSION:?MOKOSH_SERVER_VERSION missing - pin a release tag such as v0.20.0}
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: ${MOKOSH_PORT:-8080}
+      ENVIRONMENT: production
+      BASE_URL: ${BASE_URL:?BASE_URL missing - the public https origin of this API}
+
+      # DATABASE_URL is the BYPASSRLS migrator, MOKOSH_APP_DATABASE_URL the
+      # NOBYPASSRLS request-serving role. Boot 1 provisions both through
+      # MOKOSH_ADMIN_DATABASE_URL; once the migrator role connects the server
+      # skips provisioning, so the admin URL may be unset from boot 2 on.
+      DATABASE_URL: postgres://mokosh_migrator:${MOKOSH_MIGRATOR_PASSWORD:?MOKOSH_MIGRATOR_PASSWORD missing}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
+      MOKOSH_APP_DATABASE_URL: postgres://mokosh_app:${MOKOSH_APP_PASSWORD:?MOKOSH_APP_PASSWORD missing}@postgres:5432/${MOKOSH_PG_DB:-mokosh}
+      MOKOSH_ADMIN_DATABASE_URL: ${MOKOSH_ADMIN_DATABASE_URL:-}
+      MOKOSH_MIGRATOR_PASSWORD: ${MOKOSH_MIGRATOR_PASSWORD:?MOKOSH_MIGRATOR_PASSWORD missing}
+      MOKOSH_APP_PASSWORD: ${MOKOSH_APP_PASSWORD:?MOKOSH_APP_PASSWORD missing}
+
+      # Real relay, no mailpit. The password may instead come from a
+      # SMTP_PASSWORD_FILE compose secret (application-tier secrets honour the
+      # `{NAME}_FILE` convention).
+      MAIL_PROVIDER: ${MAIL_PROVIDER:-}
+      SMTP_HOST: ${SMTP_HOST:?SMTP_HOST missing - the production mail relay}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:?SMTP_FROM missing - the sender address}
+      SMTP_TLS: ${SMTP_TLS:-starttls}
+
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET missing - set it from the production secret store}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY missing - set it from the production secret store}
+
+      OIDC_ISSUER: ${OIDC_ISSUER:?OIDC_ISSUER missing - the bunyip issuer URL}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:?OIDC_AUDIENCE missing - this API's audience on the bunyip client}
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:?CLIENT_ORIGIN missing - the browser origin of the SPA}
+      SPA_BASE_URL: ${SPA_BASE_URL:?SPA_BASE_URL missing - the origin serving mokosh-apps}
+      MOKOSH_DEPLOYMENT_MODE: ${MOKOSH_DEPLOYMENT_MODE:?MOKOSH_DEPLOYMENT_MODE missing - self-hosted or saas}
+      INFISICAL_ENVIRONMENT: ${INFISICAL_ENVIRONMENT:-prod}
+      RUST_LOG: ${RUST_LOG:-info}
+
+      # Remaining optional keys, each defaulting to the code's own fallback.
+      BUNYIP_MAILER_URL: ${BUNYIP_MAILER_URL:-}
+      BUNYIP_MAILER_CLIENT_ID: ${BUNYIP_MAILER_CLIENT_ID:-}
+      BUNYIP_MAILER_CLIENT_SECRET: ${BUNYIP_MAILER_CLIENT_SECRET:-}
+      INFISICAL_ADDRESS: ${MOKOSH_SERVER_INFISICAL_ADDRESS:-}
+      SECRET_BACKEND: ${SECRET_BACKEND:-database}
+      APP_SECRET_BACKEND: ${APP_SECRET_BACKEND:-database}
+      APP_SECRETS_DIR: ${APP_SECRETS_DIR:-}
+      BUNYIP_SECRETS_URL: ${BUNYIP_SECRETS_URL:-}
+      BUNYIP_SECRETS_CLIENT_ID: ${BUNYIP_SECRETS_CLIENT_ID:-}
+      BUNYIP_SECRETS_CLIENT_SECRET: ${BUNYIP_SECRETS_CLIENT_SECRET:-}
+      CONFIG_BACKEND: ${CONFIG_BACKEND:-environment}
+      CONFIG_PROVIDERS: ${CONFIG_PROVIDERS:-}
+      CONFIG_FILE_DIR: ${CONFIG_FILE_DIR:-}
+      BUNYIP_CONFIG_URL: ${BUNYIP_CONFIG_URL:-}
+      BUNYIP_CONFIG_CLIENT_ID: ${BUNYIP_CONFIG_CLIENT_ID:-}
+      BUNYIP_CONFIG_CLIENT_SECRET: ${BUNYIP_CONFIG_CLIENT_SECRET:-}
+      AUTH_PROVIDERS: ${AUTH_PROVIDERS:-}
+      INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:-}
+      INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-}
+      INFISICAL_CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET:-}
+      OIDC_BACKCHANNEL_CLIENT_ID: ${OIDC_BACKCHANNEL_CLIENT_ID:-}
+      BUNYIP_STATUS_CLIENT_ID: ${BUNYIP_STATUS_CLIENT_ID:-}
+      BUNYIP_STATUS_CLIENT_SECRET: ${BUNYIP_STATUS_CLIENT_SECRET:-}
+      BUNYIP_API_BASE_URL: ${BUNYIP_API_BASE_URL:-}
+      BUNYIP_DIRECTORY_CLIENT_ID: ${BUNYIP_DIRECTORY_CLIENT_ID:-}
+      BUNYIP_DIRECTORY_CLIENT_SECRET: ${BUNYIP_DIRECTORY_CLIENT_SECRET:-}
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+      PORTAL_COOKIE_DOMAIN: ${PORTAL_COOKIE_DOMAIN:-}
+      ABUSE_CONTACT_EMAIL: ${ABUSE_CONTACT_EMAIL:-}
+      PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-}
+      BUNYIP_WEBHOOK_SECRET: ${BUNYIP_WEBHOOK_SECRET:-}
+      TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
+      OUTBOUND_PRIVATE_ALLOWLIST: ${OUTBOUND_PRIVATE_ALLOWLIST:-}
+      IP2LOCATION_DB_PATH: ${IP2LOCATION_DB_PATH:-}
+      IP2PROXY_DB_PATH: ${IP2PROXY_DB_PATH:-}
+      LOGIN_APPROVAL_ENABLED: ${LOGIN_APPROVAL_ENABLED:-}
+      ALLOW_UNINVITED_BUNYIP_SIGNUP: ${ALLOW_UNINVITED_BUNYIP_SIGNUP:-}
+      STORAGE_ROOT: ${STORAGE_ROOT:-/app/attachments}
+      ATTACHMENT_DIR: ${ATTACHMENT_DIR:-}
+      ATTACHMENT_MAX_BYTES: ${ATTACHMENT_MAX_BYTES:-}
+      KB_ATTACHMENT_MAX_BYTES: ${KB_ATTACHMENT_MAX_BYTES:-}
+      TENANT_LOGO_MAX_BYTES: ${TENANT_LOGO_MAX_BYTES:-}
+      BRANDING_TENANT_FAVICON_MAX_BYTES: ${BRANDING_TENANT_FAVICON_MAX_BYTES:-}
+      BRANDING_TENANT_BACKGROUND_MAX_BYTES: ${BRANDING_TENANT_BACKGROUND_MAX_BYTES:-}
+      BRANDING_COMPANY_LOGO_MAX_BYTES: ${BRANDING_COMPANY_LOGO_MAX_BYTES:-}
+      BRANDING_COMPANY_FAVICON_MAX_BYTES: ${BRANDING_COMPANY_FAVICON_MAX_BYTES:-}
+      BRANDING_COMPANY_BACKGROUND_MAX_BYTES: ${BRANDING_COMPANY_BACKGROUND_MAX_BYTES:-}
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-}
+      STORAGE_S3_ENDPOINT: ${STORAGE_S3_ENDPOINT:-}
+      STORAGE_S3_BUCKET: ${STORAGE_S3_BUCKET:-}
+      STORAGE_S3_REGION: ${STORAGE_S3_REGION:-}
+      STORAGE_S3_ACCESS_KEY_ID: ${STORAGE_S3_ACCESS_KEY_ID:-}
+      STORAGE_S3_SECRET_ACCESS_KEY: ${STORAGE_S3_SECRET_ACCESS_KEY:-}
+      STORAGE_S3_PATH_STYLE: ${STORAGE_S3_PATH_STYLE:-}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_PATH_STYLE: ${S3_PATH_STYLE:-}
+      OIDC_JWKS_CACHE_TTL_SECS: ${OIDC_JWKS_CACHE_TTL_SECS:-}
+      OIDC_LEEWAY_SECONDS: ${OIDC_LEEWAY_SECONDS:-}
+      OIDC_DEFAULT_TENANT_ID: ${OIDC_DEFAULT_TENANT_ID:-}
+      CONTACT_LOGIN_IP_RATE_MAX: ${CONTACT_LOGIN_IP_RATE_MAX:-}
+      CONTACT_LOGIN_IP_RATE_WINDOW_SECS: ${CONTACT_LOGIN_IP_RATE_WINDOW_SECS:-}
+      STRIPE_API_BASE: ${STRIPE_API_BASE:-}
+      PAYPAL_API_BASE: ${PAYPAL_API_BASE:-}
+      MOKOSH_DEMO_SEED: ${MOKOSH_DEMO_SEED:-}
+      MOKOSH_SEED_TENANT_ID: ${MOKOSH_SEED_TENANT_ID:-}
+      MOKOSH_UPDATE_CHECK_URL: ${MOKOSH_UPDATE_CHECK_URL:-}
+      MOKOSH_MAX_TENANTS: ${MOKOSH_MAX_TENANTS:-}
+    networks:
+      - private
+      - traefik-public
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: network-traefik-public
+      traefik.http.routers.mokosh-api.rule: Host(`${MOKOSH_API_HOST:?MOKOSH_API_HOST missing - the public hostname Traefik routes to this API}`)
+      traefik.http.routers.mokosh-api.entrypoints: ${MOKOSH_TRAEFIK_ENTRYPOINT:-nebula-secure}
+      traefik.http.routers.mokosh-api.tls.certresolver: ${MOKOSH_TRAEFIK_CERTRESOLVER:-cert-cloudflare}
+      traefik.http.services.mokosh-api.loadbalancer.server.port: ${MOKOSH_PORT:-8080}
+    volumes:
+      - attachments:/app/attachments
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:$${PORT}/api/v1/health || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: ${MOKOSH_SERVER_CPUS:-2}
+          memory: ${MOKOSH_SERVER_MEMORY:-1g}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  postgres-data:
+    name: mokosh-postgres-data
+  attachments:
+    name: mokosh-attachments
+
+networks:
+  private:
+    name: mokosh-private
+  # Owned by the shared Traefik stack; must already exist.
+  traefik-public:
+    name: network-traefik-public
+    external: true
