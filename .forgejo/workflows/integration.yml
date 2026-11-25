@@ -123,9 +123,12 @@ jobs:
     name: build nextest archive
     # Dev label: `cargo nextest archive` compiles natively on the runner, and
     # only the dev image ships the C toolchain + OpenSSL headers that needs
-    # (PMS-705).
+    # (PMS-705). The retired LATEST tombstone lives here; if a conflict
+    # resolver re-introduces `RUNS_ON_OPENSUSE_DEV_LATEST`, re-apply
+    # `RUNS_ON_OPENSUSE_BASE_HEAVY` per PMS-1508 and PMS-1717 (where the last
+    # regression left integration pending-forever for 36 days).
     # SPEC-10.13
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # Placeholder (PMS-1253): the first three green sharded runs after this
     # lands will supply the measured wall times for `build`, each shard, and
@@ -286,8 +289,8 @@ jobs:
     # the dev image's C toolchain and OpenSSL headers are available even
     # though no compile happens here (PMS-705). A fallback compile from a
     # dirty fingerprint would otherwise hit `linker cc not found` on the
-    # base image.
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    # base image. See the `build` job for the PMS-1717 tombstone.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # Placeholder (PMS-1253): see the `build` job's comment. Historical
     # unsharded test step took 508-938s on the fast runner, 701s on the slow
@@ -489,9 +492,10 @@ jobs:
     # so the dev image's C toolchain is strictly unneeded. The runner
     # label stays uniform across this file for the file-wide
     # `check-runner-labels` guard that reads any `cargo ` line anywhere
-    # as a requirement for every job's label (PMS-705).
+    # as a requirement for every job's label (PMS-705). See the `build`
+    # job for the PMS-1717 tombstone.
     # SPEC-10.21
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
     timeout-minutes: 5
 
     steps:
