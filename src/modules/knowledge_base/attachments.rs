@@ -354,29 +354,58 @@ impl KbAttachmentService {
         // which does distinguish: a true absence is NotFound, an I/O
         // fault bubbles verbatim so an operator sees it.
         let primary = ObjectKey::kb_attachment(row.tenant_id, row.id);
-        match self.store.open(&primary).await {
+        let primary_err = match self.store.open(&primary).await {
             Ok(reader) => return Ok(reader),
             // Logged so a storage fault on the tenant-scoped key is not lost
             // when the legacy open below succeeds or reports its own error.
-            Err(e) => tracing::warn!(
-                attachment_id = %row.id,
-                error = %e,
-                "kb attachment: primary open failed, trying legacy layout"
-            ),
-        }
+            Err(e) => {
+                tracing::warn!(
+                    attachment_id = %row.id,
+                    error = %e,
+                    "kb attachment: primary open failed, trying legacy layout"
+                );
+                e
+            }
+        };
         let legacy = ObjectKey::legacy_kb_attachment(row.tenant_id, row.id);
         match self.store.open(&legacy).await {
             Ok(reader) => Ok(reader),
-            Err(legacy_err) => {
-                let primary_absent = matches!(self.store.exists(&primary).await, Ok(false));
-                let legacy_absent = matches!(self.store.exists(&legacy).await, Ok(false));
-                if primary_absent && legacy_absent {
-                    Err(AppError::NotFound("Attachment".to_string()))
-                } else {
-                    Err(legacy_err)
-                }
-            }
+            Err(legacy_err) => Err(resolve_open_fallback_error(
+                self.store.as_ref(),
+                &primary,
+                &legacy,
+                primary_err,
+                legacy_err,
+            )
+            .await),
         }
+    }
+}
+
+/// Decide which of the primary open's error and the legacy open's error is
+/// the one to surface, once both have failed.
+///
+/// A plain "both absent" is a true 404. Otherwise, a genuinely absent legacy
+/// object means the legacy error is just a not-found with nothing to say
+/// about the primary, so when the primary object exists (it is faulting, not
+/// missing) its own error is the real problem and is what gets returned.
+/// Any other combination (legacy present-but-faulting, or both faulting)
+/// keeps the legacy error, the most recent and closest to the caller.
+async fn resolve_open_fallback_error(
+    store: &dyn ObjectProvider,
+    primary: &ObjectKey,
+    legacy: &ObjectKey,
+    primary_err: AppError,
+    legacy_err: AppError,
+) -> AppError {
+    let primary_absent = matches!(store.exists(primary).await, Ok(false));
+    let legacy_absent = matches!(store.exists(legacy).await, Ok(false));
+    if primary_absent && legacy_absent {
+        AppError::NotFound("Attachment".to_string())
+    } else if legacy_absent {
+        primary_err
+    } else {
+        legacy_err
     }
 }
 
@@ -614,5 +643,94 @@ mod tests {
         let path = attachment_path(id);
         assert!(path.starts_with("/api/v1/public/kb/attachments/"));
         assert!(!path.starts_with("http"), "nothing here knows the API base");
+    }
+
+    /// A store double whose `exists` answers are fixed per key, independent of
+    /// `open`: this is what lets a test put the primary object in the
+    /// present-but-faulting state `open()` alone cannot express.
+    #[derive(Debug)]
+    struct FaultyStore {
+        primary: ObjectKey,
+        primary_exists: bool,
+        legacy_exists: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectProvider for FaultyStore {
+        async fn put(&self, _key: &ObjectKey, _bytes: &[u8]) -> AppResult<()> {
+            unimplemented!("not exercised by open_public")
+        }
+        async fn read(&self, _key: &ObjectKey) -> AppResult<Vec<u8>> {
+            unimplemented!("not exercised by open_public")
+        }
+        async fn open(&self, key: &ObjectKey) -> AppResult<ObjectReader> {
+            Err(AppError::Internal(format!("I/O fault opening {key:?}")))
+        }
+        async fn delete(&self, _key: &ObjectKey) -> AppResult<()> {
+            unimplemented!("not exercised by open_public")
+        }
+        async fn exists(&self, key: &ObjectKey) -> AppResult<bool> {
+            if key == &self.primary {
+                Ok(self.primary_exists)
+            } else {
+                Ok(self.legacy_exists)
+            }
+        }
+        async fn rename(&self, _from: &ObjectKey, _to: &ObjectKey) -> AppResult<()> {
+            unimplemented!("not exercised by open_public")
+        }
+        fn location(&self, _key: &ObjectKey) -> AppResult<String> {
+            unimplemented!("not exercised by open_public")
+        }
+    }
+
+    /// A primary object that exists but faults on open, alongside a
+    /// genuinely absent legacy object, must surface the primary's own fault,
+    /// not the legacy lookup's not-found.
+    #[tokio::test]
+    async fn primary_fault_with_absent_legacy_surfaces_the_primary_fault() {
+        let tenant = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let primary = ObjectKey::kb_attachment(tenant, id);
+        let legacy = ObjectKey::legacy_kb_attachment(tenant, id);
+        let primary_err = AppError::Internal("permission denied".to_string());
+        let legacy_err = AppError::NotFound("Attachment".to_string());
+
+        let store = FaultyStore {
+            primary: primary.clone(),
+            primary_exists: true,
+            legacy_exists: false,
+        };
+        let resolved =
+            resolve_open_fallback_error(&store, &primary, &legacy, primary_err, legacy_err).await;
+
+        assert!(
+            matches!(resolved, AppError::Internal(_)),
+            "expected the primary's fault, got {resolved:?}"
+        );
+    }
+
+    /// Both objects genuinely absent is still a plain 404, unchanged.
+    #[tokio::test]
+    async fn both_absent_is_still_not_found() {
+        let tenant = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let primary = ObjectKey::kb_attachment(tenant, id);
+        let legacy = ObjectKey::legacy_kb_attachment(tenant, id);
+        let primary_err = AppError::Internal("permission denied".to_string());
+        let legacy_err = AppError::NotFound("Attachment".to_string());
+
+        let store = FaultyStore {
+            primary: primary.clone(),
+            primary_exists: false,
+            legacy_exists: false,
+        };
+        let resolved =
+            resolve_open_fallback_error(&store, &primary, &legacy, primary_err, legacy_err).await;
+
+        assert!(
+            matches!(resolved, AppError::NotFound(ref s) if s == "Attachment"),
+            "expected a plain 404, got {resolved:?}"
+        );
     }
 }
