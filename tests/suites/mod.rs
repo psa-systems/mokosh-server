@@ -35,6 +35,7 @@ pub mod calendar;
 pub mod calendar_reminders;
 pub mod company_delete;
 pub mod company_deletion_preview;
+pub mod company_parent_cycle_race;
 pub mod company_scoped_filtering;
 pub mod company_scoped_portal_roles;
 pub mod concurrent_login_health_latency;

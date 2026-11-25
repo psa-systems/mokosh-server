@@ -782,8 +782,6 @@ impl ContactService {
         .await?;
         self.assert_contact_of_company(tenant_id, company_id, request.default_billing_contact_id)
             .await?;
-        self.assert_no_parent_cycle(tenant_id, company_id, request.parent_company_id)
-            .await?;
 
         // Build the dynamic UPDATE the same way update_site does. The
         // previous implementation only handled name / company_type /
@@ -1037,6 +1035,17 @@ impl ContactService {
         // state) and write the audit entry on the same tx so a rollback
         // drops both. PMS-117 AC1.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // Close a parent-cycle TOCTOU race: the cycle check has to run
+        // inside this same transaction, after locking both the company
+        // being updated and its proposed parent `FOR UPDATE`, or two
+        // concurrent requests that would together close a cycle (A's parent
+        // set to B, B's parent set to A) can each pass the check against
+        // the other's not-yet-committed state. Lock in ascending id order
+        // so the two concurrent requests wait on each other's lock in the
+        // same order instead of deadlocking.
+        self.assert_no_parent_cycle(&mut *tx, tenant_id, company_id, request.parent_company_id)
+            .await?;
 
         // PMS-400: when renaming, reject a name already held by ANOTHER
         // company in the tenant (case-insensitive, trimmed). Excluding this
@@ -3893,9 +3902,19 @@ impl ContactService {
 
     /// Refuse a parent that is the company itself or one of its descendants,
     /// either of which would close a loop in the parent chain.
+    ///
+    /// Closes a parent-cycle TOCTOU race: runs on the caller's own update
+    /// transaction, not a transaction of its own, and locks both the
+    /// company and its proposed parent `FOR UPDATE` (ascending id order, to
+    /// avoid a deadlock between two concurrent callers locking the same two
+    /// rows in opposite order) before walking the ancestry. A concurrent
+    /// `update_company` on either row blocks on that lock until this
+    /// transaction commits or rolls back, so the check can no longer pass
+    /// against a sibling update's not-yet-committed state.
     // SPEC-15.25: parent must not be self or a descendant
     async fn assert_no_parent_cycle(
         &self,
+        tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         company_id: Uuid,
         parent_company_id: Option<Uuid>,
@@ -3912,7 +3931,21 @@ impl ContactService {
         if parent_id == company_id {
             return Err(cycle_error());
         }
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let (first, second) = if company_id < parent_id {
+            (company_id, parent_id)
+        } else {
+            (parent_id, company_id)
+        };
+        sqlx::query("SELECT id FROM companies WHERE tenant_id = $1 AND id = $2 FOR UPDATE")
+            .bind(tenant_id)
+            .bind(first)
+            .fetch_optional(&mut *tx)
+            .await?;
+        sqlx::query("SELECT id FROM companies WHERE tenant_id = $1 AND id = $2 FOR UPDATE")
+            .bind(tenant_id)
+            .bind(second)
+            .fetch_optional(&mut *tx)
+            .await?;
         // Walk up from the proposed parent; reaching this company means the
         // proposed parent is one of its descendants. UNION (not UNION ALL)
         // stops the walk on any pre-existing loop.
