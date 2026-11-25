@@ -72,6 +72,7 @@ pub enum BindValue {
     Int(i64),
     Bool(bool),
     Timestamp(chrono::DateTime<chrono::Utc>),
+    TimestampList(Vec<chrono::DateTime<chrono::Utc>>),
 }
 
 // SPEC-15.1615
@@ -588,7 +589,7 @@ fn coerce_bind_array(field: &str, ty: ColumnType, arr: &[Value]) -> AppResult<Bi
             }
             Ok(BindValue::UuidList(out))
         }
-        ColumnType::Text | ColumnType::Timestamp => {
+        ColumnType::Text => {
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
                 let s = v
@@ -597,6 +598,21 @@ fn coerce_bind_array(field: &str, ty: ColumnType, arr: &[Value]) -> AppResult<Bi
                 out.push(s.to_string());
             }
             Ok(BindValue::TextList(out))
+        }
+        ColumnType::Timestamp => {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| invalid(format!("Filter '{field}' values must be strings")))?;
+                let d = chrono::DateTime::parse_from_rfc3339(s).map_err(|e| {
+                    invalid(format!(
+                        "Filter '{field}' expects an RFC 3339 timestamp; '{s}' is not one ({e})"
+                    ))
+                })?;
+                out.push(d.with_timezone(&chrono::Utc));
+            }
+            Ok(BindValue::TimestampList(out))
         }
         ColumnType::Int | ColumnType::Bool => Err(invalid(format!(
             "Filter '{field}' does not support array values for its column type"
@@ -805,6 +821,34 @@ mod tests {
             tenant(),
             "tickets",
             &json!({ "created_at": "yesterday" }),
+            &json!([{"field": "ticket_number"}]),
+            &json!([]),
+            50,
+            0,
+        )
+        .expect_err("not a timestamp");
+        assert!(matches!(err, AppError::Validation { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn timestamp_array_filter_binds_a_timestamp_list_and_rejects_garbage() {
+        let q = compile(
+            tenant(),
+            "tickets",
+            &json!({ "created_at": ["2026-01-02T03:04:05Z", "2026-02-03T04:05:06Z"] }),
+            &json!([{"field": "ticket_number"}]),
+            &json!([]),
+            50,
+            0,
+        )
+        .expect("ok");
+        assert!(q.sql.contains("= ANY($2::timestamptz[])"));
+        assert!(matches!(q.binds[1], BindValue::TimestampList(ref v) if v.len() == 2));
+
+        let err = compile(
+            tenant(),
+            "tickets",
+            &json!({ "created_at": ["2026-01-02T03:04:05Z", "yesterday"] }),
             &json!([{"field": "ticket_number"}]),
             &json!([]),
             50,
