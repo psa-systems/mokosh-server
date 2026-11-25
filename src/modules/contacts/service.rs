@@ -1044,7 +1044,7 @@ impl ContactService {
         // the other's not-yet-committed state. Lock in ascending id order
         // so the two concurrent requests wait on each other's lock in the
         // same order instead of deadlocking.
-        self.assert_no_parent_cycle(&mut *tx, tenant_id, company_id, request.parent_company_id)
+        self.assert_no_parent_cycle(&mut tx, tenant_id, company_id, request.parent_company_id)
             .await?;
 
         // PMS-400: when renaming, reject a name already held by ANOTHER
