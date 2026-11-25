@@ -5912,7 +5912,7 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
 
 ### 10.1 Compile and lint gate (`.forgejo/workflows/check.yml`)
 
-- **SPEC-10.1** On every `pull_request` targeting `main`, `check.yml` must run four jobs (layout in 10.300-10.309): `classify` and `guards` and `secrets` on `${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}`, and `cargo` on `${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}`; the `cargo` job must fail if it exceeds its 45-minute timeout, and the `guards` and `secrets` jobs if they exceed 15 minutes each.
+- **SPEC-10.1** On every `pull_request` targeting `main`, `check.yml` must run four jobs (layout in 10.300-10.309): `classify` and `guards` and `secrets` on `${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}`, and `cargo` on `${{ vars.RUNS_ON_OPENSUSE_HEAVY }}`; the `cargo` job must fail if it exceeds its 45-minute timeout, and the `guards` and `secrets` jobs if they exceed 15 minutes each.
 - **SPEC-10.2** `check.yml` must not declare a `push` trigger for `main`: re-running compile and lint after a merge gates nothing, since the pull request already covered the merge commit.
 - **SPEC-10.3** The `guards` job's checkout step must set `fetch-depth: 0` (so migration-immutability can diff against `origin/main`) and `submodules: true` (so `common/common.just` resolves and `just --list` parses); the `cargo` job checks out at the default depth without submodules (10.304), and `classify` and `secrets` use `fetch-depth: 0` without submodules.
 - **SPEC-10.4** The `guards` job must shallow-clone (`fetch-depth: 1`) `<org>/mokosh-apps` to path `mokosh-apps` using `secrets.FORGEJO_PAT`, for the route-consumers check, only when the `routes` step reports a routing-relevant diff (10.308).
@@ -5921,11 +5921,11 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
 - **SPEC-10.7** The `guards` job must run, in order, and fail the workflow if any exits non-zero: `just check-migration-versions`, `just check-migration-immutability`, `just check-migration-versions-against-base`, then `nu scripts/check-guarded-content-migrations.nu`, `check-no-duplicate-mail-copy.nu`, `check-pool-safety.nu`, `check-create-update-validate-parity.nu`, `check-rate-limit-helper.nu`, `check-runner-labels.nu`, `check-oci-build-cache.nu`, `check-oci-publish-tags.nu`, `check-workspace-deps.nu`, `check-env-example.nu`, `check-doc-recipes.nu`, `check-config-doc-paths.nu`, `config-docs.nu self-test` then `config-docs.nu check`, `check-doc-links.nu`, `check-claude-md.nu --self-test` then `check-claude-md.nu`, then `check-route-consumers.nu` with env `MOKOSH_APPS_DIR=mokosh-apps` (only when the routing diff step reports `run=true`, 10.308). `check-build-target-storage.nu` and `cargo machete` run in the `cargo` job instead (10.305).
 - **SPEC-10.8** The `cargo` job must install `cargo-machete` by downloading `cargo-machete-v0.9.2-x86_64-unknown-linux-musl.tar.gz` from its GitHub release (only when `/tmp/machete.tar.gz` is absent or empty, 10.306), verifying it against SHA-256 `48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9` with `sha256sum --check --strict`, and installing to `${CARGO_HOME:-$HOME/.cargo}/bin/cargo-machete`; a checksum mismatch must fail the step (`set -euo pipefail`).
 - **SPEC-10.9** The `cargo` job must run, in order, and fail on non-zero exit: `nu scripts/check-build-target-storage.nu`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --lib`, `cargo test --workspace --doc`, then `cargo machete` (10.8). It runs no separate `cargo check`: clippy over `--workspace --all-targets` is the compile gate.
-- **SPEC-10.10** The `secrets` job must run on `${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}` with a 15-minute timeout, rename an existing `~/.gitconfig` to `~/.gitconfig-disabled` before checkout, check out with `fetch-depth: 0` and `persist-credentials: false`, then invoke the `check-secrets` composite action from `<org>/common` with a fixed `kingfisher_excludes` path list, a `kingfisher_skip_regex`, and `noseyparker_ignore_file: .noseyparker-ignore.txt`.
+- **SPEC-10.10** The `secrets` job must run on `${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}` with a 15-minute timeout, rename an existing `~/.gitconfig` to `~/.gitconfig-disabled` before checkout, check out with `fetch-depth: 0` and `persist-credentials: false`, then invoke the `check-secrets` composite action from `<org>/common` with a fixed `kingfisher_excludes` path list, a `kingfisher_skip_regex`, and `noseyparker_ignore_file: .noseyparker-ignore.txt`.
 
 ### 10.2 Migration guard on merge (`.forgejo/workflows/post-merge-guards.yml`)
 
-- **SPEC-10.11** On every `push` to `main`, the `guards` job must run on `${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}` with a 5-minute timeout, check out with `fetch-depth: 0` and `submodules: true`, then run `just check-migration-versions` and `just check-migration-immutability` against the merge result, failing the workflow if either exits non-zero.
+- **SPEC-10.11** On every `push` to `main`, the `guards` job must run on `${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}` with a 5-minute timeout, check out with `fetch-depth: 0` and `submodules: true`, then run `just check-migration-versions` and `just check-migration-immutability` against the merge result, failing the workflow if either exits non-zero.
 
 ### 10.3 Integration test gate (`.forgejo/workflows/integration.yml`)
 
@@ -5943,7 +5943,7 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
 ### 10.4 Unsupported/scheduled integration suite (`.forgejo/workflows/integration-unsupported.yml`)
 
 - **SPEC-10.22** The workflow must trigger only on `schedule: "0 6 * * 1"` (Monday 06:00 UTC) and `workflow_dispatch`, never on `push` or `pull_request`.
-- **SPEC-10.23** The job must run on `${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}` with a 30-minute timeout, with its own `postgres:18.2-alpine3.23` service identical to `integration.yml`'s.
+- **SPEC-10.23** The job must run on `${{ vars.RUNS_ON_OPENSUSE_HEAVY }}` with a 30-minute timeout, with its own `postgres:18.2-alpine3.23` service identical to `integration.yml`'s.
 - **SPEC-10.24** The job must install the same pinned nextest (0.9.145 / SHA-256 `32aa...867`), then start MinIO for the S3 suite by pulling image digest `docker.io/bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c`, extracting `/opt/bitnami/minio/bin/minio` via `docker create` plus `docker cp`, verifying it against SHA-256 `0586fed6e33767430230d2f5bafd0d2f4ea2b844ce17025593dd7ab07f5f33c2`, and running it with `MINIO_ROOT_USER=mokosh MINIO_ROOT_PASSWORD=mokosh-ci-password` bound to `127.0.0.1:9000`, polling `/minio/health/live` for up to 30 seconds before failing loud.
 - **SPEC-10.25** The step must fail immediately with an `::error::` if `uname -m` is not `x86_64` (the MinIO pin is amd64-only).
 - **SPEC-10.26** The job must export `STORAGE_S3_ENDPOINT=http://127.0.0.1:9000`, `STORAGE_S3_BUCKET=mokosh-ci`, `STORAGE_S3_REGION=us-east-1`, `STORAGE_S3_PATH_STYLE=true`, `STORAGE_S3_ACCESS_KEY_ID=mokosh`, `STORAGE_S3_SECRET_ACCESS_KEY=mokosh-ci-password` to `GITHUB_ENV`.
@@ -5953,7 +5953,7 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
 
 - **SPEC-10.28** The workflow must trigger on `push: main`, `pull_request: main`, and `workflow_dispatch` with a required `environment` choice input (`staging` default, or `production`).
 - **SPEC-10.29** All triggers must serialize under `concurrency: group: e2e-staging, cancel-in-progress: false`, so no run is ever cancelled mid-flight.
-- **SPEC-10.30** The job must run on `${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}` with a 20-minute timeout and `defaults.run.working-directory: e2e`.
+- **SPEC-10.30** The job must run on `${{ vars.RUNS_ON_OPENSUSE_HEAVY }}` with a 20-minute timeout and `defaults.run.working-directory: e2e`.
 - **SPEC-10.31** Every environment-switched `E2E_*` env var must resolve to its production secret only when `inputs.environment == 'production'`, else to its staging secret (exact secret names in 10.317); `E2E_OIDC_CLIENT_ID` must be the single `secrets.MOKOSH_OIDC_CLIENT_ID`, shared across environments; `E2E_ENVIRONMENT` must be `production` only on an explicit production dispatch, else `staging`.
 - **SPEC-10.32** Checkout must use `fetch-depth: 0` only for a `push` or a staging `workflow_dispatch` (the paths running `wait-for-deploy.mjs`'s `git log` walk), else `fetch-depth: 1` (10.316).
 - **SPEC-10.33** The job must install dependencies with `bun install --frozen-lockfile` and browsers with `bun x playwright install chromium firefox webkit`, with no separate Node setup step (the runner image ships `nodejs24`/`bun` pre-baked).
@@ -5966,13 +5966,13 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
 ### 10.6 Release and image publishing (`.forgejo/workflows/build-oci-image.yml`, `create-release.yml`)
 
 - **SPEC-10.39** `build-oci-image.yml` must trigger on `push` to `main` or tag `v*` with a path filter limited to `src/**`, `crates/**`, `migrations/**`, `.cargo/**`, `Cargo.toml`, `Cargo.lock`, `oci-build/**`, `.forgejo/workflows/build-oci-image.yml`, plus `workflow_dispatch` with `dry_run` (boolean, default `true`) and `simulate_tag` (string) inputs.
-- **SPEC-10.40** The `build-and-push` job must run only `if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')`, on `${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}`, with a 45-minute timeout and `permissions: contents: read, packages: write`.
+- **SPEC-10.40** The `build-and-push` job must run only `if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')`, on `${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}`, with a 45-minute timeout and `permissions: contents: read, packages: write`.
 - **SPEC-10.41** The publish mode must be derived from the trigger only, never `git describe`: `workflow_dispatch` resolves `dry-run`; a tag ref resolves `release`; `ref_name == main` resolves `latest`; any other ref resolves `branch` (rejected downstream unless allow-listed in `oci-build/get-tags.nu`). `dry_run` must be true unless the event is `workflow_dispatch` and `inputs.dry_run == "false"`; push events always publish for real.
 - **SPEC-10.42** Resolved tags and mode must come from `nu oci-build/get-tags.nu --mode $mode --ref-name $ref_name --simulate-tag $simulate_tag --json`, writing `mode`, `train`, `tag`, `describe`, `dry_run` to `GITHUB_OUTPUT`.
 - **SPEC-10.43** Build metadata env vars `MOKOSH_GIT_HASH` (`git rev-parse --short=12 HEAD`), `MOKOSH_GIT_DESCRIBE` (`git describe --tags --always --dirty`), `MOKOSH_BUILD_DATE` (ISO-8601 UTC), `SOURCE_DATE_EPOCH` (`git log -1 --pretty=%ct HEAD`) must be exported and passed as `--build-arg` to the Docker build.
 - **SPEC-10.44** The buildx builder must use the `docker-container` driver, required for cache export; `build-oci-image.yml` obtains it through the shared `<org>/common` `setup-buildx` composite action (builder name `build-oci-image`), which `check-oci-build-cache.nu` accepts in place of an inline `--driver docker-container`.
 - **SPEC-10.45** The image build must use `--cache-from type=gha` and, when not a dry run, `--cache-to type=gha,mode=max,ignore-error=true`; a dry run must use `--load` and skip `--push`/`--cache-to` entirely, so a simulated run never mutates the shared cache.
-- **SPEC-10.46** `create-release.yml` must trigger on `pull_request_target: closed` into `main`, and its `create-release` job must run only `if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/v')`, calling the reusable workflow `https://<forge-host>/<org>/common/.forgejo/workflows/create-release.yml@main` with `runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}` and `secrets: inherit`.
+- **SPEC-10.46** `create-release.yml` must trigger on `pull_request_target: closed` into `main`, and its `create-release` job must run only `if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/v')`, calling the reusable workflow `https://<forge-host>/<org>/common/.forgejo/workflows/create-release.yml@main` with `runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}` and `secrets: inherit`.
 
 ### 10.7 Cache warmup (`.forgejo/workflows/cache-warm.yml`)
 
@@ -6158,7 +6158,7 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
 
 - **SPEC-10.174** `check-rate-limit-helper.nu` must scan every `src/**/*.rs` file and fail if, outside `src/utils/error.rs`, a non-comment line contains `TOO_MANY_REQUESTS` or `AppError::RateLimited`, and must fail (even inside `src/utils/error.rs`) on any line containing the literal `let _ = retry_after`.
 - **SPEC-10.175** `check-route-consumers.nu` must scan `src/modules/*/*.rs` for `.route("<path>", ...)` literals (with any `#[cfg(test)]` module stripped first); a route is exempt if its first static path segment appears as `/<segment>` and every later static segment appears delimiter-bounded (a route with no static segment is exempt) in `$MOKOSH_APPS_DIR/src/**/*.rs` (default `../mokosh-apps`), or if its own file carries a `//`-comment containing both `parity record` and a `YYYY-MM-DD` date and a separate comment naming that exact route literal; under CI (`$CI` set) a missing client checkout is a hard failure, else the check is skipped.
-- **SPEC-10.176** For every job in every `.forgejo/workflows/*.yml` file, `check-runner-labels.nu` must fail a step that installs a toolchain package (`gcc`, `binutils`, `glibc-devel`, `libopenssl-devel`, `build-essential`) via a package manager at run time instead of requesting the dev image; must fail a job that runs `cargo ` natively without `RUNS_ON_OPENSUSE_BASE_HEAVY` in its `runs-on:`; and must fail any `runs-on:` line with no immediately preceding comment justifying its label.
+- **SPEC-10.176** For every job in every `.forgejo/workflows/*.yml` file, `check-runner-labels.nu` must fail a step that installs a toolchain package (`gcc`, `binutils`, `glibc-devel`, `libopenssl-devel`, `build-essential`) via a package manager at run time instead of requesting the dev image; must fail a job that runs `cargo ` natively without `RUNS_ON_OPENSUSE_HEAVY` in its `runs-on:`; and must fail any `runs-on:` line with no immediately preceding comment justifying its label.
 
 ### 10.28 CI gate scripts: OCI cache and publish-tag parity, workspace dependencies
 
@@ -6262,7 +6262,7 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
   pull request, including one whose only change is comments, because its scanners read git history that such a pull
   request still extends. When `run_gate` is not `true`, `cargo` and `guards` are skipped and none of their compile,
   lint, test or guard steps run for that pull request.
-- **SPEC-10.302**: The `classify` job must run on `${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}`, check out with
+- **SPEC-10.302**: The `classify` job must run on `${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}`, check out with
   `fetch-depth: 0`, and expose step `classify`'s `run_gate` as a job output. For a `pull_request` event it must run `git
   fetch origin <base_ref>` and classify `FETCH_HEAD` against `HEAD`; when that fetch exits non-zero it must print the
   fetch's stderr and exit 1, failing the job instead of skipping the gate.
@@ -6271,7 +6271,7 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
   any other output to `true`. For a `push` event whose `github.event.before` is empty or forty zeros it must not
   classify and must set `run_gate=true`; for any other non-pull-request event it must classify `github.event.before`
   against `HEAD`. It must append `run_gate=<true|false>` to `$GITHUB_OUTPUT` and print the same line.
-- **SPEC-10.304**: The `cargo` job must run on `${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}` with `timeout-minutes: 45`, and
+- **SPEC-10.304**: The `cargo` job must run on `${{ vars.RUNS_ON_OPENSUSE_HEAVY }}` with `timeout-minutes: 45`, and
   must check out with the default depth and no submodules, because it runs only cargo and one Nushell script that need
   neither `origin/main` history nor `common/common.just`. A run that exceeds 45 minutes fails the job.
 - **SPEC-10.305**: The `cargo` job must run these steps in order, each failing the job on a non-zero exit: set
@@ -6285,7 +6285,7 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
   is missing or empty, and verify its SHA-256 with `sha256sum --check --strict` on every run, cache hit included, so a
   wrong-version file restored from cache fails the step. The cache key's version literal must be changed together with
   `MACHETE_VERSION`.
-- **SPEC-10.307**: The `guards` job must run on `${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}` with `timeout-minutes: 15`,
+- **SPEC-10.307**: The `guards` job must run on `${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}` with `timeout-minutes: 15`,
   check out with `fetch-depth: 0` and `submodules: true`, and run no `cargo` command. A run that exceeds 15 minutes
   fails the job.
 - **SPEC-10.308**: The `guards` step `routes` must set output `run=true` only when `git diff --name-only

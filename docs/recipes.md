@@ -92,7 +92,6 @@ just migrate-create <name>  # create a new migration file
 
 # Release
 just create-release <bump>  # bump version (major|minor|hotfix), push release branch, print PR link [from common]
-just publish-release        # push the release tag the create-release workflow releases from; run after the release PR merges
 just config-release-notes <version> [--ref main] # the configuration-changes block for that release's notes, linking its changelog entry
 ```
 

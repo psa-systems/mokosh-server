@@ -71,7 +71,7 @@ jobs:
     # PMS-1652: only diffs file paths and comment/whitespace lines, no
     # compile.
     # SPEC-10.302: base-medium, fetch-depth 0, run_gate output
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     outputs:
       result: ${{ steps.classify.outputs.result }}
     steps:
@@ -91,7 +91,7 @@ jobs:
     # dev image carries `cc` / `gcc` / `ld` plus the OpenSSL headers openssl-sys
     # probes. Base fails at `linker cc not found` (PMS-705, CLAUDE-203).
     # SPEC-10.1 SPEC-10.304: pull_request on main, heavy label; cargo job bound is 45 minutes
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_HEAVY }}
 
     # Backstop, not a target (PMS-829): 38 green runs between 2026-08-22 and
     # 2026-08-24 took 1.9-9.0 minutes, median 3.5. The headroom is for a cold
@@ -245,7 +245,7 @@ jobs:
     # take a base-medium slot and leave dev-heavy for the cargo job above.
     # `check-runner-labels.nu` below asserts the dev label is reserved for
     # jobs that compile; this job does not, so the rule is satisfied.
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
 
     # Backstop, not a target. The guard set is ~20 shell / nu invocations that
     # each take seconds; the full job runs in well under a minute on a warm
@@ -515,7 +515,7 @@ jobs:
     # needed. The per-job compile-check in scripts/check-runner-labels.nu
     # scopes the dev-label rule to the enclosing job, so this base-label
     # runs-on sits beside the cargo job above without tripping the guard.
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     timeout-minutes: 15
 
     steps:
