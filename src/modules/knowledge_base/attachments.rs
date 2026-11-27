@@ -354,16 +354,19 @@ impl KbAttachmentService {
         // which does distinguish: a true absence is NotFound, an I/O
         // fault bubbles verbatim so an operator sees it.
         let primary = ObjectKey::kb_attachment(row.tenant_id, row.id);
-        match self.store.open(&primary).await {
+        let primary_err = match self.store.open(&primary).await {
             Ok(reader) => return Ok(reader),
             // Logged so a storage fault on the tenant-scoped key is not lost
             // when the legacy open below succeeds or reports its own error.
-            Err(e) => tracing::warn!(
-                attachment_id = %row.id,
-                error = %e,
-                "kb attachment: primary open failed, trying legacy layout"
-            ),
-        }
+            Err(e) => {
+                tracing::warn!(
+                    attachment_id = %row.id,
+                    error = %e,
+                    "kb attachment: primary open failed, trying legacy layout"
+                );
+                e
+            }
+        };
         let legacy = ObjectKey::legacy_kb_attachment(row.tenant_id, row.id);
         match self.store.open(&legacy).await {
             Ok(reader) => Ok(reader),
@@ -372,6 +375,11 @@ impl KbAttachmentService {
                 let legacy_absent = matches!(self.store.exists(&legacy).await, Ok(false));
                 if primary_absent && legacy_absent {
                     Err(AppError::NotFound("Attachment".to_string()))
+                } else if legacy_absent {
+                    // Primary exists but faults, legacy is genuinely absent:
+                    // the legacy NotFound is not the real problem, the
+                    // primary's fault is.
+                    Err(primary_err)
                 } else {
                     Err(legacy_err)
                 }
@@ -585,6 +593,149 @@ async fn get_public_attachment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
+    /// A store double that faults on `open(primary)` with a non-NotFound
+    /// error, while `exists(primary)` truthfully reports it is present, and
+    /// treats the legacy key as genuinely absent on both `open` and
+    /// `exists`. Pins the fix below: the primary's own fault must surface,
+    /// not the legacy lookup's not-found.
+    #[derive(Debug)]
+    struct FaultingPrimaryStore {
+        primary: ObjectKey,
+    }
+
+    #[async_trait]
+    impl ObjectProvider for FaultingPrimaryStore {
+        async fn put(&self, _key: &ObjectKey, _bytes: &[u8]) -> AppResult<()> {
+            unreachable!("not exercised by open_public")
+        }
+
+        async fn read(&self, _key: &ObjectKey) -> AppResult<Vec<u8>> {
+            unreachable!("not exercised by open_public")
+        }
+
+        async fn open(&self, key: &ObjectKey) -> AppResult<ObjectReader> {
+            if *key == self.primary {
+                Err(AppError::Internal(
+                    "simulated permission fault on primary object".to_string(),
+                ))
+            } else {
+                Err(AppError::NotFound("Attachment".to_string()))
+            }
+        }
+
+        async fn delete(&self, _key: &ObjectKey) -> AppResult<()> {
+            unreachable!("not exercised by open_public")
+        }
+
+        async fn exists(&self, key: &ObjectKey) -> AppResult<bool> {
+            Ok(*key == self.primary)
+        }
+
+        async fn rename(&self, _from: &ObjectKey, _to: &ObjectKey) -> AppResult<()> {
+            unreachable!("not exercised by open_public")
+        }
+
+        fn location(&self, _key: &ObjectKey) -> AppResult<String> {
+            unreachable!("not exercised by open_public")
+        }
+    }
+
+    fn test_service(store: Arc<dyn ObjectProvider>) -> KbAttachmentService {
+        let pool = PgPool::connect_lazy("postgres://localhost/mokosh_test_unused")
+            .expect("lazy pool construction never touches the network");
+        let db = Database::from_pool(pool);
+        KbAttachmentService {
+            ledger: FileLedger::new(db.clone()),
+            db,
+            config: KbAttachmentConfig {
+                max_bytes: DEFAULT_MAX_BYTES,
+            },
+            store,
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_fault_with_absent_legacy_surfaces_the_primary_fault() {
+        let tenant_id = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let primary = ObjectKey::kb_attachment(tenant_id, id);
+        let store = Arc::new(FaultingPrimaryStore { primary });
+        let service = test_service(store);
+        let row = PublicAttachmentRow {
+            id,
+            tenant_id,
+            mime_type: "image/png".to_string(),
+            file_size: 0,
+        };
+
+        let err = match service.open_public(&row).await {
+            Ok(_) => panic!("primary faults and legacy is absent, so this must not succeed"),
+            Err(e) => e,
+        };
+
+        match err {
+            AppError::Internal(message) => {
+                assert!(
+                    message.contains("simulated permission fault"),
+                    "expected the primary's own fault to surface, got: {message}"
+                );
+            }
+            other => panic!("expected the primary open's fault, got a different error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn both_absent_is_still_a_plain_not_found() {
+        #[derive(Debug)]
+        struct BothAbsentStore;
+
+        #[async_trait]
+        impl ObjectProvider for BothAbsentStore {
+            async fn put(&self, _key: &ObjectKey, _bytes: &[u8]) -> AppResult<()> {
+                unreachable!("not exercised by open_public")
+            }
+            async fn read(&self, _key: &ObjectKey) -> AppResult<Vec<u8>> {
+                unreachable!("not exercised by open_public")
+            }
+            async fn open(&self, _key: &ObjectKey) -> AppResult<ObjectReader> {
+                Err(AppError::NotFound("Attachment".to_string()))
+            }
+            async fn delete(&self, _key: &ObjectKey) -> AppResult<()> {
+                unreachable!("not exercised by open_public")
+            }
+            async fn exists(&self, _key: &ObjectKey) -> AppResult<bool> {
+                Ok(false)
+            }
+            async fn rename(&self, _from: &ObjectKey, _to: &ObjectKey) -> AppResult<()> {
+                unreachable!("not exercised by open_public")
+            }
+            fn location(&self, _key: &ObjectKey) -> AppResult<String> {
+                unreachable!("not exercised by open_public")
+            }
+        }
+
+        let tenant_id = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let service = test_service(Arc::new(BothAbsentStore));
+        let row = PublicAttachmentRow {
+            id,
+            tenant_id,
+            mime_type: "image/png".to_string(),
+            file_size: 0,
+        };
+
+        let err = match service.open_public(&row).await {
+            Ok(_) => panic!("both absent must still be a 404"),
+            Err(e) => e,
+        };
+
+        assert!(
+            matches!(err, AppError::NotFound(ref s) if s == "Attachment"),
+            "expected unchanged NotFound(\"Attachment\"), got: {err:?}"
+        );
+    }
 
     /// The stored path is derived from the id alone, so a `file_name` carrying
     /// `../` cannot reach outside the upload directory.
