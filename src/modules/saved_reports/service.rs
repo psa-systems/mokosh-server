@@ -422,6 +422,7 @@ where
         Int(i) => q.bind(*i),
         Bool(b) => q.bind(*b),
         Timestamp(t) => q.bind(*t),
+        TimestampList(v) => q.bind(v.clone()),
     }
 }
 
