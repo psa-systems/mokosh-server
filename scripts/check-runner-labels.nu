@@ -44,7 +44,7 @@ def is-job-header [line: string] {
     let trimmed = ($line | str trim)
     if ($trimmed | str starts-with "#") { return false }
     if not ($trimmed | str ends-with ":") { return false }
-    let name = ($trimmed | str substring 0..(($trimmed | str length) - 1))
+    let name = ($trimmed | str substring 0..<(($trimmed | str length) - 1))
     ($name | find --regex '^[A-Za-z_][A-Za-z0-9_-]*$' | is-not-empty)
 }
 
@@ -111,7 +111,15 @@ def main [] {
             let compiles = (
                 $slice_rows | any {|row|
                     let body = (command-body $row.item)
-                    (not ($body | str starts-with "#")) and ($body | str starts-with "cargo ")
+                    if ($body | str starts-with "#") {
+                        false
+                    } else {
+                        (
+                            ($body | str starts-with "cargo ")
+                            or ($body | str contains "cargo nextest archive")
+                            or ($body | str contains "cargo nextest run")
+                        )
+                    }
                 }
             )
 

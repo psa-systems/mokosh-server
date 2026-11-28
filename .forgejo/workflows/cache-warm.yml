@@ -53,7 +53,7 @@ jobs:
     name: warm check.yml cache
     # Same label as check.yml itself (the dev image carries cc / gcc / ld
     # plus the OpenSSL headers), so the restore matches the write.
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_HEAVY }}
     timeout-minutes: 20
 
     steps:
@@ -102,7 +102,7 @@ jobs:
     name: warm integration.yml cache
     # Same label as integration.yml itself (compiles natively on the
     # runner, needs the dev image's cc / gcc / ld + OpenSSL headers).
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_HEAVY }}
     timeout-minutes: 30
 
     # SQLX_OFFLINE lets `cargo nextest archive` compile the test

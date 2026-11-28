@@ -5930,15 +5930,15 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
 ### 10.3 Integration test gate (`.forgejo/workflows/integration.yml`)
 
 - **SPEC-10.12** On every `pull_request` into `main` (never `push`), the workflow must run three jobs: `build` (compiles once), `test` (a matrix of 3 shards, `fail-fast: false`), and `summary` (`needs: test`, `if: always()`); a pull request whose changed paths all match the `paths-ignore` list (10.327) does not trigger it.
-- **SPEC-10.13** The `build` job must run on `${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}` with a 45-minute timeout and env `SQLX_OFFLINE=true`, `RUST_BACKTRACE=1`.
+- **SPEC-10.13** The `build` job must run on `${{ vars.RUNS_ON_OPENSUSE_HEAVY }}` with a 45-minute timeout and env `SQLX_OFFLINE=true`, `RUST_BACKTRACE=1`.
 - **SPEC-10.14** Before building, the job must fail with exit 1 and an `::error::` annotation if free disk space on the workspace filesystem is under 25 GB.
 - **SPEC-10.15** The Rust build cache must use `shared-key: integration`, matching `cache-warm.yml`'s `warm-integration` job.
 - **SPEC-10.16** `cargo-nextest` must be installed by downloading `https://get.nexte.st/0.9.145/linux`, verifying SHA-256 `32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867` via `sha256sum --check --strict`, then extracting to `${CARGO_HOME:-$HOME/.cargo}/bin`.
 - **SPEC-10.17** The build step must run `cargo nextest archive --archive-file nextest-archive.tar.zst`, sampling free disk space every 5 seconds to `/tmp/disk-samples-build.txt` for the duration, and must propagate the archive command's own exit status, never the sampler's.
 - **SPEC-10.18** The archive must be uploaded as artifact `nextest-archive` with `retention-days: 1` and `if-no-files-found: error`.
-- **SPEC-10.19** The `test` job must run a 3-way matrix (`shard: [1, 2, 3]`) on `${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}` with `fail-fast: false` and a 30-minute per-shard timeout, each with its own `postgres:18.2-alpine3.23` service (`POSTGRES_PASSWORD=postgres`, `POSTGRES_USER=postgres`, `POSTGRES_DB=postgres`, health-checked every 5 seconds up to 20 retries).
+- **SPEC-10.19** The `test` job must run a 3-way matrix (`shard: [1, 2, 3]`) on `${{ vars.RUNS_ON_OPENSUSE_HEAVY }}` with `fail-fast: false` and a 30-minute per-shard timeout, each with its own `postgres:18.2-alpine3.23` service (`POSTGRES_PASSWORD=postgres`, `POSTGRES_USER=postgres`, `POSTGRES_DB=postgres`, health-checked every 5 seconds up to 20 retries).
 - **SPEC-10.20** Each shard must download the `nextest-archive` artifact, install the same pinned nextest (0.9.145, SHA-256 `32aa...867`), disable Postgres durability (`fsync`, `synchronous_commit`, `full_page_writes` all off via `ALTER SYSTEM SET` plus `pg_reload_conf()`), create the DB roles the migrations grant to by running `scripts/test-db-roles.sql` with `ON_ERROR_STOP=1`, set `TMPDIR=$HOME/.nextest-tmp`, build the template database by running `cargo nextest run --archive-file nextest-archive.tar.zst --profile ci --no-capture -E 'test(/^suites::template_database::/)'`, then run `cargo nextest run --archive-file nextest-archive.tar.zst --profile ci --partition hash:${shard}/3`.
-- **SPEC-10.21** The `summary` job must run on `${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}` with a 5-minute timeout, and must fail (`exit 1` with an `::error::` annotation) unless `needs.test.result == 'success'`.
+- **SPEC-10.21** The `summary` job must run on `${{ vars.RUNS_ON_OPENSUSE_HEAVY }}` with a 5-minute timeout, and must fail (`exit 1` with an `::error::` annotation) unless `needs.test.result == 'success'`.
 
 ### 10.4 Unsupported/scheduled integration suite (`.forgejo/workflows/integration-unsupported.yml`)
 
@@ -6410,11 +6410,11 @@ Requirements are numbered `SPEC-10.<n>` and cited at their implementing or enfor
   step and the shard test step run in identical environments.
 - **SPEC-10.334**: `cache-warm.yml` must declare `concurrency` group `${{ github.workflow }}-${{ github.ref }}` with
   `cancel-in-progress: true`, so back-to-back merges leave only the newest `main` commit warming the cache.
-- **SPEC-10.335**: The `warm-check` job must run on `${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}` with `timeout-minutes:
+- **SPEC-10.335**: The `warm-check` job must run on `${{ vars.RUNS_ON_OPENSUSE_HEAVY }}` with `timeout-minutes:
   20`, check out with `submodules: true`, set `CARGO_BUILD_JOBS` to `nproc/2`, and run `cargo clippy --workspace
   --all-targets -- -D warnings`, `cargo test --no-run --workspace --lib` and `cargo test --workspace --doc`. The doc
   tests execute, because cargo rejects `--no-run` for them; it runs no lib test and no `cargo check`.
-- **SPEC-10.336**: The `warm-integration` job must run on `${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}` with
+- **SPEC-10.336**: The `warm-integration` job must run on `${{ vars.RUNS_ON_OPENSUSE_HEAVY }}` with
   `timeout-minutes: 30` and env `SQLX_OFFLINE=true`, `RUST_BACKTRACE=1`, start no Postgres service, install the same
   pinned nextest as `integration.yml`, and run `cargo nextest archive --archive-file /tmp/nextest-archive.tar.zst
   --workspace --tests`, discarding the archive: the job exists only to fill the build cache.

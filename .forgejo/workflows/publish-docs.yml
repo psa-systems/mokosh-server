@@ -23,7 +23,7 @@ jobs:
   publish:
     name: Publish docs to docs.a8n.systems
     # Base-medium: one HTTP download plus one `sarracenia push`, no compile.
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     permissions:
       contents: read
     env:

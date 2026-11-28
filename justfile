@@ -57,6 +57,15 @@ test_args := "--workspace --lib"
 # and this repo keeps its own (it removes four named volumes and prints a
 # per-volume line). A value here would be read by nothing.
 
+# Kingfisher has no ignore-file mechanism of its own, so it does not read
+# `.noseyparker-ignore.txt`; these mirror that file's own `.forgejo/workflows/`
+# entry (the CI service postgres default superuser login against a
+# container-scoped database that lives only for the duration of the job) and
+# `justfile` entry (the DB-URL strings are Nushell variable templates that
+# resolve to generated values at run time, never shipped as literals) so
+# kingfisher does not flag the same already-reviewed false positives.
+secrets_kingfisher_excludes := ".forgejo/workflows/ justfile"
+
 # The local `build`, `build-docker`, `check`, `check-clippy`, `check-docker`,
 # `check-fmt`, `default`, `dev-clean`, `dev-clean-all`, `ensure-env`, `fmt`
 # and `test` below intentionally shadow common's; last definition wins.

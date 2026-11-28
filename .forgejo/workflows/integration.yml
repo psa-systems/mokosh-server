@@ -103,6 +103,7 @@ concurrency:
 jobs:
   classify:
     name: classify diff
+    # Base label: the composite action only diffs refs; it compiles nothing.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_MEDIUM }}
     outputs:
       result: ${{ steps.classify.outputs.result }}
@@ -123,12 +124,13 @@ jobs:
     name: build nextest archive
     # Dev label: `cargo nextest archive` compiles natively on the runner, and
     # only the dev image ships the C toolchain + OpenSSL headers that needs
-    # (PMS-705). The retired LATEST tombstone lives here; if a conflict
-    # resolver re-introduces `RUNS_ON_OPENSUSE_DEV_LATEST`, re-apply
-    # `RUNS_ON_OPENSUSE_BASE_HEAVY` per PMS-1508 and PMS-1717 (where the last
-    # regression left integration pending-forever for 36 days).
+    # (PMS-705). The retired-name tombstone lives here; if a conflict
+    # resolver re-introduces either of this variable's two prior, now-retired
+    # names, re-apply the current canonical name below per PMS-1508,
+    # PMS-1696, PMS-1717 and PMS-1724 (where the last two regressions each
+    # left integration pending-forever).
     # SPEC-10.13
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_HEAVY }}
 
     # Placeholder (PMS-1253): the first three green sharded runs after this
     # lands will supply the measured wall times for `build`, each shard, and
@@ -289,8 +291,8 @@ jobs:
     # the dev image's C toolchain and OpenSSL headers are available even
     # though no compile happens here (PMS-705). A fallback compile from a
     # dirty fingerprint would otherwise hit `linker cc not found` on the
-    # base image. See the `build` job for the PMS-1717 tombstone.
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
+    # base image. See the `build` job for the PMS-1724 tombstone.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_HEAVY }}
 
     # Placeholder (PMS-1253): see the `build` job's comment. Historical
     # unsharded test step took 508-938s on the fast runner, 701s on the slow
@@ -493,9 +495,9 @@ jobs:
     # label stays uniform across this file for the file-wide
     # `check-runner-labels` guard that reads any `cargo ` line anywhere
     # as a requirement for every job's label (PMS-705). See the `build`
-    # job for the PMS-1717 tombstone.
+    # job for the PMS-1724 tombstone.
     # SPEC-10.21
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_HEAVY }}
     timeout-minutes: 5
 
     steps:
